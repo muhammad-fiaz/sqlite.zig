@@ -1,0 +1,19 @@
+const std = @import("std");
+const Value = @import("../vm/value.zig").Value;
+
+pub const Result = struct {
+    allocator: std.mem.Allocator,
+    columns: []const []const u8,
+    rows: []const []Value,
+    changes: usize = 0,
+
+    pub fn deinit(self: *Result) void {
+        for (self.rows) |row| self.allocator.free(row);
+        self.allocator.free(self.rows);
+        self.allocator.free(self.columns);
+    }
+
+    pub fn rowCount(self: Result) usize {
+        return self.rows.len;
+    }
+};

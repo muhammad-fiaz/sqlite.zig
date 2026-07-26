@@ -1,0 +1,46 @@
+const Value = @import("../vm/value.zig").Value;
+const Expr = @import("expr.zig").Expr;
+
+pub fn Column(comptime table_name: []const u8, comptime column_name: []const u8, comptime FieldType: type) type {
+    return struct {
+        pub const table = table_name;
+        pub const name = column_name;
+        pub const field_type = FieldType;
+
+        pub fn eq(_: @This(), value: anytype) Expr {
+            return .{ .column = column_name, .operator = .equal, .value = toValue(value) };
+        }
+        pub fn ne(_: @This(), value: anytype) Expr {
+            return .{ .column = column_name, .operator = .not_equal, .value = toValue(value) };
+        }
+        pub fn gt(_: @This(), value: anytype) Expr {
+            return .{ .column = column_name, .operator = .greater, .value = toValue(value) };
+        }
+        pub fn ge(_: @This(), value: anytype) Expr {
+            return .{ .column = column_name, .operator = .greater_equal, .value = toValue(value) };
+        }
+        pub fn lt(_: @This(), value: anytype) Expr {
+            return .{ .column = column_name, .operator = .less, .value = toValue(value) };
+        }
+        pub fn le(_: @This(), value: anytype) Expr {
+            return .{ .column = column_name, .operator = .less_equal, .value = toValue(value) };
+        }
+        pub fn asc(_: @This()) @import("query_builder.zig").Order {
+            return .{ .column = column_name, .descending = false };
+        }
+        pub fn desc(_: @This()) @import("query_builder.zig").Order {
+            return .{ .column = column_name, .descending = true };
+        }
+    };
+}
+
+fn toValue(value: anytype) Value {
+    const T = @TypeOf(value);
+    if (T == Value) return value;
+    return switch (@typeInfo(T)) {
+        .int, .comptime_int => .{ .integer = @intCast(value) },
+        .float, .comptime_float => .{ .real = @floatCast(value) },
+        .pointer => .{ .text = value },
+        else => @compileError("unsupported DSL value"),
+    };
+}

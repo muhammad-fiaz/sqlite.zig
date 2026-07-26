@@ -1,0 +1,12 @@
+const std = @import("std");
+const sqlite = @import("sqlite_zig");
+
+pub fn main() !void {
+    var db = try sqlite.open(std.heap.page_allocator, "valid_06.db");
+    defer db.close();
+    const result = db.exec("SELECT * FROM missing;");
+    if (result) |value| {
+        var owned = value;
+        owned.deinit();
+    } else |_| {}
+}
