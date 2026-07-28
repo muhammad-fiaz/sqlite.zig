@@ -25,6 +25,7 @@ pub const Connection = connection.Connection;
 pub const Result = connection.Result;
 pub const Statement = @import("connection/statement.zig").Statement;
 pub const open = Connection.open;
+pub const version = @import("version.zig");
 pub const dsl = struct {
     pub const table = @import("dsl/table.zig").table;
     pub const Expr = @import("dsl/expr.zig").Expr;

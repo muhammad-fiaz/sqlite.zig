@@ -83,6 +83,91 @@ pub const Schema = struct {
         return error.UnknownTable;
     }
 
+    pub fn renameTable(self: *Schema, old_name: []const u8, new_name: []const u8) !void {
+        if (self.find(new_name) != null) return error.TableExists;
+        const table = self.find(old_name) orelse return error.UnknownTable;
+        const owned = try self.allocator.dupe(u8, new_name);
+        self.allocator.free(table.name);
+        table.name = owned;
+    }
+
+    pub fn truncateTable(self: *Schema, name: []const u8) !void {
+        const table = self.find(name) orelse return error.UnknownTable;
+        for (table.rows.items) |row| {
+            for (row.values) |value| freeValue(self.allocator, value);
+            self.allocator.free(row.values);
+        }
+        table.rows.clearRetainingCapacity();
+    }
+
+    pub fn addColumn(self: *Schema, table_name: []const u8, definition: ast.ColumnDef) !void {
+        const table = self.find(table_name) orelse return error.UnknownTable;
+        for (table.columns) |column| if (std.ascii.eqlIgnoreCase(column.name, definition.name)) return error.ColumnExists;
+        if (definition.not_null and table.rows.items.len != 0) return error.ConstraintViolation;
+        const new_columns = try self.allocator.alloc(Column, table.columns.len + 1);
+        errdefer self.allocator.free(new_columns);
+        for (table.columns, 0..) |column, index| new_columns[index] = column;
+        new_columns[table.columns.len] = .{ .name = try self.allocator.dupe(u8, definition.name), .type_name = try self.allocator.dupe(u8, definition.type_name), .primary_key = definition.primary_key, .not_null = definition.not_null };
+        errdefer {
+            self.allocator.free(new_columns[table.columns.len].name);
+            self.allocator.free(new_columns[table.columns.len].type_name);
+        }
+        for (table.rows.items) |*row| {
+            const values = try self.allocator.realloc(row.values, row.values.len + 1);
+            row.values = values;
+            row.values[row.values.len - 1] = .null;
+        }
+        self.allocator.free(table.columns);
+        table.columns = new_columns;
+    }
+
+    pub fn renameColumn(self: *Schema, table_name: []const u8, old_name: []const u8, new_name: []const u8) !void {
+        const table = self.find(table_name) orelse return error.UnknownTable;
+        if (self.columnIndex(table, new_name)) |_| return error.ColumnExists;
+        const index = self.columnIndex(table, old_name) orelse return error.UnknownColumn;
+        const owned = try self.allocator.dupe(u8, new_name);
+        self.allocator.free(table.columns[index].name);
+        table.columns[index].name = owned;
+    }
+
+    pub fn dropColumn(self: *Schema, table_name: []const u8, column_name: []const u8) !void {
+        const table = self.find(table_name) orelse return error.UnknownTable;
+        const index = self.columnIndex(table, column_name) orelse return error.UnknownColumn;
+        if (table.columns.len == 1) return error.ConstraintViolation;
+        const old_column = table.columns[index];
+        var new_columns = try self.allocator.alloc(Column, table.columns.len - 1);
+        var target_index: usize = 0;
+        for (table.columns, 0..) |column, source_index| {
+            if (source_index == index) continue;
+            new_columns[target_index] = column;
+            target_index += 1;
+        }
+        for (table.rows.items) |*row| {
+            const new_values = try self.allocator.alloc(Value, row.values.len - 1);
+            var value_index: usize = 0;
+            for (row.values, 0..) |value, source_index| {
+                if (source_index == index) {
+                    freeValue(self.allocator, value);
+                } else {
+                    new_values[value_index] = value;
+                    value_index += 1;
+                }
+            }
+            self.allocator.free(row.values);
+            row.values = new_values;
+        }
+        self.allocator.free(old_column.name);
+        self.allocator.free(old_column.type_name);
+        self.allocator.free(table.columns);
+        table.columns = new_columns;
+    }
+
+    fn columnIndex(self: *Schema, table: *const Table, name: []const u8) ?usize {
+        _ = self;
+        for (table.columns, 0..) |column, index| if (std.ascii.eqlIgnoreCase(column.name, name)) return index;
+        return null;
+    }
+
     fn removeTable(self: *Schema, index: usize) void {
         var table = self.tables.orderedRemove(index);
         for (table.rows.items) |row| {

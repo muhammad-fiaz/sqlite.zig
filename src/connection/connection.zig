@@ -10,6 +10,8 @@ const Parser = @import("../sql/parser.zig").Parser;
 const Prepared = @import("statement.zig").Statement;
 pub const Result = @import("result.zig").Result;
 
+pub const TableOptions = struct { if_not_exists: bool = false };
+
 const Savepoint = struct { name: []u8, schema: Schema };
 
 pub const Connection = struct {
@@ -72,9 +74,65 @@ pub const Connection = struct {
         return @import("../dsl/query_builder.zig").Query(TableType).init(self, TableType.table_name, executeForDsl);
     }
 
+    pub fn tableExists(self: *Connection, comptime TableType: type) bool {
+        return self.schema.find(TableType.table_name) != null;
+    }
+
+    pub fn createTable(self: *Connection, comptime TableType: type, options: TableOptions) !void {
+        if (self.tableExists(TableType)) {
+            if (options.if_not_exists) return;
+            return error.TableExists;
+        }
+        const Row = TableType.row_type;
+        const fields = @typeInfo(Row).@"struct".field_names;
+        var definitions: [fields.len]ast.ColumnDef = undefined;
+        inline for (fields, 0..) |field, index| definitions[index] = .{ .name = field, .type_name = dslTypeName(@FieldType(Row, field)) };
+        try self.schema.createTable(TableType.table_name, &definitions);
+        if (!self.transaction_active) try self.persist();
+    }
+
+    pub fn dropTable(self: *Connection, comptime TableType: type) !void {
+        try self.schema.dropTable(TableType.table_name);
+        if (!self.transaction_active) try self.persist();
+    }
+
+    pub fn renameTable(self: *Connection, comptime TableType: type, comptime new_name: []const u8) !void {
+        try self.schema.renameTable(TableType.table_name, new_name);
+        if (!self.transaction_active) try self.persist();
+    }
+
+    pub fn truncate(self: *Connection, comptime TableType: type) !void {
+        try self.schema.truncateTable(TableType.table_name);
+        if (!self.transaction_active) try self.persist();
+    }
+
+    pub fn addColumn(self: *Connection, comptime TableType: type, comptime field: []const u8, comptime FieldType: type) !void {
+        try self.schema.addColumn(TableType.table_name, .{ .name = field, .type_name = dslTypeName(FieldType) });
+        if (!self.transaction_active) try self.persist();
+    }
+
+    pub fn renameColumn(self: *Connection, comptime TableType: type, comptime old_name: []const u8, comptime new_name: []const u8) !void {
+        try self.schema.renameColumn(TableType.table_name, old_name, new_name);
+        if (!self.transaction_active) try self.persist();
+    }
+
+    pub fn dropColumn(self: *Connection, comptime TableType: type, comptime field: []const u8) !void {
+        try self.schema.dropColumn(TableType.table_name, field);
+        if (!self.transaction_active) try self.persist();
+    }
+
     fn executeForDsl(pointer: *anyopaque, sql: []const u8) anyerror!Result {
         const self: *Connection = @ptrCast(@alignCast(pointer));
         return self.execute(sql, &.{});
+    }
+
+    fn dslTypeName(comptime T: type) []const u8 {
+        return switch (@typeInfo(T)) {
+            .int, .comptime_int, .bool => "INTEGER",
+            .float, .comptime_float => "REAL",
+            .pointer => |pointer| if (pointer.size == .slice and pointer.child == u8) "TEXT" else "BLOB",
+            else => "BLOB",
+        };
     }
 
     fn executePrepared(pointer: *anyopaque, sql: []const u8, parameters: []const Value) anyerror!void {
@@ -185,8 +243,8 @@ pub const Connection = struct {
         var statement = try parser.parse();
         defer ast.deinit(self.allocator, &statement);
         const result = switch (statement) {
-            .create_table => |value| try self.createTable(value),
-            .drop_table => |value| try self.dropTable(value),
+            .create_table => |value| try self.createTableCommand(value),
+            .drop_table => |value| try self.dropTableCommand(value),
             .insert => |value| try self.insert(value, parameters),
             .select => |value| try self.select(value, parameters),
             .update => |value| try self.update(value, parameters),
@@ -214,12 +272,12 @@ pub const Connection = struct {
     fn emptyResult(allocator: std.mem.Allocator) !Result {
         return .{ .allocator = allocator, .columns = try allocator.alloc([]const u8, 0), .rows = try allocator.alloc([]Value, 0) };
     }
-    fn createTable(self: *Connection, value: anytype) !Result {
+    fn createTableCommand(self: *Connection, value: anytype) !Result {
         if (self.schema.find(value.name) != null and value.if_not_exists) return try emptyResult(self.allocator);
         try self.schema.createTable(value.name, value.columns);
         return try emptyResult(self.allocator);
     }
-    fn dropTable(self: *Connection, name: []const u8) !Result {
+    fn dropTableCommand(self: *Connection, name: []const u8) !Result {
         try self.schema.dropTable(name);
         return try emptyResult(self.allocator);
     }
@@ -595,4 +653,24 @@ test "connection executes order by, lower, and savepoints" {
     var count = try db.exec("SELECT count(*) FROM items;");
     defer count.deinit();
     try std.testing.expectEqual(@as(i64, 3), count.rows[0][0].integer);
+}
+
+test "typed DSL owns table lifecycle operations" {
+    const User = @import("../dsl/table.zig").table("schema_dsl_users", struct { id: i64, name: []const u8 });
+    const path = "sqlite_zig_schema_dsl_test.db";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    var db = try Connection.open(std.testing.allocator, path);
+    defer db.close();
+    try db.createTable(User, .{});
+    try std.testing.expect(db.tableExists(User));
+    try db.createTable(User, .{ .if_not_exists = true });
+    var inserted = try db.from(User).insert(.{ .id = 1, .name = "typed" });
+    inserted.deinit();
+    try db.addColumn(User, "active", bool);
+    try db.renameColumn(User, "active", "enabled");
+    try db.dropColumn(User, "enabled");
+    try db.truncate(User);
+    try db.dropTable(User);
+    try std.testing.expect(!db.tableExists(User));
 }

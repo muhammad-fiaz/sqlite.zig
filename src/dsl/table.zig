@@ -20,5 +20,5 @@ pub fn table(comptime name: []const u8, comptime Row: type) type {
 test "typed table exposes checked column types" {
     const User = table("users", struct { id: i64, name: []const u8 });
     const id = User.column("id");
-    try std.testing.expectEqualStrings("id", id.name);
+    try std.testing.expectEqualStrings("id", @TypeOf(id).name);
 }

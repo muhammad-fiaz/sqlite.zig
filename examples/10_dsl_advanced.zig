@@ -17,8 +17,7 @@ fn transfer(db: *sqlite.Connection) !void {
 pub fn main() !void {
     var db = try sqlite.open(std.heap.page_allocator, "valid_10.db");
     defer db.close();
-    var setup = try db.exec("CREATE TABLE IF NOT EXISTS dsl_accounts (id INTEGER, owner TEXT, balance INTEGER);");
-    setup.deinit();
+    try db.createTable(Account, .{ .if_not_exists = true });
 
     var first = try db.from(Account).insert(.{ .id = 1, .owner = "Alice", .balance = 100 });
     first.deinit();
