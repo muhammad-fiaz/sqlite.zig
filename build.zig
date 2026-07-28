@@ -32,6 +32,8 @@ pub fn build(b: *std.Build) void {
         "06_error_handling",
         "07_python_interop",
         "08_repair_legacy_example",
+        "09_dsl_crud",
+        "10_dsl_advanced",
     };
     for (examples) |name| {
         const executable = b.addExecutable(.{

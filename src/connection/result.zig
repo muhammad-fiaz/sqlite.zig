@@ -8,7 +8,14 @@ pub const Result = struct {
     changes: usize = 0,
 
     pub fn deinit(self: *Result) void {
-        for (self.rows) |row| self.allocator.free(row);
+        for (self.rows) |row| {
+            for (row) |value| switch (value) {
+                .text => |bytes| self.allocator.free(bytes),
+                .blob => |bytes| self.allocator.free(bytes),
+                else => {},
+            };
+            self.allocator.free(row);
+        }
         self.allocator.free(self.rows);
         self.allocator.free(self.columns);
     }

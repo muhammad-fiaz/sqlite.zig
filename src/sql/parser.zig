@@ -5,7 +5,7 @@ const lexer = @import("lexer.zig");
 const ast = @import("ast.zig");
 const Value = @import("../vm/value.zig").Value;
 
-pub const Error = error{ InvalidSql, UnexpectedToken, OutOfMemory };
+pub const Error = error{ InvalidSql, UnexpectedToken, OutOfMemory } || std.mem.Allocator.Error || lexer.Error;
 
 pub const Parser = struct {
     allocator: std.mem.Allocator,
@@ -63,7 +63,12 @@ pub const Parser = struct {
 
     pub fn parse(self: *Parser) !ast.Statement {
         var statement: ast.Statement = undefined;
-        if (self.acceptWord("create")) statement = try self.parseCreate() else if (self.acceptWord("drop")) statement = try self.parseDrop() else if (self.acceptWord("insert")) statement = try self.parseInsert() else if (self.acceptWord("select")) statement = try self.parseSelect() else if (self.acceptWord("update")) statement = try self.parseUpdate() else if (self.acceptWord("delete")) statement = try self.parseDelete() else if (self.acceptWord("begin")) statement = .begin else if (self.acceptWord("commit")) statement = .commit else if (self.acceptWord("rollback")) statement = .rollback else return Error.InvalidSql;
+        if (self.acceptWord("create")) statement = try self.parseCreate() else if (self.acceptWord("drop")) statement = try self.parseDrop() else if (self.acceptWord("insert")) statement = try self.parseInsert() else if (self.acceptWord("select")) statement = try self.parseSelect() else if (self.acceptWord("update")) statement = try self.parseUpdate() else if (self.acceptWord("delete")) statement = try self.parseDelete() else if (self.acceptWord("begin")) statement = .begin else if (self.acceptWord("commit")) statement = .commit else if (self.acceptWord("rollback")) {
+            if (self.acceptWord("to")) statement = .{ .rollback_to = try self.word() } else statement = .rollback;
+        } else if (self.acceptWord("savepoint")) statement = .{ .savepoint = try self.word() } else if (self.acceptWord("release")) {
+            _ = self.acceptWord("savepoint");
+            statement = .{ .release = try self.word() };
+        } else return Error.InvalidSql;
         _ = self.acceptTag(.semicolon);
         if (self.current().tag != .eof) return Error.UnexpectedToken;
         return statement;
@@ -104,7 +109,7 @@ pub const Parser = struct {
         return .{ .drop_table = try self.word() };
     }
 
-    fn parseLiteral(self: *Parser) !ast.Expr {
+    fn parseLiteral(self: *Parser) Error!ast.Expr {
         const token = self.current();
         if (token.tag == .parameter) {
             _ = self.advance();
@@ -124,11 +129,21 @@ pub const Parser = struct {
         if (self.acceptWord("null")) return .{ .literal = .null };
         if (self.acceptWord("true")) return .{ .literal = .{ .integer = 1 } };
         if (self.acceptWord("false")) return .{ .literal = .{ .integer = 0 } };
-        if (token.tag == .word) return .{ .identifier = self.advance().text };
+        if (token.tag == .word) {
+            const name = self.advance().text;
+            if (self.acceptTag(.lparen)) {
+                const argument = try self.allocator.create(ast.Expr);
+                errdefer self.allocator.destroy(argument);
+                argument.* = try self.parseExpr();
+                try self.requireTag(.rparen);
+                return .{ .function = .{ .name = name, .argument = argument } };
+            }
+            return .{ .identifier = name };
+        }
         return Error.UnexpectedToken;
     }
 
-    fn parseExpr(self: *Parser) !ast.Expr {
+    fn parseExpr(self: *Parser) Error!ast.Expr {
         if (self.acceptTag(.star)) return .wildcard;
         return self.parseLiteral();
     }
@@ -160,11 +175,16 @@ pub const Parser = struct {
         return .{ .insert = .{ .table = table, .columns = try columns.toOwnedSlice(self.allocator), .rows = try rows.toOwnedSlice(self.allocator) } };
     }
 
-    fn parseCondition(self: *Parser) !?ast.Condition {
+    fn parseCondition(self: *Parser) !?ast.Conditions {
         if (!self.acceptWord("where")) return null;
-        const column = try self.word();
-        const op: ast.CompareOp = if (self.acceptTag(.equal)) .equal else if (self.acceptTag(.not_equal)) .not_equal else if (self.acceptTag(.less)) .less else if (self.acceptTag(.less_equal)) .less_equal else if (self.acceptTag(.greater)) .greater else if (self.acceptTag(.greater_equal)) .greater_equal else return Error.UnexpectedToken;
-        return .{ .column = column, .op = op, .value = try self.parseExpr() };
+        var conditions = std.ArrayList(ast.Condition).empty;
+        while (true) {
+            const column = try self.word();
+            const op: ast.CompareOp = if (self.acceptTag(.equal)) .equal else if (self.acceptTag(.not_equal)) .not_equal else if (self.acceptTag(.less)) .less else if (self.acceptTag(.less_equal)) .less_equal else if (self.acceptTag(.greater)) .greater else if (self.acceptTag(.greater_equal)) .greater_equal else return Error.UnexpectedToken;
+            try conditions.append(self.allocator, .{ .column = column, .op = op, .value = try self.parseExpr() });
+            if (!self.acceptWord("and")) break;
+        }
+        return try conditions.toOwnedSlice(self.allocator);
     }
 
     fn parseSelect(self: *Parser) !ast.Statement {
@@ -190,7 +210,12 @@ pub const Parser = struct {
             const token = self.advance();
             limit = std.fmt.parseInt(usize, token.text, 10) catch return Error.InvalidSql;
         }
-        return .{ .select = .{ .projections = try projections.toOwnedSlice(self.allocator), .table = table, .condition = condition, .order = order, .limit = limit } };
+        var offset: ?usize = null;
+        if (self.acceptWord("offset")) {
+            const token = self.advance();
+            offset = std.fmt.parseInt(usize, token.text, 10) catch return Error.InvalidSql;
+        }
+        return .{ .select = .{ .projections = try projections.toOwnedSlice(self.allocator), .table = table, .condition = condition, .order = order, .limit = limit, .offset = offset } };
     }
 
     fn parseUpdate(self: *Parser) !ast.Statement {

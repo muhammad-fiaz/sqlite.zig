@@ -1,0 +1,21 @@
+const std = @import("std");
+const sqlite = @import("sqlite_zig");
+
+const User = sqlite.table("dsl_users", struct { id: i64, name: []const u8 });
+
+pub fn main() !void {
+    var db = try sqlite.open(std.heap.page_allocator, "valid_09.db");
+    defer db.close();
+    var setup = try db.exec("CREATE TABLE IF NOT EXISTS dsl_users (id INTEGER, name TEXT);");
+    setup.deinit();
+    var inserted = try db.from(User).insert(.{ .id = 1, .name = "before" });
+    inserted.deinit();
+    var mutation = try db.from(User).update(.{ .name = "after" });
+    defer mutation.deinit();
+    var updated = try mutation.where(User.column("id").eq(1)).execute();
+    updated.deinit();
+    var selected = try db.from(User).selectFields(&.{ "id", "name" }).where(User.column("id").eq(1)).fetchAll();
+    selected.deinit();
+    var deleted = try db.from(User).delete().where(User.column("id").eq(1)).execute();
+    deleted.deinit();
+}

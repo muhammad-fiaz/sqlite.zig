@@ -11,8 +11,8 @@ pub fn table(comptime name: []const u8, comptime Row: type) type {
             return .{};
         }
 
-        pub fn columns() []const std.builtin.Type.StructField {
-            return @typeInfo(Row).@"struct".fields;
+        pub fn columns() []const [:0]const u8 {
+            return @typeInfo(Row).@"struct".field_names;
         }
     };
 }

@@ -12,8 +12,13 @@ const Cell = struct { rowid: u64, values: []Value };
 
 pub const page_size: usize = 4096;
 
-fn putU16(bytes: []u8, offset: usize, value: u16) void { bytes[offset] = @truncate(value >> 8); bytes[offset + 1] = @truncate(value); }
-fn getU16(bytes: []const u8, offset: usize) u16 { return (@as(u16, bytes[offset]) << 8) | bytes[offset + 1]; }
+fn putU16(bytes: []u8, offset: usize, value: u16) void {
+    bytes[offset] = @truncate(value >> 8);
+    bytes[offset + 1] = @truncate(value);
+}
+fn getU16(bytes: []const u8, offset: usize) u16 {
+    return (@as(u16, bytes[offset]) << 8) | bytes[offset + 1];
+}
 
 fn appendVarint(list: *std.ArrayList(u8), allocator: std.mem.Allocator, value: u64) !void {
     var buffer: [9]u8 = undefined;
@@ -84,7 +89,10 @@ pub fn encode(allocator: std.mem.Allocator, schema: *const Schema) ![]u8 {
     var schema_cells = try allocator.alloc([]const u8, schema.tables.items.len);
     defer allocator.free(schema_cells);
     var schema_owned = std.ArrayList([]u8).empty;
-    defer { for (schema_owned.items) |item| allocator.free(item); schema_owned.deinit(allocator); }
+    defer {
+        for (schema_owned.items) |item| allocator.free(item);
+        schema_owned.deinit(allocator);
+    }
 
     for (schema.tables.items, 0..) |table, index| {
         const sql = try createSql(allocator, table);
@@ -109,7 +117,10 @@ pub fn encode(allocator: std.mem.Allocator, schema: *const Schema) ![]u8 {
         var table_cells = try allocator.alloc([]const u8, table.rows.items.len);
         defer allocator.free(table_cells);
         var owned = std.ArrayList([]u8).empty;
-        defer { for (owned.items) |item| allocator.free(item); owned.deinit(allocator); }
+        defer {
+            for (owned.items) |item| allocator.free(item);
+            owned.deinit(allocator);
+        }
         for (table.rows.items, 0..) |row, row_index| {
             const item = try cell(allocator, row_index + 1, row.values);
             try owned.append(allocator, item);
