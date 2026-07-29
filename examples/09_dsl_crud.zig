@@ -13,7 +13,7 @@ pub fn main() !void {
     defer mutation.deinit();
     var updated = try mutation.where(User.column("id").eq(1)).execute();
     updated.deinit();
-    var selected = try db.from(User).selectFields(&.{ "id", "name" }).where(User.column("id").eq(1)).fetchAll();
+    var selected = try db.from(User).selectFieldNames(&.{ "id", "name" }).where(User.column("id").eq(1)).fetchAll();
     selected.deinit();
     var deleted = try db.from(User).delete().where(User.column("id").eq(1)).execute();
     deleted.deinit();

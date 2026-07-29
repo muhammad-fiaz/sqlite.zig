@@ -34,6 +34,7 @@ pub fn build(b: *std.Build) void {
         "08_repair_legacy_example",
         "09_dsl_crud",
         "10_dsl_advanced",
+        "11_keys_and_joins",
     };
     for (examples) |name| {
         const executable = b.addExecutable(.{

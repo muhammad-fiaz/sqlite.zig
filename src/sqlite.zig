@@ -30,6 +30,7 @@ pub const dsl = struct {
     pub const table = @import("dsl/table.zig").table;
     pub const Expr = @import("dsl/expr.zig").Expr;
     pub const Query = @import("dsl/query_builder.zig").Query;
+    pub const ColumnKey = @import("dsl/table.zig").ColumnKey;
 };
 pub const table = @import("dsl/table.zig").table;
 pub const migration = struct {

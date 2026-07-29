@@ -21,7 +21,7 @@ pub const Page = struct {
     }
 
     pub fn setPageType(self: Page, page_type: PageType) void {
-        self.bytes[self.headerOffset()] = @backingInt(page_type);
+        self.bytes[self.headerOffset()] = @intFromEnum(page_type);
     }
 };
 

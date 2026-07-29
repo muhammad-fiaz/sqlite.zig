@@ -1,6 +1,8 @@
 const std = @import("std");
 const Column = @import("column.zig").Column;
 
+pub const ColumnKey = struct { table: []const u8, name: []const u8 };
+
 pub fn table(comptime name: []const u8, comptime Row: type) type {
     return struct {
         pub const table_name = name;
@@ -11,8 +13,15 @@ pub fn table(comptime name: []const u8, comptime Row: type) type {
             return .{};
         }
 
-        pub fn columns() []const [:0]const u8 {
-            return @typeInfo(Row).@"struct".field_names;
+        pub fn key(comptime column_name: []const u8) ColumnKey {
+            if (!@hasField(Row, column_name)) @compileError("unknown table key column");
+            return .{ .table = name, .name = column_name };
+        }
+
+        pub fn columns() [@typeInfo(Row).@"struct".fields.len][]const u8 {
+            var result: [@typeInfo(Row).@"struct".fields.len][]const u8 = undefined;
+            inline for (@typeInfo(Row).@"struct".fields, 0..) |field, index| result[index] = field.name;
+            return result;
         }
     };
 }

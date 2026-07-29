@@ -110,6 +110,11 @@ pub fn Query(comptime TableType: type) type {
         order: ?Order = null,
         limit_value: ?usize = null,
         offset_value: ?usize = null,
+        join_table: ?[]const u8 = null,
+        join_left: []const u8 = "",
+        join_right: []const u8 = "",
+        join_kind: []const u8 = "JOIN",
+        distinct_value: bool = false,
 
         pub fn init(connection: anytype, table: []const u8, execute_fn: *const fn (*anyopaque, []const u8) anyerror!Result) Self {
             return .{ .allocator = connection.allocator, .connection = connection, .execute_fn = execute_fn, .table = table };
@@ -122,7 +127,13 @@ pub fn Query(comptime TableType: type) type {
             return copy;
         }
 
-        pub fn selectFields(self: Self, comptime fields: []const []const u8) Self {
+        pub fn distinct(self: Self) Self {
+            var copy = self;
+            copy.distinct_value = true;
+            return copy;
+        }
+
+        pub fn selectFieldNames(self: Self, comptime fields: []const []const u8) Self {
             inline for (fields) |field| if (!@hasField(TableType.row_type, field)) @compileError("unknown DSL column");
             var copy = self;
             copy.selected_fields = fields;
@@ -187,6 +198,42 @@ pub fn Query(comptime TableType: type) type {
             return self.aggregate("MAX", field);
         }
 
+        pub fn innerJoin(self: Self, comptime OtherTable: type, comptime left_field: []const u8, comptime right_field: []const u8) Self {
+            return self.joinAs(OtherTable, left_field, right_field, "JOIN");
+        }
+
+        pub fn leftJoin(self: Self, comptime OtherTable: type, comptime left_field: []const u8, comptime right_field: []const u8) Self {
+            return self.joinAs(OtherTable, left_field, right_field, "LEFT JOIN");
+        }
+
+        pub fn rightJoin(self: Self, comptime OtherTable: type, comptime left_field: []const u8, comptime right_field: []const u8) Self {
+            return self.joinAs(OtherTable, left_field, right_field, "RIGHT JOIN");
+        }
+
+        pub fn fullJoin(self: Self, comptime OtherTable: type, comptime left_field: []const u8, comptime right_field: []const u8) Self {
+            return self.joinAs(OtherTable, left_field, right_field, "FULL JOIN");
+        }
+
+        pub fn crossJoin(self: Self, comptime OtherTable: type) Self {
+            var copy = self;
+            copy.join_table = OtherTable.table_name;
+            copy.join_left = "";
+            copy.join_right = "";
+            copy.join_kind = "CROSS JOIN";
+            return copy;
+        }
+
+        fn joinAs(self: Self, comptime OtherTable: type, comptime left_field: []const u8, comptime right_field: []const u8, comptime kind: []const u8) Self {
+            if (!@hasField(TableType.row_type, left_field)) @compileError("unknown DSL join column");
+            if (!@hasField(OtherTable.row_type, right_field)) @compileError("unknown DSL join column");
+            var copy = self;
+            copy.join_table = OtherTable.table_name;
+            copy.join_left = left_field;
+            copy.join_right = right_field;
+            copy.join_kind = kind;
+            return copy;
+        }
+
         fn aggregate(self: Self, comptime function_name: []const u8, comptime field: []const u8) Self {
             if (!@hasField(TableType.row_type, field)) @compileError("unknown DSL column");
             var copy = self;
@@ -203,15 +250,15 @@ pub fn Query(comptime TableType: type) type {
             try sql.appendSlice(self.allocator, "INSERT INTO ");
             try sql.appendSlice(self.allocator, self.table);
             try sql.appendSlice(self.allocator, " (");
-            const fields = @typeInfo(RowType).@"struct".field_names;
+            const fields = @typeInfo(RowType).@"struct".fields;
             inline for (fields, 0..) |field, index| {
                 if (index != 0) try sql.appendSlice(self.allocator, ", ");
-                try sql.appendSlice(self.allocator, field);
+                try sql.appendSlice(self.allocator, field.name);
             }
             try sql.appendSlice(self.allocator, ") VALUES (");
             inline for (fields, 0..) |field, index| {
                 if (index != 0) try sql.appendSlice(self.allocator, ", ");
-                try appendValue(self.allocator, &sql, @field(row, field));
+                try appendValue(self.allocator, &sql, @field(row, field.name));
             }
             try sql.appendSlice(self.allocator, ");");
             return self.execute_fn(self.connection, sql.items);
@@ -221,12 +268,12 @@ pub fn Query(comptime TableType: type) type {
             const RowType = @TypeOf(row);
             if (@typeInfo(RowType) != .@"struct") @compileError("DSL update requires a struct row");
             var sql = std.ArrayList(u8).empty;
-            const fields = @typeInfo(RowType).@"struct".field_names;
+            const fields = @typeInfo(RowType).@"struct".fields;
             inline for (fields, 0..) |field, index| {
                 if (index != 0) try sql.appendSlice(self.allocator, ", ");
-                try sql.appendSlice(self.allocator, field);
+                try sql.appendSlice(self.allocator, field.name);
                 try sql.appendSlice(self.allocator, " = ");
-                try appendValue(self.allocator, &sql, @field(row, field));
+                try appendValue(self.allocator, &sql, @field(row, field.name));
             }
             return .{ .base = self, .operation = .update, .set_sql = try sql.toOwnedSlice(self.allocator) };
         }
@@ -238,7 +285,7 @@ pub fn Query(comptime TableType: type) type {
         pub fn fetchAll(self: Self) !Result {
             var list = std.ArrayList(u8).empty;
             defer list.deinit(self.allocator);
-            try list.appendSlice(self.allocator, "SELECT ");
+            try list.appendSlice(self.allocator, if (self.distinct_value) "SELECT DISTINCT " else "SELECT ");
             if (self.selected_fields) |fields| {
                 for (fields, 0..) |field, index| {
                     if (index != 0) try list.appendSlice(self.allocator, ", ");
@@ -247,6 +294,22 @@ pub fn Query(comptime TableType: type) type {
             } else try list.appendSlice(self.allocator, self.projection);
             try list.appendSlice(self.allocator, " FROM ");
             try list.appendSlice(self.allocator, self.table);
+            if (self.join_table) |joined_table| {
+                try list.appendSlice(self.allocator, " ");
+                try list.appendSlice(self.allocator, self.join_kind);
+                try list.appendSlice(self.allocator, " ");
+                try list.appendSlice(self.allocator, joined_table);
+                if (!std.mem.eql(u8, self.join_kind, "CROSS JOIN")) {
+                    try list.appendSlice(self.allocator, " ON ");
+                    try list.appendSlice(self.allocator, self.table);
+                    try list.appendSlice(self.allocator, ".");
+                    try list.appendSlice(self.allocator, self.join_left);
+                    try list.appendSlice(self.allocator, " = ");
+                    try list.appendSlice(self.allocator, joined_table);
+                    try list.appendSlice(self.allocator, ".");
+                    try list.appendSlice(self.allocator, self.join_right);
+                }
+            }
             try appendCondition(self.allocator, &list, self.condition, self.additional_conditions[0..self.additional_condition_count]);
             if (self.order) |order| {
                 try list.appendSlice(self.allocator, " ORDER BY ");

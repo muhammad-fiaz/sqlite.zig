@@ -26,7 +26,7 @@ pub fn main() !void {
 
     try db.transaction(transfer);
     try db.savepoint("report");
-    var rows = try db.from(Account).selectFields(&.{ "id", "owner", "balance" })
+    var rows = try db.from(Account).selectFieldNames(&.{ "id", "owner", "balance" })
         .where(Account.column("balance").ge(75))
         .andWhere(Account.column("id").gt(0))
         .orderBy(Account.column("balance").desc())

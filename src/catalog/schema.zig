@@ -2,7 +2,7 @@ const std = @import("std");
 const Value = @import("../vm/value.zig").Value;
 const ast = @import("../sql/ast.zig");
 
-pub const Column = struct { name: []u8, type_name: []u8, primary_key: bool, not_null: bool };
+pub const Column = struct { name: []u8, type_name: []u8, primary_key: bool, not_null: bool, unique: bool = false, foreign_table: ?[]u8 = null, foreign_column: ?[]u8 = null };
 pub const Row = struct { values: []Value };
 pub const Table = struct { name: []u8, columns: []Column, rows: std.ArrayList(Row) };
 
@@ -24,6 +24,8 @@ pub const Schema = struct {
             for (table.columns) |column| {
                 self.allocator.free(column.name);
                 self.allocator.free(column.type_name);
+                if (column.foreign_table) |value| self.allocator.free(value);
+                if (column.foreign_column) |value| self.allocator.free(value);
             }
             self.allocator.free(table.columns);
             self.allocator.free(table.name);
@@ -67,7 +69,7 @@ pub const Schema = struct {
             self.allocator.free(column.type_name);
         };
         for (definitions, 0..) |definition, index| {
-            columns[index] = .{ .name = try self.allocator.dupe(u8, definition.name), .type_name = try self.allocator.dupe(u8, definition.type_name), .primary_key = definition.primary_key, .not_null = definition.not_null };
+            columns[index] = .{ .name = try self.allocator.dupe(u8, definition.name), .type_name = try self.allocator.dupe(u8, definition.type_name), .primary_key = definition.primary_key, .not_null = definition.not_null, .unique = definition.unique, .foreign_table = if (definition.foreign_key) |foreign_key| try self.allocator.dupe(u8, foreign_key.table) else null, .foreign_column = if (definition.foreign_key) |foreign_key| try self.allocator.dupe(u8, foreign_key.column) else null };
             count += 1;
         }
         try self.tables.append(self.allocator, .{ .name = owned_name, .columns = columns, .rows = .empty });
@@ -162,7 +164,7 @@ pub const Schema = struct {
         table.columns = new_columns;
     }
 
-    fn columnIndex(self: *Schema, table: *const Table, name: []const u8) ?usize {
+    fn columnIndex(self: *const Schema, table: *const Table, name: []const u8) ?usize {
         _ = self;
         for (table.columns, 0..) |column, index| if (std.ascii.eqlIgnoreCase(column.name, name)) return index;
         return null;
@@ -178,6 +180,8 @@ pub const Schema = struct {
         for (table.columns) |column| {
             self.allocator.free(column.name);
             self.allocator.free(column.type_name);
+            if (column.foreign_table) |value| self.allocator.free(value);
+            if (column.foreign_column) |value| self.allocator.free(value);
         }
         self.allocator.free(table.columns);
         self.allocator.free(table.name);
@@ -194,7 +198,37 @@ pub const Schema = struct {
             owned[index] = try self.copyValue(value);
             count += 1;
         }
+        try self.validateConstraints(table, owned, null);
         try table.rows.append(self.allocator, .{ .values = owned });
+    }
+
+    pub fn validateUpdate(self: *const Schema, table: *const Table, row_index: usize, values: []const Value) !void {
+        try self.validateConstraints(table, values, row_index);
+    }
+
+    fn validateConstraints(self: *const Schema, table: *const Table, values: []const Value, ignored_row: ?usize) !void {
+        for (table.columns, 0..) |column, index| {
+            if (column.primary_key and values[index] == .null) return error.ConstraintViolation;
+            if (column.unique or column.primary_key) {
+                if (values[index] != .null) for (table.rows.items, 0..) |existing, existing_index| {
+                    if (ignored_row != null and ignored_row.? == existing_index) continue;
+                    if (valuesEqual(existing.values[index], values[index])) return error.ConstraintViolation;
+                };
+            }
+            if (column.foreign_table) |foreign_table_name| {
+                const foreign_table = self.findConst(foreign_table_name) orelse return error.ConstraintViolation;
+                const foreign_column_name = column.foreign_column orelse return error.ConstraintViolation;
+                const foreign_index = self.columnIndex(foreign_table, foreign_column_name) orelse return error.ConstraintViolation;
+                if (values[index] != .null) {
+                    var found = false;
+                    for (foreign_table.rows.items) |foreign_row| if (valuesEqual(foreign_row.values[foreign_index], values[index])) {
+                        found = true;
+                        break;
+                    };
+                    if (!found) return error.ConstraintViolation;
+                }
+            }
+        }
     }
 
     pub fn clone(self: *const Schema) !Schema {
@@ -203,7 +237,7 @@ pub const Schema = struct {
         for (self.tables.items) |table| {
             const definitions = try self.allocator.alloc(ast.ColumnDef, table.columns.len);
             defer self.allocator.free(definitions);
-            for (table.columns, 0..) |column, index| definitions[index] = .{ .name = column.name, .type_name = column.type_name, .primary_key = column.primary_key, .not_null = column.not_null };
+            for (table.columns, 0..) |column, index| definitions[index] = .{ .name = column.name, .type_name = column.type_name, .primary_key = column.primary_key, .not_null = column.not_null, .unique = column.unique, .foreign_key = if (column.foreign_table != null) .{ .table = column.foreign_table.?, .column = column.foreign_column.? } else null };
             try result.createTable(table.name, definitions);
             const target = result.find(table.name).?;
             for (table.rows.items) |row| try result.appendRow(target, row.values);
@@ -211,6 +245,29 @@ pub const Schema = struct {
         return result;
     }
 };
+
+fn valuesEqual(left: Value, right: Value) bool {
+    return switch (left) {
+        .null => right == .null,
+        .integer => |value| switch (right) {
+            .integer => |other| value == other,
+            else => false,
+        },
+        .real => |value| switch (right) {
+            .real => |other| value == other,
+            .integer => |other| value == @as(f64, @floatFromInt(other)),
+            else => false,
+        },
+        .text => |value| switch (right) {
+            .text => |other| std.mem.eql(u8, value, other),
+            else => false,
+        },
+        .blob => |value| switch (right) {
+            .blob => |other| std.mem.eql(u8, value, other),
+            else => false,
+        },
+    };
+}
 
 test "schema owns tables and rows" {
     var schema = Schema.init(std.testing.allocator);

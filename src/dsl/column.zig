@@ -25,6 +25,18 @@ pub fn Column(comptime table_name: []const u8, comptime column_name: []const u8,
         pub fn le(_: @This(), value: anytype) Expr {
             return .{ .column = column_name, .operator = .less_equal, .value = toValue(value) };
         }
+        pub fn like(_: @This(), value: []const u8) Expr {
+            return .{ .column = column_name, .operator = .like, .value = toValue(value) };
+        }
+        pub fn isNull(_: @This()) Expr {
+            return .{ .column = column_name, .operator = .is_null, .value = .null };
+        }
+        pub fn isNotNull(_: @This()) Expr {
+            return .{ .column = column_name, .operator = .is_not_null, .value = .null };
+        }
+        pub fn between(_: @This(), lower: anytype, upper: anytype) Expr {
+            return .{ .column = column_name, .operator = .between, .value = toValue(lower), .value2 = toValue(upper) };
+        }
         pub fn asc(_: @This()) @import("query_builder.zig").Order {
             return .{ .column = column_name, .descending = false };
         }

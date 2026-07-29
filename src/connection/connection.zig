@@ -8,9 +8,11 @@ const Value = @import("../vm/value.zig").Value;
 const ast = @import("../sql/ast.zig");
 const Parser = @import("../sql/parser.zig").Parser;
 const Prepared = @import("statement.zig").Statement;
+const ColumnKey = @import("../dsl/table.zig").ColumnKey;
 pub const Result = @import("result.zig").Result;
 
-pub const TableOptions = struct { if_not_exists: bool = false };
+pub const ForeignKeyOption = struct { column: []const u8 = "", table: []const u8, referenced_column: []const u8, column_key: ?ColumnKey = null };
+pub const TableOptions = struct { if_not_exists: bool = false, primary_key: ?[]const u8 = null, primary_key_key: ?ColumnKey = null, unique_columns: []const []const u8 = &.{}, unique_keys: []const ColumnKey = &.{}, foreign_keys: []const ForeignKeyOption = &.{} };
 
 const Savepoint = struct { name: []u8, schema: Schema };
 
@@ -84,9 +86,22 @@ pub const Connection = struct {
             return error.TableExists;
         }
         const Row = TableType.row_type;
-        const fields = @typeInfo(Row).@"struct".field_names;
+        const fields = @typeInfo(Row).@"struct".fields;
         var definitions: [fields.len]ast.ColumnDef = undefined;
-        inline for (fields, 0..) |field, index| definitions[index] = .{ .name = field, .type_name = dslTypeName(@FieldType(Row, field)) };
+        inline for (fields, 0..) |field, index| {
+            var definition = ast.ColumnDef{ .name = field.name, .type_name = dslTypeName(field.type), .primary_key = if (options.primary_key) |key| std.mem.eql(u8, key, field.name) else if (options.primary_key_key) |key| std.mem.eql(u8, key.name, field.name) else false };
+            for (options.unique_columns) |unique_column| {
+                if (std.mem.eql(u8, unique_column, field.name)) definition.unique = true;
+            }
+            for (options.unique_keys) |unique_column| {
+                if (std.mem.eql(u8, unique_column.name, field.name)) definition.unique = true;
+            }
+            for (options.foreign_keys) |foreign_key| {
+                const local_name = if (foreign_key.column_key) |key| key.name else foreign_key.column;
+                if (std.mem.eql(u8, local_name, field.name)) definition.foreign_key = .{ .table = foreign_key.table, .column = foreign_key.referenced_column };
+            }
+            definitions[index] = definition;
+        }
         try self.schema.createTable(TableType.table_name, &definitions);
         if (!self.transaction_active) try self.persist();
     }
@@ -334,11 +349,46 @@ pub const Connection = struct {
             .less_equal => result <= 0,
             .greater => result > 0,
             .greater_equal => result >= 0,
+            .like, .is_null, .is_not_null, .between => false,
         };
     }
 
     fn matches(self: *Connection, table: *const Table, row: []const Value, condition: ?ast.Conditions, parameters: []const Value) !bool {
-        if (condition) |items| for (items) |item| if (!compare(row[try columnIndex(table, item.column)], item.op, try self.resolve(item.value, parameters))) return false;
+        if (condition) |items| {
+            var result = true;
+            for (items) |item| {
+                const current = row[try columnIndex(table, item.column)];
+                const item_result = if (item.op == .is_null) current == .null else if (item.op == .is_not_null) current != .null else if (item.op == .between) compare(current, .greater_equal, try self.resolve(item.value, parameters)) and compare(current, .less_equal, try self.resolve(item.value2 orelse return error.InvalidSql, parameters)) else if (item.op == .like) blk: {
+                    const pattern = try self.resolve(item.value, parameters);
+                    break :blk current == .text and pattern == .text and likeMatch(current.text, pattern.text);
+                } else compare(current, item.op, try self.resolve(item.value, parameters));
+                result = if (item.join_or) result or item_result else result and item_result;
+            }
+            return result;
+        }
+        return true;
+    }
+
+    fn likeMatch(text: []const u8, pattern: []const u8) bool {
+        if (pattern.len == 0) return text.len == 0;
+        if (pattern[0] == '%') {
+            var index: usize = 0;
+            while (index <= text.len) : (index += 1) if (likeMatch(text[index..], pattern[1..])) return true;
+            return false;
+        }
+        if (pattern[0] == '_') return text.len != 0 and likeMatch(text[1..], pattern[1..]);
+        return text.len != 0 and pattern[0] == text[0] and likeMatch(text[1..], pattern[1..]);
+    }
+
+    fn rowsEqual(left: []const Value, right: []const Value) bool {
+        if (left.len != right.len) return false;
+        for (left, right) |a, b| switch (a) {
+            .null => if (b != .null) return false,
+            .integer => |value| if (b != .integer or b.integer != value) return false,
+            .real => |value| if (b != .real or b.real != value) return false,
+            .text => |value| if (b != .text or !std.mem.eql(u8, value, b.text)) return false,
+            .blob => |value| if (b != .blob or !std.mem.eql(u8, value, b.blob)) return false,
+        };
         return true;
     }
 
@@ -413,6 +463,7 @@ pub const Connection = struct {
         defer projections.deinit(self.allocator);
         if (value.table) |table_name| {
             const table = self.schema.findConst(table_name) orelse return error.UnknownTable;
+            if (value.join) |join| return try self.selectJoin(value, table, join);
             if (value.projections.len == 1 and value.projections[0].expr == .function and std.ascii.eqlIgnoreCase(value.projections[0].expr.function.name, "count")) {
                 var count: usize = 0;
                 for (table.rows.items) |row| {
@@ -510,6 +561,18 @@ pub const Connection = struct {
                     result_row[out_index] = try self.materialize(table, row.values, projection.expr, parameters);
                     out_index += 1;
                 };
+                if (value.distinct) {
+                    var duplicate = false;
+                    for (rows.items) |existing| if (rowsEqual(existing, result_row)) {
+                        duplicate = true;
+                        break;
+                    };
+                    if (duplicate) {
+                        for (result_row) |item| if (item == .text) self.allocator.free(item.text) else if (item == .blob) self.allocator.free(item.blob);
+                        self.allocator.free(result_row);
+                        continue;
+                    }
+                }
                 try rows.append(self.allocator, result_row);
                 count += 1;
                 if (value.limit) |limit| if (count >= limit) break;
@@ -524,14 +587,115 @@ pub const Connection = struct {
         return .{ .allocator = self.allocator, .columns = try self.allocator.dupe([]const u8, columns.items), .rows = rows };
     }
 
+    fn selectJoin(self: *Connection, value: anytype, left: *const Table, join: ast.Join) !Result {
+        if (value.condition != null or value.order != null) return error.Unsupported;
+        const right = self.schema.findConst(join.table) orelse return error.UnknownTable;
+        var left_index: usize = 0;
+        var right_index: usize = 0;
+        if (join.kind != .cross) {
+            const left_name = if (join.left_table.len == 0) left.name else join.left_table;
+            const right_name = if (join.right_table.len == 0) right.name else join.right_table;
+            if (std.ascii.eqlIgnoreCase(left_name, left.name)) left_index = try columnIndex(left, join.left_column) else left_index = try columnIndex(left, join.right_column);
+            if (std.ascii.eqlIgnoreCase(right_name, right.name)) right_index = try columnIndex(right, join.right_column) else right_index = try columnIndex(right, join.left_column);
+        }
+        var columns = std.ArrayList([]const u8).empty;
+        defer columns.deinit(self.allocator);
+        for (value.projections) |projection| {
+            if (projection.expr == .wildcard) {
+                for (left.columns) |column| try columns.append(self.allocator, column.name);
+                for (right.columns) |column| try columns.append(self.allocator, column.name);
+            } else if (projection.expr == .identifier) {
+                const name = projection.expr.identifier;
+                const dot = std.mem.indexOfScalar(u8, name, '.');
+                const column_name = if (dot) |position| name[position + 1 ..] else name;
+                try columns.append(self.allocator, projection.alias orelse column_name);
+            } else return error.Unsupported;
+        }
+        var rows = std.ArrayList([]Value).empty;
+        errdefer {
+            for (rows.items) |row| {
+                for (row) |item| if (item == .text) self.allocator.free(item.text) else if (item == .blob) self.allocator.free(item.blob);
+                self.allocator.free(row);
+            }
+            rows.deinit(self.allocator);
+        }
+        const right_matched = try self.allocator.alloc(bool, right.rows.items.len);
+        defer self.allocator.free(right_matched);
+        @memset(right_matched, false);
+        for (left.rows.items) |left_row| {
+            var matched = false;
+            for (right.rows.items, 0..) |right_row, right_row_index| {
+                if (join.kind != .cross and !compare(left_row.values[left_index], .equal, right_row.values[right_index])) continue;
+                matched = true;
+                right_matched[right_row_index] = true;
+                try self.appendJoinRow(&rows, value.projections, left, left_row.values, right, right_row.values);
+            }
+            if ((join.kind == .left or join.kind == .full) and !matched) {
+                const nulls = try self.allocator.alloc(Value, right.columns.len);
+                @memset(nulls, .null);
+                defer self.allocator.free(nulls);
+                try self.appendJoinRow(&rows, value.projections, left, left_row.values, right, nulls);
+            }
+        }
+        if (join.kind == .right or join.kind == .full) {
+            const nulls = try self.allocator.alloc(Value, left.columns.len);
+            @memset(nulls, .null);
+            defer self.allocator.free(nulls);
+            for (right.rows.items, 0..) |right_row, right_row_index| if (!right_matched[right_row_index]) try self.appendJoinRow(&rows, value.projections, left, nulls, right, right_row.values);
+        }
+        return .{ .allocator = self.allocator, .columns = try self.allocator.dupe([]const u8, columns.items), .rows = try rows.toOwnedSlice(self.allocator) };
+    }
+
+    fn appendJoinRow(self: *Connection, rows: *std.ArrayList([]Value), projections: []const ast.Projection, left: *const Table, left_values: []const Value, right: *const Table, right_values: []const Value) !void {
+        var width: usize = 0;
+        for (projections) |projection| width += if (projection.expr == .wildcard) left.columns.len + right.columns.len else 1;
+        const output = try self.allocator.alloc(Value, width);
+        var output_index: usize = 0;
+        for (projections) |projection| {
+            if (projection.expr == .wildcard) {
+                for (left_values) |item| {
+                    output[output_index] = try self.copyValue(item);
+                    output_index += 1;
+                }
+                for (right_values) |item| {
+                    output[output_index] = try self.copyValue(item);
+                    output_index += 1;
+                }
+            } else {
+                const name = projection.expr.identifier;
+                const dot = std.mem.indexOfScalar(u8, name, '.');
+                const table_name = if (dot) |position| name[0..position] else "";
+                const column_name = if (dot) |position| name[position + 1 ..] else name;
+                if (dot != null and std.ascii.eqlIgnoreCase(table_name, right.name)) {
+                    output[output_index] = try self.copyValue(right_values[try columnIndex(right, column_name)]);
+                } else if (columnIndex(left, column_name) catch null) |index| {
+                    output[output_index] = try self.copyValue(left_values[index]);
+                } else {
+                    output[output_index] = try self.copyValue(right_values[try columnIndex(right, column_name)]);
+                }
+                output_index += 1;
+            }
+        }
+        try rows.append(self.allocator, output);
+    }
+
     fn update(self: *Connection, value: anytype, parameters: []const Value) !Result {
         const table = self.schema.find(value.table) orelse return error.UnknownTable;
         var changes: usize = 0;
-        for (table.rows.items) |*row| if (try self.matches(table, row.values, value.condition, parameters)) {
+        for (table.rows.items, 0..) |*row, row_index| if (try self.matches(table, row.values, value.condition, parameters)) {
+            const candidate = try self.allocator.alloc(Value, row.values.len);
+            defer self.allocator.free(candidate);
+            @memcpy(candidate, row.values);
             for (value.columns, value.values) |name, expr| {
                 const index = try columnIndex(table, name);
                 const new_value = try self.resolve(expr, parameters);
                 if (new_value == .null and table.columns[index].not_null) return error.ConstraintViolation;
+                candidate[index] = new_value;
+            }
+            try self.schema.validateUpdate(table, row_index, candidate);
+            for (value.columns, value.values) |name, expr| {
+                const index = try columnIndex(table, name);
+                const new_value = try self.resolve(expr, parameters);
                 if (row.values[index] == .text) self.allocator.free(row.values[index].text);
                 if (row.values[index] == .blob) self.allocator.free(row.values[index].blob);
                 row.values[index] = switch (new_value) {
@@ -673,4 +837,89 @@ test "typed DSL owns table lifecycle operations" {
     try db.truncate(User);
     try db.dropTable(User);
     try std.testing.expect(!db.tableExists(User));
+}
+
+test "typed keys and foreign keys enforce relational constraints" {
+    const Parent = @import("../dsl/table.zig").table("key_dsl_parent", struct { id: i64, email: []const u8 });
+    const Child = @import("../dsl/table.zig").table("key_dsl_child", struct { id: i64, parent_id: i64 });
+    const path = "sqlite_zig_keys_test.db";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    var db = try Connection.open(std.testing.allocator, path);
+    defer db.close();
+    try db.createTable(Parent, .{ .primary_key_key = Parent.key("id"), .unique_keys = &.{Parent.key("email")} });
+    try db.createTable(Child, .{ .primary_key_key = Child.key("id"), .foreign_keys = &.{.{ .table = "key_dsl_parent", .referenced_column = "id", .column_key = Child.key("parent_id") }} });
+    var parent = try db.from(Parent).insert(.{ .id = 1, .email = "one@example.test" });
+    parent.deinit();
+    try std.testing.expectError(error.ConstraintViolation, db.from(Parent).insert(.{ .id = 1, .email = "two@example.test" }));
+    try std.testing.expectError(error.ConstraintViolation, db.from(Child).insert(.{ .id = 1, .parent_id = 99 }));
+    var child = try db.from(Child).insert(.{ .id = 1, .parent_id = 1 });
+    child.deinit();
+    var nullable = try db.exec("INSERT INTO key_dsl_parent (id, email) VALUES (2, NULL), (3, NULL);");
+    nullable.deinit();
+    var child_update = try db.from(Child).update(.{ .parent_id = 99 });
+    defer child_update.deinit();
+    try std.testing.expectError(error.ConstraintViolation, child_update.where(Child.column("id").eq(1)).execute());
+}
+
+test "raw SQL and typed DSL execute inner and left joins" {
+    const User = @import("../dsl/table.zig").table("join_dsl_users", struct { id: i64, name: []const u8 });
+    const Order = @import("../dsl/table.zig").table("join_dsl_orders", struct { id: i64, user_id: i64 });
+    const path = "sqlite_zig_join_test.db";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    var db = try Connection.open(std.testing.allocator, path);
+    defer db.close();
+    try db.createTable(User, .{ .primary_key = "id" });
+    try db.createTable(Order, .{ .primary_key = "id" });
+    var user = try db.from(User).insert(.{ .id = 1, .name = "A" });
+    user.deinit();
+    var order = try db.from(Order).insert(.{ .id = 10, .user_id = 1 });
+    order.deinit();
+    var second_user = try db.from(User).insert(.{ .id = 2, .name = "B" });
+    second_user.deinit();
+    var orphan_order = try db.from(Order).insert(.{ .id = 11, .user_id = 99 });
+    orphan_order.deinit();
+    var raw = try db.exec("SELECT * FROM join_dsl_users JOIN join_dsl_orders ON join_dsl_users.id = join_dsl_orders.user_id;");
+    defer raw.deinit();
+    try std.testing.expectEqual(@as(usize, 1), raw.rowCount());
+    try std.testing.expectEqual(@as(i64, 10), raw.rows[0][2].integer);
+    var left = try db.from(User).leftJoin(Order, "id", "user_id").fetchAll();
+    defer left.deinit();
+    try std.testing.expectEqual(@as(usize, 2), left.rowCount());
+    var right = try db.from(User).rightJoin(Order, "id", "user_id").fetchAll();
+    defer right.deinit();
+    try std.testing.expectEqual(@as(usize, 2), right.rowCount());
+    var full = try db.from(User).fullJoin(Order, "id", "user_id").fetchAll();
+    defer full.deinit();
+    try std.testing.expectEqual(@as(usize, 3), full.rowCount());
+    var cross = try db.from(User).crossJoin(Order).fetchAll();
+    defer cross.deinit();
+    try std.testing.expectEqual(@as(usize, 4), cross.rowCount());
+}
+
+test "raw SQL and DSL support null like and between predicates" {
+    const Item = @import("../dsl/table.zig").table("predicate_dsl_items", struct { id: i64, label: []const u8 });
+    const path = "sqlite_zig_predicate_test.db";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    var db = try Connection.open(std.testing.allocator, path);
+    defer db.close();
+    try db.createTable(Item, .{});
+    var result = try db.exec("INSERT INTO predicate_dsl_items VALUES (1, 'alpha'), (2, 'beta'), (3, NULL);");
+    result.deinit();
+    result = try db.exec("INSERT INTO predicate_dsl_items VALUES (4, 'alpha');");
+    result.deinit();
+    result = try db.exec("SELECT id FROM predicate_dsl_items WHERE id BETWEEN 1 AND 2 OR id = 4;");
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 3), result.rowCount());
+    var like_result = try db.from(Item).where(Item.column("label").like("a%")).fetchAll();
+    defer like_result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), like_result.rowCount());
+    var null_result = try db.from(Item).where(Item.column("label").isNull()).fetchAll();
+    defer null_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), null_result.rowCount());
+    var distinct_result = try db.from(Item).selectFieldNames(&.{"label"}).distinct().fetchAll();
+    defer distinct_result.deinit();
+    try std.testing.expectEqual(@as(usize, 3), distinct_result.rowCount());
 }
