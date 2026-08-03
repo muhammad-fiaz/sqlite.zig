@@ -1,5 +1,5 @@
 const std = @import("std");
-const sqlite = @import("sqlite_zig");
+const sqlite = @import("sqlite");
 
 const User = sqlite.table("dsl_users", struct { id: i64, name: []const u8 });
 

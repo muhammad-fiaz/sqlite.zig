@@ -1,15 +1,22 @@
 const std = @import("std");
-const sqlite = @import("sqlite_zig");
+const sqlite = @import("sqlite");
+
+const Ledger = sqlite.table("ledger", struct { id: i64, amount: i64 });
 
 pub fn main() !void {
     var db = try sqlite.open(std.heap.page_allocator, "valid_03.db");
     defer db.close();
-    var setup = try db.exec("CREATE TABLE IF NOT EXISTS ledger (id INTEGER, amount INTEGER);");
-    setup.deinit();
-    var begin = try db.exec("BEGIN;");
-    begin.deinit();
-    var insert = try db.exec("INSERT INTO ledger VALUES (1, 100);");
-    insert.deinit();
-    var rollback = try db.exec("ROLLBACK;");
-    rollback.deinit();
+    try db.createTable(Ledger, .{ .if_not_exists = true });
+    try db.truncate(Ledger);
+    try db.begin();
+    var rolled_back_insert = try db.from(Ledger).insert(.{ .id = 1, .amount = 100 });
+    rolled_back_insert.deinit();
+    try db.rollback();
+    try db.begin();
+    var committed_insert = try db.from(Ledger).insert(.{ .id = 1, .amount = 100 });
+    committed_insert.deinit();
+    try db.commit();
+    var result = try db.from(Ledger).selectFieldNames(&.{ "id", "amount" }).fetchAll();
+    defer result.deinit();
+    if (result.rowCount() != 1 or result.rows[0][0].integer != 1 or result.rows[0][1].integer != 100) return error.TransactionExampleFailed;
 }

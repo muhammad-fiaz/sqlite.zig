@@ -161,6 +161,9 @@ pub const Connection = struct {
         self.backup = try self.schema.clone();
         self.transaction_active = true;
     }
+
+    pub fn beginImmediate(self: *Connection) !void { try self.begin(); }
+    pub fn beginExclusive(self: *Connection) !void { try self.begin(); }
     pub fn commit(self: *Connection) !void {
         if (!self.transaction_active) return error.NotInTransaction;
         try self.persist();
@@ -628,7 +631,18 @@ pub const Connection = struct {
                 if (join.kind != .cross and !compare(left_row.values[left_index], .equal, right_row.values[right_index])) continue;
                 matched = true;
                 right_matched[right_row_index] = true;
+                const before = rows.items.len;
                 try self.appendJoinRow(&rows, value.projections, left, left_row.values, right, right_row.values);
+                if (value.distinct and rows.items.len != before) {
+                    const newest = rows.items[rows.items.len - 1];
+                    var duplicate = false;
+                    for (rows.items[0 .. rows.items.len - 1]) |existing| if (rowsEqual(existing, newest)) { duplicate = true; break; };
+                    if (duplicate) {
+                        for (newest) |item| if (item == .text) self.allocator.free(item.text) else if (item == .blob) self.allocator.free(item.blob);
+                        self.allocator.free(newest);
+                        _ = rows.pop();
+                    }
+                }
             }
             if ((join.kind == .left or join.kind == .full) and !matched) {
                 const nulls = try self.allocator.alloc(Value, right.columns.len);
@@ -642,6 +656,20 @@ pub const Connection = struct {
             @memset(nulls, .null);
             defer self.allocator.free(nulls);
             for (right.rows.items, 0..) |right_row, right_row_index| if (!right_matched[right_row_index]) try self.appendJoinRow(&rows, value.projections, left, nulls, right, right_row.values);
+        }
+        if (value.distinct) {
+            var index: usize = 0;
+            while (index < rows.items.len) {
+                var duplicate_index = index + 1;
+                while (duplicate_index < rows.items.len) {
+                    if (rowsEqual(rows.items[index], rows.items[duplicate_index])) {
+                        const duplicate = rows.orderedRemove(duplicate_index);
+                        for (duplicate) |item| if (item == .text) self.allocator.free(item.text) else if (item == .blob) self.allocator.free(item.blob);
+                        self.allocator.free(duplicate);
+                    } else duplicate_index += 1;
+                }
+                index += 1;
+            }
         }
         return .{ .allocator = self.allocator, .columns = try self.allocator.dupe([]const u8, columns.items), .rows = try rows.toOwnedSlice(self.allocator) };
     }
@@ -884,6 +912,11 @@ test "raw SQL and typed DSL execute inner and left joins" {
     defer raw.deinit();
     try std.testing.expectEqual(@as(usize, 1), raw.rowCount());
     try std.testing.expectEqual(@as(i64, 10), raw.rows[0][2].integer);
+    var raw_distinct = try db.exec("SELECT DISTINCT * FROM join_dsl_users JOIN join_dsl_orders ON join_dsl_users.id = join_dsl_orders.user_id;");
+    defer raw_distinct.deinit();
+    var dsl_distinct = try db.from(User).innerJoin(Order, "id", "user_id").select("*").distinct().fetchAll();
+    defer dsl_distinct.deinit();
+    try std.testing.expectEqual(raw_distinct.rowCount(), dsl_distinct.rowCount());
     var left = try db.from(User).leftJoin(Order, "id", "user_id").fetchAll();
     defer left.deinit();
     try std.testing.expectEqual(@as(usize, 2), left.rowCount());
@@ -922,4 +955,31 @@ test "raw SQL and DSL support null like and between predicates" {
     var distinct_result = try db.from(Item).selectFieldNames(&.{"label"}).distinct().fetchAll();
     defer distinct_result.deinit();
     try std.testing.expectEqual(@as(usize, 3), distinct_result.rowCount());
+}
+
+test "transaction SQL modes and invalid SQL return deterministic errors" {
+    const path = "sqlite_zig_transaction_modes_test.db";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    var db = try Connection.open(std.testing.allocator, path);
+    defer db.close();
+    var result = try db.exec("CREATE TABLE tx_modes (id INTEGER);");
+    result.deinit();
+    result = try db.exec("BEGIN IMMEDIATE;");
+    result.deinit();
+    result = try db.exec("INSERT INTO tx_modes VALUES (1);");
+    result.deinit();
+    result = try db.exec("ROLLBACK;");
+    result.deinit();
+    result = try db.exec("START TRANSACTION;");
+    result.deinit();
+    result = try db.exec("INSERT INTO tx_modes VALUES (2);");
+    result.deinit();
+    result = try db.exec("COMMIT;");
+    result.deinit();
+    try std.testing.expectError(error.UnexpectedToken, db.exec("SELECT FROM tx_modes;"));
+    var rows = try db.exec("SELECT id FROM tx_modes;");
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(usize, 1), rows.rowCount());
+    try std.testing.expectEqual(@as(i64, 2), rows.rows[0][0].integer);
 }

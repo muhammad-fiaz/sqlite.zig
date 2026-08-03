@@ -1,5 +1,5 @@
 const std = @import("std");
-const sqlite = @import("sqlite_zig");
+const sqlite = @import("sqlite");
 
 pub fn main() !void {
     var db = try sqlite.open(std.heap.page_allocator, "valid_06.db");

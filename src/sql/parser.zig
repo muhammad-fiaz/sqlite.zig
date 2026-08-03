@@ -69,14 +69,25 @@ pub const Parser = struct {
 
     pub fn parse(self: *Parser) !ast.Statement {
         var statement: ast.Statement = undefined;
-        if (self.acceptWord("create")) statement = try self.parseCreate() else if (self.acceptWord("drop")) statement = try self.parseDrop() else if (self.acceptWord("insert")) statement = try self.parseInsert() else if (self.acceptWord("select")) statement = try self.parseSelect() else if (self.acceptWord("update")) statement = try self.parseUpdate() else if (self.acceptWord("delete")) statement = try self.parseDelete() else if (self.acceptWord("begin")) statement = .begin else if (self.acceptWord("commit")) statement = .commit else if (self.acceptWord("rollback")) {
+        if (self.acceptWord("create")) statement = try self.parseCreate() else if (self.acceptWord("drop")) statement = try self.parseDrop() else if (self.acceptWord("insert")) statement = try self.parseInsert() else if (self.acceptWord("select")) statement = try self.parseSelect() else if (self.acceptWord("update")) statement = try self.parseUpdate() else if (self.acceptWord("delete")) statement = try self.parseDelete() else if (self.acceptWord("begin")) {
+            _ = self.acceptWord("deferred");
+            _ = self.acceptWord("immediate");
+            _ = self.acceptWord("exclusive");
+            statement = .begin;
+        } else if (self.acceptWord("start")) {
+            try self.requireWord("transaction");
+            statement = .begin;
+        } else if (self.acceptWord("commit")) statement = .commit else if (self.acceptWord("rollback")) {
             if (self.acceptWord("to")) statement = .{ .rollback_to = try self.word() } else statement = .rollback;
         } else if (self.acceptWord("savepoint")) statement = .{ .savepoint = try self.word() } else if (self.acceptWord("release")) {
             _ = self.acceptWord("savepoint");
             statement = .{ .release = try self.word() };
         } else return Error.InvalidSql;
         _ = self.acceptTag(.semicolon);
-        if (self.current().tag != .eof) return Error.UnexpectedToken;
+        if (self.current().tag != .eof) {
+            ast.deinit(self.allocator, &statement);
+            return Error.UnexpectedToken;
+        }
         return statement;
     }
 

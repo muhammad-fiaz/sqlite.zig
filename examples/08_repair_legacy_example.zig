@@ -1,5 +1,5 @@
 const std = @import("std");
-const sqlite = @import("sqlite_zig");
+const sqlite = @import("sqlite");
 
 pub fn main() !void {
     var io_instance: std.Io.Threaded = .init(std.heap.page_allocator, .{});

@@ -5,7 +5,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     // Main module
-    const module = b.addModule("sqlite_zig", .{
+    const module = b.addModule("sqlite", .{
         .root_source_file = b.path("src/sqlite.zig"),
         .target = target,
         .optimize = optimize,
@@ -13,7 +13,7 @@ pub fn build(b: *std.Build) void {
 
     // Static library
     const library = b.addLibrary(.{
-        .name = "sqlite_zig",
+        .name = "sqlite",
         .root_module = module,
         .linkage = .static,
     });
@@ -51,9 +51,9 @@ pub fn build(b: *std.Build) void {
         "Build all sqlite.zig examples",
     );
 
-    const run_examples = b.step(
-        "run-examples",
-        "Build and run all sqlite.zig examples",
+    const run_all_examples = b.step(
+        "run-all-examples",
+        "Build and run every sqlite.zig example",
     );
 
     const examples = [_][]const u8{
@@ -68,6 +68,8 @@ pub fn build(b: *std.Build) void {
         "09_dsl_crud",
         "10_dsl_advanced",
         "11_keys_and_joins",
+        "12_complex_queries",
+        "13_edge_cases",
     };
 
     inline for (examples) |name| {
@@ -82,7 +84,7 @@ pub fn build(b: *std.Build) void {
             }),
         });
 
-        exe.root_module.addImport("sqlite_zig", module);
+        exe.root_module.addImport("sqlite", module);
 
         b.installArtifact(exe);
 
@@ -92,6 +94,6 @@ pub fn build(b: *std.Build) void {
         // Run example
         const run = b.addRunArtifact(exe);
         run.step.dependOn(b.getInstallStep());
-        run_examples.dependOn(&run.step);
+        run_all_examples.dependOn(&run.step);
     }
 }

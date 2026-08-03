@@ -34,6 +34,12 @@ fn appendValue(allocator: std.mem.Allocator, list: *std.ArrayList(u8), value: an
             .blob => |bytes| appendQuoted(allocator, list, bytes),
         };
     }
+    if (@typeInfo(T) == .optional) {
+        if (value) |present| {
+            return appendValue(allocator, list, present);
+        }
+        return list.appendSlice(allocator, "NULL");
+    }
     switch (@typeInfo(T)) {
         .int, .comptime_int => {
             const rendered = try std.fmt.allocPrint(allocator, "{d}", .{@as(i64, @intCast(value))});
@@ -138,6 +144,10 @@ pub fn Query(comptime TableType: type) type {
             var copy = self;
             copy.selected_fields = fields;
             return copy;
+        }
+
+        pub fn selectFields(self: Self, comptime fields: []const []const u8) Self {
+            return self.selectFieldNames(fields);
         }
 
         pub fn where(self: Self, condition: Expr) Self {

@@ -41,8 +41,8 @@ zig fetch --save https://github.com/muhammad-fiaz/sqlite.zig/archive/refs/heads/
 Then in `build.zig`:
 
 ```zig
-const sqlite_zig = b.dependency("sqlite_zig", .{ .target = target, .optimize = optimize });
-exe.root_module.addImport("sqlite", sqlite_zig.module("sqlite"));
+const sqlite = b.dependency("sqlite", .{ .target = target, .optimize = optimize });
+exe.root_module.addImport("sqlite", sqlite.module("sqlite"));
 ```
 
 > [!IMPORTANT]
@@ -55,8 +55,12 @@ exe.root_module.addImport("sqlite", sqlite_zig.module("sqlite"));
 
 ```sh
 zig build test
-zig build run-examples
+# Run every example
+zig build run-all-examples
+zig build docs
 ```
+
+`zig build docs` emits the public API documentation to `zig-out/docs/index.html`.
 
 > [!TIP]
 > Every internal module ships its own `test` blocks at the bottom of the file it tests. Running `zig build test` is the fastest way to check whether a given part of the engine currently works as expected.
