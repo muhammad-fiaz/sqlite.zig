@@ -317,9 +317,9 @@ The `examples/` directory contains **32 runnable examples**:
 Run any example:
 
 ```bash
-zig build run-01-open-and-exec
-zig build run-03-transactions
-zig build run-09-dsl-crud
+zig build run-01_open_and_exec
+zig build run-03_transactions
+zig build run-09_dsl_crud
 zig build run-all-examples
 ```
 

@@ -110,9 +110,14 @@ pub fn build(b: *std.Build) void {
         // Build example
         build_examples.dependOn(&exe.step);
 
-        // Run example
+        // Individual run step (e.g. run-01_open_and_exec)
+        const run_step_name = b.fmt("run-{s}", .{name});
         const run = b.addRunArtifact(exe);
         run.step.dependOn(b.getInstallStep());
+        const run_step = b.step(run_step_name, b.fmt("Run {s} example", .{name}));
+        run_step.dependOn(&run.step);
+
+        // Aggregate run step
         run_all_examples.dependOn(&run.step);
     }
 }
