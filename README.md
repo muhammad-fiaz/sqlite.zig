@@ -30,7 +30,7 @@
 `sqlite.zig` is a ground-up reimplementation of the SQLite engine in pure Zig, featuring a complete storage engine with the real on-disk `.db` file format, a hand-written SQL lexer and parser, a bytecode compiler and virtual machine, WAL and rollback-journal durability modes, and a type-safe comptime query builder (DSL) that stays in sync with raw SQL.
 
 > [!NOTE]
-> **Documentation:** The hosted documentation site is not ready yet. You can generate the current up-to-date docs locally by running `zig build docs`, which outputs to `zig-out/docs/index.html`.
+> Documentation is available at [muhammad-fiaz.github.io/sqlite.zig](https://muhammad-fiaz.github.io/sqlite.zig/). You can also generate it locally with `zig build docs`.
 
 > [!TIP]
 > If you build with sqlite.zig, make sure to give it a star. ⭐
