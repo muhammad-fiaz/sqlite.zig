@@ -1,0 +1,12 @@
+{
+  "name": "sqlite.zig",
+  "short_name": "sqlite.zig",
+  "description": "A fully native SQLite-compatible database engine written in Zig",
+  "icons": [
+    { "src": "/sqlite.zig/favicon.png", "sizes": "any", "type": "image/png" }
+  ],
+  "start_url": "/sqlite.zig/",
+  "display": "standalone",
+  "background_color": "#1a1a2e",
+  "theme_color": "#76b900"
+}
