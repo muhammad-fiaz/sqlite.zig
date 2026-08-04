@@ -1,5 +1,7 @@
 <div align="center">
 
+<img  height="250" alt="SQLITE.ZIG LOGO" src="https://github.com/user-attachments/assets/6071c76a-833f-464c-a3eb-d03c74fde328" />
+
 # SQLite.zig
 
 <a href="https://muhammad-fiaz.github.io/sqlite.zig/"><img src="https://img.shields.io/badge/docs-muhammad--fiaz.github.io-blue" alt="Documentation"></a>
