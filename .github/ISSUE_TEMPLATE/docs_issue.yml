@@ -1,0 +1,38 @@
+name: Documentation Issue
+description: Report an issue with documentation
+labels: ["documentation"]
+body:
+  - type: input
+    id: page
+    attributes:
+      label: Page URL
+      description: Which page has the issue?
+      placeholder: "https://muhammad-fiaz.github.io/sqlite.zig/guide/quick-start"
+    validations:
+      required: true
+  - type: dropdown
+    id: type
+    attributes:
+      label: Issue Type
+      description: What kind of issue?
+      options:
+        - Incorrect information
+        - Missing information
+        - Typo or formatting
+        - Broken link
+        - Outdated content
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: Issue Description
+      description: What is wrong or unclear?
+    validations:
+      required: true
+  - type: textarea
+    id: suggestion
+    attributes:
+      label: Suggested Fix
+      description: How should it be corrected?

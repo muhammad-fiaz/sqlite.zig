@@ -62,6 +62,47 @@ zig build docs
 
 `zig build docs` emits the public API documentation to `zig-out/docs/index.html`.
 
+### Typed DSL rows
+
+DSL inserts and updates use Zig struct fields as column names. The field names are checked at compile time against the table schema, so an attribute that is not declared on the table fails compilation:
+
+```zig
+const Account = sqlite.table("accounts", struct { id: i64, owner: []const u8, balance: i64 });
+
+var inserted = try db.from(Account).insert(.{ .id = 1, .owner = "Alice", .balance = 100 });
+inserted.deinit();
+```
+
+Partial structs are supported for column-list inserts and updates. Typed selection, joins, and aggregates are also available through `Account.key("id")`, `selectColumns`/`selectAll`, `innerJoinKeys`/`leftJoinKeys`/`rightJoinKeys`/`fullJoinKeys`, and `sumColumn`/`averageColumn`/`minimumColumn`/`maximumColumn`/`countColumn`.
+
+For strict full-row type checking, use `insertTyped` or `updateTyped`, whose parameter is exactly the declared table row struct.
+
+For typed primary keys, use the canonical option `primary_key = Table.key("id")`. The string-based alternative is `primary_key_name = "id"`.
+
+Composite table constraints are supported in both raw SQL and the typed API:
+
+```zig
+try db.createTable(Membership, .{
+    .primary_keys = &.{ Membership.key("user_id"), Membership.key("group_id") },
+    .unique_constraints = &.{&.{ Membership.key("group_id"), Membership.key("label") }},
+});
+```
+
+Raw DDL can use `PRIMARY KEY (a, b)` and `UNIQUE (a, b)`. These constraints are persisted with SQLite autoindex entries and are checked during inserts, updates, transactions, and reopen.
+
+Composite relationships are available through raw DDL and typed options:
+
+```zig
+try db.createTable(Child, .{
+    .foreign_key_constraints = &.{.{
+        .columns = &.{ Child.key("parent_a"), Child.key("parent_b") },
+        .referenced_columns = &.{ Parent.key("part_a"), Parent.key("part_b") },
+        .on_update = .cascade,
+        .on_delete = .cascade,
+    }},
+});
+```
+
 > [!TIP]
 > Every internal module ships its own `test` blocks at the bottom of the file it tests. Running `zig build test` is the fastest way to check whether a given part of the engine currently works as expected.
 

@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Documentation
+    url: https://muhammad-fiaz.github.io/sqlite.zig/
+    about: Check the docs first
+  - name: API Reference
+    url: https://muhammad-fiaz.github.io/sqlite.zig/api/sqlite
+    about: API reference documentation
+  - name: Quick Start Guide
+    url: https://muhammad-fiaz.github.io/sqlite.zig/guide/quick-start
+    about: Get started quickly

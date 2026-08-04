@@ -1,0 +1,60 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - run: zig build test
+
+  examples:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        example:
+          - 01_open_and_exec
+          - 02_prepared_statement
+          - 03_transactions
+          - 04_dsl_query_builder
+          - 05_migrations
+          - 06_error_handling
+          - 07_python_interop
+          - 08_repair_legacy_example
+          - 09_dsl_crud
+          - 10_dsl_advanced
+          - 11_keys_and_joins
+          - 12_complex_queries
+          - 13_edge_cases
+          - 14_dsl_select_projections
+          - 15_raw_dsl_interoperability
+          - 16_dsl_predicates_pagination
+          - 17_persistence_reopen_verification
+          - 18_schema_lifecycle_verification
+          - 19_prepared_parameter_verification
+          - 20_scalar_functions_typed_dsl
+          - 21_indexed_queries
+          - 22_views_and_typed_reads
+          - 23_triggers_raw_and_dsl
+          - 24_cte_raw_and_typed_reads
+          - 25_subqueries_raw_and_typed_dsl
+          - 26_foreign_key_actions
+          - 27_composite_unique_keys
+          - 28_foreign_key_update_actions
+          - 29_multiple_ctes
+          - 30_composite_table_constraints
+          - 31_composite_foreign_keys
+          - 32_recursive_ctes
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - run: zig build run-${{ matrix.example }}

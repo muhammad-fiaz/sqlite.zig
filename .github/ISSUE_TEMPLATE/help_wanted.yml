@@ -1,0 +1,36 @@
+name: Help Wanted
+description: Get help with sqlite.zig
+labels: ["help wanted", "question"]
+body:
+  - type: textarea
+    id: question
+    attributes:
+      label: Question
+      description: What do you need help with?
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: What You've Tried
+      description: Describe what you've already tried.
+  - type: input
+    id: zig-version
+    attributes:
+      label: Zig Version
+      placeholder: "0.16.0"
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating System
+      placeholder: "Windows 11 / Ubuntu 24.04 / macOS 15"
+    validations:
+      required: true
+  - type: textarea
+    id: build-zig
+    attributes:
+      label: build.zig
+      description: Paste your build.zig contents if relevant
+      render: zig

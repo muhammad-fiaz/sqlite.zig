@@ -16,6 +16,7 @@ pub const Result = struct {
             };
             self.allocator.free(row);
         }
+        for (self.columns) |column| self.allocator.free(column);
         self.allocator.free(self.rows);
         self.allocator.free(self.columns);
     }

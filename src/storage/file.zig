@@ -96,6 +96,7 @@ pub const DatabaseFile = struct {
 
     pub fn writeImage(self: *DatabaseFile, bytes: []const u8) !void {
         try self.file.writePositionalAll(self.threaded.io(), bytes, 0);
+        try self.file.setLength(self.threaded.io(), bytes.len);
     }
 };
 

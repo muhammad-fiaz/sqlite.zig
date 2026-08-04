@@ -1,0 +1,27 @@
+const std = @import("std");
+const sqlite = @import("sqlite");
+
+const Task = sqlite.table("interop_tasks", struct { id: i64, title: []const u8, done: i64 });
+
+pub fn main() !void {
+    var db = try sqlite.open(std.heap.page_allocator, "valid_15.db");
+    defer db.close();
+    try db.createTable(Task, .{ .if_not_exists = true });
+    try db.truncate(Task);
+
+    var raw_insert = try db.exec("INSERT INTO interop_tasks (id, title, done) VALUES (1, 'write docs', 0), (2, 'ship release', 1);");
+    raw_insert.deinit();
+
+    var typed_update = try db.from(Task).update(.{ .done = 1 });
+    var updated = try typed_update.where(Task.column("id").eq(1)).execute();
+    typed_update.deinit();
+    updated.deinit();
+
+    var raw_query = try db.exec("SELECT id, title FROM interop_tasks WHERE done = 1;");
+    raw_query.deinit();
+
+    var typed_delete = db.from(Task).delete().where(Task.column("id").eq(2));
+    var deleted = try typed_delete.execute();
+    typed_delete.deinit();
+    deleted.deinit();
+}

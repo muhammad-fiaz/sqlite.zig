@@ -3,8 +3,10 @@ const Expr = @import("expr.zig").Expr;
 const sql_gen = @import("sql_gen.zig");
 const Result = @import("../connection/result.zig").Result;
 const Value = @import("../vm/value.zig").Value;
+const ColumnKey = @import("table.zig").ColumnKey;
 
 pub const Order = struct { column: []const u8, descending: bool };
+const InSubquery = struct { column: []const u8, table: []const u8, subquery_column: []const u8 };
 
 fn appendQuoted(allocator: std.mem.Allocator, list: *std.ArrayList(u8), bytes: []const u8) !void {
     try list.append(allocator, '\'');
@@ -109,7 +111,10 @@ pub fn Query(comptime TableType: type) type {
         execute_fn: *const fn (*anyopaque, []const u8) anyerror!Result,
         table: []const u8,
         projection: []const u8 = "*",
+        scalar_function: ?[]const u8 = null,
+        scalar_field: ?[]const u8 = null,
         selected_fields: ?[]const []const u8 = null,
+        selected_columns: ?[]const ColumnKey = null,
         condition: ?Expr = null,
         additional_conditions: [8]Expr = emptyConditions(),
         additional_condition_count: usize = 0,
@@ -121,6 +126,7 @@ pub fn Query(comptime TableType: type) type {
         join_right: []const u8 = "",
         join_kind: []const u8 = "JOIN",
         distinct_value: bool = false,
+        in_subquery: ?InSubquery = null,
 
         pub fn init(connection: anytype, table: []const u8, execute_fn: *const fn (*anyopaque, []const u8) anyerror!Result) Self {
             return .{ .allocator = connection.allocator, .connection = connection, .execute_fn = execute_fn, .table = table };
@@ -129,8 +135,35 @@ pub fn Query(comptime TableType: type) type {
         pub fn select(self: Self, projection: []const u8) Self {
             var copy = self;
             copy.projection = projection;
+            copy.scalar_function = null;
+            copy.scalar_field = null;
             copy.selected_fields = null;
+            copy.selected_columns = null;
             return copy;
+        }
+
+        pub fn selectAll(self: Self) Self {
+            return self.select("*");
+        }
+
+        pub fn lowerColumn(self: Self, comptime field: ColumnKey) Self {
+            return self.scalarColumn("LOWER", field);
+        }
+
+        pub fn upperColumn(self: Self, comptime field: ColumnKey) Self {
+            return self.scalarColumn("UPPER", field);
+        }
+
+        pub fn lengthColumn(self: Self, comptime field: ColumnKey) Self {
+            return self.scalarColumn("LENGTH", field);
+        }
+
+        pub fn absColumn(self: Self, comptime field: ColumnKey) Self {
+            return self.scalarColumn("ABS", field);
+        }
+
+        pub fn typeofColumn(self: Self, comptime field: ColumnKey) Self {
+            return self.scalarColumn("TYPEOF", field);
         }
 
         pub fn distinct(self: Self) Self {
@@ -143,11 +176,22 @@ pub fn Query(comptime TableType: type) type {
             inline for (fields) |field| if (!@hasField(TableType.row_type, field)) @compileError("unknown DSL column");
             var copy = self;
             copy.selected_fields = fields;
+            copy.selected_columns = null;
             return copy;
         }
 
         pub fn selectFields(self: Self, comptime fields: []const []const u8) Self {
             return self.selectFieldNames(fields);
+        }
+
+        pub fn selectColumns(self: Self, comptime fields: []const ColumnKey) Self {
+            inline for (fields) |field| {
+                if (!@hasField(TableType.row_type, field.name)) @compileError("unknown DSL column");
+            }
+            var copy = self;
+            copy.selected_columns = fields;
+            copy.selected_fields = null;
+            return copy;
         }
 
         pub fn where(self: Self, condition: Expr) Self {
@@ -162,6 +206,14 @@ pub fn Query(comptime TableType: type) type {
             if (copy.additional_condition_count >= copy.additional_conditions.len) @panic("too many DSL predicates");
             copy.additional_conditions[copy.additional_condition_count] = condition;
             copy.additional_condition_count += 1;
+            return copy;
+        }
+
+        pub fn whereInColumn(self: Self, comptime column: ColumnKey, comptime OtherTable: type, comptime other_column: ColumnKey) Self {
+            if (!@hasField(TableType.row_type, column.name)) @compileError("unknown DSL IN column");
+            if (!@hasField(OtherTable.row_type, other_column.name)) @compileError("unknown DSL subquery column");
+            var copy = self;
+            copy.in_subquery = .{ .column = column.name, .table = OtherTable.table_name, .subquery_column = other_column.name };
             return copy;
         }
 
@@ -191,37 +243,72 @@ pub fn Query(comptime TableType: type) type {
             if (!@hasField(TableType.row_type, field)) @compileError("unknown DSL column");
             var copy = self;
             copy.projection = "COUNT(" ++ field ++ ")";
+            copy.scalar_function = null;
+            copy.scalar_field = null;
             copy.selected_fields = null;
+            copy.selected_columns = null;
             return copy;
+        }
+
+        pub fn countColumn(self: Self, comptime field: ColumnKey) Self {
+            return self.countField(checkedColumn(field));
         }
 
         pub fn sum(self: Self, comptime field: []const u8) Self {
             return self.aggregate("SUM", field);
         }
+        pub fn sumColumn(self: Self, comptime field: ColumnKey) Self {
+            return self.aggregate("SUM", checkedColumn(field));
+        }
         pub fn average(self: Self, comptime field: []const u8) Self {
             return self.aggregate("AVG", field);
+        }
+        pub fn averageColumn(self: Self, comptime field: ColumnKey) Self {
+            return self.aggregate("AVG", checkedColumn(field));
         }
         pub fn minimum(self: Self, comptime field: []const u8) Self {
             return self.aggregate("MIN", field);
         }
+        pub fn minimumColumn(self: Self, comptime field: ColumnKey) Self {
+            return self.aggregate("MIN", checkedColumn(field));
+        }
         pub fn maximum(self: Self, comptime field: []const u8) Self {
             return self.aggregate("MAX", field);
+        }
+        pub fn maximumColumn(self: Self, comptime field: ColumnKey) Self {
+            return self.aggregate("MAX", checkedColumn(field));
         }
 
         pub fn innerJoin(self: Self, comptime OtherTable: type, comptime left_field: []const u8, comptime right_field: []const u8) Self {
             return self.joinAs(OtherTable, left_field, right_field, "JOIN");
         }
 
+        pub fn innerJoinKeys(self: Self, comptime OtherTable: type, comptime left: ColumnKey, comptime right: ColumnKey) Self {
+            return self.joinKeysAs(OtherTable, left, right, "JOIN");
+        }
+
         pub fn leftJoin(self: Self, comptime OtherTable: type, comptime left_field: []const u8, comptime right_field: []const u8) Self {
             return self.joinAs(OtherTable, left_field, right_field, "LEFT JOIN");
+        }
+
+        pub fn leftJoinKeys(self: Self, comptime OtherTable: type, comptime left: ColumnKey, comptime right: ColumnKey) Self {
+            return self.joinKeysAs(OtherTable, left, right, "LEFT JOIN");
         }
 
         pub fn rightJoin(self: Self, comptime OtherTable: type, comptime left_field: []const u8, comptime right_field: []const u8) Self {
             return self.joinAs(OtherTable, left_field, right_field, "RIGHT JOIN");
         }
 
+        pub fn rightJoinKeys(self: Self, comptime OtherTable: type, comptime left: ColumnKey, comptime right: ColumnKey) Self {
+            return self.joinKeysAs(OtherTable, left, right, "RIGHT JOIN");
+        }
+
         pub fn fullJoin(self: Self, comptime OtherTable: type, comptime left_field: []const u8, comptime right_field: []const u8) Self {
             return self.joinAs(OtherTable, left_field, right_field, "FULL JOIN");
+        }
+
+        pub fn fullJoinKeys(self: Self, comptime OtherTable: type, comptime left: ColumnKey, comptime right: ColumnKey) Self {
+            return self.joinKeysAs(OtherTable, left, right, "FULL JOIN");
         }
 
         pub fn crossJoin(self: Self, comptime OtherTable: type) Self {
@@ -244,17 +331,47 @@ pub fn Query(comptime TableType: type) type {
             return copy;
         }
 
+        fn joinKeysAs(self: Self, comptime OtherTable: type, comptime left: ColumnKey, comptime right: ColumnKey, comptime kind: []const u8) Self {
+            return self.joinAs(OtherTable, left.name, right.name, kind);
+        }
+
         fn aggregate(self: Self, comptime function_name: []const u8, comptime field: []const u8) Self {
             if (!@hasField(TableType.row_type, field)) @compileError("unknown DSL column");
             var copy = self;
             copy.projection = function_name ++ "(" ++ field ++ ")";
+            copy.scalar_function = null;
+            copy.scalar_field = null;
             copy.selected_fields = null;
+            copy.selected_columns = null;
             return copy;
+        }
+
+        fn checkedColumn(comptime field: ColumnKey) []const u8 {
+            if (!@hasField(TableType.row_type, field.name)) @compileError("unknown DSL aggregate column");
+            return field.name;
+        }
+
+        fn scalarColumn(self: Self, comptime function_name: []const u8, comptime field: ColumnKey) Self {
+            _ = checkedColumn(field);
+            var copy = self;
+            copy.projection = "";
+            copy.scalar_function = function_name;
+            copy.scalar_field = field.name;
+            copy.selected_fields = null;
+            copy.selected_columns = null;
+            return copy;
+        }
+
+        fn validateRow(comptime RowType: type) void {
+            if (@typeInfo(RowType) != .@"struct") @compileError("DSL row must be a struct");
+            inline for (@typeInfo(RowType).@"struct".fields) |field| {
+                if (!@hasField(TableType.row_type, field.name)) @compileError("DSL row contains an unknown table column");
+            }
         }
 
         pub fn insert(self: Self, row: anytype) !Result {
             const RowType = @TypeOf(row);
-            if (@typeInfo(RowType) != .@"struct") @compileError("DSL insert requires a struct row");
+            validateRow(RowType);
             var sql = std.ArrayList(u8).empty;
             defer sql.deinit(self.allocator);
             try sql.appendSlice(self.allocator, "INSERT INTO ");
@@ -274,9 +391,13 @@ pub fn Query(comptime TableType: type) type {
             return self.execute_fn(self.connection, sql.items);
         }
 
+        pub fn insertTyped(self: Self, row: TableType.row_type) !Result {
+            return self.insert(row);
+        }
+
         pub fn update(self: Self, row: anytype) !Mutation {
             const RowType = @TypeOf(row);
-            if (@typeInfo(RowType) != .@"struct") @compileError("DSL update requires a struct row");
+            validateRow(RowType);
             var sql = std.ArrayList(u8).empty;
             const fields = @typeInfo(RowType).@"struct".fields;
             inline for (fields, 0..) |field, index| {
@@ -286,6 +407,10 @@ pub fn Query(comptime TableType: type) type {
                 try appendValue(self.allocator, &sql, @field(row, field.name));
             }
             return .{ .base = self, .operation = .update, .set_sql = try sql.toOwnedSlice(self.allocator) };
+        }
+
+        pub fn updateTyped(self: Self, row: TableType.row_type) !Mutation {
+            return self.update(row);
         }
 
         pub fn delete(self: Self) Mutation {
@@ -301,6 +426,16 @@ pub fn Query(comptime TableType: type) type {
                     if (index != 0) try list.appendSlice(self.allocator, ", ");
                     try list.appendSlice(self.allocator, field);
                 }
+            } else if (self.selected_columns) |fields| {
+                for (fields, 0..) |field, index| {
+                    if (index != 0) try list.appendSlice(self.allocator, ", ");
+                    try list.appendSlice(self.allocator, field.name);
+                }
+            } else if (self.scalar_function) |function_name| {
+                try list.appendSlice(self.allocator, function_name);
+                try list.append(self.allocator, '(');
+                try list.appendSlice(self.allocator, self.scalar_field.?);
+                try list.append(self.allocator, ')');
             } else try list.appendSlice(self.allocator, self.projection);
             try list.appendSlice(self.allocator, " FROM ");
             try list.appendSlice(self.allocator, self.table);
@@ -321,6 +456,15 @@ pub fn Query(comptime TableType: type) type {
                 }
             }
             try appendCondition(self.allocator, &list, self.condition, self.additional_conditions[0..self.additional_condition_count]);
+            if (self.in_subquery) |subquery| {
+                try list.appendSlice(self.allocator, if (self.condition == null) " WHERE " else " AND ");
+                try list.appendSlice(self.allocator, subquery.column);
+                try list.appendSlice(self.allocator, " IN (SELECT ");
+                try list.appendSlice(self.allocator, subquery.subquery_column);
+                try list.appendSlice(self.allocator, " FROM ");
+                try list.appendSlice(self.allocator, subquery.table);
+                try list.appendSlice(self.allocator, ")");
+            }
             if (self.order) |order| {
                 try list.appendSlice(self.allocator, " ORDER BY ");
                 try list.appendSlice(self.allocator, order.column);

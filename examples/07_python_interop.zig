@@ -7,7 +7,7 @@ pub fn main() !void {
     var db = try sqlite.open(std.heap.page_allocator, "python_interop.db");
     defer db.close();
     if (!db.tableExists(User)) {
-        try db.createTable(User, .{ .if_not_exists = true, .primary_key = "id" });
+        try db.createTable(User, .{ .if_not_exists = true, .primary_key = User.key("id") });
     }
     var result = try db.exec("SELECT name FROM users WHERE id = 7;");
     if (result.rowCount() == 0) {

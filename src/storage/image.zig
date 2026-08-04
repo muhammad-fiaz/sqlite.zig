@@ -95,7 +95,7 @@ pub fn decode(allocator: std.mem.Allocator, data: []const u8) !Schema {
             definitions[i] = .{ .name = column_name, .type_name = type_name, .primary_key = data[offset] != 0, .not_null = data[offset + 1] != 0 };
             offset += 2;
         }
-        try schema.createTable(name, definitions);
+        try schema.createTable(name, definitions, &.{});
         for (definitions) |definition| {
             allocator.free(definition.name);
             allocator.free(definition.type_name);
@@ -134,7 +134,7 @@ test "schema image round trip" {
     var schema = Schema.init(std.testing.allocator);
     defer schema.deinit();
     const defs = [_]ast.ColumnDef{.{ .name = "id", .type_name = "INTEGER" }};
-    try schema.createTable("t", &defs);
+    try schema.createTable("t", &defs, &.{});
     var row = [_]Value{.{ .integer = 7 }};
     try schema.appendRow(schema.find("t").?, &row);
     const image = try encode(std.testing.allocator, &schema);
