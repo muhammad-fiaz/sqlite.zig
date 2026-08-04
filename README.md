@@ -27,7 +27,7 @@ It is a ground-up reimplementation, not a wrapper around the original C library.
 ## Requirements
 
 - Zig **0.16.0** or later
-- 
+
 ---
 
 ## Installation
@@ -60,7 +60,8 @@ zig build run-all-examples
 zig build docs
 ```
 
-`zig build docs` emits the public API documentation to `zig-out/docs/index.html`.
+> [!NOTE]
+> The hosted documentation site is not ready yet. You can generate the current up-to-date docs locally by running `zig build docs`, which emits the public API documentation to `zig-out/docs/index.html`.
 
 ### Typed DSL rows
 
