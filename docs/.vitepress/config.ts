@@ -3,6 +3,7 @@ import llmstxt from "vitepress-plugin-llms";
 
 export const SITE_URL = "https://muhammad-fiaz.github.io/sqlite.zig";
 export const SITE_NAME = "sqlite.zig";
+export const SITE_TAGLINE = "Native SQLite-Compatible Database Engine in Zig";
 export const SITE_DESCRIPTION =
   "A fully native, zero-dependency SQLite-compatible database engine written entirely in Zig. Pure Zig storage engine, SQL parser, bytecode VM, typed DSL query builder, WAL journaling, and cross-platform support.";
 
@@ -16,7 +17,7 @@ export const KEYWORDS =
 export default defineConfig({
   lang: "en-US",
   title: SITE_NAME,
-  titleTemplate: `:title | ${SITE_NAME}`,
+  titleTemplate: `%s | ${SITE_NAME}`,
   description: SITE_DESCRIPTION,
   base: "/sqlite.zig/",
   lastUpdated: true,
@@ -31,35 +32,47 @@ export default defineConfig({
   },
 
   head: [
-    ["meta", { name: "title", content: SITE_NAME }],
+    // Basic Meta
+    ["meta", { name: "title", content: `${SITE_TAGLINE} | ${SITE_NAME}` }],
     ["meta", { name: "description", content: SITE_DESCRIPTION }],
     ["meta", { name: "keywords", content: KEYWORDS }],
     ["meta", { name: "author", content: "Muhammad Fiaz" }],
+    ["meta", { name: "publisher", content: "Muhammad Fiaz" }],
     ["meta", { name: "robots", content: "index, follow" }],
     ["meta", { name: "language", content: "English" }],
     ["meta", { name: "revisit-after", content: "7 days" }],
+    ["meta", { name: "application-name", content: SITE_NAME }],
+    ["meta", { name: "apple-mobile-web-app-title", content: SITE_NAME }],
+    ["meta", { name: "apple-mobile-web-app-capable", content: "yes" }],
+    ["meta", { name: "apple-mobile-web-app-status-bar-style", content: "black-translucent" }],
+    ["meta", { name: "mobile-web-app-capable", content: "yes" }],
 
     // Open Graph
     ["meta", { property: "og:type", content: "website" }],
     ["meta", { property: "og:url", content: SITE_URL }],
-    ["meta", { property: "og:title", content: "SQLite Database Engine for Zig | sqlite.zig" }],
+    ["meta", { property: "og:title", content: `${SITE_TAGLINE} | ${SITE_NAME}` }],
     ["meta", { property: "og:description", content: SITE_DESCRIPTION }],
-    ["meta", { property: "og:image", content: `${SITE_URL}/cover.png` }],
-    ["meta", { property: "og:image:width", content: "1200" }],
-    ["meta", { property: "og:image:height", content: "630" }],
-    ["meta", { property: "og:image:alt", content: "sqlite.zig — SQLite Database Engine for Zig" }],
+    ["meta", { property: "og:image", content: `${SITE_URL}/favicon.png` }],
+    ["meta", { property: "og:image:width", content: "512" }],
+    ["meta", { property: "og:image:height", content: "512" }],
+    ["meta", { property: "og:image:alt", content: `${SITE_TAGLINE} | ${SITE_NAME}` }],
     ["meta", { property: "og:site_name", content: SITE_NAME }],
     ["meta", { property: "og:locale", content: "en_US" }],
 
     // Twitter Card
     ["meta", { name: "twitter:card", content: "summary_large_image" }],
     ["meta", { name: "twitter:url", content: SITE_URL }],
-    ["meta", { name: "twitter:title", content: "SQLite Database Engine for Zig | sqlite.zig" }],
+    ["meta", { name: "twitter:title", content: `${SITE_TAGLINE} | ${SITE_NAME}` }],
     ["meta", { name: "twitter:description", content: SITE_DESCRIPTION }],
-    ["meta", { name: "twitter:image", content: `${SITE_URL}/cover.png` }],
-    ["meta", { name: "twitter:image:alt", content: "sqlite.zig — SQLite Database Engine for Zig" }],
+    ["meta", { name: "twitter:image", content: `${SITE_URL}/favicon.png` }],
+    ["meta", { name: "twitter:image:alt", content: `${SITE_TAGLINE} | ${SITE_NAME}` }],
     ["meta", { name: "twitter:site", content: "@muhammadfiaz_" }],
     ["meta", { name: "twitter:creator", content: "@muhammadfiaz_" }],
+
+    // Microsoft
+    ["meta", { name: "msapplication-TileColor", content: "#76b900" }],
+    ["meta", { name: "msapplication-TileImage", content: "/sqlite.zig/favicon.png" }],
+    ["meta", { name: "msapplication-tooltip", content: SITE_TAGLINE }],
 
     // Canonical
     ["link", { rel: "canonical", href: SITE_URL }],
@@ -71,7 +84,6 @@ export default defineConfig({
 
     // Theme
     ["meta", { name: "theme-color", content: "#76b900" }],
-    ["meta", { name: "msapplication-TileColor", content: "#76b900" }],
 
     // Google Analytics
     ["script", { async: "", src: `https://www.googletagmanager.com/gtag/js?id=${GA_ID}` }],
@@ -111,37 +123,33 @@ export default defineConfig({
     const canonicalUrl =
       normalizedPath.length > 0 ? `${SITE_URL}/${normalizedPath}` : SITE_URL;
 
-    pageData.frontmatter.head ??= [];
-    pageData.frontmatter.head.push(
-      ["link", { rel: "canonical", href: canonicalUrl }],
-      ["meta", { property: "og:title", content: `${pageTitle} | ${SITE_NAME}` }],
-      ["meta", { property: "og:url", content: canonicalUrl }],
-      ["meta", { property: "og:image", content: `${SITE_URL}/cover.png` }]
-    );
-
-    if (pageData.frontmatter.description) {
-      pageData.frontmatter.head.push(
-        ["meta", { property: "og:description", content: pageData.frontmatter.description }],
-        ["meta", { name: "description", content: pageData.frontmatter.description }]
-      );
-    }
-
     const isHome = pageData.relativePath === "index.md";
+    const fullTitle = isHome ? `${SITE_TAGLINE} | ${SITE_NAME}` : `${pageTitle} | ${SITE_NAME}`;
+
     const lastUpdated = pageData.lastUpdated
       ? new Date(pageData.lastUpdated).toISOString()
       : new Date().toISOString();
 
-    const graph: any[] = [];
+    pageData.frontmatter.head ??= [];
+    pageData.frontmatter.head.push(
+      ["meta", { name: "title", content: fullTitle }],
+      ["meta", { name: "description", content: pageDescription }],
+      ["link", { rel: "canonical", href: canonicalUrl }],
+      ["meta", { property: "og:type", content: isHome ? "website" : "article" }],
+      ["meta", { property: "og:title", content: fullTitle }],
+      ["meta", { property: "og:description", content: pageDescription }],
+      ["meta", { property: "og:url", content: canonicalUrl }],
+      ["meta", { property: "og:image", content: `${SITE_URL}/favicon.png` }],
+      ["meta", { property: "og:site_name", content: SITE_NAME }],
+      ["meta", { property: "og:locale", content: "en_US" }],
+      ["meta", { name: "twitter:card", content: "summary_large_image" }],
+      ["meta", { name: "twitter:title", content: fullTitle }],
+      ["meta", { name: "twitter:description", content: pageDescription }],
+      ["meta", { name: "twitter:image", content: `${SITE_URL}/favicon.png` }],
+    );
 
-    if (isHome) {
-      graph.push({
-        "@type": "WebSite",
-        name: SITE_NAME,
-        url: SITE_URL,
-        description: SITE_DESCRIPTION,
-        author: { "@type": "Person", name: "Muhammad Fiaz", url: "https://github.com/muhammad-fiaz" },
-      });
-    }
+    // JSON-LD structured data
+    const graph: any[] = [];
 
     const authorSchema = {
       "@type": "Person",
@@ -154,18 +162,38 @@ export default defineConfig({
       ],
     };
 
+    const publisherSchema = {
+      "@type": "Organization",
+      name: SITE_NAME,
+      url: SITE_URL,
+      logo: {
+        "@type": "ImageObject",
+        url: `${SITE_URL}/favicon.png`,
+      },
+    };
+
+    if (isHome) {
+      graph.push({
+        "@type": "WebSite",
+        name: SITE_NAME,
+        url: SITE_URL,
+        description: SITE_DESCRIPTION,
+        author: authorSchema,
+        publisher: publisherSchema,
+        image: `${SITE_URL}/favicon.png`,
+        datePublished: "2026-01-01T00:00:00Z",
+        dateModified: lastUpdated,
+      });
+    }
+
     const primarySchema: Record<string, any> = {
       "@type": isHome ? "SoftwareApplication" : "TechArticle",
       name: isHome ? SITE_NAME : pageTitle,
       description: pageDescription,
       url: canonicalUrl,
-      image: `${SITE_URL}/cover.png`,
+      image: `${SITE_URL}/favicon.png`,
       author: authorSchema,
-      publisher: {
-        "@type": "Organization",
-        name: SITE_NAME,
-        url: SITE_URL,
-      },
+      publisher: publisherSchema,
     };
 
     if (isHome) {
@@ -177,6 +205,8 @@ export default defineConfig({
         downloadUrl: "https://github.com/muhammad-fiaz/sqlite.zig",
         softwareVersion: "0.0.1",
         license: "https://opensource.org/licenses/MIT",
+        datePublished: "2026-01-01T00:00:00Z",
+        dateModified: lastUpdated,
       });
     } else {
       const pathParts = pageData.relativePath.split("/");
@@ -220,7 +250,7 @@ export default defineConfig({
   },
 
   themeConfig: {
-    siteTitle: "sqlite.zig",
+    siteTitle: SITE_NAME,
 
     nav: [
       { text: "Home", link: "/" },
@@ -256,6 +286,11 @@ export default defineConfig({
             { text: "Foreign Keys", link: "/guide/foreign-keys" },
             { text: "Views & Triggers", link: "/guide/views-triggers" },
             { text: "CTEs & Subqueries", link: "/guide/ctes-subqueries" },
+            { text: "Aggregates", link: "/guide/aggregates" },
+            { text: "Conflict Handling", link: "/guide/conflict-handling" },
+            { text: "Insert...Select", link: "/guide/insert-select" },
+            { text: "Subqueries", link: "/guide/subqueries" },
+            { text: "Update...From", link: "/guide/update-from" },
             { text: "Related Projects", link: "/guide/related-projects" },
           ],
         },

@@ -1,10 +1,15 @@
 ---
+title: "Native SQLite-Compatible Database Engine in Zig"
+description: "A fully native, zero-dependency SQLite-compatible database engine written entirely in Zig. Pure Zig storage engine, SQL parser, bytecode VM, typed DSL query builder, WAL journaling, and cross-platform support."
 layout: home
 
 hero:
   name: "sqlite.zig"
-  text: "SQLite Engine in Pure Zig"
+  text: "Native SQLite-Compatible Database Engine in Zig"
   tagline: A fully native, zero-dependency SQLite-compatible database engine written entirely in Zig
+  image:
+    src: /favicon.png
+    alt: sqlite.zig logo
   actions:
     - theme: brand
       text: Get Started
