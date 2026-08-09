@@ -1,6 +1,6 @@
 # Examples
 
-All 32 runnable examples demonstrating `sqlite.zig` features.
+All 47 runnable examples demonstrating `sqlite.zig` features.
 
 ## Getting Started
 
@@ -29,30 +29,75 @@ All 32 runnable examples demonstrating `sqlite.zig` features.
 | 11 | [Keys & Joins](/examples/11-keys-and-joins) | Primary keys, foreign keys, and JOIN queries |
 | 12 | [Complex Queries](/examples/12-complex-queries) | DISTINCT joins and aggregate functions |
 | 13 | [Edge Cases](/examples/13-edge-cases) | NULL handling, savepoints, and error cases |
+| 22 | [Views](/examples/22-views) | CREATE VIEW with typed DSL reads |
+| 23 | [Triggers](/examples/23-triggers) | BEFORE/AFTER INSERT triggers |
+| 35 | [WAL Journal Mode](/examples/35-wal-journal-mode) | WAL and journal mode switching (PRAGMA) |
+| 46 | [Raw ALTER TABLE](/examples/46-raw-alter-table) | ADD COLUMN, RENAME, DROP COLUMN |
 
-## Advanced
+## Aggregates & Functions
+
+| # | Example | Description |
+|---|---------|-------------|
+| 20 | [Scalar Functions](/examples/20-scalar-functions) | ABS, LENGTH, UPPER, LOWER, SUBSTR functions |
+| 36 | [Grouped Aggregates](/examples/36-grouped-aggregates) | GROUP BY with typed DSL aggregate functions |
+
+## CTEs & Subqueries
+
+| # | Example | Description |
+|---|---------|-------------|
+| 24 | [CTEs](/examples/24-ctes) | Common Table Expressions with typed reads |
+| 25 | [Subqueries](/examples/25-subqueries) | Subqueries in FROM and WHERE clauses |
+| 29 | [Multiple CTEs](/examples/29-multiple-ctes) | Multiple CTEs with cross-CTE joins |
+| 32 | [Recursive CTEs](/examples/32-recursive-ctes) | Recursive CTEs for hierarchical tree traversal |
+| 43 | [NOT IN Subqueries](/examples/43-not-in-subqueries) | Exclusion filtering with NOT IN |
+| 44 | [EXISTS Subqueries](/examples/44-exists-subqueries) | Existence checks in WHERE clauses |
+| 45 | [Literal IN Lists](/examples/45-literal-in-lists) | Multiple value matching without subqueries |
+
+## Foreign Keys & Constraints
+
+| # | Example | Description |
+|---|---------|-------------|
+| 26 | [FK Actions](/examples/26-foreign-key-actions) | CASCADE DELETE and SET NULL actions |
+| 27 | [Composite Unique](/examples/27-composite-unique) | Composite unique constraints |
+| 28 | [FK Update Actions](/examples/28-fk-update-actions) | CASCADE UPDATE and SET DEFAULT actions |
+| 30 | [Composite Constraints](/examples/30-composite-constraints) | Composite PRIMARY KEY and UNIQUE |
+| 31 | [Composite FKs](/examples/31-composite-foreign-keys) | Composite foreign keys referencing multiple columns |
+
+## Insert Variants & Upserts
+
+| # | Example | Description |
+|---|---------|-------------|
+| 37 | [Insert...Select Copy](/examples/37-insert-select-copy) | INSERT...SELECT for bulk data duplication |
+| 38 | [Insert OR IGNORE](/examples/38-insert-or-ignore) | Conflict-skipping inserts |
+| 39 | [UPSERT DO NOTHING](/examples/39-upsert-do-nothing) | Insert-or-skip on conflict |
+| 40 | [UPSERT DO UPDATE](/examples/40-upsert-do-update) | Insert-or-update on conflict |
+| 41 | [Insert OR REPLACE](/examples/41-insert-or-replace) | Insert-or-delete-and-reinsert on conflict |
+| 42 | [UPDATE...FROM JOIN](/examples/42-update-from-join) | Update rows using joined table data |
+
+## Schema & Persistence
+
+| # | Example | Description |
+|---|---------|-------------|
+| 17 | [Persistence](/examples/17-persistence-reopen) | Data persistence across database close/reopen |
+| 18 | [Schema Lifecycle](/examples/18-schema-lifecycle) | CREATE, ALTER, DROP table lifecycle |
+| 19 | [Prepared Parameters](/examples/19-prepared-parameter) | Typed parameter binding in prepared statements |
+| 21 | [Indexed Queries](/examples/21-indexed-queries) | Index creation and optimized lookups |
+| 47 | [Column Defaults](/examples/47-column-defaults) | Column DEFAULT expressions including dynamic defaults |
+
+## Query Inspection & Internals
+
+| # | Example | Description |
+|---|---------|-------------|
+| 33 | [EXPLAIN QUERY PLAN](/examples/33-explain-query-plan) | Inspect query execution plans |
+| 34 | [GENERATE_SERIES](/examples/34-virtual-generate-series) | Virtual table for sequence generation |
+
+## Interoperability
 
 | # | Example | Description |
 |---|---------|-------------|
 | 07 | [Python Interop](/examples/07-python-interop) | Interop with Python sqlite3 module |
 | 08 | [Repair Legacy](/examples/08-repair-legacy) | Repair and legacy database handling |
 | 15 | [Raw & DSL Interop](/examples/15-raw-dsl-interoperability) | Verify raw SQL and DSL produce identical results |
-| 17 | [Persistence](/examples/17-persistence-reopen) | Data persistence across database close/reopen |
-| 18 | [Schema Lifecycle](/examples/18-schema-lifecycle) | CREATE, ALTER, DROP table lifecycle |
-| 19 | [Prepared Parameters](/examples/19-prepared-parameter) | Typed parameter binding in prepared statements |
-| 20 | [Scalar Functions](/examples/20-scalar-functions) | ABS, LENGTH, UPPER, LOWER, SUBSTR functions |
-| 21 | [Indexed Queries](/examples/21-indexed-queries) | Index creation and optimized lookups |
-| 22 | [Views](/examples/22-views) | CREATE VIEW with typed DSL reads |
-| 23 | [Triggers](/examples/23-triggers) | BEFORE/AFTER INSERT triggers |
-| 24 | [CTEs](/examples/24-ctes) | Common Table Expressions with typed reads |
-| 25 | [Subqueries](/examples/25-subqueries) | Subqueries in FROM and WHERE clauses |
-| 26 | [FK Actions](/examples/26-foreign-key-actions) | CASCADE DELETE and SET NULL actions |
-| 27 | [Composite Unique](/examples/27-composite-unique) | Composite unique constraints |
-| 28 | [FK Update Actions](/examples/28-fk-update-actions) | CASCADE UPDATE and SET DEFAULT actions |
-| 29 | [Multiple CTEs](/examples/29-multiple-ctes) | Multiple CTEs with cross-CTE joins |
-| 30 | [Composite Constraints](/examples/30-composite-constraints) | Composite PRIMARY KEY and UNIQUE |
-| 31 | [Composite FKs](/examples/31-composite-foreign-keys) | Composite foreign keys referencing multiple columns |
-| 32 | [Recursive CTEs](/examples/32-recursive-ctes) | Recursive CTEs for hierarchical tree traversal |
 
 ## Running Examples
 
