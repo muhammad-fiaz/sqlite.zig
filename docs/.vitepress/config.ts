@@ -17,7 +17,7 @@ export const KEYWORDS =
 export default defineConfig({
   lang: "en-US",
   title: SITE_NAME,
-  titleTemplate: `%s | ${SITE_NAME}`,
+  titleTemplate: `:title | ${SITE_NAME}`,
   description: SITE_DESCRIPTION,
   base: "/sqlite.zig/",
   lastUpdated: true,
