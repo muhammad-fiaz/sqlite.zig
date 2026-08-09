@@ -1,3 +1,8 @@
+---
+title: "DSL Query Builder"
+description: "The typed DSL query builder providing compile-time safety for table definitions, queries, inserts, updates, and deletes."
+---
+
 # DSL Query Builder
 
 The typed DSL (Domain-Specific Language) query builder provides compile-time safety for database operations. Table names, column names, and types are validated at compile time.

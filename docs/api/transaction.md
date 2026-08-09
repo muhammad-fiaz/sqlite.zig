@@ -1,3 +1,8 @@
+---
+title: "Transaction API"
+description: "Transaction and locking support for concurrent access, including ACID properties, deferred/immediate/exclusive modes, and savepoints."
+---
+
 # Transaction API
 
 Transaction and locking support for concurrent access.

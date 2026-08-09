@@ -1,3 +1,8 @@
+---
+title: "Migration API"
+description: "Schema migration support for evolving database schemas over time, including version tracking and incremental updates."
+---
+
 # Migration API
 
 Schema migration support for evolving database schemas over time.

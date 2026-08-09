@@ -1,3 +1,8 @@
+---
+title: "Views & Triggers"
+description: "Creating and using SQL views and triggers with both raw SQL and the typed DSL query builder."
+---
+
 # Views & Triggers
 
 ## Views

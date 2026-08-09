@@ -1,3 +1,8 @@
+---
+title: "SQL API"
+description: "Parsing and executing raw SQL strings, including the lexer, parser, AST, and compiler for SQL statements."
+---
+
 # SQL API
 
 The SQL module handles parsing and executing raw SQL strings.

@@ -1,3 +1,8 @@
+---
+title: "SQL Engine"
+description: "The hand-written SQL lexer, parser, and bytecode compiler supporting a substantial subset of SQLite's SQL dialect."
+---
+
 # SQL Engine
 
 `sqlite.zig` includes a hand-written SQL lexer, parser, and bytecode compiler that supports a substantial subset of SQLite's SQL dialect.

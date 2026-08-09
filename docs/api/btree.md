@@ -1,3 +1,8 @@
+---
+title: "B-Tree API"
+description: "The B-Tree module managing hierarchical tree structures for indexing and storing database records, including cursors and page traversal."
+---
+
 # B-Tree API
 
 The B-Tree module manages the hierarchical tree structure used for indexing and storing database records.

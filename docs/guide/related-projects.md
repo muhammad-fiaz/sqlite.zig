@@ -1,3 +1,8 @@
+---
+title: "Related Projects"
+description: "Other Zig projects by Muhammad Fiaz that complement or integrate with sqlite.zig, including cuda.zig, env.zig, and tui.zig."
+---
+
 # Related Projects
 
 These are other Zig projects by Muhammad Fiaz that complement or integrate with `sqlite.zig`:

@@ -1,3 +1,8 @@
+---
+title: "UPDATE FROM"
+description: "Using UPDATE FROM with equi-join updates from a source table to update rows based on related data."
+---
+
 # UPDATE FROM
 
 The engine supports equi-join updates from a source table:

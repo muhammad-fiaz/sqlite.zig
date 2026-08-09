@@ -1,3 +1,8 @@
+---
+title: "Catalog API"
+description: "Schema definitions, table metadata, and type affinity management for the sqlite.zig catalog module."
+---
+
 # Catalog API
 
 The catalog module manages schema definitions, table metadata, and type affinity.

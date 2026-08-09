@@ -1,3 +1,8 @@
+---
+title: "CTEs & Subqueries"
+description: "Common Table Expressions (CTEs) and subqueries including recursive CTEs, multiple CTEs, and nested subqueries."
+---
+
 # CTEs & Subqueries
 
 ## Common Table Expressions (CTEs)

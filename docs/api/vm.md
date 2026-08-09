@@ -1,3 +1,8 @@
+---
+title: "Virtual Machine API"
+description: "The bytecode virtual machine that executes compiled SQL operations, including the execution flow from SQL string to query results."
+---
+
 # Virtual Machine API
 
 The bytecode virtual machine executes compiled SQL operations.

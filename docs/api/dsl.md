@@ -1,3 +1,8 @@
+---
+title: "DSL API"
+description: "The typed DSL query builder providing compile-time safety for table definitions, queries, inserts, updates, and deletes."
+---
+
 # DSL API
 
 The typed DSL (Domain-Specific Language) query builder provides compile-time safety for all database operations.

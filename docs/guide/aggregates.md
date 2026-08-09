@@ -1,3 +1,8 @@
+---
+title: "Grouped Aggregates"
+description: "Grouped aggregate projections with GROUP BY using COUNT, SUM, AVG, MIN, and MAX functions."
+---
+
 # Grouped Aggregates
 
 Raw SQL supports grouped aggregate projections with `GROUP BY`:

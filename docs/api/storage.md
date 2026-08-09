@@ -1,3 +1,8 @@
+---
+title: "Storage API"
+description: "Low-level file I/O, page management, and durability for the SQLite on-disk format, including pager, WAL, and journaling."
+---
+
 # Storage API
 
 The storage module handles low-level file I/O, page management, and durability.

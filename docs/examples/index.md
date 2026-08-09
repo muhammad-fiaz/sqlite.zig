@@ -1,3 +1,8 @@
+---
+title: "Examples"
+description: "All 47 runnable examples demonstrating sqlite.zig features, from basic SQL execution to advanced queries, DSL operations, and schema management."
+---
+
 # Examples
 
 All 47 runnable examples demonstrating `sqlite.zig` features.

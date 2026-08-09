@@ -1,3 +1,8 @@
+---
+title: "Version API"
+description: "Database and library version information, including sqlite.zig version constants and SQLite file format version headers."
+---
+
 # Version API
 
 Database and library version information.

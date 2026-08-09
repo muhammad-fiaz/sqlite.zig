@@ -1,3 +1,8 @@
+---
+title: "Subqueries"
+description: "Using subqueries in raw SQL and the typed DSL, including NOT IN, WHERE IN, and anti-subquery patterns."
+---
+
 # Subqueries
 
 Raw SQL and the typed DSL support anti-subqueries:

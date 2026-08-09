@@ -1,3 +1,8 @@
+---
+title: "Query Planner API"
+description: "Query planner that optimizes SQL statements for efficient execution, including cost-based plan selection and index usage."
+---
+
 # Query Planner API
 
 The query planner optimizes SQL queries for efficient execution.

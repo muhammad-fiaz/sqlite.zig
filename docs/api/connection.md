@@ -1,3 +1,8 @@
+---
+title: "Connection API"
+description: "The Connection type providing the primary interface for database operations including open, close, exec, and prepared statements."
+---
+
 # Connection API
 
 The `Connection` type is the primary interface for database operations.

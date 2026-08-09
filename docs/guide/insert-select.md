@@ -1,3 +1,8 @@
+---
+title: "INSERT SELECT"
+description: "Inserting query results into another table using INSERT ... SELECT with raw SQL."
+---
+
 # INSERT SELECT
 
 Query results can be inserted into another table using raw SQL:

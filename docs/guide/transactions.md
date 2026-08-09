@@ -1,3 +1,8 @@
+---
+title: "Transactions"
+description: "Full ACID transaction semantics with BEGIN, COMMIT, ROLLBACK, SAVEPOINT, and RELEASE support."
+---
+
 # Transactions
 
 `sqlite.zig` supports full ACID transaction semantics with BEGIN, COMMIT, ROLLBACK, SAVEPOINT, and RELEASE.

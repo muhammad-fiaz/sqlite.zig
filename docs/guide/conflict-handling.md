@@ -1,3 +1,8 @@
+---
+title: "Conflict Handling"
+description: "Handling constraint conflicts with INSERT OR IGNORE, UPSERT DO NOTHING, and UPSERT DO UPDATE patterns."
+---
+
 # Conflict Handling
 
 Use `INSERT OR IGNORE` when importing data and duplicate constraint rows

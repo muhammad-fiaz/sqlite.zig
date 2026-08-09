@@ -1,3 +1,8 @@
+---
+title: "Foreign Keys"
+description: "Foreign key constraints with referential actions including CASCADE, SET NULL, SET DEFAULT, RESTRICT, and NO ACTION."
+---
+
 # Foreign Keys
 
 `sqlite.zig` supports foreign key constraints with referential actions.

@@ -1,3 +1,8 @@
+---
+title: "Installation"
+description: "How to install and add sqlite.zig as a dependency using zig fetch, build.zig.zon, or manual integration."
+---
+
 # Installation
 
 ## Method 1: Zig Fetch (Recommended)

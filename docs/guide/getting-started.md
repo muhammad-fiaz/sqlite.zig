@@ -1,3 +1,8 @@
+---
+title: "Getting Started"
+description: "Quick start guide for sqlite.zig, a fully native, zero-dependency SQLite-compatible database engine written entirely in Zig."
+---
+
 # Getting Started
 
 `sqlite.zig` is a fully native, zero-dependency SQLite-compatible database engine written entirely in Zig. It re-implements the storage engine, SQL parser, query planner, and virtual machine from scratch — no C bindings, no link-time dependencies.

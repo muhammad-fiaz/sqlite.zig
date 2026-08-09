@@ -1,3 +1,8 @@
+---
+title: "Errors API"
+description: "Error types and handling for the sqlite.zig engine, including constraint violations, I/O errors, and lock conflicts."
+---
+
 # Errors API
 
 Error types and handling for the sqlite.zig engine.

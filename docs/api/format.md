@@ -1,3 +1,8 @@
+---
+title: "Format API"
+description: "Low-level file format handling for the SQLite on-disk structure, including page format, record encoding, and header layouts."
+---
+
 # Format API
 
 Low-level file format handling for the SQLite on-disk structure.

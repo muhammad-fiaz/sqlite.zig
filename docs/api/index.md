@@ -1,3 +1,8 @@
+---
+title: "API Reference"
+description: "Overview of the sqlite.zig public API, including core types, top-level functions, and module references for Connection, DSL, SQL, and storage."
+---
+
 # API Reference
 
 Overview of the `sqlite.zig` public API.
