@@ -1,45 +1,110 @@
 ---
-title: "Composite FKs"
-description: "Composite foreign keys"
+title: "Composite Foreign Keys"
+description: "Define and verify composite foreign keys with CASCADE update behavior using raw SQL and typed DSL."
 ---
 
-# Composite FKs
+# Composite Foreign Keys
 
-Use composite foreign keys to reference multiple columns.
+Define and verify composite foreign keys with CASCADE update behavior using raw SQL and typed DSL.
+
+## What This Example Does
+
+| Step | SQL Operation | Description |
+|------|---------------|-------------|
+| 1 | CREATE TABLE IF NOT EXISTS raw_fk_parents (part_a INTEGER, part_b INTEGER, label TEXT, PRIMARY KEY (part_a, part_b)) | Creates raw parent with composite PK |
+| 2 | CREATE TABLE IF NOT EXISTS raw_fk_children (... FOREIGN KEY (parent_a, parent_b) REFERENCES raw_fk_parents (part_a, part_b) ON UPDATE CASCADE) | Creates raw child with composite FK |
+| 3 | INSERT INTO raw_fk_parents VALUES (1, 10, 'raw') | Inserts raw parent |
+| 4 | INSERT INTO raw_fk_children VALUES (1, 1, 10) | Inserts raw child |
+| 5 | UPDATE raw_fk_parents SET part_a = 2, part_b = 20 WHERE part_a = 1 AND part_b = 10 | Updates parent (cascades) |
+| 6 | SELECT parent_a, parent_b FROM raw_fk_children | Verifies cascade on raw child |
+| 7 | CREATE TABLE typed_fk_parents (... PRIMARY KEY (part_a, part_b)) | Creates typed parent |
+| 8 | CREATE TABLE typed_fk_children (... FOREIGN KEY (parent_a, parent_b) REFERENCES typed_fk_parents (part_a, part_b) ON UPDATE CASCADE) | Creates typed child |
+| 9 | INSERT INTO typed_fk_parents VALUES (1, 10, 'typed') | Inserts typed parent |
+| 10 | INSERT INTO typed_fk_children VALUES (1, 1, 10) | Inserts typed child |
+| 11 | UPDATE typed_fk_parents SET part_a = 2, part_b = 20 WHERE part_a = 1 | Updates parent (cascades) |
+| 12 | SELECT * FROM typed_fk_children | Verifies cascade on typed child |
+
+## Source Code
 
 ```zig
 const std = @import("std");
 const sqlite = @import("sqlite");
 
-const Parent = sqlite.table("comp_parent", struct { a: i64, b: i64 });
-const Child = sqlite.table("comp_child", struct { id: i64, parent_a: i64, parent_b: i64 });
+const TypedParent = sqlite.table("typed_fk_parents", struct { part_a: i64, part_b: i64, label: []const u8 });
+const TypedChild = sqlite.table("typed_fk_children", struct { id: i64, parent_a: i64, parent_b: i64 });
 
 pub fn main() !void {
     var db = try sqlite.open(std.heap.page_allocator, "valid_31.db");
     defer db.close();
-    try db.createTable(Parent, .{
-        .if_not_exists = true,
-        .primary_keys = &.{ Parent.key("a"), Parent.key("b") },
-    });
-    try db.createTable(Child, .{
-        .if_not_exists = true,
-        .primary_key = Child.key("id"),
-        .foreign_key_constraints = &.{.{
-            .columns = &.{ Child.key("parent_a"), Child.key("parent_b") },
-            .referenced_table = "comp_parent",
-            .referenced_columns = &.{ Parent.key("a"), Parent.key("b") },
-            .on_delete = .cascade,
-        }},
-    });
-    var p = try db.from(Parent).insert(.{ .a = 1, .b = 2 });
-    p.deinit();
-    var c = try db.from(Child).insert(.{ .id = 10, .parent_a = 1, .parent_b = 2 });
-    c.deinit();
-    var result = try db.from(Child).fetchAll();
-    defer result.deinit();
-    try std.testing.expectEqual(@as(usize, 1), result.rowCount());
+
+    var setup = try db.exec("CREATE TABLE IF NOT EXISTS raw_fk_parents (part_a INTEGER, part_b INTEGER, label TEXT, PRIMARY KEY (part_a, part_b));");
+    setup.deinit();
+    setup = try db.exec("CREATE TABLE IF NOT EXISTS raw_fk_children (id INTEGER PRIMARY KEY, parent_a INTEGER, parent_b INTEGER, FOREIGN KEY (parent_a, parent_b) REFERENCES raw_fk_parents (part_a, part_b) ON UPDATE CASCADE ON DELETE CASCADE);");
+    setup.deinit();
+    var clear = try db.exec("DELETE FROM raw_fk_children;");
+    clear.deinit();
+    clear = try db.exec("DELETE FROM raw_fk_parents;");
+    clear.deinit();
+    var inserted = try db.exec("INSERT INTO raw_fk_parents VALUES (1, 10, 'raw');");
+    inserted.deinit();
+    inserted = try db.exec("INSERT INTO raw_fk_children VALUES (1, 1, 10);");
+    inserted.deinit();
+    var updated = try db.exec("UPDATE raw_fk_parents SET part_a = 2, part_b = 20 WHERE part_a = 1 AND part_b = 10;");
+    updated.deinit();
+    var raw_child = try db.exec("SELECT parent_a, parent_b FROM raw_fk_children;");
+    defer raw_child.deinit();
+    if (raw_child.rows[0][0].integer != 2 or raw_child.rows[0][1].integer != 20) return error.CompositeForeignKeyUpdateFailed;
+
+    try db.createTable(TypedParent, .{ .if_not_exists = true, .primary_keys = &.{ TypedParent.key("part_a"), TypedParent.key("part_b") } });
+    try db.createTable(TypedChild, .{ .if_not_exists = true, .foreign_key_constraints = &.{.{ .columns = &.{ TypedChild.key("parent_a"), TypedChild.key("parent_b") }, .referenced_columns = &.{ TypedParent.key("part_a"), TypedParent.key("part_b") }, .on_delete = .cascade, .on_update = .cascade }} });
+    try db.truncate(TypedChild);
+    try db.truncate(TypedParent);
+    var parent = try db.from(TypedParent).insertTyped(.{ .part_a = 1, .part_b = 10, .label = "typed" });
+    parent.deinit();
+    var child = try db.from(TypedChild).insertTyped(.{ .id = 1, .parent_a = 1, .parent_b = 10 });
+    child.deinit();
+    var parent_update = try db.from(TypedParent).update(.{ .part_a = 2, .part_b = 20 });
+    var result = try parent_update.where(TypedParent.column("part_a").eq(1)).execute();
+    parent_update.deinit();
+    result.deinit();
+    var typed_child = try db.from(TypedChild).selectAll().fetchAll();
+    defer typed_child.deinit();
+    if (typed_child.rows[0][1].integer != 2 or typed_child.rows[0][2].integer != 20) return error.TypedCompositeForeignKeyUpdateFailed;
+    std.debug.print("31 composite foreign keys: raw and typed cascading relationships verified\n", .{});
 }
 ```
 
+## Database State After Execution
+
+**raw_fk_parents:**
+
+| part_a | part_b | label |
+|--------|--------|-------|
+| 2 | 20 | raw |
+
+**raw_fk_children:**
+
+| id | parent_a | parent_b |
+|----|----------|----------|
+| 1 | 2 | 20 |
+
+**typed_fk_parents:**
+
+| part_a | part_b | label |
+|--------|--------|-------|
+| 2 | 20 | typed |
+
+**typed_fk_children:**
+
+| id | parent_a | parent_b |
+|----|----------|----------|
+| 1 | 2 | 20 |
+
+## Zig Output
+
+```
+31 composite foreign keys: raw and typed cascading relationships verified
+```
+
 > [!TIP]
-> Run with: `zig build run-31-composite-foreign-keys`
+> Run with: `zig build run-31_composite_foreign_keys`

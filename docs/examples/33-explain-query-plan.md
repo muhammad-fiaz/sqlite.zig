@@ -1,11 +1,25 @@
 ---
-title: Explain Query Plan
-description: Use EXPLAIN QUERY PLAN to verify index usage on SELECT queries.
+title: "EXPLAIN QUERY PLAN"
+description: "Use EXPLAIN QUERY PLAN to inspect query execution plans and verify index usage."
 ---
 
-# Explain Query Plan
+# EXPLAIN QUERY PLAN
 
-This example demonstrates how to use SQLite's `EXPLAIN QUERY PLAN` statement to inspect the query plan and verify that an index is being used for a lookup. It creates a table with an index, runs a query, and confirms the planner uses the index.
+Use EXPLAIN QUERY PLAN to inspect query execution plans and verify index usage.
+
+## What This Example Does
+
+| Step | SQL Operation | Description |
+|------|---------------|-------------|
+| 1 | CREATE TABLE IF NOT EXISTS planner_items (id INTEGER PRIMARY KEY, code TEXT, value INTEGER) | Creates items table |
+| 2 | CREATE INDEX planner_items_code_idx ON planner_items (code) | Creates index on code |
+| 3 | DELETE FROM planner_items | Truncates the table |
+| 4 | INSERT INTO planner_items VALUES (1, 'A', 10) | Inserts item A |
+| 5 | INSERT INTO planner_items VALUES (2, 'B', 20) | Inserts item B |
+| 6 | EXPLAIN QUERY PLAN SELECT id FROM planner_items WHERE code = 'B' | Shows query plan (uses index) |
+| 7 | SELECT id, value FROM planner_items WHERE code = 'B' | Queries using index |
+
+## Source Code
 
 ```zig
 const std = @import("std");
@@ -33,6 +47,19 @@ pub fn main() !void {
     if (rows.rowCount() != 1 or rows.rows[0][0].integer != 2) return error.IndexLookupVerificationFailed;
     std.debug.print("33 planner: EXPLAIN QUERY PLAN and indexed equality verified\n", .{});
 }
+```
+
+## Database State After Execution
+
+| id | code | value |
+|----|------|-------|
+| 1 | A | 10 |
+| 2 | B | 20 |
+
+## Zig Output
+
+```
+33 planner: EXPLAIN QUERY PLAN and indexed equality verified
 ```
 
 > [!TIP]

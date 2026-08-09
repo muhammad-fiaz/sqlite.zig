@@ -1,11 +1,27 @@
 ---
-title: EXISTS Subqueries
-description: Use EXISTS and NOT EXISTS for correlated and uncorrelated subquery filtering.
+title: "EXISTS Subqueries"
+description: "Use EXISTS and NOT EXISTS subqueries with raw SQL and typed DSL to check for related rows."
 ---
 
 # EXISTS Subqueries
 
-This example demonstrates `EXISTS` and `NOT EXISTS` subqueries in SQLite. It covers uncorrelated EXISTS (always true if the subquery returns rows), correlated EXISTS (matches on a specific column), and the DSL method `whereExistsKey` for typed queries.
+Use EXISTS and NOT EXISTS subqueries with raw SQL and typed DSL to check for related rows.
+
+## What This Example Does
+
+| Step | SQL Operation | Description |
+|------|---------------|-------------|
+| 1 | CREATE TABLE exists_users (id INTEGER) | Creates users table |
+| 2 | CREATE TABLE exists_marker (id INTEGER) | Creates marker table |
+| 3 | INSERT INTO exists_users VALUES (1), (2) | Inserts two users |
+| 4 | INSERT INTO exists_marker VALUES (1) | Inserts one marker |
+| 5 | SELECT id FROM exists_users WHERE EXISTS (SELECT id FROM exists_marker) | Unconditional EXISTS |
+| 6 | SELECT id FROM exists_users WHERE EXISTS (SELECT id FROM exists_marker WHERE exists_marker.id = exists_users.id) | Correlated EXISTS |
+| 7 | SELECT id FROM exists_users WHERE EXISTS (SELECT id FROM exists_marker WHERE exists_marker.id = exists_users.id) | Typed DSL whereExistsKey |
+| 8 | DELETE FROM exists_marker | Clears markers |
+| 9 | SELECT id FROM exists_users WHERE NOT EXISTS (SELECT id FROM exists_marker) | NOT EXISTS |
+
+## Source Code
 
 ```zig
 const std = @import("std");
@@ -39,6 +55,25 @@ pub fn main() !void {
     if (absent.rowCount() != 2) return error.NotExistsVerificationFailed;
     std.debug.print("44 EXISTS: raw EXISTS and NOT EXISTS verified\n", .{});
 }
+```
+
+## Database State After Execution
+
+**exists_users:**
+
+| id |
+|----|
+| 1 |
+| 2 |
+
+**exists_marker:**
+
+*(empty after DELETE)*
+
+## Zig Output
+
+```
+44 EXISTS: raw EXISTS and NOT EXISTS verified
 ```
 
 > [!TIP]

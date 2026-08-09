@@ -1,11 +1,22 @@
 ---
-title: Virtual Table generate_series
-description: Use SQLite's virtual generate_series table to produce a sequence of integers.
+title: "Virtual Tables: generate_series"
+description: "Use the generate_series virtual table to generate a sequence of numbers and query with typed DSL."
 ---
 
-# Virtual Table generate_series
+# Virtual Tables: generate_series
 
-This example shows how to create and query SQLite's `generate_series` virtual table. It generates a sequence of numbers from 1 to 5 and verifies the results survive a database close and reopen.
+Use the generate_series virtual table to generate a sequence of numbers and query with typed DSL.
+
+## What This Example Does
+
+| Step | SQL Operation | Description |
+|------|---------------|-------------|
+| 1 | CREATE VIRTUAL TABLE IF NOT EXISTS numbers_series USING generate_series(1, 5, 1) | Creates virtual table generating 1-5 |
+| 2 | SELECT * FROM numbers_series | Reads all generated values |
+| 3 | *(close and reopen database)* | Verifies persistence |
+| 4 | SELECT * FROM numbers_series | Reads again after reopen |
+
+## Source Code
 
 ```zig
 const std = @import("std");
@@ -31,6 +42,24 @@ pub fn main() !void {
     try verify(reopened);
     std.debug.print("34 virtual tables: generate_series native DSL reads and reopen verified\n", .{});
 }
+```
+
+## Database State After Execution
+
+**numbers_series (virtual table):**
+
+| value |
+|-------|
+| 1 |
+| 2 |
+| 3 |
+| 4 |
+| 5 |
+
+## Zig Output
+
+```
+34 virtual tables: generate_series native DSL reads and reopen verified
 ```
 
 > [!TIP]

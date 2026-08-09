@@ -1,11 +1,20 @@
 ---
-title: "Open & Execute"
-description: "Open a database and execute raw SQL statements"
+title: "Open Database and Execute SQL"
+description: "Open a SQLite database and execute raw SQL statements to create a table and insert data."
 ---
 
-# Open & Execute
+# Open Database and Execute SQL
 
-Open a database connection and execute raw SQL statements including CREATE TABLE, INSERT, and SELECT.
+Open a SQLite database and execute raw SQL statements to create a table and insert data.
+
+## What This Example Does
+
+| Step | SQL Operation | Description |
+|------|---------------|-------------|
+| 1 | CREATE TABLE IF NOT EXISTS users (id INTEGER, name TEXT) | Creates the users table if it doesn't exist |
+| 2 | INSERT INTO users VALUES (1, 'Fiaz') | Inserts a single row into the users table |
+
+## Source Code
 
 ```zig
 const std = @import("std");
@@ -14,15 +23,24 @@ const sqlite = @import("sqlite");
 pub fn main() !void {
     var db = try sqlite.open(std.heap.page_allocator, "valid_01.db");
     defer db.close();
-    var result = try db.exec("CREATE TABLE IF NOT EXISTS demo (id INTEGER, value TEXT);");
+    var result = try db.exec("CREATE TABLE IF NOT EXISTS users (id INTEGER, name TEXT);");
     result.deinit();
-    result = try db.exec("INSERT INTO demo VALUES (1, 'hello');");
+    result = try db.exec("INSERT INTO users VALUES (1, 'Fiaz');");
     result.deinit();
-    var rows = try db.exec("SELECT * FROM demo;");
-    defer rows.deinit();
-    std.debug.print("Rows: {d}\n", .{rows.rowCount()});
 }
 ```
 
+## Database State After Execution
+
+| id | name |
+|----|------|
+| 1 | Fiaz |
+
+## Zig Output
+
+```
+No console output - operations completed successfully
+```
+
 > [!TIP]
-> Run with: `zig build run-01-open-and-exec`
+> Run with: `zig build run-01_open_and_exec`

@@ -1,11 +1,22 @@
 ---
-title: UPSERT DO NOTHING
-description: Use INSERT ... ON CONFLICT DO NOTHING to skip conflicting rows in a targeted way.
+title: "UPSERT DO NOTHING"
+description: "Use INSERT ... ON CONFLICT DO NOTHING to skip conflicting rows without error."
 ---
 
 # UPSERT DO NOTHING
 
-This example demonstrates the `ON CONFLICT DO NOTHING` upsert clause. Unlike `INSERT OR IGNORE`, this targets a specific conflict column. Conflicting rows are skipped while non-conflicting rows proceed.
+Use INSERT ... ON CONFLICT DO NOTHING to skip conflicting rows without error.
+
+## What This Example Does
+
+| Step | SQL Operation | Description |
+|------|---------------|-------------|
+| 1 | CREATE TABLE IF NOT EXISTS upsert_items (id INTEGER PRIMARY KEY, label TEXT) | Creates items table |
+| 2 | DELETE FROM upsert_items | Truncates the table |
+| 3 | INSERT INTO upsert_items VALUES (1, 'original') | Inserts original row |
+| 4 | INSERT INTO upsert_items VALUES (1, 'duplicate'), (2, 'accepted') ON CONFLICT(id) DO NOTHING | Skips conflict, inserts new |
+
+## Source Code
 
 ```zig
 const std = @import("std");
@@ -25,6 +36,19 @@ pub fn main() !void {
     if (result.changes != 1) return error.UpsertDoNothingVerificationFailed;
     std.debug.print("39 UPSERT DO NOTHING: conflict target and accepted row verified\n", .{});
 }
+```
+
+## Database State After Execution
+
+| id | label |
+|----|-------|
+| 1 | original |
+| 2 | accepted |
+
+## Zig Output
+
+```
+39 UPSERT DO NOTHING: conflict target and accepted row verified
 ```
 
 > [!TIP]

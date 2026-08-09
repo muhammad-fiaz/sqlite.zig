@@ -1,11 +1,22 @@
 ---
-title: INSERT OR IGNORE
-description: Use INSERT OR IGNORE to silently skip rows that cause uniqueness conflicts.
+title: "INSERT OR IGNORE"
+description: "Use INSERT OR IGNORE to skip conflicting rows while inserting new data."
 ---
 
 # INSERT OR IGNORE
 
-This example shows how `INSERT OR IGNORE` handles primary key conflicts. When a conflicting row is encountered, it is silently skipped rather than raising an error, while non-conflicting rows are still inserted.
+Use INSERT OR IGNORE to skip conflicting rows while inserting new data.
+
+## What This Example Does
+
+| Step | SQL Operation | Description |
+|------|---------------|-------------|
+| 1 | CREATE TABLE IF NOT EXISTS ignore_items (id INTEGER PRIMARY KEY, label TEXT) | Creates items table with PK |
+| 2 | DELETE FROM ignore_items | Truncates the table |
+| 3 | INSERT INTO ignore_items VALUES (1, 'original') | Inserts original row |
+| 4 | INSERT OR IGNORE INTO ignore_items VALUES (1, 'duplicate'), (2, 'accepted') | Skips duplicate, inserts new |
+
+## Source Code
 
 ```zig
 const std = @import("std");
@@ -25,6 +36,19 @@ pub fn main() !void {
     if (result.changes != 1) return error.InsertOrIgnoreVerificationFailed;
     std.debug.print("38 INSERT OR IGNORE: conflicts skipped and accepted rows inserted\n", .{});
 }
+```
+
+## Database State After Execution
+
+| id | label |
+|----|-------|
+| 1 | original |
+| 2 | accepted |
+
+## Zig Output
+
+```
+38 INSERT OR IGNORE: conflicts skipped and accepted rows inserted
 ```
 
 > [!TIP]

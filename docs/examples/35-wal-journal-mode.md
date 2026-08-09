@@ -1,11 +1,26 @@
 ---
-title: WAL Journal Mode
-description: Enable WAL journal mode for concurrent reads and writes, then checkpoint and verify.
+title: "WAL Journal Mode"
+description: "Enable WAL journal mode for concurrent reads/writes and verify data persists across checkpoints."
 ---
 
 # WAL Journal Mode
 
-This example demonstrates enabling Write-Ahead Logging (WAL) journal mode in SQLite. WAL allows concurrent reads while writing. The example writes data, reopens the database, reads it back, then checkpoints by switching back to DELETE mode.
+Enable WAL journal mode for concurrent reads/writes and verify data persists across checkpoints.
+
+## What This Example Does
+
+| Step | SQL Operation | Description |
+|------|---------------|-------------|
+| 1 | PRAGMA journal_mode=WAL | Enables WAL journal mode |
+| 2 | CREATE TABLE IF NOT EXISTS wal_events (id INTEGER PRIMARY KEY, message TEXT NOT NULL) | Creates events table |
+| 3 | DELETE FROM wal_events | Clears the table |
+| 4 | INSERT INTO wal_events (id, message) VALUES (1, 'written through wal') | Inserts via WAL |
+| 5 | *(close database)* | Closes connection |
+| 6 | *(reopen database)* | Reopens to verify WAL data |
+| 7 | SELECT * FROM wal_events | Reads back WAL-persisted data |
+| 8 | PRAGMA journal_mode=DELETE | Checkpoints and switches back |
+
+## Source Code
 
 ```zig
 const std = @import("std");
@@ -46,6 +61,18 @@ pub fn main() !void {
     try checkRows(verified);
     std.debug.print("35 WAL journal mode: native WAL write, reopen, readback, and checkpoint verified\n", .{});
 }
+```
+
+## Database State After Execution
+
+| id | message |
+|----|---------|
+| 1 | written through wal |
+
+## Zig Output
+
+```
+35 WAL journal mode: native WAL write, reopen, readback, and checkpoint verified
 ```
 
 > [!TIP]

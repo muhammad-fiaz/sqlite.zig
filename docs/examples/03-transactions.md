@@ -1,11 +1,27 @@
 ---
-title: "Transactions"
-description: "BEGIN, COMMIT, ROLLBACK with the typed DSL"
+title: "Transactions with Rollback and Commit"
+description: "Demonstrate transaction handling with rollback and commit using the DSL query builder."
 ---
 
-# Transactions
+# Transactions with Rollback and Commit
 
-Use transactions to group multiple operations with BEGIN, COMMIT, and ROLLBACK.
+Demonstrate transaction handling with rollback and commit using the DSL query builder.
+
+## What This Example Does
+
+| Step | SQL Operation | Description |
+|------|---------------|-------------|
+| 1 | CREATE TABLE IF NOT EXISTS ledger (id INTEGER, amount INTEGER) | Creates the ledger table |
+| 2 | DELETE FROM ledger | Truncates the ledger table |
+| 3 | BEGIN | Starts a transaction |
+| 4 | INSERT INTO ledger VALUES (1, 100) | Inserts a row (will be rolled back) |
+| 5 | ROLLBACK | Rolls back the transaction |
+| 6 | BEGIN | Starts a new transaction |
+| 7 | INSERT INTO ledger VALUES (1, 100) | Inserts a row (will be committed) |
+| 8 | COMMIT | Commits the transaction |
+| 9 | SELECT id, amount FROM ledger | Queries the final state |
+
+## Source Code
 
 ```zig
 const std = @import("std");
@@ -32,5 +48,17 @@ pub fn main() !void {
 }
 ```
 
+## Database State After Execution
+
+| id | amount |
+|----|--------|
+| 1 | 100 |
+
+## Zig Output
+
+```
+No console output - operations completed successfully
+```
+
 > [!TIP]
-> Run with: `zig build run-03-transactions`
+> Run with: `zig build run-03_transactions`

@@ -1,11 +1,26 @@
 ---
-title: INSERT SELECT Copy
-description: Copy rows from one table to another using INSERT ... SELECT with a WHERE filter.
+title: "INSERT SELECT Copy"
+description: "Copy filtered rows from one table to another using INSERT ... SELECT."
 ---
 
 # INSERT SELECT Copy
 
-This example demonstrates copying data between tables using `INSERT INTO ... SELECT`. It inserts rows into a source table, then selectively copies only matching rows into a destination table using a filtered `SELECT`.
+Copy filtered rows from one table to another using INSERT ... SELECT.
+
+## What This Example Does
+
+| Step | SQL Operation | Description |
+|------|---------------|-------------|
+| 1 | CREATE TABLE IF NOT EXISTS copy_source (id INTEGER, label TEXT) | Creates source table |
+| 2 | CREATE TABLE IF NOT EXISTS copy_destination (id INTEGER, label TEXT) | Creates destination table |
+| 3 | DELETE FROM copy_source | Truncates source |
+| 4 | DELETE FROM copy_destination | Truncates destination |
+| 5 | INSERT INTO copy_source VALUES (1, 'skip') | Inserts row to skip |
+| 6 | INSERT INTO copy_source VALUES (2, 'copy') | Inserts row to copy |
+| 7 | INSERT INTO copy_destination SELECT id, label FROM copy_source WHERE id > 1 | Copies filtered rows |
+| 8 | SELECT * FROM copy_destination | Reads copied rows |
+
+## Source Code
 
 ```zig
 const std = @import("std");
@@ -32,6 +47,27 @@ pub fn main() !void {
     if (rows.rowCount() != 1 or rows.rows[0][0].integer != 2) return error.InsertSelectVerificationFailed;
     std.debug.print("37 INSERT SELECT: filtered query results copied and verified\n", .{});
 }
+```
+
+## Database State After Execution
+
+**copy_source:**
+
+| id | label |
+|----|-------|
+| 1 | skip |
+| 2 | copy |
+
+**copy_destination:**
+
+| id | label |
+|----|-------|
+| 2 | copy |
+
+## Zig Output
+
+```
+37 INSERT SELECT: filtered query results copied and verified
 ```
 
 > [!TIP]

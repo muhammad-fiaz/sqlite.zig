@@ -1,11 +1,22 @@
 ---
-title: UPSERT DO UPDATE
-description: Use INSERT ... ON CONFLICT DO UPDATE to merge new values into conflicting rows.
+title: "UPSERT DO UPDATE"
+description: "Use INSERT ... ON CONFLICT DO UPDATE to upsert data, updating conflicting rows with new values."
 ---
 
 # UPSERT DO UPDATE
 
-This example demonstrates the `ON CONFLICT DO UPDATE` upsert clause. When a conflict is found, the existing row is updated with values from the `excluded` pseudo-table, allowing you to merge or transform data.
+Use INSERT ... ON CONFLICT DO UPDATE to upsert data, updating conflicting rows with new values.
+
+## What This Example Does
+
+| Step | SQL Operation | Description |
+|------|---------------|-------------|
+| 1 | CREATE TABLE IF NOT EXISTS upsert_update_items (id INTEGER PRIMARY KEY, label TEXT, amount INTEGER) | Creates items table |
+| 2 | DELETE FROM upsert_update_items | Truncates the table |
+| 3 | INSERT INTO upsert_update_items VALUES (1, 'original', 10) | Inserts original row |
+| 4 | INSERT INTO upsert_update_items VALUES (1, 'updated', 99) ON CONFLICT(id) DO UPDATE SET label = excluded.label, amount = excluded.amount + 1 | Upserts with update |
+
+## Source Code
 
 ```zig
 const std = @import("std");
@@ -27,6 +38,20 @@ pub fn main() !void {
     if (rows.rowCount() != 1 or !std.mem.eql(u8, rows.rows[0][1].text, "updated") or rows.rows[0][2].integer != 100) return error.UpsertUpdateVerificationFailed;
     std.debug.print("40 UPSERT DO UPDATE: conflicting row updated and verified\n", .{});
 }
+```
+
+## Database State After Execution
+
+| id | label | amount |
+|----|-------|--------|
+| 1 | updated | 100 |
+
+The label was updated to 'updated' and amount became 99 + 1 = 100.
+
+## Zig Output
+
+```
+40 UPSERT DO UPDATE: conflicting row updated and verified
 ```
 
 > [!TIP]

@@ -1,28 +1,51 @@
 ---
-title: "Repair Legacy"
-description: "Repair and legacy database handling"
+title: "Repair Legacy Database"
+description: "Create a fresh database file and populate it with legacy table schema and data."
 ---
 
-# Repair Legacy
+# Repair Legacy Database
 
-Handle legacy databases and repair operations.
+Create a fresh database file and populate it with legacy table schema and data.
+
+## What This Example Does
+
+| Step | SQL Operation | Description |
+|------|---------------|-------------|
+| 1 | CREATE TABLE users (id INTEGER, name TEXT) | Creates the users table |
+| 2 | INSERT INTO users VALUES (1, 'Fiaz') | Inserts a single row |
+
+## Source Code
 
 ```zig
 const std = @import("std");
 const sqlite = @import("sqlite");
 
 pub fn main() !void {
-    var db = try sqlite.open(std.heap.page_allocator, "valid_08.db");
+    var io_instance: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+    defer io_instance.deinit();
+    const io = io_instance.io();
+    var file = try std.Io.Dir.cwd().createFile(io, "example_04.db", .{ .read = true, .truncate = true });
+    file.close(io);
+    var db = try sqlite.open(std.heap.page_allocator, "example_04.db");
     defer db.close();
-    var result = try db.exec("CREATE TABLE IF NOT EXISTS legacy (id INTEGER, data TEXT);");
-    result.deinit();
-    result = try db.exec("INSERT INTO legacy VALUES (1, 'restored');");
-    result.deinit();
-    var rows = try db.exec("SELECT * FROM legacy;");
-    defer rows.deinit();
-    try std.testing.expectEqual(@as(usize, 1), rows.rowCount());
+    var setup = try db.exec("CREATE TABLE users (id INTEGER, name TEXT);");
+    setup.deinit();
+    var insert = try db.exec("INSERT INTO users VALUES (1, 'Fiaz');");
+    insert.deinit();
 }
 ```
 
+## Database State After Execution
+
+| id | name |
+|----|------|
+| 1 | Fiaz |
+
+## Zig Output
+
+```
+No console output - operations completed successfully
+```
+
 > [!TIP]
-> Run with: `zig build run-08-repair-legacy`
+> Run with: `zig build run-08_repair_legacy_example`

@@ -1,11 +1,22 @@
 ---
-title: INSERT OR REPLACE
-description: Use INSERT OR REPLACE to delete and re-insert rows that cause uniqueness conflicts.
+title: "INSERT OR REPLACE"
+description: "Use INSERT OR REPLACE to replace conflicting rows entirely with new data."
 ---
 
 # INSERT OR REPLACE
 
-This example shows how `INSERT OR REPLACE` handles conflicts. Instead of ignoring or updating, it deletes the conflicting row and inserts the new one as a complete replacement.
+Use INSERT OR REPLACE to replace conflicting rows entirely with new data.
+
+## What This Example Does
+
+| Step | SQL Operation | Description |
+|------|---------------|-------------|
+| 1 | CREATE TABLE IF NOT EXISTS replace_items (id INTEGER PRIMARY KEY, label TEXT) | Creates items table |
+| 2 | DELETE FROM replace_items | Truncates the table |
+| 3 | INSERT INTO replace_items VALUES (1, 'original') | Inserts original row |
+| 4 | INSERT OR REPLACE INTO replace_items VALUES (1, 'replacement') | Replaces the conflicting row |
+
+## Source Code
 
 ```zig
 const std = @import("std");
@@ -27,6 +38,18 @@ pub fn main() !void {
     if (rows.rowCount() != 1 or !std.mem.eql(u8, rows.rows[0][1].text, "replacement")) return error.InsertOrReplaceVerificationFailed;
     std.debug.print("41 INSERT OR REPLACE: conflicting row replaced and verified\n", .{});
 }
+```
+
+## Database State After Execution
+
+| id | label |
+|----|-------|
+| 1 | replacement |
+
+## Zig Output
+
+```
+41 INSERT OR REPLACE: conflicting row replaced and verified
 ```
 
 > [!TIP]

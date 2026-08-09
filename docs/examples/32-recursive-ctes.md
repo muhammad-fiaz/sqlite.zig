@@ -1,11 +1,19 @@
 ---
 title: "Recursive CTEs"
-description: "Recursive CTEs for hierarchical tree traversal"
+description: "Use recursive Common Table Expressions to generate a sequence of numbers with UNION ALL."
 ---
 
 # Recursive CTEs
 
-Use recursive CTEs for hierarchical tree traversal.
+Use recursive Common Table Expressions to generate a sequence of numbers with UNION ALL.
+
+## What This Example Does
+
+| Step | SQL Operation | Description |
+|------|---------------|-------------|
+| 1 | WITH RECURSIVE nums AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM nums WHERE n < 5) SELECT n FROM nums ORDER BY n | Generates numbers 1 through 5 |
+
+## Source Code
 
 ```zig
 const std = @import("std");
@@ -14,25 +22,32 @@ const sqlite = @import("sqlite");
 pub fn main() !void {
     var db = try sqlite.open(std.heap.page_allocator, "valid_32.db");
     defer db.close();
-    var result = try db.exec("CREATE TABLE IF NOT EXISTS tree_nodes (id INTEGER, name TEXT, parent_id INTEGER);");
-    result.deinit();
-    result = try db.exec("INSERT INTO tree_nodes VALUES (1, 'root', NULL), (2, 'child1', 1), (3, 'child2', 1), (4, 'grandchild', 2);");
-    result.deinit();
-    var rows = try db.exec(
-        \\WITH RECURSIVE tree AS (
-        \\  SELECT id, name, parent_id, 0 AS depth
-        \\  FROM tree_nodes WHERE parent_id IS NULL
-        \\  UNION ALL
-        \\  SELECT n.id, n.name, n.parent_id, t.depth + 1
-        \\  FROM tree_nodes n
-        \\  INNER JOIN tree t ON n.parent_id = t.id
-        \\)
-        \\SELECT * FROM tree ORDER BY depth;
-    );
+    var rows = try db.exec("WITH RECURSIVE nums AS (SELECT 1 AS n UNION ALL SELECT n + 1 AS n FROM nums WHERE n < 5) SELECT n FROM nums ORDER BY n;");
     defer rows.deinit();
-    try std.testing.expectEqual(@as(usize, 4), rows.rowCount());
+    if (rows.rowCount() != 5 or rows.rows[0][0].integer != 1 or rows.rows[4][0].integer != 5) return error.RecursiveCteVerificationFailed;
+    std.debug.print("32 recursive CTEs: UNION ALL fixpoint and arithmetic verified\n", .{});
 }
 ```
 
+## Database State After Execution
+
+No persistent tables - the recursive CTE generates a virtual result set.
+
+**Query result:**
+
+| n |
+|---|
+| 1 |
+| 2 |
+| 3 |
+| 4 |
+| 5 |
+
+## Zig Output
+
+```
+32 recursive CTEs: UNION ALL fixpoint and arithmetic verified
+```
+
 > [!TIP]
-> Run with: `zig build run-32-recursive-ctes`
+> Run with: `zig build run-32_recursive_ctes`

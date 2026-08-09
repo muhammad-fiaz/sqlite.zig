@@ -1,11 +1,25 @@
 ---
-title: UPDATE FROM Join
-description: Use UPDATE ... FROM to update rows based on a joined source table.
+title: "UPDATE FROM Join"
+description: "Use UPDATE ... FROM to update rows based on a join with another table."
 ---
 
 # UPDATE FROM Join
 
-This example demonstrates SQLite's `UPDATE ... FROM` syntax, which allows updating a table using values from another table via an equi-join. It updates a balance record with an amount from an adjustment table.
+Use UPDATE ... FROM to update rows based on a join with another table.
+
+## What This Example Does
+
+| Step | SQL Operation | Description |
+|------|---------------|-------------|
+| 1 | CREATE TABLE IF NOT EXISTS update_from_balances (id INTEGER PRIMARY KEY, amount INTEGER) | Creates balances table |
+| 2 | CREATE TABLE IF NOT EXISTS update_from_adjustments (id INTEGER, amount INTEGER) | Creates adjustments table |
+| 3 | DELETE FROM update_from_balances | Truncates balances |
+| 4 | DELETE FROM update_from_adjustments | Truncates adjustments |
+| 5 | INSERT INTO update_from_balances VALUES (1, 10) | Inserts initial balance |
+| 6 | INSERT INTO update_from_adjustments VALUES (1, 99) | Inserts adjustment |
+| 7 | UPDATE update_from_balances SET amount = update_from_adjustments.amount FROM update_from_adjustments WHERE update_from_balances.id = update_from_adjustments.id | Updates balance from adjustment |
+
+## Source Code
 
 ```zig
 const std = @import("std");
@@ -32,6 +46,26 @@ pub fn main() !void {
     if (rows.rowCount() != 1 or rows.rows[0][1].integer != 99) return error.UpdateFromVerificationFailed;
     std.debug.print("42 UPDATE FROM: equi-join source assignment verified\n", .{});
 }
+```
+
+## Database State After Execution
+
+**update_from_balances:**
+
+| id | amount |
+|----|--------|
+| 1 | 99 |
+
+**update_from_adjustments:**
+
+| id | amount |
+|----|--------|
+| 1 | 99 |
+
+## Zig Output
+
+```
+42 UPDATE FROM: equi-join source assignment verified
 ```
 
 > [!TIP]

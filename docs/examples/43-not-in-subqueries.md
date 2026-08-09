@@ -1,11 +1,26 @@
 ---
-title: NOT IN Subqueries
-description: Use NOT IN with subqueries to filter rows not present in another table.
+title: "NOT IN Subqueries"
+description: "Use NOT IN subqueries to filter rows that are not present in a related table."
 ---
 
 # NOT IN Subqueries
 
-This example demonstrates using `NOT IN` with a subquery (or the equivalent DSL method) to exclude rows that appear in another table. It selects only users whose IDs are not in the blocked list.
+Use NOT IN subqueries to filter rows that are not present in a related table.
+
+## What This Example Does
+
+| Step | SQL Operation | Description |
+|------|---------------|-------------|
+| 1 | CREATE TABLE IF NOT EXISTS not_in_users (id INTEGER) | Creates users table |
+| 2 | CREATE TABLE IF NOT EXISTS not_in_blocked (user_id INTEGER) | Creates blocked table |
+| 3 | DELETE FROM not_in_users | Truncates users |
+| 4 | DELETE FROM not_in_blocked | Truncates blocked |
+| 5 | INSERT INTO not_in_users VALUES (1) | Inserts user 1 |
+| 6 | INSERT INTO not_in_users VALUES (2) | Inserts user 2 |
+| 7 | INSERT INTO not_in_blocked VALUES (2) | Blocks user 2 |
+| 8 | SELECT id FROM not_in_users WHERE id NOT IN (SELECT user_id FROM not_in_blocked) | Queries non-blocked users |
+
+## Source Code
 
 ```zig
 const std = @import("std");
@@ -32,6 +47,33 @@ pub fn main() !void {
     if (rows.rowCount() != 1 or rows.rows[0][0].integer != 1) return error.NotInVerificationFailed;
     std.debug.print("43 NOT IN: raw-compatible anti-subquery DSL verified\n", .{});
 }
+```
+
+## Database State After Execution
+
+**not_in_users:**
+
+| id |
+|----|
+| 1 |
+| 2 |
+
+**not_in_blocked:**
+
+| user_id |
+|---------|
+| 2 |
+
+**Query result (users NOT IN blocked):**
+
+| id |
+|----|
+| 1 |
+
+## Zig Output
+
+```
+43 NOT IN: raw-compatible anti-subquery DSL verified
 ```
 
 > [!TIP]
