@@ -23,7 +23,7 @@ pub fn main() !void {
     });
     try db.createTable(Child, .{
         .if_not_exists = true,
-        .primary_key_key = Child.key("id"),
+        .primary_key = Child.key("id"),
         .foreign_key_constraints = &.{.{
             .columns = &.{ Child.key("parent_a"), Child.key("parent_b") },
             .referenced_table = "comp_parent",

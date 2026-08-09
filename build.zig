@@ -89,6 +89,21 @@ pub fn build(b: *std.Build) void {
         "30_composite_table_constraints",
         "31_composite_foreign_keys",
         "32_recursive_ctes",
+        "33_explain_query_plan",
+        "34_virtual_generate_series",
+        "35_wal_journal_mode",
+        "36_grouped_aggregates",
+        "37_insert_select_copy",
+        "38_insert_or_ignore",
+        "39_upsert_do_nothing",
+        "40_upsert_do_update",
+        "41_insert_or_replace",
+        "42_update_from_join",
+        "43_not_in_subqueries",
+        "44_exists_subqueries",
+        "45_literal_in_lists",
+        "46_raw_alter_table",
+        "47_column_defaults",
     };
 
     inline for (examples) |name| {

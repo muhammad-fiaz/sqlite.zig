@@ -6,7 +6,7 @@
 
 - The real on-disk `.db`/`.sqlite` file format (compatible with SQLite tools)
 - A hand-written SQL lexer, parser, and bytecode compiler/VM
-- WAL and rollback-journal durability modes
+- Native WAL page-frame persistence/readback and rollback-journal durability modes
 - A type-safe, comptime Zig query builder (DSL)
 - Cross-platform support (Linux, Windows, macOS)
 

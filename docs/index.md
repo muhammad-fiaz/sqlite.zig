@@ -28,7 +28,7 @@ features:
     details: A comptime, type-safe Zig query builder that generates SQL under the hood, ensuring compile-time validation of table names, column names, and types.
   - icon: "\U0001f504"
     title: WAL & Rollback Journal
-    details: Both Write-Ahead Logging (WAL) and traditional rollback-journal durability modes for concurrent read/write access.
+    details: Native SQLite-compatible WAL page frames, reopen/readback, and checkpointing, plus rollback-journal persistence. Full multi-process locking/VFS parity is still in progress.
   - icon: "\U0001f517"
     title: Foreign Keys & Constraints
     details: CASCADE DELETE/UPDATE, SET NULL, SET DEFAULT, composite foreign keys, composite PRIMARY KEY, and composite UNIQUE constraints.

@@ -18,6 +18,8 @@ pub const Header = struct {
     schema_cookie: u32 = 0,
     schema_format: u32 = 4,
     text_encoding: u32 = 1,
+    user_version: u32 = 0,
+    application_id: u32 = 0,
 
     pub fn encode(self: Header, out: *[size]u8) void {
         @memset(out, 0);
@@ -36,6 +38,8 @@ pub const Header = struct {
         std.mem.writeInt(u32, out[40..44], self.schema_cookie, .big);
         std.mem.writeInt(u32, out[44..48], self.schema_format, .big);
         std.mem.writeInt(u32, out[56..60], self.text_encoding, .big);
+        std.mem.writeInt(u32, out[60..64], self.user_version, .big);
+        std.mem.writeInt(u32, out[68..72], self.application_id, .big);
     }
 
     pub fn decode(bytes: *const [size]u8) error{InvalidHeader}!Header {
@@ -55,6 +59,8 @@ pub const Header = struct {
             .schema_cookie = std.mem.readInt(u32, bytes[40..44], .big),
             .schema_format = std.mem.readInt(u32, bytes[44..48], .big),
             .text_encoding = std.mem.readInt(u32, bytes[56..60], .big),
+            .user_version = std.mem.readInt(u32, bytes[60..64], .big),
+            .application_id = std.mem.readInt(u32, bytes[68..72], .big),
         };
     }
 };

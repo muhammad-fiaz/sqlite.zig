@@ -25,6 +25,30 @@ fn columnIndex(table: anytype, name: []const u8) ?usize {
     return null;
 }
 
+fn appendSqlLiteral(allocator: std.mem.Allocator, sql: *std.ArrayList(u8), value: Value) !void {
+    switch (value) {
+        .null => try sql.appendSlice(allocator, "NULL"),
+        .integer => |number| {
+            const rendered = try std.fmt.allocPrint(allocator, "{d}", .{number});
+            defer allocator.free(rendered);
+            try sql.appendSlice(allocator, rendered);
+        },
+        .real => |number| {
+            const rendered = try std.fmt.allocPrint(allocator, "{d}", .{number});
+            defer allocator.free(rendered);
+            try sql.appendSlice(allocator, rendered);
+        },
+        .text, .blob => |bytes| {
+            try sql.append(allocator, '\'');
+            for (bytes) |byte| {
+                if (byte == '\'') try sql.append(allocator, '\'');
+                try sql.append(allocator, byte);
+            }
+            try sql.append(allocator, '\'');
+        },
+    }
+}
+
 fn appendVarint(list: *std.ArrayList(u8), allocator: std.mem.Allocator, value: u64) !void {
     var buffer: [9]u8 = undefined;
     const length = try varint.encode(value, &buffer);
@@ -52,10 +76,10 @@ fn indexCell(allocator: std.mem.Allocator, values: []const Value) ![]u8 {
     return result.toOwnedSlice(allocator);
 }
 
-fn addLeafPage(page: []u8, page_start: usize, header_offset: usize, page_type: u8, cells: []const []const u8) !void {
+fn addLeafPage(page: []u8, page_start: usize, header_offset: usize, page_type: u8, cells: []const []const u8, database_page_size: usize) !void {
     const header = page_start + header_offset;
     if (cells.len > 0xffff) return error.PageOverflow;
-    var content = page_start + page_size;
+    var content = page_start + database_page_size;
     for (cells) |item| {
         if (item.len > content - (header + 8 + cells.len * 2)) return error.PageOverflow;
         content -= item.len;
@@ -66,7 +90,7 @@ fn addLeafPage(page: []u8, page_start: usize, header_offset: usize, page_type: u
     putU16(page, header + 3, @intCast(cells.len));
     putU16(page, header + 5, @intCast(content - page_start));
     page[header + 7] = 0;
-    content = page_start + page_size;
+    content = page_start + database_page_size;
     for (cells, 0..) |item, index| {
         content -= item.len;
         putU16(page, header + 8 + index * 2, @intCast(content - page_start));
@@ -76,6 +100,19 @@ fn addLeafPage(page: []u8, page_start: usize, header_offset: usize, page_type: u
 fn createSql(allocator: std.mem.Allocator, table: anytype) ![]u8 {
     var sql = std.ArrayList(u8).empty;
     errdefer sql.deinit(allocator);
+    if (table.virtual_module) |module| {
+        try sql.appendSlice(allocator, "CREATE VIRTUAL TABLE ");
+        try sql.appendSlice(allocator, table.name);
+        try sql.appendSlice(allocator, " USING ");
+        try sql.appendSlice(allocator, module);
+        try sql.append(allocator, '(');
+        for (table.virtual_arguments, 0..) |argument, index| {
+            if (index != 0) try sql.appendSlice(allocator, ", ");
+            try sql.appendSlice(allocator, argument);
+        }
+        try sql.appendSlice(allocator, ");");
+        return sql.toOwnedSlice(allocator);
+    }
     try sql.appendSlice(allocator, "CREATE TABLE ");
     try sql.appendSlice(allocator, table.name);
     try sql.appendSlice(allocator, " (");
@@ -89,6 +126,10 @@ fn createSql(allocator: std.mem.Allocator, table: anytype) ![]u8 {
         if (column.primary_key) try sql.appendSlice(allocator, " PRIMARY KEY");
         if (column.not_null) try sql.appendSlice(allocator, " NOT NULL");
         if (column.unique) try sql.appendSlice(allocator, " UNIQUE");
+        if (column.default_value) |default| {
+            try sql.appendSlice(allocator, " DEFAULT ");
+            try appendSqlLiteral(allocator, &sql, default);
+        }
         if (column.foreign_table) |foreign_table| {
             try sql.appendSlice(allocator, " REFERENCES ");
             try sql.appendSlice(allocator, foreign_table);
@@ -191,12 +232,13 @@ fn createTriggerSql(allocator: std.mem.Allocator, trigger: anytype) ![]u8 {
     return sql.toOwnedSlice(allocator);
 }
 
-pub fn encode(allocator: std.mem.Allocator, schema: *const Schema) ![]u8 {
+pub fn encodeWithPageSize(allocator: std.mem.Allocator, schema: *const Schema, database_page_size: usize) ![]u8 {
+    if (database_page_size < 512 or database_page_size > 65536 or (database_page_size & (database_page_size - 1)) != 0) return error.InvalidPageSize;
     const page_count = 1 + schema.tables.items.len + schema.indexes.items.len;
-    const bytes = try allocator.alloc(u8, page_count * page_size);
+    const bytes = try allocator.alloc(u8, page_count * database_page_size);
     errdefer allocator.free(bytes);
     @memset(bytes, 0);
-    var header = Header{ .page_size = page_size, .database_size_pages = @intCast(page_count), .change_counter = 1, .schema_cookie = 1 };
+    var header = Header{ .page_size = @intCast(database_page_size), .database_size_pages = @intCast(page_count), .change_counter = 1, .schema_cookie = 1 };
     header.encode(@ptrCast(bytes[0..header_size].ptr));
 
     var schema_cells = try allocator.alloc([]const u8, schema.tables.items.len + schema.indexes.items.len + schema.views.items.len + schema.triggers.items.len);
@@ -214,7 +256,7 @@ pub fn encode(allocator: std.mem.Allocator, schema: *const Schema) ![]u8 {
             .{ .text = "table" },
             .{ .text = table.name },
             .{ .text = table.name },
-            .{ .integer = @intCast(index + 2) },
+            .{ .integer = if (table.virtual_module != null) 0 else @intCast(index + 2) },
             .{ .text = sql },
         };
         const item = try cell(allocator, index + 1, &values);
@@ -263,12 +305,13 @@ pub fn encode(allocator: std.mem.Allocator, schema: *const Schema) ![]u8 {
         try schema_owned.append(allocator, item);
         schema_cells[schema.tables.items.len + schema.indexes.items.len + schema.views.items.len + position] = item;
     }
-    addLeafPage(bytes, 0, header_size, 0x0d, schema_cells) catch |err| {
+    addLeafPage(bytes, 0, header_size, 0x0d, schema_cells, database_page_size) catch |err| {
         if (err == error.PageOverflow) return error.DatabaseTooLarge;
         return err;
     };
 
     for (schema.tables.items, 0..) |table, index| {
+        if (table.virtual_module != null) continue;
         var table_cells = try allocator.alloc([]const u8, table.rows.items.len);
         defer allocator.free(table_cells);
         var owned = std.ArrayList([]u8).empty;
@@ -281,7 +324,7 @@ pub fn encode(allocator: std.mem.Allocator, schema: *const Schema) ![]u8 {
             try owned.append(allocator, item);
             table_cells[row_index] = item;
         }
-        addLeafPage(bytes, (index + 1) * page_size, 0, 0x0d, table_cells) catch |err| {
+        addLeafPage(bytes, (index + 1) * database_page_size, 0, 0x0d, table_cells, database_page_size) catch |err| {
             if (err == error.PageOverflow) return error.DatabaseTooLarge;
             return err;
         };
@@ -304,12 +347,16 @@ pub fn encode(allocator: std.mem.Allocator, schema: *const Schema) ![]u8 {
             try owned.append(allocator, item);
             index_cells[row_position] = item;
         }
-        addLeafPage(bytes, (schema.tables.items.len + index_position + 1) * page_size, 0, 0x0a, index_cells) catch |err| {
+        addLeafPage(bytes, (schema.tables.items.len + index_position + 1) * database_page_size, 0, 0x0a, index_cells, database_page_size) catch |err| {
             if (err == error.PageOverflow) return error.DatabaseTooLarge;
             return err;
         };
     }
     return bytes;
+}
+
+pub fn encode(allocator: std.mem.Allocator, schema: *const Schema) ![]u8 {
+    return encodeWithPageSize(allocator, schema, page_size);
 }
 
 const SchemaEntry = struct { root_page: u32, sql: []const u8 };
@@ -341,12 +388,15 @@ fn leafCells(allocator: std.mem.Allocator, bytes: []const u8, page_number: u32) 
 }
 
 pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Schema {
-    if (bytes.len < page_size or !std.mem.eql(u8, bytes[0..16], "SQLite format 3\x00")) return error.InvalidHeader;
+    if (bytes.len < header_size or !std.mem.eql(u8, bytes[0..16], "SQLite format 3\x00")) return error.InvalidHeader;
+    const encoded_page_size = std.mem.readInt(u16, bytes[16..18], .big);
+    const database_page_size: usize = if (encoded_page_size == 1) 65536 else encoded_page_size;
+    if (database_page_size < 512 or database_page_size > 65536 or (database_page_size & (database_page_size - 1)) != 0 or bytes.len < database_page_size) return error.InvalidPageSize;
     const database_pages = std.mem.readInt(u32, bytes[28..32], .big);
-    if (database_pages == 0 or database_pages * page_size > bytes.len) return error.InvalidHeader;
+    if (database_pages == 0 or @as(u64, database_pages) * database_page_size > bytes.len) return error.InvalidHeader;
     var schema = Schema.init(allocator);
     errdefer schema.deinit();
-    const schema_rows = try leafCells(allocator, bytes[0..page_size], 1);
+    const schema_rows = try leafCells(allocator, bytes[0..database_page_size], 1);
     defer allocator.free(schema_rows);
     var entries = std.ArrayList(SchemaEntry).empty;
     defer entries.deinit(allocator);
@@ -361,11 +411,16 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Schema {
         defer parser.deinit();
         var statement = parser.parse() catch continue;
         defer ast.deinit(allocator, &statement);
+        if (statement == .create_virtual_table) {
+            try schema.createVirtualTable(statement.create_virtual_table.name, statement.create_virtual_table.module, statement.create_virtual_table.arguments);
+            continue;
+        }
         if (statement != .create_table) continue;
         try schema.createTable(statement.create_table.name, statement.create_table.columns, statement.create_table.constraints);
         const table = schema.find(statement.create_table.name).?;
-        const start = (@as(usize, entry.root_page) - 1) * page_size;
-        const rows = try leafCells(allocator, bytes[start .. start + page_size], entry.root_page);
+        const start = (@as(usize, entry.root_page) - 1) * database_page_size;
+        if (start + database_page_size > bytes.len) return error.InvalidHeader;
+        const rows = try leafCells(allocator, bytes[start .. start + database_page_size], entry.root_page);
         defer allocator.free(rows);
         for (rows) |row| {
             defer allocator.free(row.values);
@@ -407,4 +462,21 @@ test "SQLite image writes a Python-compatible page-one b-tree" {
     defer std.testing.allocator.free(bytes);
     try std.testing.expectEqual(@as(u8, 0x0d), bytes[100]);
     try std.testing.expectEqualStrings("SQLite format 3\x00", bytes[0..16]);
+}
+
+test "SQLite image round trips with an 8192-byte page size" {
+    var schema = Schema.init(std.testing.allocator);
+    defer schema.deinit();
+    const definitions = [_]ast.ColumnDef{.{ .name = "id", .type_name = "INTEGER" }};
+    try schema.createTable("wide_pages", &definitions, &.{});
+    var values = [_]Value{.{ .integer = 7 }};
+    try schema.appendRow(schema.find("wide_pages").?, &values);
+    const bytes = try encodeWithPageSize(std.testing.allocator, &schema, 8192);
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqual(@as(usize, 8192 * 2), bytes.len);
+    try std.testing.expectEqual(@as(u16, 8192), std.mem.readInt(u16, bytes[16..18], .big));
+    var decoded = try decode(std.testing.allocator, bytes);
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(usize, 1), decoded.findConst("wide_pages").?.rows.items.len);
+    try std.testing.expectEqual(@as(i64, 7), decoded.findConst("wide_pages").?.rows.items[0].values[0].integer);
 }

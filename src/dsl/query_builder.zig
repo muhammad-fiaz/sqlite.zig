@@ -6,7 +6,8 @@ const Value = @import("../vm/value.zig").Value;
 const ColumnKey = @import("table.zig").ColumnKey;
 
 pub const Order = struct { column: []const u8, descending: bool };
-const InSubquery = struct { column: []const u8, table: []const u8, subquery_column: []const u8 };
+const InSubquery = struct { column: []const u8, table: []const u8, subquery_column: []const u8, negated: bool = false };
+const ExistsSubquery = struct { table: []const u8, outer_table: []const u8, subquery_column: []const u8, outer_column: []const u8, negated: bool = false };
 
 fn appendQuoted(allocator: std.mem.Allocator, list: *std.ArrayList(u8), bytes: []const u8) !void {
     try list.append(allocator, '\'');
@@ -56,6 +57,17 @@ fn appendValue(allocator: std.mem.Allocator, list: *std.ArrayList(u8), value: an
         .pointer => try appendQuoted(allocator, list, value),
         else => @compileError("unsupported DSL value"),
     }
+}
+
+fn toDslValue(value: anytype) Value {
+    const T = @TypeOf(value);
+    if (T == Value) return value;
+    return switch (@typeInfo(T)) {
+        .int, .comptime_int => .{ .integer = @intCast(value) },
+        .float, .comptime_float => .{ .real = @floatCast(value) },
+        .pointer => .{ .text = value },
+        else => @compileError("unsupported DSL IN value"),
+    };
 }
 
 pub fn Query(comptime TableType: type) type {
@@ -121,12 +133,19 @@ pub fn Query(comptime TableType: type) type {
         order: ?Order = null,
         limit_value: ?usize = null,
         offset_value: ?usize = null,
+        group_by_column: ?[]const u8 = null,
+        having_count: ?struct { operator: []const u8, amount: usize } = null,
         join_table: ?[]const u8 = null,
         join_left: []const u8 = "",
         join_right: []const u8 = "",
         join_kind: []const u8 = "JOIN",
         distinct_value: bool = false,
         in_subquery: ?InSubquery = null,
+        exists_subquery: ?ExistsSubquery = null,
+        literal_in_column: []const u8 = "",
+        literal_in_values: [8]Value = undefined,
+        literal_in_count: usize = 0,
+        literal_in_negated: bool = false,
 
         pub fn init(connection: anytype, table: []const u8, execute_fn: *const fn (*anyopaque, []const u8) anyerror!Result) Self {
             return .{ .allocator = connection.allocator, .connection = connection, .execute_fn = execute_fn, .table = table };
@@ -217,6 +236,62 @@ pub fn Query(comptime TableType: type) type {
             return copy;
         }
 
+        pub fn whereNotInColumn(self: Self, comptime column: ColumnKey, comptime OtherTable: type, comptime other_column: ColumnKey) Self {
+            if (!@hasField(TableType.row_type, column.name)) @compileError("unknown DSL NOT IN column");
+            if (!@hasField(OtherTable.row_type, other_column.name)) @compileError("unknown DSL subquery column");
+            var copy = self;
+            copy.in_subquery = .{ .column = column.name, .table = OtherTable.table_name, .subquery_column = other_column.name, .negated = true };
+            return copy;
+        }
+
+        pub fn whereInValues(self: Self, comptime column: ColumnKey, comptime values: anytype) Self {
+            if (!@hasField(TableType.row_type, column.name)) @compileError("unknown DSL IN column");
+            if (values.len > 8) @compileError("DSL IN supports at most 8 literal values");
+            var copy = self;
+            copy.literal_in_column = column.name;
+            copy.literal_in_count = values.len;
+            copy.literal_in_negated = false;
+            inline for (values, 0..) |value, index| copy.literal_in_values[index] = toDslValue(value);
+            return copy;
+        }
+
+        pub fn whereNotInValues(self: Self, comptime column: ColumnKey, comptime values: anytype) Self {
+            if (!@hasField(TableType.row_type, column.name)) @compileError("unknown DSL NOT IN column");
+            if (values.len > 8) @compileError("DSL NOT IN supports at most 8 literal values");
+            var copy = self;
+            copy.literal_in_column = column.name;
+            copy.literal_in_count = values.len;
+            copy.literal_in_negated = true;
+            inline for (values, 0..) |value, index| copy.literal_in_values[index] = toDslValue(value);
+            return copy;
+        }
+
+        pub fn whereExists(self: Self, comptime OtherTable: type) Self {
+            var copy = self;
+            copy.exists_subquery = .{ .table = OtherTable.table_name, .outer_table = "", .subquery_column = "", .outer_column = "" };
+            return copy;
+        }
+
+        pub fn whereNotExists(self: Self, comptime OtherTable: type) Self {
+            var copy = self;
+            copy.exists_subquery = .{ .table = OtherTable.table_name, .outer_table = "", .subquery_column = "", .outer_column = "", .negated = true };
+            return copy;
+        }
+
+        pub fn whereExistsKey(self: Self, comptime OtherTable: type, comptime other_column: ColumnKey, comptime outer_column: ColumnKey) Self {
+            if (!@hasField(OtherTable.row_type, other_column.name)) @compileError("unknown DSL EXISTS column");
+            if (!@hasField(TableType.row_type, outer_column.name)) @compileError("unknown DSL outer column");
+            var copy = self;
+            copy.exists_subquery = .{ .table = OtherTable.table_name, .outer_table = TableType.table_name, .subquery_column = other_column.name, .outer_column = outer_column.name };
+            return copy;
+        }
+
+        pub fn whereNotExistsKey(self: Self, comptime OtherTable: type, comptime other_column: ColumnKey, comptime outer_column: ColumnKey) Self {
+            var copy = self.whereExistsKey(OtherTable, other_column, outer_column);
+            copy.exists_subquery.?.negated = true;
+            return copy;
+        }
+
         pub fn orderBy(self: Self, order: Order) Self {
             var copy = self;
             copy.order = order;
@@ -232,6 +307,23 @@ pub fn Query(comptime TableType: type) type {
         pub fn offset(self: Self, amount: usize) Self {
             var copy = self;
             copy.offset_value = amount;
+            return copy;
+        }
+
+        pub fn groupBy(self: Self, comptime field: []const u8) Self {
+            if (!@hasField(TableType.row_type, field)) @compileError("unknown DSL GROUP BY column");
+            var copy = self;
+            copy.group_by_column = field;
+            return copy;
+        }
+
+        pub fn groupByColumn(self: Self, comptime field: ColumnKey) Self {
+            return self.groupBy(checkedColumn(field));
+        }
+
+        pub fn havingCount(self: Self, comptime operator: []const u8, amount: usize) Self {
+            var copy = self;
+            copy.having_count = .{ .operator = operator, .amount = amount };
             return copy;
         }
 
@@ -369,12 +461,17 @@ pub fn Query(comptime TableType: type) type {
             }
         }
 
-        pub fn insert(self: Self, row: anytype) !Result {
+        fn insertWithMode(self: Self, row: anytype, comptime mode: []const u8) !Result {
             const RowType = @TypeOf(row);
             validateRow(RowType);
             var sql = std.ArrayList(u8).empty;
             defer sql.deinit(self.allocator);
-            try sql.appendSlice(self.allocator, "INSERT INTO ");
+            try sql.appendSlice(self.allocator, "INSERT");
+            if (mode.len != 0) {
+                try sql.append(self.allocator, ' ');
+                try sql.appendSlice(self.allocator, mode);
+            }
+            try sql.appendSlice(self.allocator, " INTO ");
             try sql.appendSlice(self.allocator, self.table);
             try sql.appendSlice(self.allocator, " (");
             const fields = @typeInfo(RowType).@"struct".fields;
@@ -389,6 +486,18 @@ pub fn Query(comptime TableType: type) type {
             }
             try sql.appendSlice(self.allocator, ");");
             return self.execute_fn(self.connection, sql.items);
+        }
+
+        pub fn insert(self: Self, row: anytype) !Result {
+            return self.insertWithMode(row, "");
+        }
+
+        pub fn insertIgnore(self: Self, row: anytype) !Result {
+            return self.insertWithMode(row, "OR IGNORE");
+        }
+
+        pub fn insertReplace(self: Self, row: anytype) !Result {
+            return self.insertWithMode(row, "OR REPLACE");
         }
 
         pub fn insertTyped(self: Self, row: TableType.row_type) !Result {
@@ -459,11 +568,49 @@ pub fn Query(comptime TableType: type) type {
             if (self.in_subquery) |subquery| {
                 try list.appendSlice(self.allocator, if (self.condition == null) " WHERE " else " AND ");
                 try list.appendSlice(self.allocator, subquery.column);
-                try list.appendSlice(self.allocator, " IN (SELECT ");
+                try list.appendSlice(self.allocator, if (subquery.negated) " NOT IN (SELECT " else " IN (SELECT ");
                 try list.appendSlice(self.allocator, subquery.subquery_column);
                 try list.appendSlice(self.allocator, " FROM ");
                 try list.appendSlice(self.allocator, subquery.table);
                 try list.appendSlice(self.allocator, ")");
+            }
+            if (self.exists_subquery) |subquery| {
+                try list.appendSlice(self.allocator, if (self.condition == null and self.in_subquery == null) " WHERE " else " AND ");
+                try list.appendSlice(self.allocator, if (subquery.negated) "NOT EXISTS (SELECT 1 FROM " else "EXISTS (SELECT 1 FROM ");
+                try list.appendSlice(self.allocator, subquery.table);
+                if (subquery.subquery_column.len != 0) {
+                    try list.appendSlice(self.allocator, " WHERE ");
+                    try list.appendSlice(self.allocator, subquery.table);
+                    try list.append(self.allocator, '.');
+                    try list.appendSlice(self.allocator, subquery.subquery_column);
+                    try list.appendSlice(self.allocator, " = ");
+                    try list.appendSlice(self.allocator, subquery.outer_table);
+                    try list.append(self.allocator, '.');
+                    try list.appendSlice(self.allocator, subquery.outer_column);
+                }
+                try list.appendSlice(self.allocator, ")");
+            }
+            if (self.literal_in_count != 0) {
+                try list.appendSlice(self.allocator, if (self.condition == null and self.in_subquery == null and self.exists_subquery == null) " WHERE " else " AND ");
+                try list.appendSlice(self.allocator, self.literal_in_column);
+                try list.appendSlice(self.allocator, if (self.literal_in_negated) " NOT IN (" else " IN (");
+                for (self.literal_in_values[0..self.literal_in_count], 0..) |value, index| {
+                    if (index != 0) try list.appendSlice(self.allocator, ", ");
+                    try appendValue(self.allocator, &list, value);
+                }
+                try list.appendSlice(self.allocator, ")");
+            }
+            if (self.group_by_column) |field| {
+                try list.appendSlice(self.allocator, " GROUP BY ");
+                try list.appendSlice(self.allocator, field);
+            }
+            if (self.having_count) |having| {
+                try list.appendSlice(self.allocator, " HAVING ");
+                try list.appendSlice(self.allocator, "COUNT(*) ");
+                try list.appendSlice(self.allocator, having.operator);
+                const rendered = try std.fmt.allocPrint(self.allocator, " {d}", .{having.amount});
+                defer self.allocator.free(rendered);
+                try list.appendSlice(self.allocator, rendered);
             }
             if (self.order) |order| {
                 try list.appendSlice(self.allocator, " ORDER BY ");

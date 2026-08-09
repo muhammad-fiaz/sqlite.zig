@@ -32,6 +32,46 @@ for (rows.rows) |row| {
 }
 ```
 
+`exec` also accepts multiple semicolon-separated statements and returns the
+result of the final statement. Semicolons inside quoted strings and trigger
+`BEGIN`/`END` bodies are preserved.
+
+```zig
+var rows = try db.exec(
+    "CREATE TABLE logs (message TEXT); INSERT INTO logs VALUES ('ready'); SELECT message FROM logs;",
+);
+defer rows.deinit();
+```
+
+SQLite `DEFAULT VALUES` inserts are supported for rows whose omitted columns
+use their NULL/default representation:
+
+```zig
+var inserted = try db.exec("INSERT INTO logs DEFAULT VALUES;");
+inserted.deinit();
+```
+
+Migration versions use SQLite's persistent header field:
+
+```zig
+var version = try db.exec("PRAGMA user_version = 3;");
+version.deinit();
+```
+
+Applications can also persist an identifier in SQLite's standard header field:
+
+```zig
+var application = try db.exec("PRAGMA application_id = 305419896;");
+application.deinit();
+```
+
+Foreign-key checks and cascading actions can be controlled per connection:
+
+```zig
+var foreign_keys = try db.exec("PRAGMA foreign_keys = ON;");
+foreign_keys.deinit();
+```
+
 ## DSL Query Interface
 
 ```zig
@@ -83,7 +123,7 @@ try db.commit();
 // Create table
 try db.createTable(User, .{
     .if_not_exists = true,
-    .primary_key_key = User.key("id"),
+    .primary_key = User.key("id"),
 });
 
 // Truncate table

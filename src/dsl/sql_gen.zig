@@ -10,8 +10,11 @@ pub fn renderExpr(allocator: std.mem.Allocator, expr: Expr) ![]u8 {
         .greater => ">",
         .greater_equal => ">=",
         .like => "LIKE",
+        .not_like => "NOT LIKE",
         .is_null => "IS NULL",
         .is_not_null => "IS NOT NULL",
+        .is_value => "IS",
+        .is_not_value => "IS NOT",
         .between => "BETWEEN",
     };
     if (expr.operator == .is_null or expr.operator == .is_not_null) return std.fmt.allocPrint(allocator, "{s} {s}", .{ expr.column, operator });

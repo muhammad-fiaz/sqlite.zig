@@ -6,7 +6,7 @@
 
 | Statement | Syntax |
 |-----------|--------|
-| **CREATE TABLE** | `CREATE TABLE [IF NOT EXISTS] name (columns, constraints)` |
+| **CREATE TABLE** | `CREATE TABLE [IF NOT EXISTS] name (columns [DEFAULT literal], constraints)` |
 | **DROP TABLE** | `DROP TABLE [IF EXISTS] name` |
 | **INSERT** | `INSERT INTO name VALUES (...)` or `INSERT INTO name (cols) VALUES (...)` |
 | **SELECT** | `SELECT [DISTINCT] columns FROM table [JOIN ...] [WHERE ...] [GROUP BY ...] [HAVING ...] [ORDER BY ...] [LIMIT ... [OFFSET ...]]` |
@@ -17,9 +17,10 @@
 | **ROLLBACK** | `ROLLBACK [TO [SAVEPOINT] name]` |
 | **SAVEPOINT** | `SAVEPOINT name` |
 | **RELEASE** | `RELEASE [SAVEPOINT] name` |
-| **CREATE VIEW** | `CREATE VIEW name AS SELECT ...` |
-| **CREATE TRIGGER** | `CREATE TRIGGER name BEFORE\|AFTER INSERT\|UPDATE\|DELETE ON table ...` |
-| **CREATE INDEX** | `CREATE INDEX name ON table (columns)` |
+| **CREATE VIEW** | `CREATE VIEW [IF NOT EXISTS] name AS SELECT ...` |
+| **CREATE TRIGGER** | `CREATE TRIGGER [IF NOT EXISTS] name BEFORE\|AFTER INSERT\|UPDATE\|DELETE ON table ...` |
+| **CREATE INDEX** | `CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (columns)` |
+| **ALTER TABLE** | `ADD COLUMN`, `RENAME TO`, `RENAME COLUMN ... TO`, and `DROP COLUMN` |
 
 ## JOIN Types
 
@@ -28,6 +29,18 @@
 - `RIGHT [OUTER] JOIN`
 - `FULL [OUTER] JOIN`
 - `CROSS JOIN`
+
+Comparison predicates include `LIKE` and `NOT LIKE`; a NULL operand produces no
+match, following SQLite's three-valued predicate behavior. The typed DSL exposes
+these as `column.like(pattern)` and `column.notLike(pattern)`.
+
+Literal membership lists are supported in raw SQL (`id IN (1, 3, 4)` and
+`id NOT IN (1, 3, 4)`) and in the checked DSL through
+`whereInValues(ColumnKey, values)` and `whereNotInValues(ColumnKey, values)`.
+
+SQLite identity predicates are also supported: `IS`, `IS NOT`, `IS NULL`, and
+`IS NOT NULL`. The typed equivalents for value identity are
+`column.isValue(value)` and `column.isNotValue(value)`.
 
 ## WHERE Clauses
 

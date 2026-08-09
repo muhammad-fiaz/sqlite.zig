@@ -22,13 +22,20 @@ var p = try pager.Pager.init(allocator, "my.db");
 
 ## Write-Ahead Log (WAL)
 
-Provides concurrent read/write access:
+WAL mode is selected through the public connection API. The implementation writes
+SQLite-compatible WAL headers and page frames, merges them on native reopen, and
+checkpoints back to the main database when switched to `DELETE` mode.
 
 ```zig
-const wal = @import("wal");
-
-var w = try wal.WAL.init("my.db");
+var mode = try db.exec("PRAGMA journal_mode=WAL;");
+mode.deinit();
+// ... writes are durable in the native WAL ...
+var checkpoint = try db.exec("PRAGMA journal_mode=DELETE;");
+checkpoint.deinit();
 ```
+
+This is single-process native WAL support; multi-process locking, VFS callbacks,
+and full SQLite concurrency semantics remain under development.
 
 ## Rollback Journal
 

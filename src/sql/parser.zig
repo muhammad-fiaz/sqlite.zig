@@ -5,6 +5,21 @@ const lexer = @import("lexer.zig");
 const ast = @import("ast.zig");
 const Value = @import("../vm/value.zig").Value;
 
+fn freeParserExpr(allocator: std.mem.Allocator, expr: ast.Expr) void {
+    switch (expr) {
+        .function => |call| {
+            freeParserExpr(allocator, call.argument.*);
+            allocator.destroy(call.argument);
+        },
+        .binary => |binary| {
+            freeParserExpr(allocator, binary.left.*);
+            freeParserExpr(allocator, binary.right.*);
+            allocator.destroy(binary.left);
+            allocator.destroy(binary.right);
+        },
+        else => {},
+    }
+}
 pub const Error = error{ InvalidSql, UnexpectedToken, OutOfMemory } || std.mem.Allocator.Error || lexer.Error;
 
 pub const Parser = struct {
@@ -71,7 +86,26 @@ pub const Parser = struct {
 
     pub fn parse(self: *Parser) !ast.Statement {
         var statement: ast.Statement = undefined;
-        if (self.acceptWord("with")) statement = try self.parseWith() else if (self.acceptWord("create")) statement = try self.parseCreate() else if (self.acceptWord("drop")) statement = try self.parseDrop() else if (self.acceptWord("insert")) statement = try self.parseInsert() else if (self.acceptWord("select")) statement = try self.parseSelect() else if (self.acceptWord("update")) statement = try self.parseUpdate() else if (self.acceptWord("delete")) statement = try self.parseDelete() else if (self.acceptWord("begin")) {
+        if (self.acceptWord("pragma")) {
+            const pragma_name = try self.word();
+            var pragma_value: ?[]const u8 = null;
+            if (self.acceptTag(.equal)) {
+                const token = self.current();
+                if (token.tag != .word and token.tag != .number and token.tag != .string) return Error.UnexpectedToken;
+                _ = self.advance();
+                pragma_value = token.text;
+            }
+            statement = .{ .pragma = .{ .name = pragma_name, .value = pragma_value } };
+        } else if (self.acceptWord("with")) statement = try self.parseWith() else if (self.acceptWord("explain")) {
+            try self.requireWord("query");
+            try self.requireWord("plan");
+            const start = self.current().position;
+            try self.requireWord("select");
+            var query = try self.parseSelect();
+            defer ast.deinit(self.allocator, &query);
+            const end = self.current().position;
+            statement = .{ .explain_query_plan = try self.copy(self.source[start..end]) };
+        } else if (self.acceptWord("create")) statement = try self.parseCreate() else if (self.acceptWord("drop")) statement = try self.parseDrop() else if (self.acceptWord("alter")) statement = try self.parseAlter() else if (self.acceptWord("insert")) statement = try self.parseInsert() else if (self.acceptWord("select")) statement = try self.parseSelect() else if (self.acceptWord("update")) statement = try self.parseUpdate() else if (self.acceptWord("delete")) statement = try self.parseDelete() else if (self.acceptWord("begin")) {
             _ = self.acceptWord("deferred");
             _ = self.acceptWord("immediate");
             _ = self.acceptWord("exclusive");
@@ -137,19 +171,48 @@ pub const Parser = struct {
 
     fn parseCreate(self: *Parser) !ast.Statement {
         if (self.acceptWord("trigger")) return self.parseTrigger();
+        if (self.acceptWord("virtual")) {
+            try self.requireWord("table");
+            const if_not_exists = if (self.acceptWord("if")) blk: {
+                try self.requireWord("not");
+                try self.requireWord("exists");
+                break :blk true;
+            } else false;
+            const name = try self.word();
+            try self.requireWord("using");
+            const module = try self.word();
+            try self.requireTag(.lparen);
+            var arguments = std.ArrayList([]const u8).empty;
+            errdefer arguments.deinit(self.allocator);
+            if (!self.acceptTag(.rparen)) {
+                while (true) {
+                    const token = self.current();
+                    if (token.tag != .number and token.tag != .word and token.tag != .string and token.tag != .parameter) return Error.UnexpectedToken;
+                    _ = self.advance();
+                    try arguments.append(self.allocator, token.text);
+                    if (!self.acceptTag(.comma)) break;
+                }
+                try self.requireTag(.rparen);
+            }
+            return .{ .create_virtual_table = .{ .name = name, .module = module, .arguments = try arguments.toOwnedSlice(self.allocator), .if_not_exists = if_not_exists } };
+        }
         if (self.acceptWord("view")) {
+            const if_not_exists = if (self.acceptWord("if")) blk: {
+                try self.requireWord("not");
+                try self.requireWord("exists");
+                break :blk true;
+            } else false;
             const name = try self.word();
             try self.requireWord("as");
             const start = self.current().position;
             try self.requireWord("select");
-            const select_statement = try self.parseSelect();
+            var select_statement = try self.parseSelect();
+            defer ast.deinit(self.allocator, &select_statement);
             if (select_statement != .select) {
-                var invalid = select_statement;
-                ast.deinit(self.allocator, &invalid);
                 return Error.InvalidSql;
             }
             const end = self.current().position;
-            return .{ .create_view = .{ .name = name, .sql = try self.copy(self.source[start..end]) } };
+            return .{ .create_view = .{ .name = name, .sql = try self.copy(self.source[start..end]), .if_not_exists = if_not_exists } };
         }
         if (self.acceptWord("unique")) {
             try self.requireWord("index");
@@ -245,6 +308,7 @@ pub const Parser = struct {
             var not_null = false;
             var unique = false;
             var foreign_key: ?ast.ForeignKeyDef = null;
+            var default_value: ?Value = null;
             if (self.acceptWord("primary")) {
                 try self.requireWord("key");
                 primary_key = true;
@@ -254,6 +318,13 @@ pub const Parser = struct {
                 not_null = true;
             }
             if (self.acceptWord("unique")) unique = true;
+            if (self.acceptWord("default")) {
+                const expression = try self.parseExpr();
+                default_value = switch (expression) {
+                    .literal => |value| value,
+                    else => return Error.InvalidSql,
+                };
+            }
             if (self.acceptWord("references")) {
                 const foreign_table = try self.word();
                 try self.requireTag(.lparen);
@@ -274,7 +345,7 @@ pub const Parser = struct {
                 }
                 foreign_key = .{ .table = foreign_table, .column = foreign_column, .on_delete = on_delete, .on_update = on_update };
             }
-            try columns.append(self.allocator, .{ .name = column_name, .type_name = type_name, .primary_key = primary_key, .not_null = not_null, .unique = unique, .foreign_key = foreign_key });
+            try columns.append(self.allocator, .{ .name = column_name, .type_name = type_name, .primary_key = primary_key, .not_null = not_null, .unique = unique, .foreign_key = foreign_key, .default_value = default_value });
             if (!self.acceptTag(.comma)) break;
         }
         try self.requireTag(.rparen);
@@ -282,6 +353,11 @@ pub const Parser = struct {
     }
 
     fn parseIndex(self: *Parser, unique: bool) !ast.Statement {
+        const if_not_exists = if (self.acceptWord("if")) blk: {
+            try self.requireWord("not");
+            try self.requireWord("exists");
+            break :blk true;
+        } else false;
         const name = try self.word();
         try self.requireWord("on");
         const table = try self.word();
@@ -292,10 +368,15 @@ pub const Parser = struct {
             if (!self.acceptTag(.comma)) break;
         }
         try self.requireTag(.rparen);
-        return .{ .create_index = .{ .name = name, .table = table, .columns = try columns.toOwnedSlice(self.allocator), .unique = unique } };
+        return .{ .create_index = .{ .name = name, .table = table, .columns = try columns.toOwnedSlice(self.allocator), .unique = unique, .if_not_exists = if_not_exists } };
     }
 
     fn parseTrigger(self: *Parser) !ast.Statement {
+        const if_not_exists = if (self.acceptWord("if")) blk: {
+            try self.requireWord("not");
+            try self.requireWord("exists");
+            break :blk true;
+        } else false;
         const name = try self.word();
         try self.requireWord("after");
         const event: ast.TriggerEvent = if (self.acceptWord("insert")) .insert else if (self.acceptWord("update")) .update else if (self.acceptWord("delete")) .delete else return Error.UnexpectedToken;
@@ -307,14 +388,44 @@ pub const Parser = struct {
         if (self.current().tag == .eof or self.current().position == body_start) return Error.UnexpectedToken;
         const body_end = self.current().position;
         _ = self.advance();
-        return .{ .create_trigger = .{ .name = name, .table = table, .event = event, .body = try self.copy(self.source[body_start..body_end]) } };
+        return .{ .create_trigger = .{ .name = name, .table = table, .event = event, .body = try self.copy(self.source[body_start..body_end]), .if_not_exists = if_not_exists } };
     }
 
     fn parseDrop(self: *Parser) !ast.Statement {
-        if (self.acceptWord("table")) return .{ .drop_table = try self.word() };
-        if (self.acceptWord("index")) return .{ .drop_index = try self.word() };
-        if (self.acceptWord("view")) return .{ .drop_view = try self.word() };
-        if (self.acceptWord("trigger")) return .{ .drop_trigger = try self.word() };
+        const kind: enum { table, index, view, trigger } = if (self.acceptWord("table")) .table else if (self.acceptWord("index")) .index else if (self.acceptWord("view")) .view else if (self.acceptWord("trigger")) .trigger else return Error.UnexpectedToken;
+        const if_exists = if (self.acceptWord("if")) blk: {
+            try self.requireWord("exists");
+            break :blk true;
+        } else false;
+        const name = try self.word();
+        return switch (kind) {
+            .table => .{ .drop_table = .{ .name = name, .if_exists = if_exists } },
+            .index => .{ .drop_index = .{ .name = name, .if_exists = if_exists } },
+            .view => .{ .drop_view = .{ .name = name, .if_exists = if_exists } },
+            .trigger => .{ .drop_trigger = .{ .name = name, .if_exists = if_exists } },
+        };
+    }
+
+    fn parseAlter(self: *Parser) !ast.Statement {
+        try self.requireWord("table");
+        const table = try self.word();
+        if (self.acceptWord("add")) {
+            _ = self.acceptWord("column");
+            const name = try self.word();
+            const type_name = if (self.current().tag == .word) try self.word() else "";
+            return .{ .alter_table = .{ .add_column = .{ .table = table, .definition = .{ .name = name, .type_name = type_name } } } };
+        }
+        if (self.acceptWord("rename")) {
+            if (self.acceptWord("to")) return .{ .alter_table = .{ .rename_table = .{ .table = table, .new_name = try self.word() } } };
+            try self.requireWord("column");
+            const old_name = try self.word();
+            try self.requireWord("to");
+            return .{ .alter_table = .{ .rename_column = .{ .table = table, .old_name = old_name, .new_name = try self.word() } } };
+        }
+        if (self.acceptWord("drop")) {
+            _ = self.acceptWord("column");
+            return .{ .alter_table = .{ .drop_column = .{ .table = table, .column = try self.word() } } };
+        }
         return Error.UnexpectedToken;
     }
 
@@ -342,7 +453,9 @@ pub const Parser = struct {
             var name = self.advance().text;
             if (self.acceptTag(.dot)) {
                 const column = try self.word();
-                name = try self.copy(try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ name, column }));
+                const qualified = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ name, column });
+                defer self.allocator.free(qualified);
+                name = try self.copy(qualified);
             }
             if (self.acceptTag(.lparen)) {
                 const argument = try self.allocator.create(ast.Expr);
@@ -374,6 +487,13 @@ pub const Parser = struct {
     }
 
     fn parseInsert(self: *Parser) !ast.Statement {
+        var conflict: ast.InsertConflict = .none;
+        var upsert_columns: []const []const u8 = &.{};
+        var upsert_values: []const ast.Expr = &.{};
+        var upsert_where: ?ast.Conditions = null;
+        if (self.acceptWord("or")) {
+            if (self.acceptWord("ignore")) conflict = .ignore else if (self.acceptWord("replace")) conflict = .replace else return Error.UnexpectedToken;
+        }
         try self.requireWord("into");
         const table = try self.word();
         var columns = std.ArrayList([]const u8).empty;
@@ -383,6 +503,51 @@ pub const Parser = struct {
                 if (!self.acceptTag(.comma)) break;
             }
             try self.requireTag(.rparen);
+        }
+        if (self.acceptWord("default")) {
+            try self.requireWord("values");
+            const empty_row = try self.allocator.alloc(ast.Expr, 0);
+            var default_rows = try self.allocator.alloc([]const ast.Expr, 1);
+            default_rows[0] = empty_row;
+            return .{ .insert = .{ .table = table, .columns = try columns.toOwnedSlice(self.allocator), .rows = default_rows, .conflict = conflict } };
+        }
+        if (self.current().tag == .word and std.ascii.eqlIgnoreCase(self.current().text, "select")) {
+            const select_start = self.current().position;
+            _ = self.advance();
+            var query = try self.parseSelect();
+            defer ast.deinit(self.allocator, &query);
+            const select_end = self.current().position;
+            const empty_rows = try self.allocator.alloc([]const ast.Expr, 0);
+            if (self.acceptWord("on")) {
+                try self.requireWord("conflict");
+                if (self.acceptTag(.lparen)) {
+                    while (true) {
+                        _ = try self.word();
+                        if (!self.acceptTag(.comma)) break;
+                    }
+                    try self.requireTag(.rparen);
+                }
+                try self.requireWord("do");
+                if (self.acceptWord("nothing")) {
+                    conflict = .ignore;
+                } else {
+                    try self.requireWord("update");
+                    try self.requireWord("set");
+                    var names = std.ArrayList([]const u8).empty;
+                    var expressions = std.ArrayList(ast.Expr).empty;
+                    while (true) {
+                        try names.append(self.allocator, try self.word());
+                        try self.requireTag(.equal);
+                        try expressions.append(self.allocator, try self.parseExpr());
+                        if (!self.acceptTag(.comma)) break;
+                    }
+                    upsert_columns = try names.toOwnedSlice(self.allocator);
+                    upsert_values = try expressions.toOwnedSlice(self.allocator);
+                    conflict = .update;
+                    if (self.current().tag == .word and std.ascii.eqlIgnoreCase(self.current().text, "where")) upsert_where = try self.parseCondition();
+                }
+            }
+            return .{ .insert = .{ .table = table, .columns = try columns.toOwnedSlice(self.allocator), .rows = empty_rows, .select_sql = try self.copy(self.source[select_start..select_end]), .conflict = conflict, .upsert_where = upsert_where } };
         }
         try self.requireWord("values");
         var rows = std.ArrayList([]const ast.Expr).empty;
@@ -397,7 +562,36 @@ pub const Parser = struct {
             try rows.append(self.allocator, try row.toOwnedSlice(self.allocator));
             if (!self.acceptTag(.comma)) break;
         }
-        return .{ .insert = .{ .table = table, .columns = try columns.toOwnedSlice(self.allocator), .rows = try rows.toOwnedSlice(self.allocator) } };
+        if (self.acceptWord("on")) {
+            try self.requireWord("conflict");
+            if (self.acceptTag(.lparen)) {
+                while (true) {
+                    _ = try self.word();
+                    if (!self.acceptTag(.comma)) break;
+                }
+                try self.requireTag(.rparen);
+            }
+            try self.requireWord("do");
+            if (self.acceptWord("nothing")) {
+                conflict = .ignore;
+            } else {
+                try self.requireWord("update");
+                try self.requireWord("set");
+                var names = std.ArrayList([]const u8).empty;
+                var expressions = std.ArrayList(ast.Expr).empty;
+                while (true) {
+                    try names.append(self.allocator, try self.word());
+                    try self.requireTag(.equal);
+                    try expressions.append(self.allocator, try self.parseExpr());
+                    if (!self.acceptTag(.comma)) break;
+                }
+                upsert_columns = try names.toOwnedSlice(self.allocator);
+                upsert_values = try expressions.toOwnedSlice(self.allocator);
+                conflict = .update;
+                if (self.current().tag == .word and std.ascii.eqlIgnoreCase(self.current().text, "where")) upsert_where = try self.parseCondition();
+            }
+        }
+        return .{ .insert = .{ .table = table, .columns = try columns.toOwnedSlice(self.allocator), .rows = try rows.toOwnedSlice(self.allocator), .conflict = conflict, .upsert_columns = upsert_columns, .upsert_values = upsert_values, .upsert_where = upsert_where } };
     }
 
     fn parseCondition(self: *Parser) anyerror!?ast.Conditions {
@@ -405,26 +599,101 @@ pub const Parser = struct {
         var conditions = std.ArrayList(ast.Condition).empty;
         var join_or = false;
         while (true) {
-            const column = try self.word();
-            if (self.acceptWord("is")) {
-                const is_not = self.acceptWord("not");
-                try self.requireWord("null");
-                try conditions.append(self.allocator, .{ .column = column, .op = if (is_not) .is_not_null else .is_null, .value = .{ .literal = .null }, .join_or = join_or });
-            } else if (self.acceptWord("between")) {
-                const lower = try self.parseExpr();
-                try self.requireWord("and");
-                try conditions.append(self.allocator, .{ .column = column, .op = .between, .value = lower, .value2 = try self.parseExpr(), .join_or = join_or });
-            } else if (self.acceptWord("in")) {
+            if (self.acceptWord("not")) {
+                if (self.acceptWord("exists")) {
+                    try self.requireTag(.lparen);
+                    const start = self.current().position;
+                    try self.requireWord("select");
+                    var subquery = try self.parseSelect();
+                    defer ast.deinit(self.allocator, &subquery);
+                    const end = self.current().position;
+                    try self.requireTag(.rparen);
+                    try conditions.append(self.allocator, .{ .column = "", .op = .not_exists, .value = .{ .literal = .null }, .subquery = try self.copy(self.source[start..end]), .join_or = join_or });
+                } else {
+                    return Error.UnexpectedToken;
+                }
+            } else if (self.acceptWord("exists")) {
                 try self.requireTag(.lparen);
                 const start = self.current().position;
                 try self.requireWord("select");
-                _ = try self.parseSelect();
+                var subquery = try self.parseSelect();
+                defer ast.deinit(self.allocator, &subquery);
                 const end = self.current().position;
                 try self.requireTag(.rparen);
-                try conditions.append(self.allocator, .{ .column = column, .op = .in, .value = .{ .literal = .null }, .subquery = try self.copy(self.source[start..end]), .join_or = join_or });
+                try conditions.append(self.allocator, .{ .column = "", .op = .exists, .value = .{ .literal = .null }, .subquery = try self.copy(self.source[start..end]), .join_or = join_or });
             } else {
-                const op: ast.CompareOp = if (self.acceptTag(.equal)) .equal else if (self.acceptTag(.not_equal)) .not_equal else if (self.acceptTag(.less)) .less else if (self.acceptTag(.less_equal)) .less_equal else if (self.acceptTag(.greater)) .greater else if (self.acceptTag(.greater_equal)) .greater_equal else if (self.acceptWord("like")) .like else return Error.UnexpectedToken;
-                try conditions.append(self.allocator, .{ .column = column, .op = op, .value = try self.parseExpr(), .join_or = join_or });
+                const qualified = try self.qualifiedName();
+                const column = if (qualified.table.len == 0) qualified.column else blk: {
+                    const combined = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ qualified.table, qualified.column });
+                    defer self.allocator.free(combined);
+                    break :blk try self.copy(combined);
+                };
+                if (self.acceptWord("is")) {
+                    const is_not = self.acceptWord("not");
+                    if (self.acceptWord("null")) {
+                        try conditions.append(self.allocator, .{ .column = column, .op = if (is_not) .is_not_null else .is_null, .value = .{ .literal = .null }, .join_or = join_or });
+                    } else {
+                        try conditions.append(self.allocator, .{ .column = column, .op = if (is_not) .is_not_value else .is_value, .value = try self.parseExpr(), .join_or = join_or });
+                    }
+                } else if (self.acceptWord("between")) {
+                    const lower = try self.parseExpr();
+                    try self.requireWord("and");
+                    try conditions.append(self.allocator, .{ .column = column, .op = .between, .value = lower, .value2 = try self.parseExpr(), .join_or = join_or });
+                } else if (self.acceptWord("not")) {
+                    if (self.acceptWord("like")) {
+                        try conditions.append(self.allocator, .{ .column = column, .op = .not_like, .value = try self.parseExpr(), .join_or = join_or });
+                    } else {
+                        try self.requireWord("in");
+                        try self.requireTag(.lparen);
+                        if (self.current().tag == .word and std.ascii.eqlIgnoreCase(self.current().text, "select")) {
+                            const start = self.current().position;
+                            try self.requireWord("select");
+                            var subquery = try self.parseSelect();
+                            defer ast.deinit(self.allocator, &subquery);
+                            const end = self.current().position;
+                            try self.requireTag(.rparen);
+                            try conditions.append(self.allocator, .{ .column = column, .op = .not_in, .value = .{ .literal = .null }, .subquery = try self.copy(self.source[start..end]), .join_or = join_or });
+                        } else {
+                            var values = std.ArrayList(ast.Expr).empty;
+                            errdefer {
+                                for (values.items) |item| freeParserExpr(self.allocator, item);
+                                values.deinit(self.allocator);
+                            }
+                            while (true) {
+                                try values.append(self.allocator, try self.parseExpr());
+                                if (!self.acceptTag(.comma)) break;
+                            }
+                            try self.requireTag(.rparen);
+                            try conditions.append(self.allocator, .{ .column = column, .op = .not_in, .value = .{ .literal = .null }, .list_values = try values.toOwnedSlice(self.allocator), .join_or = join_or });
+                        }
+                    }
+                } else if (self.acceptWord("in")) {
+                    try self.requireTag(.lparen);
+                    if (self.current().tag == .word and std.ascii.eqlIgnoreCase(self.current().text, "select")) {
+                        const start = self.current().position;
+                        try self.requireWord("select");
+                        var subquery = try self.parseSelect();
+                        defer ast.deinit(self.allocator, &subquery);
+                        const end = self.current().position;
+                        try self.requireTag(.rparen);
+                        try conditions.append(self.allocator, .{ .column = column, .op = .in, .value = .{ .literal = .null }, .subquery = try self.copy(self.source[start..end]), .join_or = join_or });
+                    } else {
+                        var values = std.ArrayList(ast.Expr).empty;
+                        errdefer {
+                            for (values.items) |item| freeParserExpr(self.allocator, item);
+                            values.deinit(self.allocator);
+                        }
+                        while (true) {
+                            try values.append(self.allocator, try self.parseExpr());
+                            if (!self.acceptTag(.comma)) break;
+                        }
+                        try self.requireTag(.rparen);
+                        try conditions.append(self.allocator, .{ .column = column, .op = .in, .value = .{ .literal = .null }, .list_values = try values.toOwnedSlice(self.allocator), .join_or = join_or });
+                    }
+                } else {
+                    const op: ast.CompareOp = if (self.acceptTag(.equal)) .equal else if (self.acceptTag(.not_equal)) .not_equal else if (self.acceptTag(.less)) .less else if (self.acceptTag(.less_equal)) .less_equal else if (self.acceptTag(.greater)) .greater else if (self.acceptTag(.greater_equal)) .greater_equal else if (self.acceptWord("like")) .like else return Error.UnexpectedToken;
+                    try conditions.append(self.allocator, .{ .column = column, .op = op, .value = try self.parseExpr(), .join_or = join_or });
+                }
             }
             if (self.acceptWord("or")) {
                 join_or = true;
@@ -464,6 +733,17 @@ pub const Parser = struct {
             }
         }
         const condition = try self.parseCondition();
+        var group_by: ?[]const u8 = null;
+        if (self.acceptWord("group")) {
+            try self.requireWord("by");
+            group_by = try self.word();
+        }
+        var having: ?ast.Having = null;
+        if (self.acceptWord("having")) {
+            const left = try self.parseExpr();
+            const op: ast.CompareOp = if (self.acceptTag(.equal)) .equal else if (self.acceptTag(.not_equal)) .not_equal else if (self.acceptTag(.less)) .less else if (self.acceptTag(.less_equal)) .less_equal else if (self.acceptTag(.greater)) .greater else if (self.acceptTag(.greater_equal)) .greater_equal else return Error.UnexpectedToken;
+            having = .{ .left = left, .op = op, .right = try self.parseExpr() };
+        }
         var order: ?ast.Order = null;
         if (self.acceptWord("order")) {
             try self.requireWord("by");
@@ -480,7 +760,7 @@ pub const Parser = struct {
             const token = self.advance();
             offset = std.fmt.parseInt(usize, token.text, 10) catch return Error.InvalidSql;
         }
-        return .{ .select = .{ .projections = try projections.toOwnedSlice(self.allocator), .table = table, .join = join, .condition = condition, .order = order, .limit = limit, .offset = offset, .distinct = distinct } };
+        return .{ .select = .{ .projections = try projections.toOwnedSlice(self.allocator), .table = table, .join = join, .condition = condition, .group_by = group_by, .having = having, .order = order, .limit = limit, .offset = offset, .distinct = distinct } };
     }
 
     fn parseUpdate(self: *Parser) !ast.Statement {
@@ -494,7 +774,17 @@ pub const Parser = struct {
             try values.append(self.allocator, try self.parseExpr());
             if (!self.acceptTag(.comma)) break;
         }
-        return .{ .update = .{ .table = table, .columns = try columns.toOwnedSlice(self.allocator), .values = try values.toOwnedSlice(self.allocator), .condition = try self.parseCondition() } };
+        var from: ?ast.UpdateFrom = null;
+        var condition: ?ast.Conditions = null;
+        if (self.acceptWord("from")) {
+            const source_table = try self.word();
+            try self.requireWord("where");
+            const left = try self.qualifiedName();
+            try self.requireTag(.equal);
+            const right = try self.qualifiedName();
+            from = .{ .table = source_table, .left_table = left.table, .left_column = left.column, .right_table = right.table, .right_column = right.column };
+        } else condition = try self.parseCondition();
+        return .{ .update = .{ .table = table, .columns = try columns.toOwnedSlice(self.allocator), .values = try values.toOwnedSlice(self.allocator), .condition = condition, .from = from } };
     }
 
     fn parseDelete(self: *Parser) !ast.Statement {

@@ -1,6 +1,6 @@
 const Value = @import("../vm/value.zig").Value;
 
-pub const Operator = enum { equal, not_equal, less, less_equal, greater, greater_equal, like, is_null, is_not_null, between };
+pub const Operator = enum { equal, not_equal, less, less_equal, greater, greater_equal, like, not_like, is_null, is_not_null, is_value, is_not_value, between };
 pub const Expr = struct {
     column: []const u8,
     operator: Operator,

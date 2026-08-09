@@ -10,12 +10,12 @@ const Order = sqlite.table("orders", struct { id: i64, user_id: i64, amount: i64
 
 try db.createTable(User, .{
     .if_not_exists = true,
-    .primary_key_key = User.key("id"),
+    .primary_key = User.key("id"),
 });
 
 try db.createTable(Order, .{
     .if_not_exists = true,
-    .primary_key_key = Order.key("id"),
+    .primary_key = Order.key("id"),
     .foreign_key_constraints = &.{.{
         .columns = &.{Order.key("user_id")},
         .referenced_table = "users",
@@ -40,7 +40,7 @@ try db.createTable(Order, .{
 
 ```zig
 try db.createTable(Child, .{
-    .primary_key_key = Child.key("id"),
+    .primary_key = Child.key("id"),
     .foreign_key_constraints = &.{.{
         .columns = &.{Child.key("parent_a"), Child.key("parent_b")},
         .referenced_table = "parents",
@@ -63,7 +63,7 @@ result = try db.from(Order).insert(.{ .id = 1, .user_id = 1, .amount = 100 });
 result.deinit();
 try db.commit();
 
-// Delete the user — orders are cascade-deleted
+// Delete the user â€” orders are cascade-deleted
 try db.begin();
 var deleted = try db.from(User).where(User.column("id").eq(1)).delete();
 deleted.deinit();

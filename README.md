@@ -32,7 +32,7 @@
 `sqlite.zig` is a ground-up reimplementation of the SQLite engine in pure Zig, featuring a complete storage engine with the real on-disk `.db` file format, a hand-written SQL lexer and parser, a bytecode compiler and virtual machine, WAL and rollback-journal durability modes, and a type-safe comptime query builder (DSL) that stays in sync with raw SQL.
 
 > [!NOTE]
-> Documentation is available at [muhammad-fiaz.github.io/sqlite.zig](https://muhammad-fiaz.github.io/sqlite.zig/). You can also generate it locally with `zig build docs`.
+> Due to ongoing development, limited documentation is available at [muhammad-fiaz.github.io/sqlite.zig](https://muhammad-fiaz.github.io/sqlite.zig/). You can also generate it locally with `zig build docs`.
 
 > [!TIP]
 > If you build with sqlite.zig, make sure to give it a star. ⭐
@@ -75,7 +75,7 @@
 | **Real On-Disk Format** | Full implementation of the SQLite `.db`/`.sqlite` file format including 100-byte header, table/index B-tree pages, record encoding, varints, and freelist pages. |
 | **SQL Lexer & Parser** | Hand-written SQL lexer and parser supporting CREATE TABLE, INSERT, SELECT, UPDATE, DELETE, BEGIN, COMMIT, ROLLBACK, JOINs, subqueries, CTEs, views, triggers, and more. |
 | **Bytecode Compiler & VM** | A bytecode virtual machine that compiles parsed SQL into opcodes and executes them against the storage engine, modeled on SQLite's own architecture. |
-| **WAL & Rollback Journal** | Both Write-Ahead Logging (WAL) and traditional rollback-journal durability modes for concurrent read/write access. |
+| **WAL & Rollback Journal** | SQLite-compatible WAL page headers/frames, native WAL readback, checkpointing through `PRAGMA journal_mode=DELETE`, and rollback-journal persistence. Multi-process locking/VFS parity is still in progress. |
 | **Typed DSL Query Builder** | A comptime, type-safe Zig query builder that generates SQL under the hood, ensuring compile-time validation of table names, column names, and types. |
 | **DISTINCT Joins** | Full DISTINCT support for JOIN queries with automatic deduplication of result rows. |
 | **Transaction Modes** | BEGIN DEFERRED, BEGIN IMMEDIATE, BEGIN EXCLUSIVE, START TRANSACTION, COMMIT, ROLLBACK, SAVEPOINT, RELEASE, and ROLLBACK TO SAVEPOINT. |
@@ -86,6 +86,8 @@
 | **Subqueries** | Scalar subqueries, EXISTS/NOT EXISTS, IN/NOT IN, and derived table subqueries in FROM and WHERE clauses. |
 | **Scalar Functions** | ABS, LENGTH, UPPER, LOWER, SUBSTR, and other scalar functions in both raw SQL and typed DSL. |
 | **Indexed Queries** | CREATE INDEX and optimized indexed lookups for performance-critical queries. |
+| **Query Planning** | `EXPLAIN QUERY PLAN` reports index-backed equality searches and table scans. |
+| **Virtual Tables** | Native `generate_series` virtual tables support raw creation, typed DSL reads, and native reopen. Other modules return `Unsupported`. |
 | **Prepared Statements** | Parameterized queries with typed binding and automatic memory management. |
 | **Schema Lifecycle** | CREATE TABLE, ALTER TABLE ADD COLUMN, DROP TABLE with full schema persistence and verification. |
 | **Python Interop** | Databases created by sqlite.zig can be read by Python's `sqlite3` module and vice versa. |

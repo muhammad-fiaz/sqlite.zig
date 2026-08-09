@@ -16,7 +16,7 @@ const User = sqlite.table("idx_users", struct { id: i64, name: []const u8 });
 pub fn main() !void {
     var db = try sqlite.open(std.heap.page_allocator, "valid_21.db");
     defer db.close();
-    try db.createTable(User, .{ .if_not_exists = true, .primary_key_key = User.key("id") });
+    try db.createTable(User, .{ .if_not_exists = true, .primary_key = User.key("id") });
     try db.truncate(User);
     var result = try db.exec("CREATE INDEX IF NOT EXISTS idx_name ON idx_users (name);");
     result.deinit();

@@ -28,11 +28,20 @@ pub fn Column(comptime table_name: []const u8, comptime column_name: []const u8,
         pub fn like(_: @This(), value: []const u8) Expr {
             return .{ .column = column_name, .operator = .like, .value = toValue(value) };
         }
+        pub fn notLike(_: @This(), value: []const u8) Expr {
+            return .{ .column = column_name, .operator = .not_like, .value = toValue(value) };
+        }
         pub fn isNull(_: @This()) Expr {
             return .{ .column = column_name, .operator = .is_null, .value = .null };
         }
         pub fn isNotNull(_: @This()) Expr {
             return .{ .column = column_name, .operator = .is_not_null, .value = .null };
+        }
+        pub fn isValue(_: @This(), value: anytype) Expr {
+            return .{ .column = column_name, .operator = .is_value, .value = toValue(value) };
+        }
+        pub fn isNotValue(_: @This(), value: anytype) Expr {
+            return .{ .column = column_name, .operator = .is_not_value, .value = toValue(value) };
         }
         pub fn between(_: @This(), lower: anytype, upper: anytype) Expr {
             return .{ .column = column_name, .operator = .between, .value = toValue(lower), .value2 = toValue(upper) };

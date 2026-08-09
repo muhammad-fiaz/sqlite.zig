@@ -16,7 +16,7 @@ const Item = sqlite.table("edge_items", struct { id: i64, label: ?[]const u8 });
 pub fn main() !void {
     var db = try sqlite.open(std.heap.page_allocator, "valid_13.db");
     defer db.close();
-    try db.createTable(Item, .{ .if_not_exists = true, .primary_key_key = Item.key("id") });
+    try db.createTable(Item, .{ .if_not_exists = true, .primary_key = Item.key("id") });
     try db.truncate(Item);
     var first = try db.from(Item).insert(.{ .id = 1, .label = "alpha" });
     first.deinit();

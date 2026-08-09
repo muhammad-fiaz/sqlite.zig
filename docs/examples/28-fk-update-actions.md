@@ -17,10 +17,10 @@ const Child = sqlite.table("fk_upd_child", struct { id: i64, parent_id: i64 });
 pub fn main() !void {
     var db = try sqlite.open(std.heap.page_allocator, "valid_28.db");
     defer db.close();
-    try db.createTable(Parent, .{ .if_not_exists = true, .primary_key_key = Parent.key("id") });
+    try db.createTable(Parent, .{ .if_not_exists = true, .primary_key = Parent.key("id") });
     try db.createTable(Child, .{
         .if_not_exists = true,
-        .primary_key_key = Child.key("id"),
+        .primary_key = Child.key("id"),
         .foreign_key_constraints = &.{.{
             .columns = &.{Child.key("parent_id")},
             .referenced_table = "fk_upd_parent",
