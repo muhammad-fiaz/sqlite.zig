@@ -33,7 +33,6 @@ export default defineConfig({
 
   head: [
     // Basic Meta
-    ["meta", { name: "title", content: `${SITE_TAGLINE} | ${SITE_NAME}` }],
     ["meta", { name: "description", content: SITE_DESCRIPTION }],
     ["meta", { name: "keywords", content: KEYWORDS }],
     ["meta", { name: "author", content: "Muhammad Fiaz" }],
@@ -130,7 +129,6 @@ export default defineConfig({
 
     pageData.frontmatter.head ??= [];
     pageData.frontmatter.head.push(
-      ["meta", { name: "title", content: fullTitle }],
       ["meta", { name: "description", content: pageDescription }],
       ["link", { rel: "canonical", href: canonicalUrl }],
       ["meta", { property: "og:type", content: isHome ? "website" : "article" }],
