@@ -1,11 +1,11 @@
 ---
 title: "Examples"
-description: "All 47 runnable examples demonstrating sqlite.zig features, from basic SQL execution to advanced queries, DSL operations, and schema management."
+description: "Runnable examples demonstrating sqlite.zig features, from basic SQL execution to advanced queries, Raw DSL operations, and schema management."
 ---
 
 # Examples
 
-All 47 runnable examples demonstrating `sqlite.zig` features.
+Runnable examples demonstrating `sqlite.zig` features.
 
 ## Getting Started
 
@@ -24,6 +24,12 @@ All 47 runnable examples demonstrating `sqlite.zig` features.
 | 10 | [DSL Advanced](/examples/10-dsl-advanced) | Advanced DSL queries and predicates |
 | 14 | [Select Projections](/examples/14-dsl-select-projections) | SELECT field projections with selectFields() |
 | 16 | [Predicates & Pagination](/examples/16-dsl-predicates-pagination) | WHERE predicates with LIMIT/OFFSET |
+
+## Raw DSL
+
+| # | Example | Description |
+|---|---------|-------------|
+| 48 | [Raw DSL](/examples/48-raw-dsl) | Schema-less runtime-column querying |
 
 ## SQL Features
 
@@ -88,6 +94,7 @@ All 47 runnable examples demonstrating `sqlite.zig` features.
 | 19 | [Prepared Parameters](/examples/19-prepared-parameter) | Typed parameter binding in prepared statements |
 | 21 | [Indexed Queries](/examples/21-indexed-queries) | Index creation and optimized lookups |
 | 47 | [Column Defaults](/examples/47-column-defaults) | Column DEFAULT expressions including dynamic defaults |
+| 49 | [SQLite Coverage Layers](/examples/49-sqlite-coverage-layers) | Raw SQL, RAW DSL, and typed Zig-first DSL interoperability |
 
 ## Query Inspection & Internals
 

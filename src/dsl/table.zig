@@ -18,7 +18,12 @@ pub fn table(comptime name: []const u8, comptime Row: type) type {
             return .{ .table = name, .name = column_name };
         }
 
-        pub fn columns() [@typeInfo(Row).@"struct".fields.len][]const u8 {
+        pub fn columns(comptime column_name: []const u8) Column(name, column_name, @TypeOf(@field(@as(Row, undefined), column_name))) {
+            if (!@hasField(Row, column_name)) @compileError("unknown table column");
+            return .{};
+        }
+
+        pub fn columnNames() [@typeInfo(Row).@"struct".fields.len][]const u8 {
             var result: [@typeInfo(Row).@"struct".fields.len][]const u8 = undefined;
             inline for (@typeInfo(Row).@"struct".fields, 0..) |field, index| result[index] = field.name;
             return result;
@@ -30,4 +35,6 @@ test "typed table exposes checked column types" {
     const User = table("users", struct { id: i64, name: []const u8 });
     const id = User.column("id");
     try std.testing.expectEqualStrings("id", @TypeOf(id).name);
+    const age = table("users", struct { id: i64, age: i64 }).columns("age");
+    try std.testing.expectEqualStrings("age", @TypeOf(age).name);
 }

@@ -1,18 +1,18 @@
 const Value = @import("../vm/value.zig").Value;
 
-pub const CompareOp = enum { equal, not_equal, less, less_equal, greater, greater_equal, like, not_like, is_null, is_not_null, is_value, is_not_value, between, in, not_in, exists, not_exists };
+pub const CompareOp = enum { equal, not_equal, less, less_equal, greater, greater_equal, like, not_like, glob, not_glob, is_null, is_not_null, is_value, is_not_value, is_distinct, is_not_distinct, between, in, not_in, exists, not_exists };
 
 pub const Expr = union(enum) {
     literal: Value,
     identifier: []const u8,
     parameter: usize,
     wildcard,
-    function: struct { name: []const u8, argument: *const Expr },
+    function: struct { name: []const u8, argument: *const Expr, argument2: ?*const Expr = null, argument3: ?*const Expr = null },
     binary: struct { op: BinaryOp, left: *const Expr, right: *const Expr },
 };
 pub const BinaryOp = enum { add, subtract };
 
-pub const Condition = struct { column: []const u8, op: CompareOp, value: Expr, value2: ?Expr = null, subquery: ?[]const u8 = null, list_values: []const Expr = &.{}, join_or: bool = false };
+pub const Condition = struct { column: []const u8, op: CompareOp, value: Expr, value2: ?Expr = null, subquery: ?[]const u8 = null, list_values: []const Expr = &.{}, join_or: bool = false, left_expr: ?Expr = null };
 pub const Having = struct { left: Expr, op: CompareOp, right: Expr };
 pub const Conditions = []const Condition;
 pub const Order = struct { column: []const u8, descending: bool };
@@ -77,6 +77,8 @@ pub fn deinit(allocator: anytype, statement: *Statement) void {
                 .function => |call| {
                     run(gpa, call.argument.*);
                     gpa.destroy(call.argument);
+                    if (call.argument2) |argument| { run(gpa, argument.*); gpa.destroy(argument); }
+                    if (call.argument3) |argument| { run(gpa, argument.*); gpa.destroy(argument); }
                 },
                 .binary => |binary| {
                     run(gpa, binary.left.*);
@@ -122,6 +124,7 @@ pub fn deinit(allocator: anytype, statement: *Statement) void {
             allocator.free(value.upsert_values);
             if (value.upsert_where) |conditions| {
                 for (conditions) |condition| {
+                    if (condition.left_expr) |left| freeExpr(allocator, left);
                     freeExpr(allocator, condition.value);
                     if (condition.value2) |second| freeExpr(allocator, second);
                     for (condition.list_values) |item| freeExpr(allocator, item);
@@ -135,6 +138,7 @@ pub fn deinit(allocator: anytype, statement: *Statement) void {
             allocator.free(value.projections);
             if (value.condition) |conditions| {
                 for (conditions) |condition| {
+                    if (condition.left_expr) |left| freeExpr(allocator, left);
                     freeExpr(allocator, condition.value);
                     if (condition.value2) |second| freeExpr(allocator, second);
                     for (condition.list_values) |item| freeExpr(allocator, item);
@@ -153,6 +157,7 @@ pub fn deinit(allocator: anytype, statement: *Statement) void {
             allocator.free(value.values);
             if (value.condition) |conditions| {
                 for (conditions) |condition| {
+                    if (condition.left_expr) |left| freeExpr(allocator, left);
                     freeExpr(allocator, condition.value);
                     if (condition.value2) |second| freeExpr(allocator, second);
                     for (condition.list_values) |item| freeExpr(allocator, item);
@@ -163,6 +168,7 @@ pub fn deinit(allocator: anytype, statement: *Statement) void {
         },
         .delete => |value| if (value.condition) |conditions| {
             for (conditions) |condition| {
+                if (condition.left_expr) |left| freeExpr(allocator, left);
                 freeExpr(allocator, condition.value);
                 if (condition.value2) |second| freeExpr(allocator, second);
                 for (condition.list_values) |item| freeExpr(allocator, item);

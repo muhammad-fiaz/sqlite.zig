@@ -129,8 +129,18 @@ pub const Connection = struct {
         return .{ .connection = self, .sql = try self.allocator.dupe(u8, sql), .allocator = self.allocator, .parameters = .empty, .execute_fn = executePrepared };
     }
 
-    pub fn from(self: *Connection, comptime TableType: type) @import("../dsl/query_builder.zig").Query(TableType) {
-        return @import("../dsl/query_builder.zig").Query(TableType).init(self, TableType.table_name, executeForDsl);
+    pub fn from(self: *Connection, comptime source: anytype) if (@TypeOf(source) == type)
+        @import("../dsl/query_builder.zig").Query(source)
+    else
+        @import("../dsl/raw_dsl.zig").RawQuery(executeForRawDsl) {
+        if (@TypeOf(source) == type) {
+            return @import("../dsl/query_builder.zig").Query(source).init(self, source.table_name, executeForDsl);
+        }
+        return @import("../dsl/raw_dsl.zig").RawQuery(executeForRawDsl).init(self.allocator, self, source);
+    }
+
+    pub fn col(_: *Connection, name: []const u8) @import("../dsl/raw_dsl.zig").RawColumn {
+        return .{ .name = name };
     }
 
     pub fn tableExists(self: *Connection, comptime TableType: type) bool {
@@ -272,6 +282,11 @@ pub const Connection = struct {
     fn executeForDsl(pointer: *anyopaque, sql: []const u8) anyerror!Result {
         const self: *Connection = @ptrCast(@alignCast(pointer));
         return self.execute(sql, &.{});
+    }
+
+    fn executeForRawDsl(pointer: *anyopaque, sql: []const u8, parameters: []const Value) anyerror!Result {
+        const self: *Connection = @ptrCast(@alignCast(pointer));
+        return self.execute(sql, parameters);
     }
 
     fn dslTypeName(comptime T: type) []const u8 {
@@ -783,7 +798,7 @@ pub const Connection = struct {
             .less_equal => result <= 0,
             .greater => result > 0,
             .greater_equal => result >= 0,
-            .like, .not_like, .is_null, .is_not_null, .is_value, .is_not_value, .between, .in, .not_in, .exists, .not_exists => false,
+            .like, .not_like, .glob, .not_glob, .is_null, .is_not_null, .is_value, .is_not_value, .is_distinct, .is_not_distinct, .between, .in, .not_in, .exists, .not_exists => false,
         };
     }
 
@@ -812,9 +827,12 @@ pub const Connection = struct {
                     };
                     break :blk if (item.op == .exists) found else !found;
                 } else blk: {
-                    const condition_column = if (std.mem.indexOfScalar(u8, item.column, '.')) |dot| item.column[dot + 1 ..] else item.column;
-                    const current = row[try columnIndex(table, condition_column)];
-                    break :blk if (item.op == .is_null) current == .null else if (item.op == .is_not_null) current != .null else if (item.op == .is_value) sameValue(current, try self.evalContext(table, row, item.value, parameters, outer)) else if (item.op == .is_not_value) !sameValue(current, try self.evalContext(table, row, item.value, parameters, outer)) else if (item.op == .in and item.subquery != null) in_subquery: {
+                    const current = if (item.left_expr) |left| try self.evalContext(table, row, left, parameters, outer) else current_column: {
+                        const condition_column = if (std.mem.indexOfScalar(u8, item.column, '.')) |dot| item.column[dot + 1 ..] else item.column;
+                        break :current_column row[try columnIndex(table, condition_column)];
+                    };
+                    defer if (item.left_expr != null and current == .text) self.allocator.free(current.text);
+                    break :blk if (item.op == .is_null) current == .null else if (item.op == .is_not_null) current != .null else if (item.op == .is_value) sameValue(current, try self.evalContext(table, row, item.value, parameters, outer)) else if (item.op == .is_not_value) !sameValue(current, try self.evalContext(table, row, item.value, parameters, outer)) else if (item.op == .is_distinct) !sameValue(current, try self.evalContext(table, row, item.value, parameters, outer)) else if (item.op == .is_not_distinct) sameValue(current, try self.evalContext(table, row, item.value, parameters, outer)) else if (item.op == .in and item.subquery != null) in_subquery: {
                         const sql = item.subquery orelse return error.InvalidSql;
                         var subquery = try self.execute(sql, parameters);
                         defer subquery.deinit();
@@ -846,6 +864,11 @@ pub const Connection = struct {
                         const comparable = current == .text and pattern == .text;
                         const matched = comparable and likeMatch(current.text, pattern.text);
                         break :like_pattern if (item.op == .like) matched else comparable and !matched;
+                    } else if (item.op == .glob or item.op == .not_glob) glob_pattern: {
+                        const pattern = try self.evalContext(table, row, item.value, parameters, outer);
+                        const comparable = current == .text and pattern == .text;
+                        const matched = comparable and globMatch(current.text, pattern.text);
+                        break :glob_pattern if (item.op == .glob) matched else comparable and !matched;
                     } else compare(current, item.op, try self.evalContext(table, row, item.value, parameters, outer));
                 };
                 result = if (item.join_or) result or item_result else result and item_result;
@@ -863,7 +886,7 @@ pub const Connection = struct {
             return false;
         }
         if (pattern[0] == '_') return text.len != 0 and likeMatch(text[1..], pattern[1..]);
-        return text.len != 0 and pattern[0] == text[0] and likeMatch(text[1..], pattern[1..]);
+        return text.len != 0 and std.ascii.toLower(pattern[0]) == std.ascii.toLower(text[0]) and likeMatch(text[1..], pattern[1..]);
     }
 
     fn rowsEqual(left: []const Value, right: []const Value) bool {
@@ -926,27 +949,310 @@ pub const Connection = struct {
                     .real => |n| .{ .real = if (n < 0) -n else n },
                     else => .null,
                 };
+                if (std.ascii.eqlIgnoreCase(call.name, "round")) break :blk switch (argument) {
+                    .integer => |n| if (call.argument2 == null) .{ .integer = n } else blk_round: {
+                        const precision_value = try self.evalContext(table, row, call.argument2.?.*, parameters, outer);
+                        if (precision_value != .integer) break :blk_round .null;
+                        var factor: f64 = 1;
+                        if (precision_value.integer >= 0) {
+                            var count: i64 = 0;
+                            while (count < precision_value.integer) : (count += 1) factor *= 10;
+                        } else {
+                            var count: i64 = 0;
+                            while (count > precision_value.integer) : (count -= 1) factor /= 10;
+                        }
+                        break :blk_round .{ .real = std.math.round(@as(f64, @floatFromInt(n)) * factor) / factor };
+                    },
+                    .real => |n| if (call.argument2) |precision_expr| blk_round: {
+                        const precision_value = try self.evalContext(table, row, precision_expr.*, parameters, outer);
+                        if (precision_value != .integer) break :blk_round .null;
+                        var factor: f64 = 1;
+                        if (precision_value.integer >= 0) {
+                            var count: i64 = 0;
+                            while (count < precision_value.integer) : (count += 1) factor *= 10;
+                        } else {
+                            var count: i64 = 0;
+                            while (count > precision_value.integer) : (count -= 1) factor /= 10;
+                        }
+                        break :blk_round .{ .real = std.math.round(n * factor) / factor };
+                    } else .{ .real = std.math.round(n) },
+                    else => .null,
+                };
                 if (std.ascii.eqlIgnoreCase(call.name, "typeof")) break :blk .{ .text = argument.typeName() };
-                if (std.ascii.eqlIgnoreCase(call.name, "coalesce") or std.ascii.eqlIgnoreCase(call.name, "ifnull")) break :blk argument;
+                if (std.ascii.eqlIgnoreCase(call.name, "cast")) {
+                    const target = call.argument2 orelse return error.InvalidSql;
+                    const target_name = switch (target.*) {
+                        .identifier => |name| name,
+                        else => return error.InvalidSql,
+                    };
+                    if (std.ascii.eqlIgnoreCase(target_name, "integer") or std.ascii.eqlIgnoreCase(target_name, "int")) break :blk switch (argument) {
+                        .integer => argument,
+                        .real => |n| .{ .integer = @intFromFloat(n) },
+                        .text => |text| .{ .integer = std.fmt.parseInt(i64, text, 10) catch 0 },
+                        else => .null,
+                    };
+                    if (std.ascii.eqlIgnoreCase(target_name, "real") or std.ascii.eqlIgnoreCase(target_name, "float")) break :blk switch (argument) {
+                        .integer => |n| .{ .real = @floatFromInt(n) },
+                        .real => argument,
+                        .text => |text| .{ .real = std.fmt.parseFloat(f64, text) catch 0 },
+                        else => .null,
+                    };
+                    if (std.ascii.eqlIgnoreCase(target_name, "text")) break :blk switch (argument) {
+                        .text => argument,
+                        else => .null,
+                    };
+                    break :blk .null;
+                }
+                if (std.ascii.eqlIgnoreCase(call.name, "lower") or std.ascii.eqlIgnoreCase(call.name, "upper")) {
+                    if (argument == .text) {
+                        const copy = try self.allocator.dupe(u8, argument.text);
+                        for (copy) |*byte| byte.* = if (std.ascii.eqlIgnoreCase(call.name, "lower")) std.ascii.toLower(byte.*) else std.ascii.toUpper(byte.*);
+                        break :blk .{ .text = copy };
+                    }
+                    break :blk .null;
+                }
+                if (std.ascii.eqlIgnoreCase(call.name, "trim") or std.ascii.eqlIgnoreCase(call.name, "ltrim") or std.ascii.eqlIgnoreCase(call.name, "rtrim")) {
+                    if (argument == .text) {
+                        var start: usize = 0;
+                        var end: usize = argument.text.len;
+                        if (!std.ascii.eqlIgnoreCase(call.name, "rtrim")) while (start < end and std.ascii.isWhitespace(argument.text[start])) : (start += 1) {};
+                        if (!std.ascii.eqlIgnoreCase(call.name, "ltrim")) while (end > start and std.ascii.isWhitespace(argument.text[end - 1])) : (end -= 1) {};
+                        break :blk .{ .text = try self.allocator.dupe(u8, argument.text[start..end]) };
+                    }
+                    break :blk .null;
+                }
+                if (std.ascii.eqlIgnoreCase(call.name, "instr")) {
+                    const needle_expr = call.argument2 orelse return error.InvalidSql;
+                    const needle = try self.evalContext(table, row, needle_expr.*, parameters, outer);
+                    if (argument == .text and needle == .text) {
+                        const position = std.mem.indexOf(u8, argument.text, needle.text) orelse break :blk .{ .integer = 0 };
+                        break :blk .{ .integer = @intCast(position + 1) };
+                    }
+                    break :blk .null;
+                }
+                if (std.ascii.eqlIgnoreCase(call.name, "json_extract")) {
+                    const path_expr = call.argument2 orelse return error.InvalidSql;
+                    const path = try self.evalContext(table, row, path_expr.*, parameters, outer);
+                    break :blk try self.extractJsonTopLevel(argument, path);
+                }
+                if (std.ascii.eqlIgnoreCase(call.name, "nullif")) {
+                    const second_expr = call.argument2 orelse return error.InvalidSql;
+                    const second = try self.evalContext(table, row, second_expr.*, parameters, outer);
+                    if (sameValue(argument, second)) break :blk .null;
+                    break :blk argument;
+                }
+                if (std.ascii.eqlIgnoreCase(call.name, "coalesce") or std.ascii.eqlIgnoreCase(call.name, "ifnull")) {
+                    if (argument != .null) break :blk argument;
+                    if (call.argument2) |second| {
+                        const value = try self.evalContext(table, row, second.*, parameters, outer);
+                        if (value != .null or std.ascii.eqlIgnoreCase(call.name, "ifnull")) break :blk value;
+                    }
+                    if (call.argument3) |third| break :blk try self.evalContext(table, row, third.*, parameters, outer);
+                    break :blk .null;
+                }
                 return error.Unsupported;
             },
         };
     }
 
+    fn extractJsonTopLevel(self: *Connection, source: Value, path: Value) !Value {
+        if (source != .text or path != .text or !std.mem.startsWith(u8, path.text, "$.")) return .null;
+        const key = path.text[2..];
+        var cursor: usize = 0;
+        while (cursor < source.text.len) : (cursor += 1) {
+            if (source.text[cursor] != '"') continue;
+            const key_start = cursor + 1;
+            const key_end = std.mem.indexOfScalarPos(u8, source.text, key_start, '"') orelse break;
+            if (!std.mem.eql(u8, source.text[key_start..key_end], key)) {
+                cursor = key_end;
+                continue;
+            }
+            var value_start = key_end + 1;
+            while (value_start < source.text.len and (source.text[value_start] == ' ' or source.text[value_start] == '\t' or source.text[value_start] == ':')) : (value_start += 1) {}
+            if (value_start >= source.text.len) break;
+            if (source.text[value_start] == '"') {
+                const text_start = value_start + 1;
+                const text_end = std.mem.indexOfScalarPos(u8, source.text, text_start, '"') orelse break;
+                return .{ .text = try self.allocator.dupe(u8, source.text[text_start..text_end]) };
+            }
+            const value_end = std.mem.indexOfAnyPos(u8, source.text, value_start, ",}") orelse source.text.len;
+            const raw = std.mem.trim(u8, source.text[value_start..value_end], " \t\r\n");
+            if (std.mem.eql(u8, raw, "null")) return .null;
+            if (std.fmt.parseInt(i64, raw, 10)) |number| return .{ .integer = number } else |_| {}
+            if (std.fmt.parseFloat(f64, raw)) |number| return .{ .real = number } else |_| {}
+            return .null;
+        }
+        return .null;
+    }
+
+    fn globMatch(text: []const u8, pattern: []const u8) bool {
+        if (pattern.len == 0) return text.len == 0;
+        if (pattern[0] == '*') return globMatch(text, pattern[1..]) or (text.len != 0 and globMatch(text[1..], pattern));
+        if (text.len == 0) return false;
+        if (pattern[0] == '?') return globMatch(text[1..], pattern[1..]);
+        if (pattern[0] == '[') {
+            var i: usize = 1;
+            var matched = false;
+            var negated = false;
+            if (i < pattern.len and (pattern[i] == '^' or pattern[i] == '!')) {
+                negated = true;
+                i += 1;
+            }
+            while (i < pattern.len and pattern[i] != ']') : (i += 1) {
+                if (i + 2 < pattern.len and pattern[i + 1] == '-' and pattern[i + 2] != ']') {
+                    if (text[0] >= pattern[i] and text[0] <= pattern[i + 2]) matched = true;
+                    i += 2;
+                } else if (text[0] == pattern[i]) matched = true;
+            }
+            if (i >= pattern.len) return text[0] == '[' and globMatch(text[1..], pattern[1..]);
+            if (negated) matched = !matched;
+            return matched and globMatch(text[1..], pattern[i + 1 ..]);
+        }
+        return text[0] == pattern[0] and globMatch(text[1..], pattern[1..]);
+    }
+
     fn materialize(self: *Connection, table: *const Table, row: []const Value, expr: ast.Expr, parameters: []const Value) !Value {
         if (expr == .function) {
             const call = expr.function;
-            if (std.ascii.eqlIgnoreCase(call.name, "lower") or std.ascii.eqlIgnoreCase(call.name, "upper")) {
+            if (std.ascii.eqlIgnoreCase(call.name, "json_extract")) {
+                const path_expr = call.argument2 orelse return error.InvalidSql;
+                const source = try self.eval(table, row, call.argument.*, parameters);
+                const path = try self.eval(table, row, path_expr.*, parameters);
+                if (source == .text and path == .text and std.mem.startsWith(u8, path.text, "$.")) {
+                    const key = path.text[2..];
+                    var cursor: usize = 0;
+                    while (cursor < source.text.len) : (cursor += 1) {
+                        if (source.text[cursor] != '"') continue;
+                        const key_start = cursor + 1;
+                        const key_end = std.mem.indexOfScalarPos(u8, source.text, key_start, '"') orelse break;
+                        if (!std.mem.eql(u8, source.text[key_start..key_end], key)) {
+                            cursor = key_end;
+                            continue;
+                        }
+                        var value_start = key_end + 1;
+                        while (value_start < source.text.len and (source.text[value_start] == ' ' or source.text[value_start] == '\t' or source.text[value_start] == ':')) : (value_start += 1) {}
+                        if (value_start >= source.text.len) break;
+                        if (source.text[value_start] == '"') {
+                            const text_start = value_start + 1;
+                            const text_end = std.mem.indexOfScalarPos(u8, source.text, text_start, '"') orelse break;
+                            return .{ .text = try self.allocator.dupe(u8, source.text[text_start..text_end]) };
+                        }
+                        const value_end = std.mem.indexOfAnyPos(u8, source.text, value_start, ",}") orelse source.text.len;
+                        const raw = std.mem.trim(u8, source.text[value_start..value_end], " \t\r\n");
+                        if (std.mem.eql(u8, raw, "null")) return .null;
+                        if (std.fmt.parseInt(i64, raw, 10)) |number| return .{ .integer = number } else |_| {}
+                        if (std.fmt.parseFloat(f64, raw)) |number| return .{ .real = number } else |_| {}
+                        return .null;
+                    }
+                }
+                return .null;
+            }
+            if (std.ascii.eqlIgnoreCase(call.name, "json_set")) {
+                const path_expr = call.argument2 orelse return error.InvalidSql;
+                const value_expr = call.argument3 orelse return error.InvalidSql;
+                const source = try self.eval(table, row, call.argument.*, parameters);
+                const path = try self.eval(table, row, path_expr.*, parameters);
+                const replacement = try self.eval(table, row, value_expr.*, parameters);
+                if (source == .text and path == .text and replacement == .text and std.mem.startsWith(u8, path.text, "$.")) {
+                    const key = path.text[2..];
+                    var cursor: usize = 0;
+                    while (cursor < source.text.len) : (cursor += 1) {
+                        if (source.text[cursor] != '"') continue;
+                        const key_start = cursor + 1;
+                        const key_end = std.mem.indexOfScalarPos(u8, source.text, key_start, '"') orelse break;
+                        if (!std.mem.eql(u8, source.text[key_start..key_end], key)) {
+                            cursor = key_end;
+                            continue;
+                        }
+                        var value_start = key_end + 1;
+                        while (value_start < source.text.len and (source.text[value_start] == ' ' or source.text[value_start] == '\t' or source.text[value_start] == ':')) : (value_start += 1) {}
+                        const value_end = if (value_start < source.text.len and source.text[value_start] == '"') (std.mem.indexOfScalarPos(u8, source.text, value_start + 1, '"') orelse return .null) + 1 else (std.mem.indexOfAnyPos(u8, source.text, value_start, ",}") orelse source.text.len);
+                        var output = std.ArrayList(u8).empty;
+                        defer output.deinit(self.allocator);
+                        try output.appendSlice(self.allocator, source.text[0..value_start]);
+                        try output.append(self.allocator, '"');
+                        try output.appendSlice(self.allocator, replacement.text);
+                        try output.append(self.allocator, '"');
+                        try output.appendSlice(self.allocator, source.text[value_end..]);
+                        return .{ .text = try output.toOwnedSlice(self.allocator) };
+                    }
+                    if (source.text.len >= 2 and source.text[source.text.len - 1] == '}') {
+                        var body_end = source.text.len - 1;
+                        while (body_end > 0 and (source.text[body_end - 1] == ' ' or source.text[body_end - 1] == '\t' or source.text[body_end - 1] == '\r' or source.text[body_end - 1] == '\n')) : (body_end -= 1) {}
+                        const body = source.text[0..body_end];
+                        var output = std.ArrayList(u8).empty;
+                        defer output.deinit(self.allocator);
+                        try output.appendSlice(self.allocator, body);
+                        if (body.len != 1) try output.append(self.allocator, ',');
+                        try output.appendSlice(self.allocator, "\"");
+                        try output.appendSlice(self.allocator, key);
+                        try output.appendSlice(self.allocator, "\":\"");
+                        try output.appendSlice(self.allocator, replacement.text);
+                        try output.appendSlice(self.allocator, "\"}");
+                        return .{ .text = try output.toOwnedSlice(self.allocator) };
+                    }
+                }
+                return .null;
+            }
+            if (std.ascii.eqlIgnoreCase(call.name, "replace")) {
+                const old_expr = call.argument2 orelse return error.InvalidSql;
+                const new_expr = call.argument3 orelse return error.InvalidSql;
+                const source = try self.eval(table, row, call.argument.*, parameters);
+                const old = try self.eval(table, row, old_expr.*, parameters);
+                const replacement = try self.eval(table, row, new_expr.*, parameters);
+                if (source == .text and old == .text and replacement == .text) {
+                    var output = std.ArrayList(u8).empty;
+                    defer output.deinit(self.allocator);
+                    var offset: usize = 0;
+                    while (std.mem.indexOfPos(u8, source.text, offset, old.text)) |found| {
+                        try output.appendSlice(self.allocator, source.text[offset..found]);
+                        try output.appendSlice(self.allocator, replacement.text);
+                        offset = found + old.text.len;
+                        if (old.text.len == 0) break;
+                    }
+                    try output.appendSlice(self.allocator, source.text[offset..]);
+                    return .{ .text = try output.toOwnedSlice(self.allocator) };
+                }
+                return .null;
+            }
+            if (std.ascii.eqlIgnoreCase(call.name, "substr")) {
+                const start_expr = call.argument2 orelse return error.InvalidSql;
+                const source = try self.eval(table, row, call.argument.*, parameters);
+                const start = try self.eval(table, row, start_expr.*, parameters);
+                if (source == .text and start == .integer) {
+                    const start_index: usize = if (start.integer <= 1) 0 else @min(@as(usize, @intCast(start.integer - 1)), source.text.len);
+                    var end = source.text.len;
+                    if (call.argument3) |length_expr| {
+                        const length = try self.eval(table, row, length_expr.*, parameters);
+                        if (length != .integer) return .null;
+                        end = @min(source.text.len, start_index + @as(usize, @intCast(@max(length.integer, 0))));
+                    }
+                    return .{ .text = try self.allocator.dupe(u8, source.text[start_index..end]) };
+                }
+                return .null;
+            }
+            if (std.ascii.eqlIgnoreCase(call.name, "instr")) {
+                const needle_expr = call.argument2 orelse return error.InvalidSql;
+                const source = try self.eval(table, row, call.argument.*, parameters);
+                const needle = try self.eval(table, row, needle_expr.*, parameters);
+                if (source == .text and needle == .text) {
+                    const position = std.mem.indexOf(u8, source.text, needle.text) orelse return .{ .integer = 0 };
+                    return .{ .integer = @intCast(position + 1) };
+                }
+                return .null;
+            }
+            if (std.ascii.eqlIgnoreCase(call.name, "lower") or std.ascii.eqlIgnoreCase(call.name, "upper") or std.ascii.eqlIgnoreCase(call.name, "trim") or std.ascii.eqlIgnoreCase(call.name, "ltrim") or std.ascii.eqlIgnoreCase(call.name, "rtrim")) {
                 const argument = try self.eval(table, row, call.argument.*, parameters);
                 if (argument == .text) {
-                    const copy = try self.allocator.dupe(u8, argument.text);
-                    for (copy) |*byte| {
-                        if (std.ascii.eqlIgnoreCase(call.name, "lower")) {
-                            byte.* = std.ascii.toLower(byte.*);
-                        } else {
-                            byte.* = std.ascii.toUpper(byte.*);
-                        }
+                    if (std.ascii.eqlIgnoreCase(call.name, "trim") or std.ascii.eqlIgnoreCase(call.name, "ltrim") or std.ascii.eqlIgnoreCase(call.name, "rtrim")) {
+                        var start: usize = 0;
+                        var end: usize = argument.text.len;
+                        if (!std.ascii.eqlIgnoreCase(call.name, "rtrim")) while (start < end and std.ascii.isWhitespace(argument.text[start])) : (start += 1) {};
+                        if (!std.ascii.eqlIgnoreCase(call.name, "ltrim")) while (end > start and std.ascii.isWhitespace(argument.text[end - 1])) : (end -= 1) {};
+                        return .{ .text = try self.allocator.dupe(u8, argument.text[start..end]) };
                     }
+                    const copy = try self.allocator.dupe(u8, argument.text);
+                    for (copy) |*byte| byte.* = if (std.ascii.eqlIgnoreCase(call.name, "lower")) std.ascii.toLower(byte.*) else std.ascii.toUpper(byte.*);
                     return .{ .text = copy };
                 }
             }
@@ -2640,4 +2946,488 @@ test "ordinary UPDATE evaluates row expressions" {
     defer rows.deinit();
     try std.testing.expectEqual(@as(i64, 15), rows.rows[0][0].integer);
     try std.testing.expectEqualStrings("new", rows.rows[0][1].text);
+}
+
+test "GLOB supports wildcards, character classes, and typed DSL" {
+    const path = "sqlite_zig_glob_test.db";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    const User = @import("../dsl/table.zig").table("glob_items", struct { id: i64, name: []const u8 });
+    var db = try Connection.open(std.testing.allocator, path);
+    defer db.close();
+    var created = try db.exec("CREATE TABLE glob_items (id INTEGER, name TEXT); INSERT INTO glob_items VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Rob');");
+    created.deinit();
+    var raw = try db.exec("SELECT id FROM glob_items WHERE name GLOB '[BR]ob' ORDER BY id;");
+    defer raw.deinit();
+    try std.testing.expectEqual(@as(usize, 2), raw.rowCount());
+    var typed = try db.from(User).select("*").where(User.column("name").glob("A*")).fetchAll();
+    defer typed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), typed.rowCount());
+}
+
+test "trim family works in raw and typed projections" {
+    const path = "sqlite_zig_trim_test.db";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    const Item = @import("../dsl/table.zig").table("trim_items", struct { id: i64, label: []const u8 });
+    var db = try Connection.open(std.testing.allocator, path);
+    defer db.close();
+    var created = try db.exec("CREATE TABLE trim_items (id INTEGER, label TEXT); INSERT INTO trim_items VALUES (1, '  Alpha  ');");
+    created.deinit();
+    var raw = try db.exec("SELECT TRIM(label), LTRIM(label), RTRIM(label) FROM trim_items;");
+    defer raw.deinit();
+    try std.testing.expectEqualStrings("Alpha", raw.rows[0][0].text);
+    try std.testing.expectEqualStrings("Alpha  ", raw.rows[0][1].text);
+    try std.testing.expectEqualStrings("  Alpha", raw.rows[0][2].text);
+    var typed = try db.from(Item).trimColumn(Item.key("label")).fetchAll();
+    defer typed.deinit();
+    try std.testing.expectEqualStrings("Alpha", typed.rows[0][0].text);
+}
+
+test "replace and substr support multiple scalar arguments" {
+    const path = "sqlite_zig_string_functions_test.db";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    var db = try Connection.open(std.testing.allocator, path);
+    defer db.close();
+    var created = try db.exec("CREATE TABLE string_items (label TEXT); INSERT INTO string_items VALUES ('Alice in SQLite');");
+    created.deinit();
+    var rows = try db.exec("SELECT REPLACE(label, 'SQLite', 'Zig'), SUBSTR(label, 1, 5) FROM string_items;");
+    defer rows.deinit();
+    try std.testing.expectEqualStrings("Alice in Zig", rows.rows[0][0].text);
+    try std.testing.expectEqualStrings("Alice", rows.rows[0][1].text);
+}
+
+test "typed replace and substr projections check columns at compile time" {
+    const path = "sqlite_zig_typed_string_functions_test.db";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    const Item = @import("../dsl/table.zig").table("typed_string_items", struct { id: i64, label: []const u8 });
+    var db = try Connection.open(std.testing.allocator, path);
+    defer db.close();
+    var created = try db.exec("CREATE TABLE typed_string_items (id INTEGER, label TEXT); INSERT INTO typed_string_items VALUES (1, 'Alice in SQLite');");
+    created.deinit();
+    var replaced = try db.from(Item).replaceColumn(Item.key("label"), "SQLite", "Zig").fetchAll();
+    defer replaced.deinit();
+    try std.testing.expectEqualStrings("Alice in Zig", replaced.rows[0][0].text);
+    var shortened = try db.from(Item).substrColumn(Item.key("label"), 1, 5).fetchAll();
+    defer shortened.deinit();
+    try std.testing.expectEqualStrings("Alice", shortened.rows[0][0].text);
+}
+
+test "typed fetch maps result columns into the table struct" {
+    const path = "sqlite_zig_typed_fetch_test.db";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    const Item = @import("../dsl/table.zig").table("typed_fetch_items", struct { id: i64, label: []const u8 });
+    var db = try Connection.open(std.testing.allocator, path);
+    defer db.close();
+    var created = try db.exec("CREATE TABLE typed_fetch_items (id INTEGER, label TEXT); INSERT INTO typed_fetch_items VALUES (7, 'mapped');");
+    created.deinit();
+    var typed = try db.from(Item).selectColumns(&.{ Item.key("label"), Item.key("id") }).fetchTyped();
+    defer typed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), typed.rowCount());
+    try std.testing.expectEqual(@as(i64, 7), typed.rows[0].id);
+    try std.testing.expectEqualStrings("mapped", typed.rows[0].label);
+}
+
+test "coalesce, ifnull, and instr evaluate their arguments" {
+    const path = "sqlite_zig_coalesce_instr_test.db";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    var db = try Connection.open(std.testing.allocator, path);
+    defer db.close();
+    var created = try db.exec("CREATE TABLE scalar_items (a TEXT, b TEXT); INSERT INTO scalar_items VALUES (NULL, 'fallback');");
+    created.deinit();
+    var rows = try db.exec("SELECT COALESCE(a, NULL, b), IFNULL(a, b), INSTR(b, 'back') FROM scalar_items;");
+    defer rows.deinit();
+    try std.testing.expectEqualStrings("fallback", rows.rows[0][0].text);
+    try std.testing.expectEqualStrings("fallback", rows.rows[0][1].text);
+    try std.testing.expectEqual(@as(i64, 5), rows.rows[0][2].integer);
+}
+
+test "NOT GLOB works in raw SQL and typed DSL" {
+    const path = "sqlite_zig_not_glob_test.db";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    const Item = @import("../dsl/table.zig").table("not_glob_items", struct { id: i64, name: []const u8 });
+    var db = try Connection.open(std.testing.allocator, path);
+    defer db.close();
+    var created = try db.exec("CREATE TABLE not_glob_items (id INTEGER, name TEXT); INSERT INTO not_glob_items VALUES (1, 'Alice'), (2, 'Bob');");
+    created.deinit();
+    var raw = try db.exec("SELECT id FROM not_glob_items WHERE name NOT GLOB 'A*';");
+    defer raw.deinit();
+    try std.testing.expectEqual(@as(usize, 1), raw.rowCount());
+    var typed = try db.from(Item).where(Item.column("name").notGlob("A*")).fetchAll();
+    defer typed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), typed.rowCount());
+}
+
+test "typed fetch maps SQLite NULL into optional struct fields" {
+    const path = "sqlite_zig_typed_optional_fetch_test.db";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    const Item = @import("../dsl/table.zig").table("typed_optional_items", struct { id: i64, label: ?[]const u8 });
+    var db = try Connection.open(std.testing.allocator, path);
+    defer db.close();
+    var created = try db.exec("CREATE TABLE typed_optional_items (id INTEGER, label TEXT); INSERT INTO typed_optional_items VALUES (1, NULL), (2, 'present');");
+    created.deinit();
+    var typed = try db.from(Item).fetchTyped();
+    defer typed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), typed.rowCount());
+    try std.testing.expect(typed.rows[0].label == null);
+    try std.testing.expectEqualStrings("present", typed.rows[1].label.?);
+}
+
+test "typed boolean fields use SQLite INTEGER affinity" {
+    const path = "sqlite_zig_typed_bool_test.db";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    const Item = @import("../dsl/table.zig").table("typed_bool_items", struct { id: i64, enabled: bool });
+    var db = try Connection.open(std.testing.allocator, path);
+    defer db.close();
+    try db.createTable(Item, .{});
+    var inserted = try db.from(Item).insert(.{ .id = 1, .enabled = true });
+    inserted.deinit();
+    var typed = try db.from(Item).fetchTyped();
+    defer typed.deinit();
+    try std.testing.expect(typed.rows[0].enabled);
+}
+
+test "LIKE is ASCII case-insensitive while GLOB remains case-sensitive" {
+    const path = "sqlite_zig_like_case_test.db";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    var db = try Connection.open(std.testing.allocator, path);
+    defer db.close();
+    var created = try db.exec("CREATE TABLE case_items (name TEXT); INSERT INTO case_items VALUES ('Alice');");
+    created.deinit();
+    var like_rows = try db.exec("SELECT name FROM case_items WHERE name LIKE 'a%';");
+    defer like_rows.deinit();
+    try std.testing.expectEqual(@as(usize, 1), like_rows.rowCount());
+    var glob_rows = try db.exec("SELECT name FROM case_items WHERE name GLOB 'a*';");
+    defer glob_rows.deinit();
+    try std.testing.expectEqual(@as(usize, 0), glob_rows.rowCount());
+}
+
+test "function expressions are valid predicate left-hand sides" {
+    const path = "sqlite_zig_function_predicate_test.db";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    var db = try Connection.open(std.testing.allocator, path);
+    defer db.close();
+    var created = try db.exec("CREATE TABLE function_predicate_items (name TEXT); INSERT INTO function_predicate_items VALUES ('Alice'), ('Bob');");
+    created.deinit();
+    var rows = try db.exec("SELECT name FROM function_predicate_items WHERE LOWER(name) = 'alice';");
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(usize, 1), rows.rowCount());
+    try std.testing.expectEqualStrings("Alice", rows.rows[0][0].text);
+}
+
+test "trim functions work in predicate expressions" {
+    const path = "sqlite_zig_trim_predicate_test.db";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    var db = try Connection.open(std.testing.allocator, path);
+    defer db.close();
+    var created = try db.exec("CREATE TABLE trim_predicate_items (name TEXT); INSERT INTO trim_predicate_items VALUES ('  Alice  '), ('Bob');");
+    created.deinit();
+    var rows = try db.exec("SELECT name FROM trim_predicate_items WHERE TRIM(name) = 'Alice';");
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(usize, 1), rows.rowCount());
+    try std.testing.expectEqualStrings("  Alice  ", rows.rows[0][0].text);
+}
+
+test "INSTR works in numeric predicate expressions" {
+    const path = "sqlite_zig_instr_predicate_test.db";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    var db = try Connection.open(std.testing.allocator, path);
+    defer db.close();
+    var created = try db.exec("CREATE TABLE instr_predicate_items (name TEXT); INSERT INTO instr_predicate_items VALUES ('SQLite'), ('Zig');");
+    created.deinit();
+    var rows = try db.exec("SELECT name FROM instr_predicate_items WHERE INSTR(name, 'ite') > 0;");
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(usize, 1), rows.rowCount());
+    try std.testing.expectEqualStrings("SQLite", rows.rows[0][0].text);
+}
+
+test "typed DSL function predicates validate columns" {
+    const path = "sqlite_zig_typed_function_predicate_test.db";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    const Item = @import("../dsl/table.zig").table("typed_function_items", struct { name: []const u8 });
+    var db = try Connection.open(std.testing.allocator, path);
+    defer db.close();
+    var created = try db.exec("CREATE TABLE typed_function_items (name TEXT); INSERT INTO typed_function_items VALUES ('  Alice  '), ('Alice'), ('Bob');");
+    created.deinit();
+    var lower = try db.from(Item).whereLower(Item.key("name"), "alice").fetchAll();
+    defer lower.deinit();
+    try std.testing.expectEqual(@as(usize, 1), lower.rowCount());
+    var trimmed = try db.from(Item).whereTrim(Item.key("name"), "Alice").fetchAll();
+    defer trimmed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), trimmed.rowCount());
+}
+
+test "generic typed function predicate supports scalar comparisons" {
+    const path = "sqlite_zig_generic_function_predicate_test.db";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    const Item = @import("../dsl/table.zig").table("generic_function_items", struct { name: []const u8 });
+    var db = try Connection.open(std.testing.allocator, path);
+    defer db.close();
+    var created = try db.exec("CREATE TABLE generic_function_items (name TEXT); INSERT INTO generic_function_items VALUES ('long'), ('x');");
+    created.deinit();
+    var rows = try db.from(Item).whereFunction("LENGTH", Item.key("name"), .greater, 1).fetchAll();
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(usize, 1), rows.rowCount());
+}
+
+test "typed two-argument function predicates support INSTR" {
+    const path = "sqlite_zig_typed_function2_predicate_test.db";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    const Item = @import("../dsl/table.zig").table("typed_function2_items", struct { name: []const u8 });
+    var db = try Connection.open(std.testing.allocator, path);
+    defer db.close();
+    var created = try db.exec("CREATE TABLE typed_function2_items (name TEXT); INSERT INTO typed_function2_items VALUES ('SQLite'), ('Zig');");
+    created.deinit();
+    var rows = try db.from(Item).whereFunction2("INSTR", Item.key("name"), "ite", .greater, 0).fetchAll();
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(usize, 1), rows.rowCount());
+}
+
+test "NULL-safe IS DISTINCT FROM works in raw SQL and typed DSL" {
+    const path = "sqlite_zig_distinct_predicate_test.db";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    const Item = @import("../dsl/table.zig").table("distinct_items", struct { id: i64, label: ?[]const u8 });
+    var db = try Connection.open(std.testing.allocator, path);
+    defer db.close();
+    var created = try db.exec("CREATE TABLE distinct_items (id INTEGER, label TEXT); INSERT INTO distinct_items VALUES (1, NULL), (2, 'x');");
+    created.deinit();
+    var raw = try db.exec("SELECT id FROM distinct_items WHERE label IS NOT DISTINCT FROM NULL ORDER BY id;");
+    defer raw.deinit();
+    try std.testing.expectEqual(@as(usize, 1), raw.rowCount());
+    try std.testing.expectEqual(@as(i64, 1), raw.rows[0][0].integer);
+    var typed = try db.from(Item).where(Item.column("label").isDistinctFrom(@as(Value, .null))).fetchAll();
+    defer typed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), typed.rowCount());
+    try std.testing.expectEqual(@as(i64, 2), typed.rows[0][0].integer);
+}
+
+test "NULLIF returns NULL only when its arguments are equal" {
+    const path = "sqlite_zig_nullif_test.db";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    var db = try Connection.open(std.testing.allocator, path);
+    defer db.close();
+    var created = try db.exec("CREATE TABLE nullif_items (value INTEGER); INSERT INTO nullif_items VALUES (0), (7);");
+    created.deinit();
+    var rows = try db.exec("SELECT NULLIF(value, 0), NULLIF(value, 7) FROM nullif_items ORDER BY value;");
+    defer rows.deinit();
+    try std.testing.expect(rows.rows[0][0] == .null);
+    try std.testing.expectEqual(@as(i64, 0), rows.rows[0][1].integer);
+    try std.testing.expectEqual(@as(i64, 7), rows.rows[1][0].integer);
+    try std.testing.expect(rows.rows[1][1] == .null);
+}
+
+test "ROUND works in raw and typed projections" {
+    const path = "sqlite_zig_round_test.db";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    const Item = @import("../dsl/table.zig").table("round_items", struct { value: f64 });
+    var db = try Connection.open(std.testing.allocator, path);
+    defer db.close();
+    var created = try db.exec("CREATE TABLE round_items (value REAL); INSERT INTO round_items VALUES (1.6), (2.2);");
+    created.deinit();
+    var raw = try db.exec("SELECT ROUND(value) FROM round_items ORDER BY value;");
+    defer raw.deinit();
+    try std.testing.expectEqual(@as(f64, 2), raw.rows[0][0].real);
+    var typed = try db.from(Item).roundColumn(Item.key("value")).fetchAll();
+    defer typed.deinit();
+    try std.testing.expectEqual(@as(f64, 2), typed.rows[0][0].real);
+}
+
+test "ROUND honors positive and negative precision" {
+    const path = "sqlite_zig_round_precision_test.db";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    var db = try Connection.open(std.testing.allocator, path);
+    defer db.close();
+    var created = try db.exec("CREATE TABLE round_precision_items (id INTEGER); INSERT INTO round_precision_items VALUES (1);");
+    created.deinit();
+    var rows = try db.exec("SELECT ROUND(1.236, 2), ROUND(123, -1) FROM round_precision_items;");
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(f64, 1.24), rows.rows[0][0].real);
+    try std.testing.expectEqual(@as(f64, 120), rows.rows[0][1].real);
+}
+
+test "CAST supports INTEGER, REAL, and TEXT affinities" {
+    const path = "sqlite_zig_cast_test.db";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    const Item = @import("../dsl/table.zig").table("cast_items", struct { value: []const u8 });
+    var db = try Connection.open(std.testing.allocator, path);
+    defer db.close();
+    var created = try db.exec("CREATE TABLE cast_items (value TEXT); INSERT INTO cast_items VALUES ('42');");
+    created.deinit();
+    var raw = try db.exec("SELECT CAST(value AS INTEGER), CAST(value AS REAL), CAST(value AS TEXT) FROM cast_items;");
+    defer raw.deinit();
+    try std.testing.expectEqual(@as(i64, 42), raw.rows[0][0].integer);
+    try std.testing.expectEqual(@as(f64, 42), raw.rows[0][1].real);
+    try std.testing.expectEqualStrings("42", raw.rows[0][2].text);
+    var typed = try db.from(Item).castColumn(Item.key("value"), "INTEGER").fetchAll();
+    defer typed.deinit();
+    try std.testing.expectEqual(@as(i64, 42), typed.rows[0][0].integer);
+}
+
+test "json_extract reads simple top-level scalar object fields" {
+    const path = "sqlite_zig_json_extract_test.db";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    var db = try Connection.open(std.testing.allocator, path);
+    defer db.close();
+    var created = try db.exec("CREATE TABLE json_items (payload TEXT); INSERT INTO json_items VALUES ('{\"name\":\"Alice\",\"age\":42,\"missing\":null}');");
+    created.deinit();
+    var rows = try db.exec("SELECT json_extract(payload, '$.name'), json_extract(payload, '$.age'), json_extract(payload, '$.missing') FROM json_items;");
+    defer rows.deinit();
+    try std.testing.expectEqualStrings("Alice", rows.rows[0][0].text);
+    try std.testing.expectEqual(@as(i64, 42), rows.rows[0][1].integer);
+    try std.testing.expect(rows.rows[0][2] == .null);
+}
+
+test "typed json_extract validates the source column" {
+    const path = "sqlite_zig_typed_json_extract_test.db";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    const Item = @import("../dsl/table.zig").table("typed_json_items", struct { payload: []const u8 });
+    var db = try Connection.open(std.testing.allocator, path);
+    defer db.close();
+    var created = try db.exec("CREATE TABLE typed_json_items (payload TEXT); INSERT INTO typed_json_items VALUES ('{\"name\":\"Alice\"}'), ('{\"name\":\"Bob\"}');");
+    created.deinit();
+    var typed = try db.from(Item).jsonExtractColumn(Item.key("payload"), "$.name").fetchAll();
+    defer typed.deinit();
+    try std.testing.expectEqualStrings("Alice", typed.rows[0][0].text);
+    var filtered = try db.from(Item).whereJsonExtract(Item.key("payload"), "$.name", .equal, "Bob").fetchAll();
+    defer filtered.deinit();
+    try std.testing.expectEqual(@as(usize, 1), filtered.rowCount());
+}
+
+test "typed text convenience predicates compile to LIKE" {
+    const path = "sqlite_zig_text_predicates_test.db";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    const Item = @import("../dsl/table.zig").table("text_predicate_items", struct { name: []const u8 });
+    var db = try Connection.open(std.testing.allocator, path);
+    defer db.close();
+    var created = try db.exec("CREATE TABLE text_predicate_items (name TEXT); INSERT INTO text_predicate_items VALUES ('Alice'), ('Malice'), ('Bob');");
+    created.deinit();
+    var contains = try db.from(Item).where(Item.column("name").contains("ali")).fetchAll();
+    defer contains.deinit();
+    try std.testing.expectEqual(@as(usize, 2), contains.rowCount());
+    var starts = try db.from(Item).where(Item.column("name").startsWith("Al")).fetchAll();
+    defer starts.deinit();
+    try std.testing.expectEqual(@as(usize, 1), starts.rowCount());
+    var ends = try db.from(Item).where(Item.column("name").endsWith("ob")).fetchAll();
+    defer ends.deinit();
+    try std.testing.expectEqual(@as(usize, 1), ends.rowCount());
+    var not_contains = try db.from(Item).where(Item.column("name").notContains("ali")).fetchAll();
+    defer not_contains.deinit();
+    try std.testing.expectEqual(@as(usize, 1), not_contains.rowCount());
+}
+
+test "select accepts typed column arrays" {
+    const path = "sqlite_zig_typed_select_test.db";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    const Item = @import("../dsl/table.zig").table("typed_select_items", struct { id: i64, label: []const u8 });
+    var db = try Connection.open(std.testing.allocator, path);
+    defer db.close();
+    var created = try db.exec("CREATE TABLE typed_select_items (id INTEGER, label TEXT); INSERT INTO typed_select_items VALUES (7, 'seven');");
+    created.deinit();
+    var rows = try db.from(Item).selectTyped(&.{ Item.key("label"), Item.key("id") }).fetchAll();
+    defer rows.deinit();
+    try std.testing.expectEqualStrings("seven", rows.rows[0][0].text);
+    try std.testing.expectEqual(@as(i64, 7), rows.rows[0][1].integer);
+}
+
+test "fetchOneTyped returns a mapped row or null" {
+    const path = "sqlite_zig_fetch_one_typed_test.db";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    const Item = @import("../dsl/table.zig").table("fetch_one_items", struct { id: i64, label: []const u8 });
+    var db = try Connection.open(std.testing.allocator, path);
+    defer db.close();
+    var created = try db.exec("CREATE TABLE fetch_one_items (id INTEGER, label TEXT); INSERT INTO fetch_one_items VALUES (3, 'three');");
+    created.deinit();
+    var row = (try db.from(Item).where(Item.column("id").eq(3)).fetchOneTyped()).?;
+    defer db.from(Item).deinitTypedRow(&row);
+    try std.testing.expectEqual(@as(i64, 3), row.id);
+    try std.testing.expectEqualStrings("three", row.label);
+    const missing = try db.from(Item).where(Item.column("id").eq(99)).fetchOneTyped();
+    try std.testing.expect(missing == null);
+}
+
+test "typed coalesce and ifnull projections use SQLite null semantics" {
+    const path = "sqlite_zig_typed_null_functions_test.db";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    const Item = @import("../dsl/table.zig").table("typed_null_function_items", struct { label: ?[]const u8 });
+    var db = try Connection.open(std.testing.allocator, path);
+    defer db.close();
+    var created = try db.exec("CREATE TABLE typed_null_function_items (label TEXT); INSERT INTO typed_null_function_items VALUES (NULL), ('ready');");
+    created.deinit();
+    var coalesced = try db.from(Item).coalesceColumn(Item.key("label"), "fallback").fetchAll();
+    defer coalesced.deinit();
+    try std.testing.expectEqualStrings("fallback", coalesced.rows[0][0].text);
+    try std.testing.expectEqualStrings("ready", coalesced.rows[1][0].text);
+    var ifnulled = try db.from(Item).ifNullColumn(Item.key("label"), 7).fetchAll();
+    defer ifnulled.deinit();
+    try std.testing.expectEqual(@as(i64, 7), ifnulled.rows[0][0].integer);
+}
+
+test "json_set updates a simple top-level scalar key" {
+    const path = "sqlite_zig_json_set_test.db";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    const Item = @import("../dsl/table.zig").table("json_set_items", struct { payload: []const u8 });
+    var db = try Connection.open(std.testing.allocator, path);
+    defer db.close();
+    var created = try db.exec("CREATE TABLE json_set_items (payload TEXT); INSERT INTO json_set_items VALUES ('{\"city\":\"London\"}');");
+    created.deinit();
+    var raw = try db.exec("SELECT json_set(payload, '$.city', 'Paris') FROM json_set_items;");
+    defer raw.deinit();
+    try std.testing.expectEqualStrings("{\"city\":\"Paris\"}", raw.rows[0][0].text);
+    var typed = try db.from(Item).jsonSetColumn(Item.key("payload"), "$.city", "Paris").fetchAll();
+    defer typed.deinit();
+    try std.testing.expectEqualStrings("{\"city\":\"Paris\"}", typed.rows[0][0].text);
+    var inserted = try db.exec("SELECT json_set(payload, '$.country', 'UK') FROM json_set_items;");
+    defer inserted.deinit();
+    try std.testing.expectEqualStrings("{\"city\":\"London\",\"country\":\"UK\"}", inserted.rows[0][0].text);
+}
+
+test "raw DSL queries schema-less tables with runtime columns" {
+    const path = "sqlite_zig_dynamic_dsl_test.db";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    var db = try Connection.open(std.testing.allocator, path);
+    defer db.close();
+    var created = try db.exec("CREATE TABLE dynamic_items (id INTEGER, name TEXT); INSERT INTO dynamic_items VALUES (1, 'Alice'), (2, 'Bob');");
+    created.deinit();
+    var rows = try db.from("dynamic_items").where(db.col("id").gte(2)).select("name").fetchAll();
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(usize, 1), rows.rowCount());
+    try std.testing.expectEqualStrings("Bob", rows.rows[0][0].text);
+    var compound = try db.from("dynamic_items").where(db.col("id").gt(0)).andWhere(db.col("name").like("B%")).fetchAll();
+    defer compound.deinit();
+    try std.testing.expectEqual(@as(usize, 1), compound.rowCount());
+    var glob = try db.from("dynamic_items").where(db.col("name").glob("A*")).fetchAll();
+    defer glob.deinit();
+    try std.testing.expectEqual(@as(usize, 1), glob.rowCount());
+    var nulls = try db.exec("INSERT INTO dynamic_items VALUES (3, NULL);");
+    nulls.deinit();
+    var missing = try db.from("dynamic_items").where(db.col("name").isNull()).fetchAll();
+    defer missing.deinit();
+    try std.testing.expectEqual(@as(usize, 1), missing.rowCount());
 }

@@ -104,6 +104,8 @@ pub fn build(b: *std.Build) void {
         "45_literal_in_lists",
         "46_raw_alter_table",
         "47_column_defaults",
+        "48_raw_dsl",
+        "49_sqlite_coverage_layers",
     };
 
     inline for (examples) |name| {

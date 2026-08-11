@@ -44,6 +44,7 @@ fn appendValue(allocator: std.mem.Allocator, list: *std.ArrayList(u8), value: an
         return list.appendSlice(allocator, "NULL");
     }
     switch (@typeInfo(T)) {
+        .bool => if (value) try list.appendSlice(allocator, "1") else try list.appendSlice(allocator, "0"),
         .int, .comptime_int => {
             const rendered = try std.fmt.allocPrint(allocator, "{d}", .{@as(i64, @intCast(value))});
             defer allocator.free(rendered);
@@ -62,11 +63,31 @@ fn appendValue(allocator: std.mem.Allocator, list: *std.ArrayList(u8), value: an
 fn toDslValue(value: anytype) Value {
     const T = @TypeOf(value);
     if (T == Value) return value;
+    if (@typeInfo(T) == .optional) {
+        if (value) |present| return toDslValue(present);
+        return .null;
+    }
     return switch (@typeInfo(T)) {
+        .bool => .{ .integer = if (value) 1 else 0 },
         .int, .comptime_int => .{ .integer = @intCast(value) },
         .float, .comptime_float => .{ .real = @floatCast(value) },
         .pointer => .{ .text = value },
         else => @compileError("unsupported DSL IN value"),
+    };
+}
+
+fn nullFallbackSql(comptime function_name: []const u8, comptime field_name: []const u8, comptime value: anytype) []const u8 {
+    const T = @TypeOf(value);
+    if (T == []const u8 or (@typeInfo(T) == .pointer and
+        @typeInfo(@typeInfo(T).pointer.child) == .array and
+        @typeInfo(@typeInfo(T).pointer.child).array.child == u8)) {
+        return std.fmt.comptimePrint("{s}({s}, '{s}')", .{ function_name, field_name, value });
+    }
+    return switch (@typeInfo(T)) {
+        .int, .comptime_int => std.fmt.comptimePrint("{s}({s}, {d})", .{ function_name, field_name, value }),
+        .float, .comptime_float => std.fmt.comptimePrint("{s}({s}, {d})", .{ function_name, field_name, value }),
+        .bool => std.fmt.comptimePrint("{s}({s}, {d})", .{ function_name, field_name, if (value) 1 else 0 }),
+        else => @compileError("unsupported scalar fallback"),
     };
 }
 
@@ -173,6 +194,54 @@ pub fn Query(comptime TableType: type) type {
             return self.scalarColumn("UPPER", field);
         }
 
+        pub fn trimColumn(self: Self, comptime field: ColumnKey) Self {
+            return self.scalarColumn("TRIM", field);
+        }
+
+        pub fn ltrimColumn(self: Self, comptime field: ColumnKey) Self {
+            return self.scalarColumn("LTRIM", field);
+        }
+
+        pub fn rtrimColumn(self: Self, comptime field: ColumnKey) Self {
+            return self.scalarColumn("RTRIM", field);
+        }
+
+        pub fn replaceColumn(self: Self, comptime field: ColumnKey, comptime search: []const u8, comptime replacement: []const u8) Self {
+            _ = checkedColumn(field);
+            var copy = self;
+            copy.projection = std.fmt.comptimePrint("REPLACE({s}, '{s}', '{s}')", .{ field.name, search, replacement });
+            copy.scalar_function = null;
+            copy.scalar_field = null;
+            copy.selected_fields = null;
+            copy.selected_columns = null;
+            return copy;
+        }
+
+        pub fn substrColumn(self: Self, comptime field: ColumnKey, comptime start: i64, comptime length: ?i64) Self {
+            _ = checkedColumn(field);
+            var copy = self;
+            copy.projection = if (length) |amount|
+                std.fmt.comptimePrint("SUBSTR({s}, {d}, {d})", .{ field.name, start, amount })
+            else
+                std.fmt.comptimePrint("SUBSTR({s}, {d})", .{ field.name, start });
+            copy.scalar_function = null;
+            copy.scalar_field = null;
+            copy.selected_fields = null;
+            copy.selected_columns = null;
+            return copy;
+        }
+
+        pub fn instrColumn(self: Self, comptime field: ColumnKey, comptime needle: []const u8) Self {
+            _ = checkedColumn(field);
+            var copy = self;
+            copy.projection = std.fmt.comptimePrint("INSTR({s}, '{s}')", .{ field.name, needle });
+            copy.scalar_function = null;
+            copy.scalar_field = null;
+            copy.selected_fields = null;
+            copy.selected_columns = null;
+            return copy;
+        }
+
         pub fn lengthColumn(self: Self, comptime field: ColumnKey) Self {
             return self.scalarColumn("LENGTH", field);
         }
@@ -181,8 +250,67 @@ pub fn Query(comptime TableType: type) type {
             return self.scalarColumn("ABS", field);
         }
 
+        pub fn roundColumn(self: Self, comptime field: ColumnKey) Self {
+            return self.scalarColumn("ROUND", field);
+        }
+
+        pub fn castColumn(self: Self, comptime field: ColumnKey, comptime target_type: []const u8) Self {
+            _ = checkedColumn(field);
+            var copy = self;
+            copy.projection = std.fmt.comptimePrint("CAST({s} AS {s})", .{ field.name, target_type });
+            copy.scalar_function = null;
+            copy.scalar_field = null;
+            copy.selected_fields = null;
+            copy.selected_columns = null;
+            return copy;
+        }
+
+        pub fn jsonExtractColumn(self: Self, comptime field: ColumnKey, comptime path: []const u8) Self {
+            _ = checkedColumn(field);
+            var copy = self;
+            copy.projection = std.fmt.comptimePrint("json_extract({s}, '{s}')", .{ field.name, path });
+            copy.scalar_function = null;
+            copy.scalar_field = null;
+            copy.selected_fields = null;
+            copy.selected_columns = null;
+            return copy;
+        }
+
+        pub fn jsonSetColumn(self: Self, comptime field: ColumnKey, comptime path: []const u8, comptime value: []const u8) Self {
+            _ = checkedColumn(field);
+            var copy = self;
+            copy.projection = std.fmt.comptimePrint("json_set({s}, '{s}', '{s}')", .{ field.name, path, value });
+            copy.scalar_function = null;
+            copy.scalar_field = null;
+            copy.selected_fields = null;
+            copy.selected_columns = null;
+            return copy;
+        }
+
         pub fn typeofColumn(self: Self, comptime field: ColumnKey) Self {
             return self.scalarColumn("TYPEOF", field);
+        }
+
+        pub fn coalesceColumn(self: Self, comptime field: ColumnKey, comptime fallback: anytype) Self {
+            _ = checkedColumn(field);
+            var copy = self;
+            copy.projection = nullFallbackSql("COALESCE", field.name, fallback);
+            copy.scalar_function = null;
+            copy.scalar_field = null;
+            copy.selected_fields = null;
+            copy.selected_columns = null;
+            return copy;
+        }
+
+        pub fn ifNullColumn(self: Self, comptime field: ColumnKey, comptime fallback: anytype) Self {
+            _ = checkedColumn(field);
+            var copy = self;
+            copy.projection = nullFallbackSql("IFNULL", field.name, fallback);
+            copy.scalar_function = null;
+            copy.scalar_field = null;
+            copy.selected_fields = null;
+            copy.selected_columns = null;
+            return copy;
         }
 
         pub fn distinct(self: Self) Self {
@@ -213,11 +341,39 @@ pub fn Query(comptime TableType: type) type {
             return copy;
         }
 
+        pub fn selectTyped(self: Self, comptime fields: []const ColumnKey) Self {
+            return self.selectColumns(fields);
+        }
+
         pub fn where(self: Self, condition: Expr) Self {
             var copy = self;
             copy.condition = condition;
             copy.additional_condition_count = 0;
             return copy;
+        }
+
+        pub fn whereLower(self: Self, comptime field: ColumnKey, value: anytype) Self {
+            return self.whereFunction("LOWER", field, .equal, value);
+        }
+
+        pub fn whereUpper(self: Self, comptime field: ColumnKey, value: anytype) Self {
+            return self.whereFunction("UPPER", field, .equal, value);
+        }
+
+        pub fn whereTrim(self: Self, comptime field: ColumnKey, value: anytype) Self {
+            return self.whereFunction("TRIM", field, .equal, value);
+        }
+
+        pub fn whereFunction(self: Self, comptime function_name: []const u8, comptime field: ColumnKey, comptime operator: @import("expr.zig").Operator, value: anytype) Self {
+            return self.where(.{ .column = checkedColumn(field), .operator = operator, .value = toDslValue(value), .function = function_name });
+        }
+
+        pub fn whereFunction2(self: Self, comptime function_name: []const u8, comptime field: ColumnKey, comptime function_argument: anytype, comptime operator: @import("expr.zig").Operator, value: anytype) Self {
+            return self.where(.{ .column = checkedColumn(field), .operator = operator, .value = toDslValue(value), .function = function_name, .function_argument = toDslValue(function_argument) });
+        }
+
+        pub fn whereJsonExtract(self: Self, comptime field: ColumnKey, comptime path: []const u8, comptime operator: @import("expr.zig").Operator, value: anytype) Self {
+            return self.whereFunction2("json_extract", field, path, operator, value);
         }
 
         pub fn andWhere(self: Self, condition: Expr) Self {
@@ -628,6 +784,85 @@ pub fn Query(comptime TableType: type) type {
                 try list.appendSlice(self.allocator, rendered);
             }
             return self.execute_fn(self.connection, list.items);
+        }
+
+        pub const TypedResult = struct {
+            allocator: std.mem.Allocator,
+            rows: []TableType.row_type,
+
+            pub fn deinit(self: *TypedResult) void {
+                for (self.rows) |row| {
+                    inline for (@typeInfo(TableType.row_type).@"struct".fields) |field| freeTypedValue(self.allocator, @field(row, field.name));
+                }
+                self.allocator.free(self.rows);
+            }
+
+            pub fn rowCount(self: TypedResult) usize {
+                return self.rows.len;
+            }
+        };
+
+        fn freeTypedValue(allocator: std.mem.Allocator, value: anytype) void {
+            const T = @TypeOf(value);
+            if (@typeInfo(T) == .pointer and @typeInfo(T).pointer.size == .slice and @typeInfo(T).pointer.child == u8) allocator.free(value);
+            if (@typeInfo(T) == .optional) if (value) |present| freeTypedValue(allocator, present);
+        }
+
+        fn assignTypedValue(allocator: std.mem.Allocator, destination: anytype, value: Value) !void {
+            const T = @TypeOf(destination.*);
+            if (@typeInfo(T) == .optional) {
+                if (value == .null) { destination.* = null; return; }
+                var present: @typeInfo(T).optional.child = undefined;
+                try assignTypedValue(allocator, &present, value);
+                destination.* = present;
+                return;
+            }
+            if (value == .null) return error.InvalidSql;
+            switch (@typeInfo(T)) {
+                .bool => destination.* = switch (value) { .integer => |n| n != 0, else => return error.InvalidSql },
+                .int => destination.* = @intCast(switch (value) { .integer => |n| n, .real => |n| @as(i64, @intFromFloat(n)), else => return error.InvalidSql }),
+                .float => destination.* = @floatCast(switch (value) { .integer => |n| @as(f64, @floatFromInt(n)), .real => |n| n, else => return error.InvalidSql }),
+                .pointer => if (@typeInfo(T).pointer.size == .slice and @typeInfo(T).pointer.child == u8) {
+                    if (value != .text) return error.InvalidSql;
+                    destination.* = try allocator.dupe(u8, value.text);
+                } else return error.InvalidSql,
+                else => return error.InvalidSql,
+            }
+        }
+
+        pub fn fetchTyped(self: Self) !TypedResult {
+            var result = try self.fetchAll();
+            defer result.deinit();
+            const rows = try self.allocator.alloc(TableType.row_type, result.rows.len);
+            errdefer self.allocator.free(rows);
+            for (result.rows, 0..) |source, row_index| {
+                var destination: TableType.row_type = undefined;
+                inline for (@typeInfo(TableType.row_type).@"struct".fields) |field| {
+                    var found: ?usize = null;
+                    for (result.columns, 0..) |column, index| if (std.ascii.eqlIgnoreCase(column, field.name)) { found = index; break; };
+                    const index = found orelse return error.UnknownColumn;
+                    try assignTypedValue(self.allocator, &@field(destination, field.name), source[index]);
+                }
+                rows[row_index] = destination;
+            }
+            return .{ .allocator = self.allocator, .rows = rows };
+        }
+
+        pub fn fetchOneTyped(self: Self) !?TableType.row_type {
+            var typed = try self.limit(1).fetchTyped();
+            if (typed.rows.len == 0) {
+                typed.deinit();
+                return null;
+            }
+            const row = typed.rows[0];
+            self.allocator.free(typed.rows);
+            return row;
+        }
+
+        pub fn deinitTypedRow(self: Self, row: *TableType.row_type) void {
+            inline for (@typeInfo(TableType.row_type).@"struct".fields) |field| {
+                freeTypedValue(self.allocator, @field(row.*, field.name));
+            }
         }
     };
 }

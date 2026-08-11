@@ -1,3 +1,4 @@
+const std = @import("std");
 const Value = @import("../vm/value.zig").Value;
 const Expr = @import("expr.zig").Expr;
 
@@ -31,6 +32,24 @@ pub fn Column(comptime table_name: []const u8, comptime column_name: []const u8,
         pub fn notLike(_: @This(), value: []const u8) Expr {
             return .{ .column = column_name, .operator = .not_like, .value = toValue(value) };
         }
+        pub fn contains(_: @This(), comptime value: []const u8) Expr {
+            return .{ .column = column_name, .operator = .like, .value = toValue(std.fmt.comptimePrint("%{s}%", .{value})) };
+        }
+        pub fn notContains(_: @This(), comptime value: []const u8) Expr {
+            return .{ .column = column_name, .operator = .not_like, .value = toValue(std.fmt.comptimePrint("%{s}%", .{value})) };
+        }
+        pub fn startsWith(_: @This(), comptime value: []const u8) Expr {
+            return .{ .column = column_name, .operator = .like, .value = toValue(std.fmt.comptimePrint("{s}%", .{value})) };
+        }
+        pub fn endsWith(_: @This(), comptime value: []const u8) Expr {
+            return .{ .column = column_name, .operator = .like, .value = toValue(std.fmt.comptimePrint("%{s}", .{value})) };
+        }
+        pub fn glob(_: @This(), value: []const u8) Expr {
+            return .{ .column = column_name, .operator = .glob, .value = toValue(value) };
+        }
+        pub fn notGlob(_: @This(), value: []const u8) Expr {
+            return .{ .column = column_name, .operator = .not_glob, .value = toValue(value) };
+        }
         pub fn isNull(_: @This()) Expr {
             return .{ .column = column_name, .operator = .is_null, .value = .null };
         }
@@ -42,6 +61,12 @@ pub fn Column(comptime table_name: []const u8, comptime column_name: []const u8,
         }
         pub fn isNotValue(_: @This(), value: anytype) Expr {
             return .{ .column = column_name, .operator = .is_not_value, .value = toValue(value) };
+        }
+        pub fn isDistinctFrom(_: @This(), value: anytype) Expr {
+            return .{ .column = column_name, .operator = .is_distinct, .value = toValue(value) };
+        }
+        pub fn isNotDistinctFrom(_: @This(), value: anytype) Expr {
+            return .{ .column = column_name, .operator = .is_not_distinct, .value = toValue(value) };
         }
         pub fn between(_: @This(), lower: anytype, upper: anytype) Expr {
             return .{ .column = column_name, .operator = .between, .value = toValue(lower), .value2 = toValue(upper) };
@@ -58,7 +83,12 @@ pub fn Column(comptime table_name: []const u8, comptime column_name: []const u8,
 fn toValue(value: anytype) Value {
     const T = @TypeOf(value);
     if (T == Value) return value;
+    if (@typeInfo(T) == .optional) {
+        if (value) |present| return toValue(present);
+        return .null;
+    }
     return switch (@typeInfo(T)) {
+        .bool => .{ .integer = if (value) 1 else 0 },
         .int, .comptime_int => .{ .integer = @intCast(value) },
         .float, .comptime_float => .{ .real = @floatCast(value) },
         .pointer => .{ .text = value },

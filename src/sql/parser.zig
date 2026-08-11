@@ -10,6 +10,8 @@ fn freeParserExpr(allocator: std.mem.Allocator, expr: ast.Expr) void {
         .function => |call| {
             freeParserExpr(allocator, call.argument.*);
             allocator.destroy(call.argument);
+            if (call.argument2) |argument| { freeParserExpr(allocator, argument.*); allocator.destroy(argument); }
+            if (call.argument3) |argument| { freeParserExpr(allocator, argument.*); allocator.destroy(argument); }
         },
         .binary => |binary| {
             freeParserExpr(allocator, binary.left.*);
@@ -430,6 +432,20 @@ pub const Parser = struct {
     }
 
     fn parseLiteral(self: *Parser) Error!ast.Expr {
+        if (self.acceptTag(.minus)) {
+            const inner = try self.parseLiteral();
+            return switch (inner) {
+                .literal => |value| switch (value) {
+                    .integer => |n| .{ .literal = .{ .integer = -n } },
+                    .real => |n| .{ .literal = .{ .real = -n } },
+                    else => return Error.InvalidSql,
+                },
+                else => {
+                    freeParserExpr(self.allocator, inner);
+                    return Error.InvalidSql;
+                },
+            };
+        }
         const token = self.current();
         if (token.tag == .parameter) {
             _ = self.advance();
@@ -461,8 +477,30 @@ pub const Parser = struct {
                 const argument = try self.allocator.create(ast.Expr);
                 errdefer self.allocator.destroy(argument);
                 argument.* = try self.parseExpr();
+                if (std.ascii.eqlIgnoreCase(name, "cast")) {
+                    try self.requireWord("as");
+                    const target = try self.allocator.create(ast.Expr);
+                    errdefer self.allocator.destroy(target);
+                    target.* = .{ .identifier = try self.copy(try self.word()) };
+                    try self.requireTag(.rparen);
+                    return .{ .function = .{ .name = name, .argument = argument, .argument2 = target } };
+                }
+                var argument2: ?*const ast.Expr = null;
+                var argument3: ?*const ast.Expr = null;
+                if (self.acceptTag(.comma)) {
+                    const second = try self.allocator.create(ast.Expr);
+                    errdefer self.allocator.destroy(second);
+                    second.* = try self.parseExpr();
+                    argument2 = second;
+                    if (self.acceptTag(.comma)) {
+                        const third = try self.allocator.create(ast.Expr);
+                        errdefer self.allocator.destroy(third);
+                        third.* = try self.parseExpr();
+                        argument3 = third;
+                    }
+                }
                 try self.requireTag(.rparen);
-                return .{ .function = .{ .name = name, .argument = argument } };
+                return .{ .function = .{ .name = name, .argument = argument, .argument2 = argument2, .argument3 = argument3 } };
             }
             return .{ .identifier = name };
         }
@@ -622,16 +660,26 @@ pub const Parser = struct {
                 try self.requireTag(.rparen);
                 try conditions.append(self.allocator, .{ .column = "", .op = .exists, .value = .{ .literal = .null }, .subquery = try self.copy(self.source[start..end]), .join_or = join_or });
             } else {
-                const qualified = try self.qualifiedName();
-                const column = if (qualified.table.len == 0) qualified.column else blk: {
-                    const combined = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ qualified.table, qualified.column });
-                    defer self.allocator.free(combined);
-                    break :blk try self.copy(combined);
-                };
+                var left_expr: ?ast.Expr = null;
+                var column: []const u8 = undefined;
+                if (self.current().tag == .word and self.index + 1 < self.tokens.len and self.tokens[self.index + 1].tag == .lparen) {
+                    left_expr = try self.parseLiteral();
+                    column = "";
+                } else {
+                    const qualified = try self.qualifiedName();
+                    column = if (qualified.table.len == 0) qualified.column else blk: {
+                        const combined = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ qualified.table, qualified.column });
+                        defer self.allocator.free(combined);
+                        break :blk try self.copy(combined);
+                    };
+                }
                 if (self.acceptWord("is")) {
                     const is_not = self.acceptWord("not");
                     if (self.acceptWord("null")) {
                         try conditions.append(self.allocator, .{ .column = column, .op = if (is_not) .is_not_null else .is_null, .value = .{ .literal = .null }, .join_or = join_or });
+                    } else if (self.acceptWord("distinct")) {
+                        try self.requireWord("from");
+                        try conditions.append(self.allocator, .{ .column = column, .op = if (is_not) .is_not_distinct else .is_distinct, .value = try self.parseExpr(), .join_or = join_or, .left_expr = left_expr });
                     } else {
                         try conditions.append(self.allocator, .{ .column = column, .op = if (is_not) .is_not_value else .is_value, .value = try self.parseExpr(), .join_or = join_or });
                     }
@@ -642,6 +690,8 @@ pub const Parser = struct {
                 } else if (self.acceptWord("not")) {
                     if (self.acceptWord("like")) {
                         try conditions.append(self.allocator, .{ .column = column, .op = .not_like, .value = try self.parseExpr(), .join_or = join_or });
+                    } else if (self.acceptWord("glob")) {
+                        try conditions.append(self.allocator, .{ .column = column, .op = .not_glob, .value = try self.parseExpr(), .join_or = join_or });
                     } else {
                         try self.requireWord("in");
                         try self.requireTag(.lparen);
@@ -691,8 +741,8 @@ pub const Parser = struct {
                         try conditions.append(self.allocator, .{ .column = column, .op = .in, .value = .{ .literal = .null }, .list_values = try values.toOwnedSlice(self.allocator), .join_or = join_or });
                     }
                 } else {
-                    const op: ast.CompareOp = if (self.acceptTag(.equal)) .equal else if (self.acceptTag(.not_equal)) .not_equal else if (self.acceptTag(.less)) .less else if (self.acceptTag(.less_equal)) .less_equal else if (self.acceptTag(.greater)) .greater else if (self.acceptTag(.greater_equal)) .greater_equal else if (self.acceptWord("like")) .like else return Error.UnexpectedToken;
-                    try conditions.append(self.allocator, .{ .column = column, .op = op, .value = try self.parseExpr(), .join_or = join_or });
+                    const op: ast.CompareOp = if (self.acceptTag(.equal)) .equal else if (self.acceptTag(.not_equal)) .not_equal else if (self.acceptTag(.less)) .less else if (self.acceptTag(.less_equal)) .less_equal else if (self.acceptTag(.greater)) .greater else if (self.acceptTag(.greater_equal)) .greater_equal else if (self.acceptWord("like")) .like else if (self.acceptWord("glob")) .glob else return Error.UnexpectedToken;
+                    try conditions.append(self.allocator, .{ .column = column, .op = op, .value = try self.parseExpr(), .join_or = join_or, .left_expr = left_expr });
                 }
             }
             if (self.acceptWord("or")) {
