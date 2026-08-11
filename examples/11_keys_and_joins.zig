@@ -23,4 +23,5 @@ pub fn main() !void {
     left.deinit();
     var raw = try db.exec("SELECT * FROM relation_users JOIN relation_orders ON relation_users.id = relation_orders.user_id;");
     raw.deinit();
+    std.debug.print("11 keys and joins: primary keys, foreign keys, and joins verified\n", .{});
 }

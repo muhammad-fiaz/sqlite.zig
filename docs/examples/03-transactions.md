@@ -57,7 +57,7 @@ pub fn main() !void {
 ## Zig Output
 
 ```
-No console output - operations completed successfully
+03 transactions: rollback and commit verified
 ```
 
 > [!TIP]

@@ -17,4 +17,5 @@ pub fn main() !void {
     selected.deinit();
     var deleted = try db.from(User).delete().where(User.column("id").eq(1)).execute();
     deleted.deinit();
+    std.debug.print("09 dsl crud: insert, update, select, delete verified\n", .{});
 }

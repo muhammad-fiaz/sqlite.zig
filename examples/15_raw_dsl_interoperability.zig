@@ -24,4 +24,5 @@ pub fn main() !void {
     var deleted = try typed_delete.execute();
     typed_delete.deinit();
     deleted.deinit();
+    std.debug.print("15 raw dsl interop: raw SQL and DSL produce identical results\n", .{});
 }

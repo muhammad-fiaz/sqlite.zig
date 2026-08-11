@@ -33,4 +33,5 @@ pub fn main() !void {
         owned.deinit();
         return error.InvalidQueryWasAccepted;
     }
+    std.debug.print("13 edge cases: nulls, savepoints, and error handling verified\n", .{});
 }

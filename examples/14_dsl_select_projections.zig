@@ -26,4 +26,5 @@ pub fn main() !void {
 
     var total = try db.from(Product).count().fetchAll();
     total.deinit();
+    std.debug.print("14 dsl select projections: field projections and distinct verified\n", .{});
 }

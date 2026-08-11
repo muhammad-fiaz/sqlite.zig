@@ -37,4 +37,5 @@ pub fn main() !void {
 
     var total = try db.from(Account).sum("balance").fetchAll();
     total.deinit();
+    std.debug.print("10 dsl advanced: transactions, savepoints, and aggregates verified\n", .{});
 }

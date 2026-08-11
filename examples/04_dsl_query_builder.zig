@@ -12,4 +12,5 @@ pub fn main() !void {
     insert.deinit();
     var rows = try db.from(User).where(User.column("id").gt(0)).fetchAll();
     defer rows.deinit();
+    std.debug.print("04 dsl query builder: {d} row(s) fetched\n", .{rows.rowCount()});
 }

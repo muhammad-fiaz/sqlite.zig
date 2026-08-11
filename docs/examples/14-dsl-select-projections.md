@@ -63,7 +63,7 @@ pub fn main() !void {
 ## Zig Output
 
 ```
-No console output - operations completed successfully
+14 dsl select projections: field projections and distinct verified
 ```
 
 > [!TIP]

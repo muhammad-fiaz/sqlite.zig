@@ -42,7 +42,7 @@ pub fn main() !void {
 ## Zig Output
 
 ```
-No console output - operations completed successfully
+02 prepared statement: parameterized insert completed
 ```
 
 > [!TIP]

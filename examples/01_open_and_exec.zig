@@ -8,4 +8,5 @@ pub fn main() !void {
     result.deinit();
     result = try db.exec("INSERT INTO users VALUES (1, 'Fiaz');");
     result.deinit();
+    std.debug.print("01 open and exec: table created and row inserted\n", .{});
 }

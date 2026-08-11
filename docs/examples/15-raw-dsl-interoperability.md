@@ -59,7 +59,7 @@ pub fn main() !void {
 ## Zig Output
 
 ```
-No console output - operations completed successfully
+15 raw dsl interop: raw SQL and DSL produce identical results
 ```
 
 > [!TIP]

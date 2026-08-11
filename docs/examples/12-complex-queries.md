@@ -82,7 +82,7 @@ pub fn main() !void {
 ## Zig Output
 
 ```
-No console output - operations completed successfully
+12 complex queries: distinct joins and aggregates verified
 ```
 
 > [!TIP]

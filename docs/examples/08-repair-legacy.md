@@ -44,7 +44,7 @@ pub fn main() !void {
 ## Zig Output
 
 ```
-No console output - operations completed successfully
+08 repair legacy: legacy database created and populated
 ```
 
 > [!TIP]

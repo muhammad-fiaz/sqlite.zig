@@ -74,7 +74,7 @@ pub fn main() !void {
 ## Zig Output
 
 ```
-No console output - operations completed successfully
+10 dsl advanced: transactions, savepoints, and aggregates verified
 ```
 
 > [!TIP]

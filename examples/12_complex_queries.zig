@@ -31,4 +31,5 @@ pub fn main() !void {
     dsl.deinit();
     var aggregate = try db.from(Order).sumColumn(Order.key("amount")).fetchAll();
     aggregate.deinit();
+    std.debug.print("12 complex queries: distinct joins and aggregates verified\n", .{});
 }

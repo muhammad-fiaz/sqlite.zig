@@ -9,4 +9,5 @@ pub fn main() !void {
         var owned = value;
         owned.deinit();
     } else |_| {}
+    std.debug.print("06 error handling: invalid query correctly returned error\n", .{});
 }

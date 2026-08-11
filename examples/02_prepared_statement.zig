@@ -11,4 +11,5 @@ pub fn main() !void {
     try statement.bind(1, 1);
     try statement.bind(2, "Fiaz");
     try statement.step();
+    std.debug.print("02 prepared statement: parameterized insert completed\n", .{});
 }

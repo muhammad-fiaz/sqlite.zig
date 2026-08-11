@@ -74,7 +74,7 @@ pub fn main() !void {
 ## Zig Output
 
 ```
-No console output - operations completed successfully
+13 edge cases: nulls, savepoints, and error handling verified
 ```
 
 > [!TIP]

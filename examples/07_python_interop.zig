@@ -18,4 +18,5 @@ pub fn main() !void {
     }
     defer result.deinit();
     if (result.rowCount() != 1 or !std.mem.eql(u8, result.rows[0][0].text, "Python")) return error.InteropMismatch;
+    std.debug.print("07 python interop: database compatible with Python sqlite3\n", .{});
 }

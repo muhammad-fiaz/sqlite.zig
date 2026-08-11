@@ -39,7 +39,7 @@ pub fn main() !void {
 ## Zig Output
 
 ```
-No console output - operations completed successfully
+01 open and exec: table created and row inserted
 ```
 
 > [!TIP]

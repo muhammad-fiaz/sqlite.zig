@@ -53,7 +53,7 @@ The row is deleted at the end of the example, so the table is empty:
 ## Zig Output
 
 ```
-No console output - operations completed successfully
+09 dsl crud: insert, update, select, delete verified
 ```
 
 > [!TIP]

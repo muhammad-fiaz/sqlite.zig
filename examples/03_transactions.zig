@@ -19,4 +19,5 @@ pub fn main() !void {
     var result = try db.from(Ledger).selectFieldNames(&.{ "id", "amount" }).fetchAll();
     defer result.deinit();
     if (result.rowCount() != 1 or result.rows[0][0].integer != 1 or result.rows[0][1].integer != 100) return error.TransactionExampleFailed;
+    std.debug.print("03 transactions: rollback and commit verified\n", .{});
 }

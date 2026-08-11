@@ -51,7 +51,7 @@ pub fn main() !void {
 ## Zig Output
 
 ```
-No console output - operations completed successfully
+07 python interop: database compatible with Python sqlite3
 ```
 
 > [!TIP]

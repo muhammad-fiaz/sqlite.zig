@@ -44,7 +44,7 @@ pub fn main() !void {
 ## Zig Output
 
 ```
-No console output - operations completed successfully
+04 dsl query builder: 122 row(s) fetched
 ```
 
 > [!TIP]

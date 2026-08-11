@@ -41,7 +41,7 @@ The `users` table is created with columns `id` and `name`. No rows are inserted.
 ## Zig Output
 
 ```
-No console output - operations completed successfully
+05 migrations: schema migration applied
 ```
 
 > [!TIP]

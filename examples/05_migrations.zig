@@ -9,4 +9,5 @@ pub fn main() !void {
     };
     var runner = sqlite.migration.Runner.init(std.heap.page_allocator, &migrations);
     _ = try runner.apply(db);
+    std.debug.print("05 migrations: schema migration applied\n", .{});
 }

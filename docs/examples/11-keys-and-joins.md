@@ -69,7 +69,7 @@ pub fn main() !void {
 ## Zig Output
 
 ```
-No console output - operations completed successfully
+11 keys and joins: primary keys, foreign keys, and joins verified
 ```
 
 > [!TIP]

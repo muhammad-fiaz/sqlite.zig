@@ -37,7 +37,7 @@ No tables exist in the database - the example only demonstrates error handling o
 ## Zig Output
 
 ```
-No console output - operations completed successfully
+06 error handling: invalid query correctly returned error
 ```
 
 > [!TIP]

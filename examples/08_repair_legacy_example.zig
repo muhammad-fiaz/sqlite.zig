@@ -13,4 +13,5 @@ pub fn main() !void {
     setup.deinit();
     var insert = try db.exec("INSERT INTO users VALUES (1, 'Fiaz');");
     insert.deinit();
+    std.debug.print("08 repair legacy: legacy database created and populated\n", .{});
 }
