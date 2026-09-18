@@ -8,18 +8,18 @@ pub fn main() !void {
     var db = try sqlite.open(std.heap.page_allocator, "valid_30.db");
     defer db.close();
 
-    var raw_setup = try db.exec("CREATE TABLE IF NOT EXISTS raw_composite_items (left_id INTEGER, right_id INTEGER, label TEXT, PRIMARY KEY (left_id, right_id), UNIQUE (right_id, label));");
-    raw_setup.deinit();
-    var raw_clear = try db.exec("DELETE FROM raw_composite_items;");
-    raw_clear.deinit();
-    var raw_insert = try db.exec("INSERT INTO raw_composite_items VALUES (1, 10, 'alpha');");
-    raw_insert.deinit();
+    var rawSetup = try db.exec("CREATE TABLE IF NOT EXISTS raw_composite_items (left_id INTEGER, right_id INTEGER, label TEXT, PRIMARY KEY (left_id, right_id), UNIQUE (right_id, label));");
+    rawSetup.deinit();
+    var rawClear = try db.exec("DELETE FROM raw_composite_items;");
+    rawClear.deinit();
+    var rawInsert = try db.exec("INSERT INTO raw_composite_items VALUES (1, 10, 'alpha');");
+    rawInsert.deinit();
     try std.testing.expectError(error.ConstraintViolation, db.exec("INSERT INTO raw_composite_items VALUES (1, 10, 'duplicate');"));
 
-    try db.createTable(Membership, .{ .if_not_exists = true, .primary_keys = &.{ Membership.key("user_id"), Membership.key("group_id") }, .unique_constraints = &.{&.{ Membership.key("group_id"), Membership.key("label") }} });
+    try db.createTable(Membership, .{ .ifNotExists = true, .primaryKey = &.{ Membership.columns.user_id, Membership.columns.group_id }, .unique = &.{&.{ Membership.columns.group_id, Membership.columns.label }} });
     try db.truncate(Membership);
-    var typed = try db.from(Membership).insertTyped(.{ .user_id = 1, .group_id = 10, .label = "alpha" });
+    var typed = try db.from(Membership).insert(.{ .user_id = 1, .group_id = 10, .label = "alpha" });
     typed.deinit();
-    try std.testing.expectError(error.ConstraintViolation, db.from(Membership).insertTyped(.{ .user_id = 1, .group_id = 10, .label = "duplicate" }));
+    try std.testing.expectError(error.ConstraintViolation, db.from(Membership).insert(.{ .user_id = 1, .group_id = 10, .label = "duplicate" }));
     std.debug.print("30 composite constraints: raw and typed PRIMARY KEY/UNIQUE verified\n", .{});
 }

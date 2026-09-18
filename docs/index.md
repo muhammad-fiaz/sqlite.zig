@@ -36,7 +36,7 @@ features:
     details: Native SQLite-compatible WAL page frames, reopen/readback, and checkpointing, plus rollback-journal persistence. Full multi-process locking/VFS parity is still in progress.
   - icon: "\U0001f517"
     title: Foreign Keys & Constraints
-    details: CASCADE DELETE/UPDATE, SET NULL, SET DEFAULT, composite foreign keys, composite PRIMARY KEY, and composite UNIQUE constraints.
+    details: CASCADE DELETE/UPDATE, SET NULL, RESTRICT, composite foreign keys, composite PRIMARY KEY, and composite UNIQUE constraints.
   - icon: "\U0001f9e9"
     title: Views, Triggers & CTEs
     details: CREATE VIEW, CREATE TRIGGER, Common Table Expressions including recursive CTEs for hierarchical data traversal.
@@ -53,12 +53,12 @@ pub fn main() !void {
     var db = try sqlite.open(std.heap.page_allocator, "my.db");
     defer db.close();
 
-    try db.createTable(User, .{ .if_not_exists = true });
+    try db.createTable(User, .{ .ifNotExists = true });
 
     var inserted = try db.from(User).insert(.{ .id = 1, .name = "Alice" });
     inserted.deinit();
 
-    var result = try db.from(User).fetchAll();
+    var result = try db.from(User).fetch();
     defer result.deinit();
 }
 ```

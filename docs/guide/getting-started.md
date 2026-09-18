@@ -33,14 +33,14 @@ pub fn main() !void {
     defer db.close();
 
     // Create a table using the typed DSL
-    try db.createTable(User, .{ .if_not_exists = true });
+    try db.createTable(User, .{ .ifNotExists = true });
 
     // Insert a row
     var inserted = try db.from(User).insert(.{ .id = 1, .name = "Alice" });
     inserted.deinit();
 
     // Query all rows
-    var result = try db.from(User).fetchAll();
+    var result = try db.from(User).fetch();
     defer result.deinit();
 
     std.debug.print("Rows: {d}\n", .{result.rowCount()});

@@ -91,17 +91,52 @@ pub fn tokenize(allocator: std.mem.Allocator, sql: []const u8) ![]Token {
                 i += 1;
             },
             '=' => {
-                try tokens.append(allocator, .{ .tag = .equal, .text = sql[i .. i + 1], .position = i });
+                if (i + 1 < sql.len and sql[i + 1] == '=') {
+                    try tokens.append(allocator, .{ .tag = .equal, .text = sql[i .. i + 2], .position = i });
+                    i += 2;
+                } else {
+                    try tokens.append(allocator, .{ .tag = .equal, .text = sql[i .. i + 1], .position = i });
+                    i += 1;
+                }
+            },
+            '!' => {
+                if (i + 1 < sql.len and sql[i + 1] == '=') {
+                    try tokens.append(allocator, .{ .tag = .notEqual, .text = sql[i .. i + 2], .position = i });
+                    i += 2;
+                } else return Error.InvalidCharacter;
+            },
+            '%' => {
+                try tokens.append(allocator, .{ .tag = .percent, .text = sql[i .. i + 1], .position = i });
+                i += 1;
+            },
+            '&' => {
+                try tokens.append(allocator, .{ .tag = .amp, .text = sql[i .. i + 1], .position = i });
+                i += 1;
+            },
+            '|' => {
+                if (i + 1 < sql.len and sql[i + 1] == '|') {
+                    try tokens.append(allocator, .{ .tag = .concat, .text = sql[i .. i + 2], .position = i });
+                    i += 2;
+                } else {
+                    try tokens.append(allocator, .{ .tag = .pipe, .text = sql[i .. i + 1], .position = i });
+                    i += 1;
+                }
+            },
+            '~' => {
+                try tokens.append(allocator, .{ .tag = .tilde, .text = sql[i .. i + 1], .position = i });
                 i += 1;
             },
             '<' => {
                 i += 1;
                 const tag: Tag = if (i < sql.len and sql[i] == '=') blk: {
                     i += 1;
-                    break :blk .less_equal;
+                    break :blk .lessEqual;
                 } else if (i < sql.len and sql[i] == '>') blk: {
                     i += 1;
-                    break :blk .not_equal;
+                    break :blk .notEqual;
+                } else if (i < sql.len and sql[i] == '<') blk: {
+                    i += 1;
+                    break :blk .lshift;
                 } else .less;
                 try tokens.append(allocator, .{ .tag = tag, .text = sql[start..i], .position = start });
             },
@@ -109,7 +144,10 @@ pub fn tokenize(allocator: std.mem.Allocator, sql: []const u8) ![]Token {
                 i += 1;
                 const tag: Tag = if (i < sql.len and sql[i] == '=') blk: {
                     i += 1;
-                    break :blk .greater_equal;
+                    break :blk .greaterEqual;
+                } else if (i < sql.len and sql[i] == '>') blk: {
+                    i += 1;
+                    break :blk .rshift;
                 } else .greater;
                 try tokens.append(allocator, .{ .tag = tag, .text = sql[start..i], .position = start });
             },
@@ -132,6 +170,6 @@ test "lexer handles SQL primitives" {
     const tokens = try tokenize(std.testing.allocator, "SELECT name FROM users WHERE age >= 18 AND name = 'A''B';");
     defer std.testing.allocator.free(tokens);
     try std.testing.expectEqual(Tag.word, tokens[0].tag);
-    try std.testing.expectEqual(Tag.greater_equal, tokens[6].tag);
+    try std.testing.expectEqual(Tag.greaterEqual, tokens[6].tag);
     try std.testing.expectEqualStrings("A''B", tokens[11].text);
 }

@@ -9,13 +9,9 @@ pub fn main() !void {
     setup.deinit();
 
     var rows = try db.from("raw_dsl_items")
+        .select(.{ db.col("id"), db.col("name") })
         .where(db.col("id").gte(2))
-        .select("id, name")
-        .fetchAll();
+        .fetch();
     defer rows.deinit();
     std.debug.print("Raw DSL rows: {d}\n", .{rows.rowCount()});
 }
-
-
-
-

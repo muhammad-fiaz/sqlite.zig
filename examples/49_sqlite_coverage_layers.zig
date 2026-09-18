@@ -24,33 +24,33 @@ pub fn main() !void {
     defer raw.deinit();
     if (raw.rowCount() != 2) return error.UnexpectedResult;
 
-    var raw_dsl = try db.from("coverage_users")
+    var rawDsl = try db.from("coverage_users")
+        .select(.{ db.col("id"), db.col("name") })
         .where(db.col("age").gte(18))
         .andWhere(db.col("name").glob("A*"))
-        .select("id, name")
-        .fetchAll();
-    defer raw_dsl.deinit();
-    if (raw_dsl.rowCount() != 1) return error.UnexpectedResult;
+        .fetch();
+    defer rawDsl.deinit();
+    if (rawDsl.rowCount() != 1) return error.UnexpectedResult;
 
     var text = try db.from("coverage_users")
-        .where(db.col("name").startsWith("Al"))
-        .andWhere(db.col("name").endsWith("ce"))
-        .fetchAll();
+        .where(db.col("name").like("Al%"))
+        .andWhere(db.col("name").like("%ce"))
+        .fetch();
     defer text.deinit();
     if (text.rowCount() != 1) return error.UnexpectedResult;
 
     var ranged = try db.from("coverage_users")
         .where(db.col("age").between(18, 40))
-        .fetchAll();
+        .fetch();
     defer ranged.deinit();
     if (ranged.rowCount() != 1) return error.UnexpectedResult;
 
     var typed = try db.from(User)
-        .where(User.columns("age").ge(18))
-        .orderBy(User.columns("id").asc())
-        .fetchTyped();
+        .where(User.columns.age.gte(18))
+        .orderBy(User.columns.id.asc())
+        .fetch();
     defer typed.deinit();
     if (typed.rowCount() != 2) return error.UnexpectedResult;
 
-    std.debug.print("raw={d} raw_dsl={d} typed={d}\n", .{ raw.rowCount(), raw_dsl.rowCount(), typed.rowCount() });
+    std.debug.print("raw={d} raw_dsl={d} typed={d}\n", .{ raw.rowCount(), rawDsl.rowCount(), typed.rowCount() });
 }

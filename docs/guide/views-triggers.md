@@ -34,18 +34,21 @@ Views can be queried using raw SQL and their results read into typed structures.
 
 Triggers automatically execute SQL in response to INSERT, UPDATE, or DELETE operations.
 
-### BEFORE INSERT Trigger
+### AFTER INSERT Trigger
 
 ```zig
 var result = try db.exec(
-    \\CREATE TRIGGER auto_timestamp
-    \\BEFORE INSERT ON orders
+    \\CREATE TRIGGER audit_after_insert
+    \\AFTER INSERT ON orders
     \\BEGIN
-    \\  UPDATE orders SET created_at = datetime('now') WHERE id = NEW.id;
+    \\  INSERT INTO audit (id) VALUES (NEW.id);
     \\END
 );
 result.deinit();
 ```
+
+Only `AFTER` triggers are supported; `BEFORE` and `INSTEAD OF` are rejected
+by the parser.
 
 ### AFTER DELETE Trigger
 
@@ -64,11 +67,8 @@ result.deinit();
 
 | Event | Description |
 |-------|-------------|
-| `BEFORE INSERT` | Fires before a new row is inserted |
 | `AFTER INSERT` | Fires after a new row is inserted |
-| `BEFORE UPDATE` | Fires before a row is updated |
 | `AFTER UPDATE` | Fires after a row is updated |
-| `BEFORE DELETE` | Fires before a row is deleted |
 | `AFTER DELETE` | Fires after a row is deleted |
 
 ### OLD and NEW References

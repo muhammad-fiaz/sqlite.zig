@@ -22,24 +22,23 @@ pub fn main() !void {
     inserted.deinit();
     var updated = try db.exec("UPDATE raw_fk_parents SET part_a = 2, part_b = 20 WHERE part_a = 1 AND part_b = 10;");
     updated.deinit();
-    var raw_child = try db.exec("SELECT parent_a, parent_b FROM raw_fk_children;");
-    defer raw_child.deinit();
-    if (raw_child.rows[0][0].integer != 2 or raw_child.rows[0][1].integer != 20) return error.CompositeForeignKeyUpdateFailed;
+    var rawChild = try db.exec("SELECT parent_a, parent_b FROM raw_fk_children;");
+    defer rawChild.deinit();
+    if (rawChild.rows[0][0].integer != 2 or rawChild.rows[0][1].integer != 20) return error.CompositeForeignKeyUpdateFailed;
 
-    try db.createTable(TypedParent, .{ .if_not_exists = true, .primary_keys = &.{ TypedParent.key("part_a"), TypedParent.key("part_b") } });
-    try db.createTable(TypedChild, .{ .if_not_exists = true, .foreign_key_constraints = &.{.{ .columns = &.{ TypedChild.key("parent_a"), TypedChild.key("parent_b") }, .referenced_columns = &.{ TypedParent.key("part_a"), TypedParent.key("part_b") }, .on_delete = .cascade, .on_update = .cascade }} });
+    try db.createTable(TypedParent, .{ .ifNotExists = true, .primaryKey = &.{ TypedParent.columns.part_a, TypedParent.columns.part_b } });
+    try db.createTable(TypedChild, .{ .ifNotExists = true, .foreignKeys = &.{.{ .columns = &.{ TypedChild.columns.parent_a, TypedChild.columns.parent_b }, .references = &.{ TypedParent.columns.part_a, TypedParent.columns.part_b }, .onDelete = .cascade, .onUpdate = .cascade }} });
     try db.truncate(TypedChild);
     try db.truncate(TypedParent);
-    var parent = try db.from(TypedParent).insertTyped(.{ .part_a = 1, .part_b = 10, .label = "typed" });
+    var parent = try db.from(TypedParent).insert(.{ .part_a = 1, .part_b = 10, .label = "typed" });
     parent.deinit();
-    var child = try db.from(TypedChild).insertTyped(.{ .id = 1, .parent_a = 1, .parent_b = 10 });
+    var child = try db.from(TypedChild).insert(.{ .id = 1, .parent_a = 1, .parent_b = 10 });
     child.deinit();
-    var parent_update = try db.from(TypedParent).update(.{ .part_a = 2, .part_b = 20 });
-    var result = try parent_update.where(TypedParent.column("part_a").eq(1)).execute();
-    parent_update.deinit();
+    var parentUpdate = try db.from(TypedParent).update(.{ .part_a = 2, .part_b = 20 });
+    var result = try parentUpdate.where(TypedParent.columns.part_a.eq(1)).execute();
     result.deinit();
-    var typed_child = try db.from(TypedChild).selectAll().fetchAll();
-    defer typed_child.deinit();
-    if (typed_child.rows[0][1].integer != 2 or typed_child.rows[0][2].integer != 20) return error.TypedCompositeForeignKeyUpdateFailed;
+    var typedChild = try db.from(TypedChild).selectAll().fetch();
+    defer typedChild.deinit();
+    if (typedChild.rows[0].parent_a != 2 or typedChild.rows[0].parent_b != 20) return error.TypedCompositeForeignKeyUpdateFailed;
     std.debug.print("31 composite foreign keys: raw and typed cascading relationships verified\n", .{});
 }

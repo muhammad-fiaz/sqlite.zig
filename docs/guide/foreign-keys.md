@@ -1,11 +1,13 @@
 ---
 title: "Foreign Keys"
-description: "Foreign key constraints with referential actions including CASCADE, SET NULL, SET DEFAULT, RESTRICT, and NO ACTION."
+description: "Foreign key constraints with CASCADE, SET NULL, and RESTRICT actions, single and composite."
 ---
 
 # Foreign Keys
 
-`sqlite.zig` supports foreign key constraints with referential actions.
+`sqlite.zig` supports foreign key constraints with the referential actions
+the engine implements. Typed keys derive both table names from the column
+descriptors; dynamic keys use runtime strings.
 
 ## Basic Foreign Key
 
@@ -14,19 +16,34 @@ const User = sqlite.table("users", struct { id: i64, name: []const u8 });
 const Order = sqlite.table("orders", struct { id: i64, user_id: i64, amount: i64 });
 
 try db.createTable(User, .{
-    .if_not_exists = true,
-    .primary_key = User.key("id"),
+    .ifNotExists = true,
+    .primaryKey = User.columns.id,
 });
 
 try db.createTable(Order, .{
-    .if_not_exists = true,
-    .primary_key = Order.key("id"),
-    .foreign_key_constraints = &.{.{
-        .columns = &.{Order.key("user_id")},
-        .referenced_table = "users",
-        .referenced_columns = &.{User.key("id")},
-        .on_delete = .cascade,
-        .on_update = .cascade,
+    .ifNotExists = true,
+    .primaryKey = Order.columns.id,
+    .foreignKeys = &.{.{
+        .column = Order.columns.user_id,
+        .references = User.columns.id,
+        .onDelete = .cascade,
+        .onUpdate = .cascade,
+    }},
+});
+```
+
+Dynamic equivalent (no structs):
+
+```zig
+try db.createTable("orders", .{
+    .columns = &.{
+        .{ .name = "id", .type = "INTEGER" },
+        .{ .name = "user_id", .type = "INTEGER" },
+    },
+    .foreignKeys = &.{.{
+        .column = "user_id",
+        .references = .{ .table = "users", .column = "id" },
+        .onDelete = .cascade,
     }},
 });
 ```
@@ -35,23 +52,22 @@ try db.createTable(Order, .{
 
 | Action | Behavior |
 |--------|----------|
-| `CASCADE` | Delete/Update matching rows in child table |
-| `SET NULL` | Set foreign key columns to NULL |
-| `SET DEFAULT` | Set foreign key columns to default value |
-| `RESTRICT` | Reject the delete/update if children exist |
-| `NO ACTION` | Do nothing (default) |
+| `.cascade` | Delete/update matching rows in the child table |
+| `.setNull` | Set foreign key columns to NULL |
+| `.restrict` | Reject the delete/update if children exist (default) |
+
+`SET DEFAULT` and `NO ACTION` are not implemented by the engine.
 
 ## Composite Foreign Keys
 
 ```zig
 try db.createTable(Child, .{
-    .primary_key = Child.key("id"),
-    .foreign_key_constraints = &.{.{
-        .columns = &.{Child.key("parent_a"), Child.key("parent_b")},
-        .referenced_table = "parents",
-        .referenced_columns = &.{Parent.key("a"), Parent.key("b")},
-        .on_delete = .cascade,
-        .on_update = .cascade,
+    .primaryKey = Child.columns.id,
+    .foreignKeys = &.{.{
+        .columns = &.{ Child.columns.parent_a, Child.columns.parent_b },
+        .references = &.{ Parent.columns.a, Parent.columns.b },
+        .onDelete = .cascade,
+        .onUpdate = .cascade,
     }},
 });
 ```
@@ -68,14 +84,14 @@ result = try db.from(Order).insert(.{ .id = 1, .user_id = 1, .amount = 100 });
 result.deinit();
 try db.commit();
 
-// Delete the user â€” orders are cascade-deleted
+// Delete the user; orders are cascade-deleted
 try db.begin();
-var deleted = try db.from(User).where(User.column("id").eq(1)).delete();
+var deleted = try db.from(User).delete().where(User.columns.id.eq(1)).execute();
 deleted.deinit();
 try db.commit();
 
 // Order count is now 0
-var count = try db.from(Order).count("id").fetchAll();
+var count = try db.from(Order).select(.{Order.columns.id.count()}).fetch();
 defer count.deinit();
 ```
 

@@ -30,12 +30,12 @@ pub fn encode(allocator: std.mem.Allocator, values: []const Value) ![]u8 {
     defer header.deinit(allocator);
     var body = std.ArrayList(u8).empty;
     defer body.deinit(allocator);
-    var header_lengths: usize = 0;
+    var headerLengths: usize = 0;
     for (values) |value| {
         var tmp: [9]u8 = undefined;
-        header_lengths += (try varint.encode(serialType(value), &tmp));
+        headerLengths += (try varint.encode(serialType(value), &tmp));
     }
-    try appendVarint(&header, allocator, header_lengths + varint.encodedLength(@intCast(header_lengths)));
+    try appendVarint(&header, allocator, headerLengths + varint.encodedLength(@intCast(headerLengths)));
     for (values) |value| try appendVarint(&header, allocator, serialType(value));
     for (values) |value| switch (value) {
         .null => {},
@@ -65,27 +65,27 @@ fn readInteger(bytes: []const u8, count: usize) i64 {
     var value: u64 = 0;
     for (bytes[0..count]) |byte| value = (value << 8) | byte;
     if (count < 8 and (value & (@as(u64, 1) << @as(u6, @intCast(count * 8 - 1)))) != 0) {
-        var sign_extension = count;
-        while (sign_extension < 8) : (sign_extension += 1) value |= @as(u64, 0xff) << @as(u6, @intCast(sign_extension * 8));
+        var signExtension = count;
+        while (signExtension < 8) : (signExtension += 1) value |= @as(u64, 0xff) << @as(u6, @intCast(signExtension * 8));
     }
     return @bitCast(value);
 }
 
 pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) ![]Value {
     const first = try varint.decode(bytes);
-    const header_size: usize = first.value;
-    if (header_size > bytes.len or header_size == 0) return Error.InvalidRecord;
+    const headerSize: usize = first.value;
+    if (headerSize > bytes.len or headerSize == 0) return Error.InvalidRecord;
     var types = std.ArrayList(u64).empty;
     defer types.deinit(allocator);
     var offset: usize = first.length;
-    while (offset < header_size) {
+    while (offset < headerSize) {
         const item = try varint.decode(bytes[offset..]);
         try types.append(allocator, item.value);
         offset += item.length;
     }
     var values = try std.ArrayList(Value).initCapacity(allocator, types.items.len);
     errdefer values.deinit(allocator);
-    var payload = header_size;
+    var payload = headerSize;
     for (types.items) |code| {
         switch (code) {
             0 => try values.append(allocator, .null),

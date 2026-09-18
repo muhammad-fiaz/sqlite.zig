@@ -51,6 +51,7 @@ Runnable examples demonstrating `sqlite.zig` features.
 |---|---------|-------------|
 | 20 | [Scalar Functions](/examples/20-scalar-functions) | ABS, LENGTH, UPPER, LOWER, SUBSTR functions |
 | 36 | [Grouped Aggregates](/examples/36-grouped-aggregates) | GROUP BY with typed DSL aggregate functions |
+| 53 | [Expression Operators](/examples/53-expression-operators) | Full comparison, pattern, string, and predicate operators |
 
 ## CTEs & Subqueries
 
@@ -95,6 +96,9 @@ Runnable examples demonstrating `sqlite.zig` features.
 | 21 | [Indexed Queries](/examples/21-indexed-queries) | Index creation and optimized lookups |
 | 47 | [Column Defaults](/examples/47-column-defaults) | Column DEFAULT expressions including dynamic defaults |
 | 49 | [SQLite Coverage Layers](/examples/49-sqlite-coverage-layers) | Raw SQL, RAW DSL, and typed Zig-first DSL interoperability |
+| 50 | [Schema Validation](/examples/50-schema-validation-interop) | Adopt legacy tables with strict schema validation |
+| 51 | [DSL CTEs](/examples/51-dsl-ctes) | WITH and WITH RECURSIVE in dynamic and typed DSL |
+| 52 | [Column Mapping](/examples/52-column-mapping) | camelCase Zig fields over unchanged SQL names |
 
 ## Query Inspection & Internals
 

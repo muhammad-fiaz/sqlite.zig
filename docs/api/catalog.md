@@ -1,79 +1,86 @@
 ---
 title: "Catalog API"
-description: "Schema definitions, table metadata, and type affinity management for the sqlite.zig catalog module."
+description: "Schema definitions, table metadata, and type affinity in the sqlite.zig catalog module."
 ---
 
 # Catalog API
 
-The catalog module manages schema definitions, table metadata, and type affinity.
+The catalog module stores live schema metadata: tables, columns,
+constraints, indexes, views, and triggers.
 
 ## Table Definitions
 
 ```zig
-const catalog = @import("catalog");
-
-// Table definition
-const table_def = catalog.TableDef{
-    .name = "users",
-    .columns = &.{
-        .{ .name = "id", .type = .integer, .primary_key = true },
-        .{ .name = "name", .type = .text },
-    },
-};
+const Name = "users";
+// Schema columns carry declared type names plus flags:
+const col = table.columns[0]; // .name, .typeName, .primaryKey, .notNull,
+// .unique, .defaultValue, .foreignTable, .foreignColumn,
+// .onDelete, .onUpdate
 ```
+
+`TableDef.column(name)` resolves a column case-insensitively.
 
 ## Schema Management
 
 ```zig
-const schema = @import("schema");
-
-// Get current schema
-const current_schema = try schema.Schema.init(allocator, &connection);
+var schema = Schema.init(allocator);
+defer schema.deinit();
 
 // Clone for backup
-const backup = try current_schema.clone();
+var backup = try schema.clone();
+defer backup.deinit();
 ```
+
+`Connection` owns one live `Schema` (`db.store`); transactions and
+savepoints snapshot it with `clone()`.
 
 ## Type Affinity
 
-SQLite uses type affinity to determine how values are stored:
+Declared type names map to affinities for schema validation:
 
-| Affinity | Storage | Description |
-|----------|---------|-------------|
-| `INTEGER` | 1-8 bytes | Whole numbers |
-| `REAL` | 8 bytes | Floating-point |
-| `TEXT` | Variable | Text strings |
-| `BLOB` | Variable | Binary data |
-| `NULL` | 0 bytes | Null values |
+| Affinity | Matches declarations containing |
+|----------|---------------------------------|
+| `INTEGER` | `INT` |
+| `TEXT` | `CHAR`, `CLOB`, `TEXT` |
+| `BLOB` | `BLOB`, or no type at all |
+| `REAL` | `REAL`, `FLOA`, `DOUB` |
+| `NUMERIC` | anything else (validates against INTEGER/REAL) |
 
-## Column Definitions
-
-```zig
-const column = catalog.ColumnDef{
-    .name = "email",
-    .type = .text,
-    .nullable = false,
-    .unique = true,
-};
-```
+Zig mapping: `int`/`bool` to `INTEGER`, `float` to `REAL`,
+`[]const u8` to `TEXT`, everything else to `BLOB`; non-optional fields are
+`NOT NULL`, `?T` fields are nullable.
 
 ## Index Definitions
 
 ```zig
-const index_def = catalog.IndexDef{
+const indexDef = IndexDef{
     .name = "idx_users_email",
-    .table_name = "users",
+    .table = "users",
     .columns = &.{"email"},
     .unique = true,
 };
 ```
 
+Only plain and unique column indexes exist (no partial or expression
+indexes). Use `db.createIndex(Table, name, cols, unique)`.
+
 ## Key Definitions
 
 ```zig
 // Primary key
-const pk = User.key("id");
+.primaryKey = User.columns.id,
 
 // Composite primary key
-const cpk = &.{ User.key("a"), User.key("b") };
+.primaryKey = &.{ User.columns.tenant_id, User.columns.user_id },
+
+// Unique
+.unique = &.{User.columns.email},
+
+// Foreign key
+.foreignKeys = &.{
+    .{ .column = Order.columns.user_id, .references = User.columns.id },
+},
 ```
+
+Single-column keys live on the column definition; composite keys become
+table constraints. Actions are `.restrict`, `.cascade`, `.setNull`.

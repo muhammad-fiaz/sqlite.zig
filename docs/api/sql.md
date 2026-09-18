@@ -38,7 +38,7 @@ const ast = @import("ast");
 
 // Statement types
 switch (statement) {
-    .create_table => |ct| { /* ... */ },
+    .createTable => |ct| { /* ... */ },
     .insert => |ins| { /* ... */ },
     .select => |sel| { /* ... */ },
     .update => |upd| { /* ... */ },

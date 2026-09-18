@@ -30,7 +30,7 @@ const Account = sqlite.table("lifecycle_accounts", struct { id: i64, name: []con
 pub fn main() !void {
     var db = try sqlite.open(std.heap.page_allocator, "valid_18.db");
     defer db.close();
-    try db.createTable(Account, .{ .if_not_exists = true });
+    try db.createTable(Account, .{ .ifNotExists = true });
     if (!db.tableExists(Account)) return error.TableWasNotCreated;
     try db.addColumn(Account, "active", i64);
     try db.renameColumn(Account, "active", "enabled");

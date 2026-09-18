@@ -17,7 +17,7 @@ Use EXISTS and NOT EXISTS subqueries with raw SQL and typed DSL to check for rel
 | 4 | INSERT INTO exists_marker VALUES (1) | Inserts one marker |
 | 5 | SELECT id FROM exists_users WHERE EXISTS (SELECT id FROM exists_marker) | Unconditional EXISTS |
 | 6 | SELECT id FROM exists_users WHERE EXISTS (SELECT id FROM exists_marker WHERE exists_marker.id = exists_users.id) | Correlated EXISTS |
-| 7 | SELECT id FROM exists_users WHERE EXISTS (SELECT id FROM exists_marker WHERE exists_marker.id = exists_users.id) | Typed DSL whereExistsKey |
+| 7 | SELECT id FROM exists_users WHERE EXISTS (SELECT id FROM exists_marker WHERE exists_marker.id = exists_users.id) | Typed DSL whereExists |
 | 8 | DELETE FROM exists_marker | Clears markers |
 | 9 | SELECT id FROM exists_users WHERE NOT EXISTS (SELECT id FROM exists_marker) | NOT EXISTS |
 
@@ -45,9 +45,9 @@ pub fn main() !void {
     var correlated = try db.exec("SELECT id FROM exists_users WHERE EXISTS (SELECT id FROM exists_marker WHERE exists_marker.id = exists_users.id) ORDER BY id;");
     defer correlated.deinit();
     if (correlated.rowCount() != 1 or correlated.rows[0][0].integer != 1) return error.CorrelatedExistsVerificationFailed;
-    var typed = try db.from(Users).whereExistsKey(Marker, Marker.key("id"), Users.key("id")).fetchAll();
+    var typed = try db.from(Users).whereExists(Marker, Marker.columns.id.eq(Users.columns.id)).fetch();
     defer typed.deinit();
-    if (typed.rowCount() != 1 or typed.rows[0][0].integer != 1) return error.TypedExistsVerificationFailed;
+    if (typed.rowCount() != 1 or typed.rows[0].id != 1) return error.TypedExistsVerificationFailed;
     result = try db.exec("DELETE FROM exists_marker;");
     result.deinit();
     var absent = try db.exec("SELECT id FROM exists_users WHERE NOT EXISTS (SELECT id FROM exists_marker) ORDER BY id;");

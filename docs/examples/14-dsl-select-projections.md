@@ -30,7 +30,7 @@ const Product = sqlite.table("select_products", struct { id: i64, name: []const 
 pub fn main() !void {
     var db = try sqlite.open(std.heap.page_allocator, "valid_14.db");
     defer db.close();
-    try db.createTable(Product, .{ .if_not_exists = true });
+    try db.createTable(Product, .{ .ifNotExists = true });
     try db.truncate(Product);
 
     var first = try db.from(Product).insert(.{ .id = 1, .name = "keyboard", .price = 80 });
@@ -39,17 +39,18 @@ pub fn main() !void {
     second.deinit();
 
     var projected = try db.from(Product)
-        .selectColumns(&.{ Product.key("id"), Product.key("name") })
-        .where(Product.column("price").ge(30))
-        .orderBy(Product.column("price").desc())
-        .fetchAll();
+        .select(&.{ Product.columns.id, Product.columns.name })
+        .where(Product.columns.price.gte(30))
+        .orderBy(Product.columns.price.desc())
+        .fetch();
     projected.deinit();
 
-    var distinct_names = try db.from(Product).selectFieldNames(&.{"name"}).distinct().fetchAll();
-    distinct_names.deinit();
+    var distinctNames = try db.from(Product).select(.{Product.columns.name}).distinct().fetch();
+    distinctNames.deinit();
 
-    var total = try db.from(Product).count().fetchAll();
+    var total = try db.from(Product).countStar().fetch();
     total.deinit();
+    std.debug.print("14 dsl select projections: field projections and distinct verified\n", .{});
 }
 ```
 

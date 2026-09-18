@@ -1,11 +1,11 @@
 ---
 title: "Subqueries with Raw and Typed DSL"
-description: "Use IN subqueries with raw SQL and typed DSL whereInColumn to filter rows based on related tables."
+description: "Use IN subqueries with raw SQL and typed DSL whereInQuery to filter rows based on related tables."
 ---
 
 # Subqueries with Raw and Typed DSL
 
-Use IN subqueries with raw SQL and typed DSL whereInColumn to filter rows based on related tables.
+Use IN subqueries with raw SQL and typed DSL whereInQuery to filter rows based on related tables.
 
 ## What This Example Does
 
@@ -19,7 +19,7 @@ Use IN subqueries with raw SQL and typed DSL whereInColumn to filter rows based 
 | 6 | INSERT INTO subquery_users VALUES (2, 'Bob') | Inserts Bob |
 | 7 | INSERT INTO subquery_orders VALUES (10, 1) | Inserts order for Alice |
 | 8 | SELECT id, name FROM subquery_users WHERE id IN (SELECT user_id FROM subquery_orders) | Raw IN subquery |
-| 9 | SELECT id, name FROM subquery_users WHERE id IN (SELECT user_id FROM subquery_orders) | Typed DSL whereInColumn |
+| 9 | SELECT id, name FROM subquery_users WHERE id IN (SELECT user_id FROM subquery_orders) | Typed DSL whereInQuery |
 
 ## Source Code
 
@@ -35,23 +35,23 @@ const Order = sqlite.table("subquery_orders", OrderRow);
 pub fn main() !void {
     var db = try sqlite.open(std.heap.page_allocator, "valid_25.db");
     defer db.close();
-    try db.createTable(User, .{ .if_not_exists = true, .primary_key = User.key("id") });
-    try db.createTable(Order, .{ .if_not_exists = true, .primary_key = Order.key("id") });
+    try db.createTable(User, .{ .ifNotExists = true, .primaryKey = User.columns.id });
+    try db.createTable(Order, .{ .ifNotExists = true, .primaryKey = Order.columns.id });
     try db.truncate(User);
     try db.truncate(Order);
-    var alice = try db.from(User).insertTyped(.{ .id = 1, .name = "Alice" });
+    var alice = try db.from(User).insert(.{ .id = 1, .name = "Alice" });
     alice.deinit();
-    var bob = try db.from(User).insertTyped(.{ .id = 2, .name = "Bob" });
+    var bob = try db.from(User).insert(.{ .id = 2, .name = "Bob" });
     bob.deinit();
-    var order = try db.from(Order).insertTyped(.{ .id = 10, .user_id = 1 });
+    var order = try db.from(Order).insert(.{ .id = 10, .user_id = 1 });
     order.deinit();
 
     var raw = try db.exec("SELECT id, name FROM subquery_users WHERE id IN (SELECT user_id FROM subquery_orders);");
     defer raw.deinit();
-    var typed = try db.from(User).whereInColumn(User.key("id"), Order, Order.key("user_id")).selectColumns(&.{ User.key("id"), User.key("name") }).fetchAll();
+    var typed = try db.from(User).whereInQuery(User.columns.id, Order, Order.columns.user_id).select(&.{ User.columns.id, User.columns.name }).fetch();
     defer typed.deinit();
     if (raw.rowCount() != 1 or typed.rowCount() != 1 or typed.rows[0][0].integer != 1) return error.SubqueryVerificationFailed;
-    std.debug.print("25 subqueries: raw IN SELECT and typed whereInColumn verified\n", .{});
+    std.debug.print("25 subqueries: raw IN SELECT and typed whereInQuery verified\n", .{});
 }
 ```
 
@@ -73,7 +73,7 @@ pub fn main() !void {
 ## Zig Output
 
 ```
-25 subqueries: raw IN SELECT and typed whereInColumn verified
+25 subqueries: raw IN SELECT and typed whereInQuery verified
 ```
 
 > [!TIP]

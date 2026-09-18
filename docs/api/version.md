@@ -12,8 +12,9 @@ Database and library version information.
 ```zig
 const version = @import("version");
 
-// Get sqlite.zig version
-const lib_version = version.VERSION;
+// SQLite source snapshot this engine implements (mirrors sqlite/VERSION)
+const engine = version.sqliteEngineVersion;
+const source = version.sqliteSourceVersion;
 ```
 
 ## Database Version
@@ -27,14 +28,9 @@ The SQLite file format includes version information in the database header:
 
 ## Schema Version
 
-Track schema changes with a version counter:
-
-```zig
-// Schema cookie changes whenever the schema is modified
-var rows = try db.exec("PRAGMA schema_version;");
-defer rows.deinit();
-const schema_version = rows.rows[0][0].integer;
-```
+Implemented PRAGMAs are `foreign_keys`, `user_version`, `application_id`,
+and `journal_mode`. Other PRAGMAs, including `schema_version`, return an
+unsupported-feature error rather than a fabricated value.
 
 ## User Version
 
@@ -48,5 +44,5 @@ result.deinit();
 // Get user version
 var rows = try db.exec("PRAGMA user_version;");
 defer rows.deinit();
-const user_version = rows.rows[0][0].integer;
+const userVersion = rows.rows[0][0].integer;
 ```

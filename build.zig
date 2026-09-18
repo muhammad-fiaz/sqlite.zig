@@ -4,14 +4,12 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Main module
     const module = b.addModule("sqlite", .{
         .root_source_file = b.path("src/sqlite.zig"),
         .target = target,
         .optimize = optimize,
     });
 
-    // Static library
     const library = b.addLibrary(.{
         .name = "sqlite",
         .root_module = module,
@@ -19,39 +17,36 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(library);
 
-    // Documentation
-    const install_docs = b.addInstallDirectory(.{
+    const installDocs = b.addInstallDirectory(.{
         .source_dir = library.getEmittedDocs(),
         .install_dir = .prefix,
         .install_subdir = "docs",
     });
 
-    const docs_step = b.step(
+    const docsStep = b.step(
         "docs",
         "Generate sqlite.zig API documentation",
     );
-    docs_step.dependOn(&install_docs.step);
+    docsStep.dependOn(&installDocs.step);
 
-    // Tests
     const tests = b.addTest(.{
         .root_module = module,
     });
 
-    const run_tests = b.addRunArtifact(tests);
+    const runTests = b.addRunArtifact(tests);
 
-    const test_step = b.step(
+    const testStep = b.step(
         "test",
         "Run the sqlite.zig test suite",
     );
-    test_step.dependOn(&run_tests.step);
+    testStep.dependOn(&runTests.step);
 
-    // Examples
-    const build_examples = b.step(
+    const buildExamples = b.step(
         "examples",
         "Build all sqlite.zig examples",
     );
 
-    const run_all_examples = b.step(
+    const runAllExamples = b.step(
         "run-all-examples",
         "Build and run every sqlite.zig example",
     );
@@ -106,6 +101,10 @@ pub fn build(b: *std.Build) void {
         "47_column_defaults",
         "48_raw_dsl",
         "49_sqlite_coverage_layers",
+        "50_schema_validation_interop",
+        "51_dsl_ctes",
+        "52_column_mapping",
+        "53_expression_operators",
     };
 
     inline for (examples) |name| {
@@ -124,17 +123,14 @@ pub fn build(b: *std.Build) void {
 
         b.installArtifact(exe);
 
-        // Build example
-        build_examples.dependOn(&exe.step);
+        buildExamples.dependOn(&exe.step);
 
-        // Individual run step (e.g. run-01_open_and_exec)
-        const run_step_name = b.fmt("run-{s}", .{name});
+        const runStepName = b.fmt("run-{s}", .{name});
         const run = b.addRunArtifact(exe);
         run.step.dependOn(b.getInstallStep());
-        const run_step = b.step(run_step_name, b.fmt("Run {s} example", .{name}));
-        run_step.dependOn(&run.step);
+        const runStep = b.step(runStepName, b.fmt("Run {s} example", .{name}));
+        runStep.dependOn(&run.step);
 
-        // Aggregate run step
-        run_all_examples.dependOn(&run.step);
+        runAllExamples.dependOn(&run.step);
     }
 }

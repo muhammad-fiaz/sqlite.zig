@@ -23,7 +23,7 @@ description: "The hand-written SQL lexer, parser, and bytecode compiler supporti
 | **SAVEPOINT** | `SAVEPOINT name` |
 | **RELEASE** | `RELEASE [SAVEPOINT] name` |
 | **CREATE VIEW** | `CREATE VIEW [IF NOT EXISTS] name AS SELECT ...` |
-| **CREATE TRIGGER** | `CREATE TRIGGER [IF NOT EXISTS] name BEFORE\|AFTER INSERT\|UPDATE\|DELETE ON table ...` |
+| **CREATE TRIGGER** | `CREATE TRIGGER [IF NOT EXISTS] name AFTER INSERT\|UPDATE\|DELETE ON table ...` |
 | **CREATE INDEX** | `CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (columns)` |
 | **ALTER TABLE** | `ADD COLUMN`, `RENAME TO`, `RENAME COLUMN ... TO`, and `DROP COLUMN` |
 
@@ -52,41 +52,41 @@ are also supported. Patterns support `*`, `?`, and simple character classes such
 as `[A-Z]`.
 
 The text projection functions `TRIM`, `LTRIM`, and `RTRIM` are supported in raw
-SQL and through `trimColumn`, `ltrimColumn`, and `rtrimColumn` on typed queries.
+SQL and as column wrappers (`.trim()`, `.ltrim()`, `.rtrim()`) usable in both
+`select` projections and `where` predicates in either DSL mode.
 
-Multi-argument scalar projections `REPLACE(value, search, replacement)` and
-`SUBSTR(value, start[, length])` are also supported in raw SQL, with typed
-`replaceColumn` and `substrColumn` projection helpers.
+Multi-argument scalar functions `REPLACE(value, search, replacement)` and
+`SUBSTR(value, start, length)` are also supported in raw SQL, with column
+wrappers `.replace(search, replacement)` and `.substr(start, length)`.
 
-`COALESCE`, `IFNULL`, and `INSTR(value, needle)` are supported as well; the
-typed DSL exposes `instrColumn` for checked column projections.
+`COALESCE`, `IFNULL`, and `INSTR(value, needle)` are supported as well via
+`.coalesce(fallback)`, `.ifNull(fallback)`, and `.instr(needle)`.
 
-`NULLIF(value, other)` is supported in raw SQL and through the generic
-two-argument typed function predicate builder.
+`NULLIF(value, other)` is supported in raw SQL.
 
-The numeric `ROUND(value[, digits])` function is available in raw SQL. The typed
-DSL exposes `roundColumn` for the standard one-argument form.
+The numeric `ROUND(value, digits)` function is available in raw SQL and as
+`.round(digits)` in the DSL.
 
-Common casts are supported with `CAST(value AS INTEGER|REAL|TEXT)`; the typed
-DSL exposes `castColumn` with compile-time column validation.
+Common casts are supported with `CAST(value AS INTEGER|REAL|TEXT)`; the DSL
+exposes `.cast("INTEGER")` with compile-time column validation.
 
 The initial JSON support includes `json_extract(json_text, '$.key')` and
-`json_set(json_text, '$.key', 'value')` for simple top-level scalar fields.
-The typed DSL exposes these through `jsonExtractColumn` and `jsonSetColumn`.
-Nested objects, arrays, and the complete JSON1 function family are not yet
-implemented.
+`json_set(json_text, '$.key', 'value')` for simple top-level scalar fields,
+exposed as `.jsonExtract(path)` / `.jsonSet(path, value)`. Nested objects,
+arrays, and the complete JSON1 function family are not yet implemented.
 
 Function expressions such as `WHERE LOWER(name) = 'alice'` and
 `WHERE TRIM(name) = 'alice'` are supported on the left side of comparison
-predicates, including numeric expressions such as `WHERE INSTR(name, 'x') > 0`.
+predicates, including numeric expressions such as `WHERE INSTR(name, 'x') > 0`;
+in the DSL these are `col.lower().eq("alice")` style wrappers.
 
 Literal membership lists are supported in raw SQL (`id IN (1, 3, 4)` and
-`id NOT IN (1, 3, 4)`) and in the checked DSL through
-`whereInValues(ColumnKey, values)` and `whereNotInValues(ColumnKey, values)`.
+`id NOT IN (1, 3, 4)`) and in both DSL modes through
+`whereInValues(col, values)` and `whereNotInValues(col, values)`.
 
 SQLite identity predicates are also supported: `IS`, `IS NOT`, `IS NULL`, and
 `IS NOT NULL`. The typed equivalents for value identity are
-`column.isValue(value)` and `column.isNotValue(value)`.
+`column.is(value)` and `column.isNot(value)`.
 
 ## WHERE Clauses
 

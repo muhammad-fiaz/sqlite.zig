@@ -23,8 +23,8 @@ pub const Value = union(enum) {
 };
 
 test "sql values expose stable types" {
-    const null_value: Value = .null;
-    const integer_value: Value = .{ .integer = 4 };
-    try std.testing.expect(null_value.isNull());
-    try std.testing.expectEqualStrings("integer", integer_value.typeName());
+    const nullValue: Value = .null;
+    const integerValue: Value = .{ .integer = 4 };
+    try std.testing.expect(nullValue.isNull());
+    try std.testing.expectEqualStrings("integer", integerValue.typeName());
 }

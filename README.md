@@ -79,12 +79,13 @@
 | **Typed DSL Query Builder** | A comptime, type-safe Zig query builder that generates SQL under the hood, ensuring compile-time validation of table names, column names, and types. |
 | **DISTINCT Joins** | Full DISTINCT support for JOIN queries with automatic deduplication of result rows. |
 | **Transaction Modes** | BEGIN DEFERRED, BEGIN IMMEDIATE, BEGIN EXCLUSIVE, START TRANSACTION, COMMIT, ROLLBACK, SAVEPOINT, RELEASE, and ROLLBACK TO SAVEPOINT. |
-| **Foreign Key Actions** | CASCADE DELETE, CASCADE UPDATE, SET NULL, SET DEFAULT, and RESTRICT with composite foreign key support. |
+| **Foreign Key Actions** | CASCADE DELETE, CASCADE UPDATE, SET NULL, and RESTRICT (plus composite foreign keys). SET DEFAULT / NO ACTION are not implemented. |
 | **Composite Constraints** | Composite PRIMARY KEY, composite UNIQUE, and composite FOREIGN KEY constraints across multiple columns. |
-| **Views & Triggers** | CREATE VIEW and CREATE TRIGGER with BEFORE/AFTER INSERT/UPDATE/DELETE support. |
+| **Views & Triggers** | CREATE VIEW and CREATE TRIGGER (AFTER INSERT/UPDATE/DELETE) with NEW/OLD references. |
 | **CTEs & Recursive CTEs** | Common Table Expressions including recursive CTEs for hierarchical data traversal (tree/graph structures). |
-| **Subqueries** | Scalar subqueries, EXISTS/NOT EXISTS, IN/NOT IN, and derived table subqueries in FROM and WHERE clauses. |
-| **Scalar Functions** | ABS, LENGTH, UPPER, LOWER, SUBSTR, and other scalar functions in both raw SQL and typed DSL. |
+| **Subqueries** | EXISTS/NOT EXISTS (incl. correlated), IN/NOT IN (lists and subqueries), and CTEs (incl. recursive). No derived tables in FROM. |
+| **Expression Operators** | `= == != <> < <= > >=`, `AND OR NOT`, `LIKE NOT LIKE` (`% _ ESCAPE`), `GLOB NOT GLOB` (`* ? []`), `REGEXP NOT REGEXP`, `MATCH NOT MATCH`, `||`, `IS IS NOT IS DISTINCT FROM`, `IN NOT IN`, `BETWEEN NOT BETWEEN`, `CASE`, `CAST`, `COLLATE NOCASE`, `+ - * / %`, `& | << >> ~`, all with correct NULL and precedence semantics. |
+| **Scalar Functions** | ABS, LENGTH, UPPER, LOWER, SUBSTR/SUBSTRING, REPLACE, TRIM/LTRIM/RTRIM (incl. custom chars), INSTR, HEX, QUOTE, UNICODE, CHAR, PRINTF/FORMAT, ROUND, TYPEOF, CAST, COALESCE/IFNULL, NULLIF, JSON_EXTRACT/JSON_SET in raw SQL, dynamic DSL, and typed DSL. |
 | **Indexed Queries** | CREATE INDEX and optimized indexed lookups for performance-critical queries. |
 | **Query Planning** | `EXPLAIN QUERY PLAN` reports index-backed equality searches and table scans. |
 | **Virtual Tables** | Native `generate_series` virtual tables support raw creation, typed DSL reads, and native reopen. Other modules return `Unsupported`. |
@@ -187,11 +188,11 @@ To use a local checkout from another project, add a path dependency to your `bui
 After adding the dependency, import the module in your `build.zig`:
 
 ```zig
-const sqlite_dep = b.dependency("sqlite", .{
+const sqliteDep = b.dependency("sqlite", .{
     .target = target,
     .optimize = optimize,
 });
-exe.root_module.addImport("sqlite", sqlite_dep.module("sqlite"));
+exe.root_module.addImport("sqlite", sqliteDep.module("sqlite"));
 ```
 
 ## Quick Start
@@ -208,12 +209,12 @@ pub fn main() !void {
     var db = try sqlite.open(std.heap.page_allocator, "my_database.db");
     defer db.close();
 
-    try db.createTable(User, .{ .if_not_exists = true });
+    try db.createTable(User, .{ .ifNotExists = true });
 
     var inserted = try db.from(User).insert(.{ .id = 1, .name = "Alice" });
     inserted.deinit();
 
-    var result = try db.from(User).fetchAll();
+    var result = try db.from(User).fetch();
     defer result.deinit();
 
     for (result.rows) |row| {
@@ -235,8 +236,8 @@ pub fn main() !void {
     var db = try sqlite.open(std.heap.page_allocator, "shop.db");
     defer db.close();
 
-    try db.createTable(User, .{ .if_not_exists = true });
-    try db.createTable(Order, .{ .if_not_exists = true });
+    try db.createTable(User, .{ .ifNotExists = true });
+    try db.createTable(Order, .{ .ifNotExists = true });
 
     // Transaction with rollback safety
     try db.begin();
@@ -246,15 +247,48 @@ pub fn main() !void {
 
     // Typed JOIN query
     var joined = try db.from(User)
-        .innerJoin(Order, "id", "user_id")
-        .select("*")
+        .innerJoin(Order, User.columns.id.eq(Order.columns.user_id))
+        .selectAll()
         .distinct()
-        .fetchAll();
+        .fetch();
     defer joined.deinit();
 
     std.debug.print("Found {d} rows\n", .{joined.rowCount()});
 }
 ```
+
+### Three interfaces: Raw SQL, Dynamic DSL, Typed DSL
+
+```zig
+// Raw SQL: unrestricted, no struct required.
+var rows = try db.exec("SELECT id, name FROM users WHERE age >= 18;");
+defer rows.deinit();
+
+// Dynamic DSL: runtime table/column names, no struct required.
+// For existing databases, legacy schemas, and ad-hoc queries.
+var dyn = try db.from("users")
+    .select(.{ db.col("id"), db.col("name") })
+    .where(db.col("age").gte(18))
+    .orderBy(db.col("name").asc())
+    .fetch();
+defer dyn.deinit();
+
+// Typed DSL: Zig structs, compile-time columns, typed rows.
+const User = sqlite.table("users", struct { id: i64, name: []const u8, age: i64 });
+try db.schema(User).validate();
+var typed = try db.from(User)
+    .where(User.columns.age.gte(18))
+    .orderBy(User.columns.name.asc())
+    .fetch();
+defer typed.deinit();
+for (typed.rows) |user| {
+    std.debug.print("{d} {s} {d}\n", .{ user.id, user.name, user.age });
+}
+```
+
+Typed keys use the same descriptors (`.primaryKey = User.columns.id`);
+dynamic keys use strings (`.primaryKey = "id"`). All values are bound as
+parameters; identifiers are quoted. See `docs/api/dsl.md`.
 
 ### Raw SQL
 
@@ -281,7 +315,7 @@ pub fn main() !void {
 
 ## Examples
 
-The `examples/` directory contains **32 runnable examples**:
+The `examples/` directory contains **53 runnable examples**:
 
 | # | Example | Description |
 |---|---------|-------------|
@@ -298,7 +332,7 @@ The `examples/` directory contains **32 runnable examples**:
 | 11 | [`keys_and_joins`](examples/11_keys_and_joins.zig) | Primary keys, foreign keys, and JOIN queries |
 | 12 | [`complex_queries`](examples/12_complex_queries.zig) | DISTINCT joins and aggregate functions |
 | 13 | [`edge_cases`](examples/13_edge_cases.zig) | NULL handling, savepoints, and error cases |
-| 14 | [`dsl_select_projections`](examples/14_dsl_select_projections.zig) | SELECT field projections with selectFields() |
+| 14 | [`dsl_select_projections`](examples/14_dsl_select_projections.zig) | SELECT field projections with select() |
 | 15 | [`raw_dsl_interoperability`](examples/15_raw_dsl_interoperability.zig) | Verify raw SQL and DSL produce identical results |
 | 16 | [`dsl_predicates_pagination`](examples/16_dsl_predicates_pagination.zig) | WHERE predicates with LIMIT/OFFSET pagination |
 | 17 | [`persistence_reopen_verification`](examples/17_persistence_reopen_verification.zig) | Data persistence across database close/reopen |
@@ -307,16 +341,37 @@ The `examples/` directory contains **32 runnable examples**:
 | 20 | [`scalar_functions_typed_dsl`](examples/20_scalar_functions_typed_dsl.zig) | ABS, LENGTH, UPPER, LOWER, SUBSTR functions |
 | 21 | [`indexed_queries`](examples/21_indexed_queries.zig) | Index creation and optimized lookups |
 | 22 | [`views_and_typed_reads`](examples/22_views_and_typed_reads.zig) | CREATE VIEW with typed DSL reads |
-| 23 | [`triggers_raw_and_dsl`](examples/23_triggers_raw_and_dsl.zig) | BEFORE/AFTER INSERT triggers |
+| 23 | [`triggers_raw_and_dsl`](examples/23_triggers_raw_and_dsl.zig) | AFTER INSERT triggers |
 | 24 | [`cte_raw_and_typed_reads`](examples/24_cte_raw_and_typed_reads.zig) | Common Table Expressions with typed reads |
-| 25 | [`subqueries_raw_and_typed_dsl`](examples/25_subqueries_raw_and_typed_dsl.zig) | Subqueries in FROM and WHERE clauses |
+| 25 | [`subqueries_raw_and_typed_dsl`](examples/25_subqueries_raw_and_typed_dsl.zig) | IN subqueries in WHERE clauses |
 | 26 | [`foreign_key_actions`](examples/26_foreign_key_actions.zig) | CASCADE DELETE and SET NULL actions |
 | 27 | [`composite_unique_keys`](examples/27_composite_unique_keys.zig) | Composite unique constraints |
-| 28 | [`foreign_key_update_actions`](examples/28_foreign_key_update_actions.zig) | CASCADE UPDATE and SET DEFAULT actions |
-| 29 | [`multiple_ctes`](examples/29_multiple_ctes.zig) | Multiple CTEs with cross-CTE joins |
+| 28 | [`foreign_key_update_actions`](examples/28_foreign_key_update_actions.zig) | ON UPDATE CASCADE, SET NULL, RESTRICT |
+| 29 | [`multiple_ctes`](examples/29_multiple_ctes.zig) | Multiple dependent non-recursive CTEs |
 | 30 | [`composite_table_constraints`](examples/30_composite_table_constraints.zig) | Composite PRIMARY KEY and UNIQUE |
 | 31 | [`composite_foreign_keys`](examples/31_composite_foreign_keys.zig) | Composite foreign keys referencing multiple columns |
 | 32 | [`recursive_ctes`](examples/32_recursive_ctes.zig) | Recursive CTEs for hierarchical tree traversal |
+| 33 | [`explain_query_plan`](examples/33_explain_query_plan.zig) | EXPLAIN QUERY PLAN and indexed lookups |
+| 34 | [`virtual_generate_series`](examples/34_virtual_generate_series.zig) | generate_series virtual table |
+| 35 | [`wal_journal_mode`](examples/35_wal_journal_mode.zig) | WAL journal mode and checkpointing |
+| 36 | [`grouped_aggregates`](examples/36_grouped_aggregates.zig) | GROUP BY aggregates |
+| 37 | [`insert_select_copy`](examples/37_insert_select_copy.zig) | INSERT...SELECT copies |
+| 38 | [`insert_or_ignore`](examples/38_insert_or_ignore.zig) | INSERT OR IGNORE conflicts |
+| 39 | [`upsert_do_nothing`](examples/39_upsert_do_nothing.zig) | ON CONFLICT DO NOTHING |
+| 40 | [`upsert_do_update`](examples/40_upsert_do_update.zig) | ON CONFLICT DO UPDATE |
+| 41 | [`insert_or_replace`](examples/41_insert_or_replace.zig) | INSERT OR REPLACE |
+| 42 | [`update_from_join`](examples/42_update_from_join.zig) | UPDATE...FROM joins |
+| 43 | [`not_in_subqueries`](examples/43_not_in_subqueries.zig) | NOT IN subqueries |
+| 44 | [`exists_subqueries`](examples/44_exists_subqueries.zig) | EXISTS / NOT EXISTS |
+| 45 | [`literal_in_lists`](examples/45_literal_in_lists.zig) | Literal IN lists |
+| 46 | [`raw_alter_table`](examples/46_raw_alter_table.zig) | ALTER TABLE variants |
+| 47 | [`column_defaults`](examples/47_column_defaults.zig) | Column DEFAULTs |
+| 48 | [`raw_dsl`](examples/48_raw_dsl.zig) | Schema-less dynamic DSL |
+| 49 | [`sqlite_coverage_layers`](examples/49_sqlite_coverage_layers.zig) | Raw, dynamic, and typed interop |
+| 50 | [`schema_validation_interop`](examples/50_schema_validation_interop.zig) | Strict schema validation |
+| 51 | [`dsl_ctes`](examples/51_dsl_ctes.zig) | WITH and WITH RECURSIVE in the DSL |
+| 52 | [`column_mapping`](examples/52_column_mapping.zig) | camelCase Zig fields over SQL names |
+| 53 | [`expression_operators`](examples/53_expression_operators.zig) | Full operator coverage across raw, dynamic, and typed DSL |
 
 Run any example:
 

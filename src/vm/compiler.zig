@@ -7,10 +7,10 @@ pub fn compileLiteral(allocator: std.mem.Allocator, expression: ast.Expr) !opcod
     errdefer program.deinit();
     switch (expression) {
         .literal => |value| try program.append(.{ .opcode = switch (value) {
-            .null => .load_null,
-            .integer => .load_integer,
-            .real => .load_real,
-            .text, .blob => .load_text,
+            .null => .loadNull,
+            .integer => .loadInteger,
+            .real => .loadReal,
+            .text, .blob => .loadText,
         }, .register = 0, .value = value }),
         else => return error.InvalidSql,
     }
@@ -21,5 +21,5 @@ pub fn compileLiteral(allocator: std.mem.Allocator, expression: ast.Expr) !opcod
 test "compiler emits a constant program" {
     var program = try compileLiteral(std.testing.allocator, .{ .literal = .{ .integer = 5 } });
     defer program.deinit();
-    try std.testing.expectEqual(opcode.OpCode.load_integer, program.instructions.items[0].opcode);
+    try std.testing.expectEqual(opcode.OpCode.loadInteger, program.instructions.items[0].opcode);
 }

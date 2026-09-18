@@ -19,3 +19,4 @@ zig-out/
 
 Thumbs.db
 Desktop.ini
+/sqlite

@@ -21,6 +21,7 @@ pub const Error = error{
     NotInTransaction,
     TransactionActive,
     Unsupported,
+    SchemaMismatch,
 };
 
 pub fn message(err: Error) []const u8 {
@@ -45,6 +46,7 @@ pub fn message(err: Error) []const u8 {
         error.NotInTransaction => "not in transaction",
         error.TransactionActive => "transaction already active",
         error.Unsupported => "unsupported feature",
+        error.SchemaMismatch => "database schema does not match the declared table",
     };
 }
 

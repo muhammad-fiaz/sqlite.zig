@@ -6,7 +6,7 @@ const Sale = sqlite.table("grouped_sales", struct { category: []const u8, amount
 pub fn main() !void {
     var db = try sqlite.open(std.heap.page_allocator, "valid_36.db");
     defer db.close();
-    try db.createTable(Sale, .{ .if_not_exists = true });
+    try db.createTable(Sale, .{ .ifNotExists = true });
     try db.truncate(Sale);
     inline for (.{ .{ "hardware", @as(i64, 10) }, .{ "hardware", @as(i64, 20) }, .{ "software", @as(i64, 7) } }) |item| {
         var inserted = try db.from(Sale).insert(.{ .category = item[0], .amount = item[1] });

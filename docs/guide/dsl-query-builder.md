@@ -1,13 +1,15 @@
 ---
 title: "DSL Query Builder"
-description: "The typed DSL query builder providing compile-time safety for table definitions, queries, inserts, updates, and deletes."
+description: "Raw SQL, the dynamic DSL, and the typed DSL over one shared query engine."
 ---
 
 # DSL Query Builder
 
-The typed DSL (Domain-Specific Language) query builder provides compile-time safety for database operations. Table names, column names, and types are validated at compile time.
+Three interfaces share one engine: unrestricted raw SQL, a dynamic DSL for
+runtime table/column names (no struct required), and a typed DSL where
+`User.columns.<field>` gives compile-time columns and typed rows.
 
-## Defining Tables
+## Defining tables
 
 ```zig
 const sqlite = @import("sqlite");
@@ -25,7 +27,49 @@ const Order = sqlite.table("orders", struct {
 });
 ```
 
-## CRUD Operations
+Non-optional fields are `NOT NULL`, `?T` fields are nullable, and struct
+field defaults become `DEFAULT` clauses.
+
+## Dynamic queries without structs
+
+```zig
+var rows = try db
+    .from("users")
+    .select(.{ db.col("id"), db.col("name") })
+    .where(db.col("age").gte(18))
+    .orderBy(db.col("name").asc())
+    .fetch();
+defer rows.deinit();
+```
+
+This is the mode for existing databases, legacy schemas, runtime table
+names, and ad-hoc queries: `db.from("users")` plus `db.col("age")` never
+require a Zig struct.
+
+## Typed queries
+
+```zig
+// Fetch all rows
+var all = try db.from(User).fetch();
+defer all.deinit();
+
+// With WHERE clause
+var filtered = try db.from(User)
+    .where(User.columns.name.eq("Alice"))
+    .fetch();
+defer filtered.deinit();
+
+// With specific columns (projections return raw rows)
+var projected = try db.from(User).select(.{ User.columns.id, User.columns.name }).fetch();
+defer projected.deinit();
+
+// Full-row queries map back into the table struct.
+var typed = try db.from(User).selectAll().fetch();
+defer typed.deinit();
+const firstId = typed.rows[0].id;
+```
+
+## CRUD operations
 
 ### Insert
 
@@ -34,222 +78,192 @@ var result = try db.from(User).insert(.{ .id = 1, .name = "Alice", .email = "ali
 result.deinit();
 ```
 
-### Select
+Partial inserts name a subset of columns:
 
 ```zig
-// Fetch all rows
-var all = try db.from(User).fetchAll();
-defer all.deinit();
-
-// With WHERE clause
-var filtered = try db.from(User)
-    .where(User.column("name").eq("Alice"))
-    .fetchAll();
-defer filtered.deinit();
-
-// With specific columns
-var projected = try db.from(User).select(&.{ "id", "name" }).fetchAll();
-defer projected.deinit();
-
-// Map named result columns back into the table struct.
-var typed = try db.from(User).selectColumns(&.{ User.key("name"), User.key("id") }).fetchTyped();
-defer typed.deinit();
-const first_id = typed.rows[0].id;
+var partial = try db.from(User).insert(.{ .id = 1, .name = "Alice" });
+partial.deinit();
 ```
+
+Conflict handling: `insertOrIgnore` / `insertOrReplace`. Advanced
+`ON CONFLICT ... DO UPDATE` belongs in raw SQL.
 
 ### Update
 
 ```zig
-var result = try db.from(User)
-    .where(User.column("id").eq(1))
-    .update(.{ .name = "Bob" });
-result.deinit();
+var mutation = try db.from(User).update(.{ .name = "Bob" });
+var result = try mutation.where(User.columns.id.eq(1)).execute();
+defer result.deinit();
 ```
 
 ### Delete
 
 ```zig
-var result = try db.from(User)
-    .where(User.column("id").eq(1))
-    .delete();
-result.deinit();
+var result = try db.from(User).delete().where(User.columns.id.eq(1)).execute();
+defer result.deinit();
 ```
 
 ## Joins
 
+Joins take the other table plus one column-comparison expression:
+
 ```zig
 // Inner join
 var result = try db.from(User)
-    .innerJoin(Order, "id", "user_id")
-    .select("*")
-    .fetchAll();
+    .innerJoin(Order, User.columns.id.eq(Order.columns.user_id))
+    .fetch();
 defer result.deinit();
 
 // Left join
 var left = try db.from(User)
-    .leftJoin(Order, "id", "user_id")
-    .fetchAll();
+    .leftJoin(Order, User.columns.id.eq(Order.columns.user_id))
+    .fetch();
 defer left.deinit();
+```
+
+Dynamic equivalent:
+
+```zig
+var dyn = try db.from("users")
+    .innerJoin("orders", db.col("users.id").eq(db.col("orders.user_id")))
+    .fetch();
+defer dyn.deinit();
 ```
 
 ## DISTINCT
 
 ```zig
 var result = try db.from(User)
-    .innerJoin(Order, "id", "user_id")
-    .select("*")
+    .innerJoin(Order, User.columns.id.eq(Order.columns.user_id))
+    .selectAll()
     .distinct()
-    .fetchAll();
+    .fetch();
 defer result.deinit();
 ```
 
 ## Aggregates
 
+Aggregates are column projections used with `select` (one per statement,
+matching what the engine evaluates):
+
 ```zig
-var total = try db.from(Order).sum("amount").fetchAll();
+var total = try db.from(Order).select(.{Order.columns.amount.sum()}).fetch();
 defer total.deinit();
 
-var avg = try db.from(Order).average("amount").fetchAll();
+var avg = try db.from(Order).select(.{Order.columns.amount.avg()}).fetch();
 defer avg.deinit();
 
-var count = try db.from(Order).count("id").fetchAll();
+var count = try db.from(Order).select(.{Order.columns.id.count()}).fetch();
 defer count.deinit();
+
+var all = try db.from(Order).countStar().fetch(); // COUNT(*)
+defer all.deinit();
 ```
 
-## Typed text projections
+## Scalar functions
 
-Column-backed helpers are available for common scalar text operations:
+Column wrappers cover the engine-supported functions and compose with both
+predicates and projections:
 
 ```zig
 var changed = try db.from(User)
-    .replaceColumn(User.key("name"), "Alice", "A.")
-    .fetchAll();
+    .select(.{User.columns.name.replace("Alice", "A.")})
+    .fetch();
 defer changed.deinit();
 
 var prefix = try db.from(User)
-    .substrColumn(User.key("name"), 1, 3)
-    .fetchAll();
+    .select(.{User.columns.name.substr(1, 3)})
+    .fetch();
 defer prefix.deinit();
-```
 
-NULL fallback projections are also available without writing SQL:
-
-```zig
 var labels = try db.from(User)
-    .coalesceColumn(User.key("nickname"), "anonymous")
-    .fetchAll();
+    .select(.{User.columns.nickname.coalesce("anonymous")})
+    .fetch();
 defer labels.deinit();
-```
 
-Use `ifNullColumn` for SQLite's two-argument `IFNULL` spelling.
-
-Function predicates are also checked against the table struct:
-
-Typed columns also provide concise text-search predicates:
-
-```zig
-var matches = try db.from(User)
-    .where(User.key("name").contains("ali"))
-    .fetchAll();
-defer matches.deinit();
-```
-
-`contains("ali")`, `notContains("ali")`, `startsWith("Ali")`, and `endsWith("son")` generate
-`LIKE` patterns `%ali%`, `Ali%`, and `%son` respectively.
-
-```zig
 var normalized = try db.from(User)
-    .whereLower(User.key("name"), "alice")
-    .fetchAll();
+    .where(User.columns.name.lower().eq("alice"))
+    .fetch();
 defer normalized.deinit();
 
-// Generic checked scalar predicate.
-var long_names = try db.from(User)
-    .whereFunction("LENGTH", User.key("name"), .greater, 3)
-    .fetchAll();
-defer long_names.deinit();
+var longNames = try db.from(User)
+    .where(User.columns.name.length().gt(3))
+    .fetch();
+defer longNames.deinit();
 
 var contains = try db.from(User)
-    .whereFunction2("INSTR", User.key("name"), "ali", .greater, 0)
-    .fetchAll();
+    .where(User.columns.name.instr("ali").gt(0))
+    .fetch();
 defer contains.deinit();
 
-var changed = try db.from(User)
-    .where(User.key("name").isDistinctFrom(@as(sqlite.value.Value, .null)))
-    .fetchAll();
-defer changed.deinit();
-
 var names = try db.from(User)
-    .jsonExtractColumn(User.key("email"), "$.name")
-    .fetchAll();
+    .select(.{User.columns.email.jsonExtract("$.name")})
+    .fetch();
 defer names.deinit();
 
 var matching = try db.from(User)
-    .whereJsonExtract(User.key("profile"), "$.city", .equal, "London")
-    .fetchAll();
+    .where(User.columns.profile.jsonExtract("$.city").eq("London"))
+    .fetch();
 defer matching.deinit();
 ```
 
-The column key is checked against the table struct at compile time; string-based
-selection remains available when the projection is intentionally dynamic.
-
-## Raw DSL
-
-For tables without a Zig schema, use the schema-less Raw DSL. Runtime
-identifiers are accepted here, while values are still rendered safely:
+Text search uses `LIKE`/`GLOB` patterns directly:
 
 ```zig
-var rows = try db
-    .from("users")
-    .where(db.col("age").gte(18))
-    .select("id, name")
-    .fetchAll();
-defer rows.deinit();
+var matches = try db.from(User)
+    .where(User.columns.name.like("%ali%"))
+    .fetch();
+defer matches.deinit();
 ```
 
-For an explicitly typed projection, use `selectTyped`:
-
-```zig
-var rows = try db.from(User)
-    .selectTyped(&.{ User.key("id"), User.key("name") })
-    .fetchAll();
-defer rows.deinit();
-```
-
-For single-row lookups, `fetchOneTyped()` returns an optional row struct:
+## Single-row typed lookups
 
 ```zig
 if (try db.from(User)
-    .where(User.column("id").eq(1))
-    .fetchOneTyped()) |*user| {
-    defer db.from(User).deinitTypedRow(user);
+    .where(User.columns.id.eq(1))
+    .fetchOne()) |*user| {
+    defer db.from(User).freeRow(user);
     std.debug.print("{d} {s}\n", .{ user.id, user.name });
 }
 ```
 
 It returns `null` when no row matches. Typed text fields are allocator-owned;
-release them with `deinitTypedRow`.
+release them with `freeRow`.
 
 ## Pagination
 
 ```zig
 var page = try db.from(User)
-    .select("*")
+    .selectAll()
     .limit(10)
     .offset(20)
-    .fetchAll();
+    .fetch();
 defer page.deinit();
 ```
 
-## Partial Struct Inserts
+## CTEs
 
-You can insert only a subset of columns:
+`.with` / `.withRecursive` prefix raw-SQL CTE bodies; the typed table names
+the CTE being read, like a view:
 
 ```zig
-var result = try db.from(User).insert(.{ .id = 1, .name = "Alice" });
-result.deinit();
+var rows = try db.from(Live)
+    .with("live", "SELECT id, name FROM users WHERE active = 1")
+    .orderBy(Live.columns.id.asc())
+    .fetch();
+defer rows.deinit();
 ```
 
+## Explicit name mapping
 
+SQL names never change for Zig. Declare the mapping once:
 
+```zig
+const User = sqlite.table("users", .{
+    .firstName = sqlite.column("first_name", []const u8),
+});
+```
 
+Inserts, validation, and typed mapping translate both ways; key options
+use SQL names. See the [coverage matrix](/guide/coverage) for the honest
+per-feature status of Raw SQL, Dynamic DSL, and Typed DSL.

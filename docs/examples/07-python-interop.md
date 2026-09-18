@@ -28,7 +28,7 @@ pub fn main() !void {
     var db = try sqlite.open(std.heap.page_allocator, "python_interop.db");
     defer db.close();
     if (!db.tableExists(User)) {
-        try db.createTable(User, .{ .if_not_exists = true, .primary_key = User.key("id") });
+        try db.createTable(User, .{ .ifNotExists = true, .primaryKey = User.columns.id });
     }
     var result = try db.exec("SELECT name FROM users WHERE id = 7;");
     if (result.rowCount() == 0) {
@@ -39,6 +39,7 @@ pub fn main() !void {
     }
     defer result.deinit();
     if (result.rowCount() != 1 or !std.mem.eql(u8, result.rows[0][0].text, "Python")) return error.InteropMismatch;
+    std.debug.print("07 python interop: database compatible with Python sqlite3\n", .{});
 }
 ```
 

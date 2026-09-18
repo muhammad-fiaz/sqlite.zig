@@ -1,7 +1,7 @@
 const std = @import("std");
 const Value = @import("value.zig").Value;
 
-pub const OpCode = enum { halt, load_null, load_integer, load_real, load_text, move };
+pub const OpCode = enum { halt, loadNull, loadInteger, loadReal, loadText, move };
 pub const Instruction = struct { opcode: OpCode, register: usize = 0, value: Value = .null };
 
 pub const Program = struct {
@@ -21,6 +21,6 @@ pub const Program = struct {
 test "bytecode program stores instructions" {
     var program = Program.init(std.testing.allocator);
     defer program.deinit();
-    try program.append(.{ .opcode = .load_integer, .register = 0, .value = .{ .integer = 3 } });
-    try std.testing.expectEqual(OpCode.load_integer, program.instructions.items[0].opcode);
+    try program.append(.{ .opcode = .loadInteger, .register = 0, .value = .{ .integer = 3 } });
+    try std.testing.expectEqual(OpCode.loadInteger, program.instructions.items[0].opcode);
 }

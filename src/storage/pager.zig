@@ -17,20 +17,20 @@ pub const Pager = struct {
         self.dirty.deinit();
     }
 
-    pub fn get(self: *Pager, page_number: u32) ![]u8 {
-        if (self.pages.get(page_number)) |page| return page;
-        const page = try self.file.readPage(page_number);
-        try self.pages.put(page_number, page);
+    pub fn get(self: *Pager, pageNumber: u32) ![]u8 {
+        if (self.pages.get(pageNumber)) |page| return page;
+        const page = try self.file.readPage(pageNumber);
+        try self.pages.put(pageNumber, page);
         return page;
     }
 
-    pub fn markDirty(self: *Pager, page_number: u32) !void {
-        try self.dirty.put(page_number, {});
+    pub fn markDirty(self: *Pager, pageNumber: u32) !void {
+        try self.dirty.put(pageNumber, {});
     }
 
     pub fn flush(self: *Pager) !void {
         var iterator = self.dirty.keyIterator();
-        while (iterator.next()) |page_number| try self.file.writePage(page_number.*, self.pages.get(page_number.*).?);
+        while (iterator.next()) |pageNumber| try self.file.writePage(pageNumber.*, self.pages.get(pageNumber.*).?);
         self.dirty.clearRetainingCapacity();
     }
 };

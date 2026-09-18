@@ -43,9 +43,9 @@ pub fn encode(allocator: std.mem.Allocator, schema: *const Schema) ![]u8 {
         try u32Bytes(&result, allocator, @intCast(table.columns.len));
         for (table.columns) |column| {
             try bytes(&result, allocator, column.name);
-            try bytes(&result, allocator, column.type_name);
-            result.append(allocator, @intFromBool(column.primary_key)) catch return error.OutOfMemory;
-            result.append(allocator, @intFromBool(column.not_null)) catch return error.OutOfMemory;
+            try bytes(&result, allocator, column.typeName);
+            result.append(allocator, @intFromBool(column.primaryKey)) catch return error.OutOfMemory;
+            result.append(allocator, @intFromBool(column.notNull)) catch return error.OutOfMemory;
         }
         try u32Bytes(&result, allocator, @intCast(table.rows.items.len));
         for (table.rows.items) |row| for (row.values) |value| switch (value) {
@@ -79,32 +79,32 @@ pub fn decode(allocator: std.mem.Allocator, data: []const u8) !Schema {
     var schema = Schema.init(allocator);
     errdefer schema.deinit();
     var offset: usize = 0;
-    const table_count = try readU32(data, &offset);
-    var table_index: u32 = 0;
-    while (table_index < table_count) : (table_index += 1) {
+    const tableCount = try readU32(data, &offset);
+    var tableIndex: u32 = 0;
+    while (tableIndex < tableCount) : (tableIndex += 1) {
         const name = try readBytes(allocator, data, &offset);
         defer allocator.free(name);
-        const column_count = try readU32(data, &offset);
-        const definitions = try allocator.alloc(ast.ColumnDef, column_count);
+        const columnCount = try readU32(data, &offset);
+        const definitions = try allocator.alloc(ast.ColumnDef, columnCount);
         defer allocator.free(definitions);
         var i: usize = 0;
-        while (i < column_count) : (i += 1) {
-            const column_name = try readBytes(allocator, data, &offset);
-            const type_name = try readBytes(allocator, data, &offset);
+        while (i < columnCount) : (i += 1) {
+            const columnName = try readBytes(allocator, data, &offset);
+            const typeName = try readBytes(allocator, data, &offset);
             if (offset + 2 > data.len) return error.InvalidHeader;
-            definitions[i] = .{ .name = column_name, .type_name = type_name, .primary_key = data[offset] != 0, .not_null = data[offset + 1] != 0 };
+            definitions[i] = .{ .name = columnName, .typeName = typeName, .primaryKey = data[offset] != 0, .notNull = data[offset + 1] != 0 };
             offset += 2;
         }
         try schema.createTable(name, definitions, &.{});
         for (definitions) |definition| {
             allocator.free(definition.name);
-            allocator.free(definition.type_name);
+            allocator.free(definition.typeName);
         }
         const table = schema.find(name).?;
-        const row_count = try readU32(data, &offset);
-        var row_index: u32 = 0;
-        while (row_index < row_count) : (row_index += 1) {
-            const values = try allocator.alloc(Value, column_count);
+        const rowCount = try readU32(data, &offset);
+        var rowIndex: u32 = 0;
+        while (rowIndex < rowCount) : (rowIndex += 1) {
+            const values = try allocator.alloc(Value, columnCount);
             defer allocator.free(values);
             for (values) |*value| {
                 if (offset >= data.len) return error.InvalidHeader;
@@ -133,7 +133,7 @@ pub fn decode(allocator: std.mem.Allocator, data: []const u8) !Schema {
 test "schema image round trip" {
     var schema = Schema.init(std.testing.allocator);
     defer schema.deinit();
-    const defs = [_]ast.ColumnDef{.{ .name = "id", .type_name = "INTEGER" }};
+    const defs = [_]ast.ColumnDef{.{ .name = "id", .typeName = "INTEGER" }};
     try schema.createTable("t", &defs, &.{});
     var row = [_]Value{.{ .integer = 7 }};
     try schema.appendRow(schema.find("t").?, &row);

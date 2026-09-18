@@ -28,31 +28,39 @@ var rows = try db.exec(
     \\WITH
     \\  high_value AS (SELECT id, amount FROM orders WHERE amount > 100),
     \\  customer AS (SELECT id, name FROM users)
-    \\SELECT c.name, h.amount
-    \\FROM customer c
-    \\INNER JOIN high_value h ON c.id = h.id;
+    \\SELECT id, name FROM customer ORDER BY id;
 );
 defer rows.deinit();
+```
+
+Later CTEs can read earlier ones:
+
+```zig
+var chained = try db.exec(
+    \\WITH first_set AS (SELECT id FROM source WHERE id >= 2),
+    \\     second_set AS (SELECT id FROM first_set)
+    \\SELECT id FROM second_set ORDER BY id;
+);
+defer chained.deinit();
 ```
 
 ### Recursive CTEs
 
-Recursive CTEs traverse hierarchical data like tree structures:
+Recursive CTEs iterate to a fixpoint (bounded at 1000 iterations):
 
 ```zig
 var rows = try db.exec(
-    \\WITH RECURSIVE tree AS (
-    \\  SELECT id, name, parent_id, 0 AS depth
-    \\  FROM nodes WHERE parent_id IS NULL
+    \\WITH RECURSIVE nums AS (
+    \\  SELECT 1 AS n
     \\  UNION ALL
-    \\  SELECT n.id, n.name, n.parent_id, t.depth + 1
-    \\  FROM nodes n
-    \\  INNER JOIN tree t ON n.parent_id = t.id
+    \\  SELECT n + 1 AS n FROM nums WHERE n < 5
     \\)
-    \\SELECT * FROM tree ORDER BY depth;
+    \\SELECT n FROM nums ORDER BY n;
 );
 defer rows.deinit();
 ```
+
+Table aliases (`FROM nodes n`) are not supported; use full table names.
 
 ## Subqueries
 
@@ -76,28 +84,17 @@ var rows = try db.exec(
 defer rows.deinit();
 ```
 
-### Subquery in FROM (Derived Table)
+### Subqueries in FROM and SELECT lists
+
+Derived tables (`FROM (SELECT ...)`) and scalar subqueries in the projection
+list are not supported by the engine. Express them with CTEs plus joins, or
+with `IN` / `EXISTS` predicates (all supported, including correlated
+`EXISTS`):
 
 ```zig
 var rows = try db.exec(
-    \\SELECT avg_amount, user_count FROM (
-    \\  SELECT user_id, AVG(amount) AS avg_amount
-    \\  FROM orders GROUP BY user_id
-    \\) stats
-    \\INNER JOIN (
-    \\  SELECT user_id, COUNT(*) AS user_count
-    \\  FROM orders GROUP BY user_id
-    \\) counts ON stats.user_id = counts.user_id
-);
-defer rows.deinit();
-```
-
-### Scalar Subquery
-
-```zig
-var rows = try db.exec(
-    \\SELECT name, (SELECT COUNT(*) FROM orders WHERE user_id = users.id) AS order_count
-    \\FROM users
+    \\WITH stats AS (SELECT user_id, AVG(amount) AS avg_amount FROM orders GROUP BY user_id)
+    \\SELECT user_id, avg_amount FROM stats ORDER BY user_id;
 );
 defer rows.deinit();
 ```

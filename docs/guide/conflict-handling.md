@@ -48,9 +48,9 @@ The typed DSL exposes the same modes while retaining compile-time row-field
 validation:
 
 ```zig
-var ignored = try db.from(Item).insertIgnore(.{ .id = 1, .label = "duplicate" });
+var ignored = try db.from(Item).insertOrIgnore(.{ .id = 1, .label = "duplicate" });
 ignored.deinit();
-var replaced = try db.from(Item).insertReplace(.{ .id = 1, .label = "new value" });
+var replaced = try db.from(Item).insertOrReplace(.{ .id = 1, .label = "new value" });
 replaced.deinit();
 ```
 

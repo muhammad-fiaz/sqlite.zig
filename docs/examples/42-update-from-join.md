@@ -31,8 +31,8 @@ const Adjustment = sqlite.table("update_from_adjustments", struct { id: i64, amo
 pub fn main() !void {
     var db = try sqlite.open(std.heap.page_allocator, "valid_42.db");
     defer db.close();
-    try db.createTable(Balance, .{ .if_not_exists = true, .primary_key = Balance.key("id") });
-    try db.createTable(Adjustment, .{ .if_not_exists = true });
+    try db.createTable(Balance, .{ .ifNotExists = true, .primaryKey = Balance.columns.id });
+    try db.createTable(Adjustment, .{ .ifNotExists = true });
     try db.truncate(Balance);
     try db.truncate(Adjustment);
     var balance = try db.from(Balance).insert(.{ .id = 1, .amount = 10 });
@@ -41,9 +41,9 @@ pub fn main() !void {
     adjustment.deinit();
     var result = try db.exec("UPDATE update_from_balances SET amount = update_from_adjustments.amount FROM update_from_adjustments WHERE update_from_balances.id = update_from_adjustments.id;");
     defer result.deinit();
-    var rows = try db.from(Balance).selectAll().fetchAll();
+    var rows = try db.from(Balance).selectAll().fetch();
     defer rows.deinit();
-    if (rows.rowCount() != 1 or rows.rows[0][1].integer != 99) return error.UpdateFromVerificationFailed;
+    if (rows.rowCount() != 1 or rows.rows[0].amount != 99) return error.UpdateFromVerificationFailed;
     std.debug.print("42 UPDATE FROM: equi-join source assignment verified\n", .{});
 }
 ```

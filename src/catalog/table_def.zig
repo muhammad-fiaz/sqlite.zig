@@ -12,7 +12,9 @@ pub const TableDef = struct {
 };
 
 test "table definition resolves columns case insensitively" {
-    const columns = [_]Column{.{ .name = "id", .type_name = "INTEGER", .primary_key = false, .not_null = false }};
+    var idName = "id".*;
+    var intName = "INTEGER".*;
+    const columns = [_]Column{.{ .name = &idName, .typeName = &intName, .primaryKey = false, .notNull = false }};
     const definition = TableDef{ .name = "users", .columns = &columns };
     try std.testing.expect(definition.column("ID") != null);
 }

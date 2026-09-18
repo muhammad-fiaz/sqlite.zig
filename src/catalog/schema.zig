@@ -2,10 +2,10 @@ const std = @import("std");
 const Value = @import("../vm/value.zig").Value;
 const ast = @import("../sql/ast.zig");
 
-pub const Column = struct { name: []u8, type_name: []u8, primary_key: bool, not_null: bool, unique: bool = false, default_value: ?Value = null, foreign_table: ?[]u8 = null, foreign_column: ?[]u8 = null, on_delete: ast.ReferentialAction = .restrict, on_update: ast.ReferentialAction = .restrict };
+pub const Column = struct { name: []u8, typeName: []u8, primaryKey: bool, notNull: bool, unique: bool = false, defaultValue: ?Value = null, foreignTable: ?[]u8 = null, foreignColumn: ?[]u8 = null, onDelete: ast.ReferentialAction = .restrict, onUpdate: ast.ReferentialAction = .restrict };
 pub const Row = struct { values: []Value };
-pub const Constraint = struct { kind: enum { primary_key, unique, foreign_key }, columns: [][]u8, foreign_table: ?[]u8 = null, referenced_columns: [][]u8 = &.{}, on_delete: ast.ReferentialAction = .restrict, on_update: ast.ReferentialAction = .restrict };
-pub const Table = struct { name: []u8, columns: []Column, constraints: []Constraint, rows: std.ArrayList(Row), virtual_module: ?[]u8 = null, virtual_arguments: [][]u8 = &.{} };
+pub const Constraint = struct { kind: enum { primaryKey, unique, foreignKey }, columns: [][]u8, foreignTable: ?[]u8 = null, referencedColumns: [][]u8 = &.{}, onDelete: ast.ReferentialAction = .restrict, onUpdate: ast.ReferentialAction = .restrict };
+pub const Table = struct { name: []u8, columns: []Column, constraints: []Constraint, rows: std.ArrayList(Row), virtualModule: ?[]u8 = null, virtualArguments: [][]u8 = &.{} };
 pub const Index = struct { name: []u8, table: []u8, columns: [][]u8, unique: bool = false };
 pub const View = struct { name: []u8, sql: []u8 };
 pub const Trigger = struct { name: []u8, table: []u8, event: ast.TriggerEvent, body: []u8 };
@@ -16,7 +16,7 @@ pub const Schema = struct {
     indexes: std.ArrayList(Index),
     views: std.ArrayList(View),
     triggers: std.ArrayList(Trigger),
-    foreign_keys_enabled: bool = true,
+    foreignKeysEnabled: bool = true,
 
     pub fn init(allocator: std.mem.Allocator) Schema {
         return .{ .allocator = allocator, .tables = .empty, .indexes = .empty, .views = .empty, .triggers = .empty };
@@ -31,23 +31,23 @@ pub const Schema = struct {
             table.rows.deinit(self.allocator);
             for (table.columns) |column| {
                 self.allocator.free(column.name);
-                self.allocator.free(column.type_name);
-                if (column.default_value) |value| freeValue(self.allocator, value);
-                if (column.foreign_table) |value| self.allocator.free(value);
-                if (column.foreign_column) |value| self.allocator.free(value);
+                self.allocator.free(column.typeName);
+                if (column.defaultValue) |value| freeValue(self.allocator, value);
+                if (column.foreignTable) |value| self.allocator.free(value);
+                if (column.foreignColumn) |value| self.allocator.free(value);
             }
             self.allocator.free(table.columns);
             for (table.constraints) |constraint| {
                 for (constraint.columns) |column| self.allocator.free(column);
                 self.allocator.free(constraint.columns);
-                if (constraint.foreign_table) |foreign_table| self.allocator.free(foreign_table);
-                for (constraint.referenced_columns) |column| self.allocator.free(column);
-                self.allocator.free(constraint.referenced_columns);
+                if (constraint.foreignTable) |foreignTable| self.allocator.free(foreignTable);
+                for (constraint.referencedColumns) |column| self.allocator.free(column);
+                self.allocator.free(constraint.referencedColumns);
             }
             self.allocator.free(table.constraints);
-            if (table.virtual_module) |module| self.allocator.free(module);
-            for (table.virtual_arguments) |argument| self.allocator.free(argument);
-            self.allocator.free(table.virtual_arguments);
+            if (table.virtualModule) |module| self.allocator.free(module);
+            for (table.virtualArguments) |argument| self.allocator.free(argument);
+            self.allocator.free(table.virtualArguments);
             self.allocator.free(table.name);
         }
         self.tables.deinit(self.allocator);
@@ -164,8 +164,8 @@ pub const Schema = struct {
         for (definition.columns) |name| if (self.columnIndex(table, name) == null) return error.UnknownColumn;
         const name = try self.allocator.dupe(u8, definition.name);
         errdefer self.allocator.free(name);
-        const table_name = try self.allocator.dupe(u8, definition.table);
-        errdefer self.allocator.free(table_name);
+        const tableName = try self.allocator.dupe(u8, definition.table);
+        errdefer self.allocator.free(tableName);
         const columns = try self.allocator.alloc([]u8, definition.columns.len);
         errdefer self.allocator.free(columns);
         var copied: usize = 0;
@@ -174,11 +174,11 @@ pub const Schema = struct {
             columns[index] = try self.allocator.dupe(u8, column);
             copied += 1;
         }
-        try self.indexes.append(self.allocator, .{ .name = name, .table = table_name, .columns = columns, .unique = definition.unique });
+        try self.indexes.append(self.allocator, .{ .name = name, .table = tableName, .columns = columns, .unique = definition.unique });
         if (definition.unique) {
             errdefer _ = self.indexes.pop();
-            for (table.rows.items, 0..) |row, row_index| {
-                for (table.rows.items[row_index + 1 ..]) |other| if (indexValuesEqual(table, row.values, other.values, definition.columns)) return error.ConstraintViolation;
+            for (table.rows.items, 0..) |row, rowIndex| {
+                for (table.rows.items[rowIndex + 1 ..]) |other| if (indexValuesEqual(table, row.values, other.values, definition.columns)) return error.ConstraintViolation;
             }
         }
     }
@@ -195,81 +195,81 @@ pub const Schema = struct {
         return error.UnknownIndex;
     }
 
-    pub fn createTable(self: *Schema, name: []const u8, definitions: []const ast.ColumnDef, definitions_constraints: []const ast.TableConstraint) !void {
+    pub fn createTable(self: *Schema, name: []const u8, definitions: []const ast.ColumnDef, definitionsConstraints: []const ast.TableConstraint) !void {
         if (self.find(name) != null) return error.TableExists;
-        const owned_name = try self.allocator.dupe(u8, name);
-        errdefer self.allocator.free(owned_name);
+        const ownedName = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(ownedName);
         const columns = try self.allocator.alloc(Column, definitions.len);
         errdefer self.allocator.free(columns);
         var count: usize = 0;
         errdefer for (columns[0..count]) |column| {
             self.allocator.free(column.name);
-            self.allocator.free(column.type_name);
+            self.allocator.free(column.typeName);
         };
         for (definitions, 0..) |definition, index| {
-            columns[index] = .{ .name = try self.allocator.dupe(u8, definition.name), .type_name = try self.allocator.dupe(u8, definition.type_name), .primary_key = definition.primary_key, .not_null = definition.not_null, .unique = definition.unique, .default_value = if (definition.default_value) |value| try self.copyValue(value) else null, .foreign_table = if (definition.foreign_key) |foreign_key| try self.allocator.dupe(u8, foreign_key.table) else null, .foreign_column = if (definition.foreign_key) |foreign_key| try self.allocator.dupe(u8, foreign_key.column) else null, .on_delete = if (definition.foreign_key) |foreign_key| foreign_key.on_delete else .restrict, .on_update = if (definition.foreign_key) |foreign_key| foreign_key.on_update else .restrict };
+            columns[index] = .{ .name = try self.allocator.dupe(u8, definition.name), .typeName = try self.allocator.dupe(u8, definition.typeName), .primaryKey = definition.primaryKey, .notNull = definition.notNull, .unique = definition.unique, .defaultValue = if (definition.defaultValue) |value| try self.copyValue(value) else null, .foreignTable = if (definition.foreignKey) |foreignKey| try self.allocator.dupe(u8, foreignKey.table) else null, .foreignColumn = if (definition.foreignKey) |foreignKey| try self.allocator.dupe(u8, foreignKey.column) else null, .onDelete = if (definition.foreignKey) |foreignKey| foreignKey.onDelete else .restrict, .onUpdate = if (definition.foreignKey) |foreignKey| foreignKey.onUpdate else .restrict };
             count += 1;
         }
-        const constraints = try self.allocator.alloc(Constraint, definitions_constraints.len);
+        const constraints = try self.allocator.alloc(Constraint, definitionsConstraints.len);
         errdefer self.allocator.free(constraints);
-        var constraint_count: usize = 0;
-        errdefer for (constraints[0..constraint_count]) |constraint| {
+        var constraintCount: usize = 0;
+        errdefer for (constraints[0..constraintCount]) |constraint| {
             for (constraint.columns) |column| self.allocator.free(column);
             self.allocator.free(constraint.columns);
-            if (constraint.foreign_table) |foreign_table| self.allocator.free(foreign_table);
-            for (constraint.referenced_columns) |column| self.allocator.free(column);
-            self.allocator.free(constraint.referenced_columns);
+            if (constraint.foreignTable) |foreignTable| self.allocator.free(foreignTable);
+            for (constraint.referencedColumns) |column| self.allocator.free(column);
+            self.allocator.free(constraint.referencedColumns);
         };
-        for (definitions_constraints, 0..) |definition, index| {
-            const source_columns = switch (definition) {
-                .primary_key => |value| value,
+        for (definitionsConstraints, 0..) |definition, index| {
+            const sourceColumns = switch (definition) {
+                .primaryKey => |value| value,
                 .unique => |value| value,
-                .foreign_key => |value| value.columns,
+                .foreignKey => |value| value.columns,
             };
-            const copied_columns = try self.allocator.alloc([]u8, source_columns.len);
-            var copied_count: usize = 0;
-            errdefer for (copied_columns[0..copied_count]) |column| self.allocator.free(column);
-            for (source_columns, 0..) |column, column_index| {
+            const copiedColumns = try self.allocator.alloc([]u8, sourceColumns.len);
+            var copiedCount: usize = 0;
+            errdefer for (copiedColumns[0..copiedCount]) |column| self.allocator.free(column);
+            for (sourceColumns, 0..) |column, columnIdx| {
                 if (self.columnIndexByName(definitions, column) == null) return error.UnknownColumn;
-                copied_columns[column_index] = try self.allocator.dupe(u8, column);
-                copied_count += 1;
+                copiedColumns[columnIdx] = try self.allocator.dupe(u8, column);
+                copiedCount += 1;
             }
             constraints[index] = .{ .kind = switch (definition) {
-                .primary_key => .primary_key,
+                .primaryKey => .primaryKey,
                 .unique => .unique,
-                .foreign_key => .foreign_key,
-            }, .columns = copied_columns };
+                .foreignKey => .foreignKey,
+            }, .columns = copiedColumns };
             switch (definition) {
-                .foreign_key => |foreign_key| {
-                    if (foreign_key.referenced_columns.len != source_columns.len) return error.ConstraintViolation;
-                    const referenced_columns = try self.allocator.alloc([]u8, foreign_key.referenced_columns.len);
-                    for (foreign_key.referenced_columns, 0..) |column, column_index| {
-                        referenced_columns[column_index] = try self.allocator.dupe(u8, column);
-                        if (self.findConst(foreign_key.table)) |parent| {
+                .foreignKey => |foreignKey| {
+                    if (foreignKey.referencedColumns.len != sourceColumns.len) return error.ConstraintViolation;
+                    const referencedColumns = try self.allocator.alloc([]u8, foreignKey.referencedColumns.len);
+                    for (foreignKey.referencedColumns, 0..) |column, columnIdx| {
+                        referencedColumns[columnIdx] = try self.allocator.dupe(u8, column);
+                        if (self.findConst(foreignKey.table)) |parent| {
                             if (self.columnIndex(parent, column) == null) return error.UnknownColumn;
                         }
                     }
-                    constraints[index].foreign_table = try self.allocator.dupe(u8, foreign_key.table);
-                    constraints[index].referenced_columns = referenced_columns;
-                    constraints[index].on_delete = foreign_key.on_delete;
-                    constraints[index].on_update = foreign_key.on_update;
+                    constraints[index].foreignTable = try self.allocator.dupe(u8, foreignKey.table);
+                    constraints[index].referencedColumns = referencedColumns;
+                    constraints[index].onDelete = foreignKey.onDelete;
+                    constraints[index].onUpdate = foreignKey.onUpdate;
                 },
                 else => {},
             }
-            constraint_count += 1;
+            constraintCount += 1;
         }
-        try self.tables.append(self.allocator, .{ .name = owned_name, .columns = columns, .constraints = constraints, .rows = .empty });
-        var autoindex_number: usize = 0;
+        try self.tables.append(self.allocator, .{ .name = ownedName, .columns = columns, .constraints = constraints, .rows = .empty });
+        var autoindexNumber: usize = 0;
         for (constraints) |constraint| {
-            if (constraint.kind == .foreign_key) continue;
-            autoindex_number += 1;
-            const index_name = try std.fmt.allocPrint(self.allocator, "sqlite_autoindex_{s}_{d}", .{ name, autoindex_number });
-            const index_table = try self.allocator.dupe(u8, name);
-            const index_columns = try self.allocator.alloc([]u8, constraint.columns.len);
-            for (constraint.columns, 0..) |column, column_index| {
-                index_columns[column_index] = try self.allocator.dupe(u8, column);
+            if (constraint.kind == .foreignKey) continue;
+            autoindexNumber += 1;
+            const indexName = try std.fmt.allocPrint(self.allocator, "sqlite_autoindex_{s}_{d}", .{ name, autoindexNumber });
+            const indexTable = try self.allocator.dupe(u8, name);
+            const indexColumns = try self.allocator.alloc([]u8, constraint.columns.len);
+            for (constraint.columns, 0..) |column, columnIdx| {
+                indexColumns[columnIdx] = try self.allocator.dupe(u8, column);
             }
-            try self.indexes.append(self.allocator, .{ .name = index_name, .table = index_table, .columns = index_columns, .unique = true });
+            try self.indexes.append(self.allocator, .{ .name = indexName, .table = indexTable, .columns = indexColumns, .unique = true });
         }
     }
 
@@ -281,13 +281,13 @@ pub const Schema = struct {
         const stop = std.fmt.parseInt(i64, arguments[1], 10) catch return error.InvalidSql;
         const step = if (arguments.len == 3) std.fmt.parseInt(i64, arguments[2], 10) catch return error.InvalidSql else if (start <= stop) @as(i64, 1) else @as(i64, -1);
         if (step == 0) return error.InvalidSql;
-        const definitions = [_]ast.ColumnDef{.{ .name = "value", .type_name = "INTEGER" }};
+        const definitions = [_]ast.ColumnDef{.{ .name = "value", .typeName = "INTEGER" }};
         try self.createTable(name, &definitions, &.{});
         const table = self.find(name).?;
-        table.virtual_module = try self.allocator.dupe(u8, module);
-        const copied_arguments = try self.allocator.alloc([]u8, arguments.len);
-        for (arguments, 0..) |argument, index| copied_arguments[index] = try self.allocator.dupe(u8, argument);
-        table.virtual_arguments = copied_arguments;
+        table.virtualModule = try self.allocator.dupe(u8, module);
+        const copiedArguments = try self.allocator.alloc([]u8, arguments.len);
+        for (arguments, 0..) |argument, index| copiedArguments[index] = try self.allocator.dupe(u8, argument);
+        table.virtualArguments = copiedArguments;
         var current = start;
         var count: usize = 0;
         while (if (step > 0) current <= stop else current >= stop) : (current += step) {
@@ -301,24 +301,24 @@ pub const Schema = struct {
     pub fn dropTable(self: *Schema, name: []const u8) !void {
         for (self.tables.items, 0..) |*table, index| {
             if (std.ascii.eqlIgnoreCase(table.name, name)) {
-                var index_position: usize = 0;
-                while (index_position < self.indexes.items.len) {
-                    if (std.ascii.eqlIgnoreCase(self.indexes.items[index_position].table, name)) {
-                        const removed = self.indexes.orderedRemove(index_position);
+                var indexPosition: usize = 0;
+                while (indexPosition < self.indexes.items.len) {
+                    if (std.ascii.eqlIgnoreCase(self.indexes.items[indexPosition].table, name)) {
+                        const removed = self.indexes.orderedRemove(indexPosition);
                         self.allocator.free(removed.name);
                         self.allocator.free(removed.table);
                         for (removed.columns) |column| self.allocator.free(column);
                         self.allocator.free(removed.columns);
-                    } else index_position += 1;
+                    } else indexPosition += 1;
                 }
-                var trigger_position: usize = 0;
-                while (trigger_position < self.triggers.items.len) {
-                    if (std.ascii.eqlIgnoreCase(self.triggers.items[trigger_position].table, name)) {
-                        const removed = self.triggers.orderedRemove(trigger_position);
+                var triggerPosition: usize = 0;
+                while (triggerPosition < self.triggers.items.len) {
+                    if (std.ascii.eqlIgnoreCase(self.triggers.items[triggerPosition].table, name)) {
+                        const removed = self.triggers.orderedRemove(triggerPosition);
                         self.allocator.free(removed.name);
                         self.allocator.free(removed.table);
                         self.allocator.free(removed.body);
-                    } else trigger_position += 1;
+                    } else triggerPosition += 1;
                 }
                 self.removeTable(index);
                 return;
@@ -327,10 +327,10 @@ pub const Schema = struct {
         return error.UnknownTable;
     }
 
-    pub fn renameTable(self: *Schema, old_name: []const u8, new_name: []const u8) !void {
-        if (self.find(new_name) != null) return error.TableExists;
-        const table = self.find(old_name) orelse return error.UnknownTable;
-        const owned = try self.allocator.dupe(u8, new_name);
+    pub fn renameTable(self: *Schema, oldName: []const u8, newName: []const u8) !void {
+        if (self.find(newName) != null) return error.TableExists;
+        const table = self.find(oldName) orelse return error.UnknownTable;
+        const owned = try self.allocator.dupe(u8, newName);
         self.allocator.free(table.name);
         table.name = owned;
     }
@@ -344,17 +344,17 @@ pub const Schema = struct {
         table.rows.clearRetainingCapacity();
     }
 
-    pub fn addColumn(self: *Schema, table_name: []const u8, definition: ast.ColumnDef) !void {
-        const table = self.find(table_name) orelse return error.UnknownTable;
+    pub fn addColumn(self: *Schema, tableName: []const u8, definition: ast.ColumnDef) !void {
+        const table = self.find(tableName) orelse return error.UnknownTable;
         for (table.columns) |column| if (std.ascii.eqlIgnoreCase(column.name, definition.name)) return error.ColumnExists;
-        if (definition.not_null and table.rows.items.len != 0) return error.ConstraintViolation;
-        const new_columns = try self.allocator.alloc(Column, table.columns.len + 1);
-        errdefer self.allocator.free(new_columns);
-        for (table.columns, 0..) |column, index| new_columns[index] = column;
-        new_columns[table.columns.len] = .{ .name = try self.allocator.dupe(u8, definition.name), .type_name = try self.allocator.dupe(u8, definition.type_name), .primary_key = definition.primary_key, .not_null = definition.not_null, .default_value = if (definition.default_value) |value| try self.copyValue(value) else null, .on_delete = if (definition.foreign_key) |foreign_key| foreign_key.on_delete else .restrict, .on_update = if (definition.foreign_key) |foreign_key| foreign_key.on_update else .restrict };
+        if (definition.notNull and table.rows.items.len != 0) return error.ConstraintViolation;
+        const newColumns = try self.allocator.alloc(Column, table.columns.len + 1);
+        errdefer self.allocator.free(newColumns);
+        for (table.columns, 0..) |column, index| newColumns[index] = column;
+        newColumns[table.columns.len] = .{ .name = try self.allocator.dupe(u8, definition.name), .typeName = try self.allocator.dupe(u8, definition.typeName), .primaryKey = definition.primaryKey, .notNull = definition.notNull, .defaultValue = if (definition.defaultValue) |value| try self.copyValue(value) else null, .onDelete = if (definition.foreignKey) |foreignKey| foreignKey.onDelete else .restrict, .onUpdate = if (definition.foreignKey) |foreignKey| foreignKey.onUpdate else .restrict };
         errdefer {
-            self.allocator.free(new_columns[table.columns.len].name);
-            self.allocator.free(new_columns[table.columns.len].type_name);
+            self.allocator.free(newColumns[table.columns.len].name);
+            self.allocator.free(newColumns[table.columns.len].typeName);
         }
         for (table.rows.items) |*row| {
             const values = try self.allocator.realloc(row.values, row.values.len + 1);
@@ -362,49 +362,49 @@ pub const Schema = struct {
             row.values[row.values.len - 1] = .null;
         }
         self.allocator.free(table.columns);
-        table.columns = new_columns;
+        table.columns = newColumns;
     }
 
-    pub fn renameColumn(self: *Schema, table_name: []const u8, old_name: []const u8, new_name: []const u8) !void {
-        const table = self.find(table_name) orelse return error.UnknownTable;
-        if (self.columnIndex(table, new_name)) |_| return error.ColumnExists;
-        const index = self.columnIndex(table, old_name) orelse return error.UnknownColumn;
-        const owned = try self.allocator.dupe(u8, new_name);
+    pub fn renameColumn(self: *Schema, tableName: []const u8, oldName: []const u8, newName: []const u8) !void {
+        const table = self.find(tableName) orelse return error.UnknownTable;
+        if (self.columnIndex(table, newName)) |_| return error.ColumnExists;
+        const index = self.columnIndex(table, oldName) orelse return error.UnknownColumn;
+        const owned = try self.allocator.dupe(u8, newName);
         self.allocator.free(table.columns[index].name);
         table.columns[index].name = owned;
     }
 
-    pub fn dropColumn(self: *Schema, table_name: []const u8, column_name: []const u8) !void {
-        const table = self.find(table_name) orelse return error.UnknownTable;
-        const index = self.columnIndex(table, column_name) orelse return error.UnknownColumn;
+    pub fn dropColumn(self: *Schema, tableName: []const u8, columnName: []const u8) !void {
+        const table = self.find(tableName) orelse return error.UnknownTable;
+        const index = self.columnIndex(table, columnName) orelse return error.UnknownColumn;
         if (table.columns.len == 1) return error.ConstraintViolation;
-        const old_column = table.columns[index];
-        var new_columns = try self.allocator.alloc(Column, table.columns.len - 1);
-        var target_index: usize = 0;
-        for (table.columns, 0..) |column, source_index| {
-            if (source_index == index) continue;
-            new_columns[target_index] = column;
-            target_index += 1;
+        const oldColumn = table.columns[index];
+        var newColumns = try self.allocator.alloc(Column, table.columns.len - 1);
+        var targetIndex: usize = 0;
+        for (table.columns, 0..) |column, sourceIndex| {
+            if (sourceIndex == index) continue;
+            newColumns[targetIndex] = column;
+            targetIndex += 1;
         }
         for (table.rows.items) |*row| {
-            const new_values = try self.allocator.alloc(Value, row.values.len - 1);
-            var value_index: usize = 0;
-            for (row.values, 0..) |value, source_index| {
-                if (source_index == index) {
+            const newValues = try self.allocator.alloc(Value, row.values.len - 1);
+            var valueIndex: usize = 0;
+            for (row.values, 0..) |value, sourceIndex| {
+                if (sourceIndex == index) {
                     freeValue(self.allocator, value);
                 } else {
-                    new_values[value_index] = value;
-                    value_index += 1;
+                    newValues[valueIndex] = value;
+                    valueIndex += 1;
                 }
             }
             self.allocator.free(row.values);
-            row.values = new_values;
+            row.values = newValues;
         }
-        self.allocator.free(old_column.name);
-        self.allocator.free(old_column.type_name);
-        if (old_column.default_value) |value| freeValue(self.allocator, value);
+        self.allocator.free(oldColumn.name);
+        self.allocator.free(oldColumn.typeName);
+        if (oldColumn.defaultValue) |value| freeValue(self.allocator, value);
         self.allocator.free(table.columns);
-        table.columns = new_columns;
+        table.columns = newColumns;
     }
 
     fn columnIndex(self: *const Schema, table: *const Table, name: []const u8) ?usize {
@@ -428,22 +428,22 @@ pub const Schema = struct {
         table.rows.deinit(self.allocator);
         for (table.columns) |column| {
             self.allocator.free(column.name);
-            self.allocator.free(column.type_name);
-            if (column.foreign_table) |value| self.allocator.free(value);
-            if (column.foreign_column) |value| self.allocator.free(value);
+            self.allocator.free(column.typeName);
+            if (column.foreignTable) |value| self.allocator.free(value);
+            if (column.foreignColumn) |value| self.allocator.free(value);
         }
         self.allocator.free(table.columns);
         for (table.constraints) |constraint| {
             for (constraint.columns) |column| self.allocator.free(column);
             self.allocator.free(constraint.columns);
-            if (constraint.foreign_table) |foreign_table| self.allocator.free(foreign_table);
-            for (constraint.referenced_columns) |column| self.allocator.free(column);
-            self.allocator.free(constraint.referenced_columns);
+            if (constraint.foreignTable) |foreignTable| self.allocator.free(foreignTable);
+            for (constraint.referencedColumns) |column| self.allocator.free(column);
+            self.allocator.free(constraint.referencedColumns);
         }
         self.allocator.free(table.constraints);
-        if (table.virtual_module) |module| self.allocator.free(module);
-        for (table.virtual_arguments) |argument| self.allocator.free(argument);
-        self.allocator.free(table.virtual_arguments);
+        if (table.virtualModule) |module| self.allocator.free(module);
+        for (table.virtualArguments) |argument| self.allocator.free(argument);
+        self.allocator.free(table.virtualArguments);
         self.allocator.free(table.name);
     }
 
@@ -454,7 +454,7 @@ pub const Schema = struct {
         var count: usize = 0;
         errdefer for (owned[0..count]) |value| freeValue(self.allocator, value);
         for (values, 0..) |value, index| {
-            if (table.columns[index].not_null and value == .null) return error.ConstraintViolation;
+            if (table.columns[index].notNull and value == .null) return error.ConstraintViolation;
             owned[index] = try self.copyValue(value);
             count += 1;
         }
@@ -462,27 +462,27 @@ pub const Schema = struct {
         try table.rows.append(self.allocator, .{ .values = owned });
     }
 
-    pub fn validateUpdate(self: *const Schema, table: *const Table, row_index: usize, values: []const Value) !void {
-        try self.validateConstraints(table, values, row_index);
+    pub fn validateUpdate(self: *const Schema, table: *const Table, rowIndex: usize, values: []const Value) !void {
+        try self.validateConstraints(table, values, rowIndex);
     }
 
-    fn validateConstraints(self: *const Schema, table: *const Table, values: []const Value, ignored_row: ?usize) !void {
+    fn validateConstraints(self: *const Schema, table: *const Table, values: []const Value, ignoredRow: ?usize) !void {
         for (table.columns, 0..) |column, index| {
-            if (column.primary_key and values[index] == .null) return error.ConstraintViolation;
-            if (column.unique or column.primary_key) {
-                if (values[index] != .null) for (table.rows.items, 0..) |existing, existing_index| {
-                    if (ignored_row != null and ignored_row.? == existing_index) continue;
+            if (column.primaryKey and values[index] == .null) return error.ConstraintViolation;
+            if (column.unique or column.primaryKey) {
+                if (values[index] != .null) for (table.rows.items, 0..) |existing, existingIndex| {
+                    if (ignoredRow != null and ignoredRow.? == existingIndex) continue;
                     if (valuesEqual(existing.values[index], values[index])) return error.ConstraintViolation;
                 };
             }
-            if (self.foreign_keys_enabled) {
-                if (column.foreign_table) |foreign_table_name| {
-                    const foreign_table = self.findConst(foreign_table_name) orelse return error.ConstraintViolation;
-                    const foreign_column_name = column.foreign_column orelse return error.ConstraintViolation;
-                    const foreign_index = self.columnIndex(foreign_table, foreign_column_name) orelse return error.ConstraintViolation;
+            if (self.foreignKeysEnabled) {
+                if (column.foreignTable) |foreignTableName| {
+                    const foreignTable = self.findConst(foreignTableName) orelse return error.ConstraintViolation;
+                    const foreignColumnName = column.foreignColumn orelse return error.ConstraintViolation;
+                    const foreignIndex = self.columnIndex(foreignTable, foreignColumnName) orelse return error.ConstraintViolation;
                     if (values[index] != .null) {
                         var found = false;
-                        for (foreign_table.rows.items) |foreign_row| if (valuesEqual(foreign_row.values[foreign_index], values[index])) {
+                        for (foreignTable.rows.items) |foreignRow| if (valuesEqual(foreignRow.values[foreignIndex], values[index])) {
                             found = true;
                             break;
                         };
@@ -492,40 +492,40 @@ pub const Schema = struct {
             }
         }
         for (table.constraints) |constraint| {
-            var has_null = false;
+            var hasNull = false;
             for (constraint.columns) |name| {
                 const index = self.columnIndex(table, name) orelse return error.UnknownColumn;
-                if (values[index] == .null) has_null = true;
+                if (values[index] == .null) hasNull = true;
             }
-            if (constraint.kind == .primary_key and has_null) return error.ConstraintViolation;
-            if (constraint.kind == .unique and has_null) continue;
-            if (constraint.kind == .foreign_key and self.foreign_keys_enabled) {
-                if (has_null) continue;
-                const foreign_table = self.findConst(constraint.foreign_table orelse return error.ConstraintViolation) orelse return error.ConstraintViolation;
-                for (foreign_table.rows.items) |foreign_row| {
+            if (constraint.kind == .primaryKey and hasNull) return error.ConstraintViolation;
+            if (constraint.kind == .unique and hasNull) continue;
+            if (constraint.kind == .foreignKey and self.foreignKeysEnabled) {
+                if (hasNull) continue;
+                const foreignTable = self.findConst(constraint.foreignTable orelse return error.ConstraintViolation) orelse return error.ConstraintViolation;
+                for (foreignTable.rows.items) |foreignRow| {
                     var matched = true;
-                    for (constraint.columns, constraint.referenced_columns) |child_name, parent_name| {
-                        const child_index = self.columnIndex(table, child_name) orelse return error.UnknownColumn;
-                        const parent_index = self.columnIndex(foreign_table, parent_name) orelse return error.UnknownColumn;
-                        if (!valuesEqual(values[child_index], foreign_row.values[parent_index])) matched = false;
+                    for (constraint.columns, constraint.referencedColumns) |childName, parentName| {
+                        const childIndex = self.columnIndex(table, childName) orelse return error.UnknownColumn;
+                        const parentIndex = self.columnIndex(foreignTable, parentName) orelse return error.UnknownColumn;
+                        if (!valuesEqual(values[childIndex], foreignRow.values[parentIndex])) matched = false;
                     }
                     if (matched) break;
                 } else return error.ConstraintViolation;
                 continue;
             }
-            for (table.rows.items, 0..) |existing, existing_index| {
-                if (ignored_row != null and ignored_row.? == existing_index) continue;
+            for (table.rows.items, 0..) |existing, existingIndex| {
+                if (ignoredRow != null and ignoredRow.? == existingIndex) continue;
                 if (indexValuesEqual(table, values, existing.values, constraint.columns)) return error.ConstraintViolation;
             }
         }
         for (self.indexes.items) |index| if (index.unique and std.ascii.eqlIgnoreCase(index.table, table.name)) {
-            var has_null = false;
+            var hasNull = false;
             for (index.columns) |name| {
-                const column_index = self.columnIndex(table, name) orelse continue;
-                if (values[column_index] == .null) has_null = true;
+                const columnIdx = self.columnIndex(table, name) orelse continue;
+                if (values[columnIdx] == .null) hasNull = true;
             }
-            if (!has_null) for (table.rows.items, 0..) |existing, existing_index| {
-                if (ignored_row != null and ignored_row.? == existing_index) continue;
+            if (!hasNull) for (table.rows.items, 0..) |existing, existingIndex| {
+                if (ignoredRow != null and ignoredRow.? == existingIndex) continue;
                 if (indexValuesEqual(table, values, existing.values, index.columns)) return error.ConstraintViolation;
             };
         };
@@ -533,24 +533,24 @@ pub const Schema = struct {
 
     pub fn clone(self: *const Schema) !Schema {
         var result = Schema.init(self.allocator);
-        result.foreign_keys_enabled = self.foreign_keys_enabled;
+        result.foreignKeysEnabled = self.foreignKeysEnabled;
         errdefer result.deinit();
         for (self.tables.items) |table| {
-            if (table.virtual_module) |module| {
-                try result.createVirtualTable(table.name, module, table.virtual_arguments);
+            if (table.virtualModule) |module| {
+                try result.createVirtualTable(table.name, module, table.virtualArguments);
                 continue;
             }
             const definitions = try self.allocator.alloc(ast.ColumnDef, table.columns.len);
             defer self.allocator.free(definitions);
-            for (table.columns, 0..) |column, index| definitions[index] = .{ .name = column.name, .type_name = column.type_name, .primary_key = column.primary_key, .not_null = column.not_null, .unique = column.unique, .default_value = column.default_value, .foreign_key = if (column.foreign_table != null) .{ .table = column.foreign_table.?, .column = column.foreign_column.?, .on_delete = column.on_delete, .on_update = column.on_update } else null };
-            const constraint_definitions = try self.allocator.alloc(ast.TableConstraint, table.constraints.len);
-            defer self.allocator.free(constraint_definitions);
-            for (table.constraints, 0..) |constraint, index| constraint_definitions[index] = switch (constraint.kind) {
-                .primary_key => .{ .primary_key = constraint.columns },
+            for (table.columns, 0..) |column, index| definitions[index] = .{ .name = column.name, .typeName = column.typeName, .primaryKey = column.primaryKey, .notNull = column.notNull, .unique = column.unique, .defaultValue = column.defaultValue, .foreignKey = if (column.foreignTable != null) .{ .table = column.foreignTable.?, .column = column.foreignColumn.?, .onDelete = column.onDelete, .onUpdate = column.onUpdate } else null };
+            const constraintDefinitions = try self.allocator.alloc(ast.TableConstraint, table.constraints.len);
+            defer self.allocator.free(constraintDefinitions);
+            for (table.constraints, 0..) |constraint, index| constraintDefinitions[index] = switch (constraint.kind) {
+                .primaryKey => .{ .primaryKey = constraint.columns },
                 .unique => .{ .unique = constraint.columns },
-                .foreign_key => .{ .foreign_key = .{ .columns = constraint.columns, .table = constraint.foreign_table.?, .referenced_columns = constraint.referenced_columns, .on_delete = constraint.on_delete, .on_update = constraint.on_update } },
+                .foreignKey => .{ .foreignKey = .{ .columns = constraint.columns, .table = constraint.foreignTable.?, .referencedColumns = constraint.referencedColumns, .onDelete = constraint.onDelete, .onUpdate = constraint.onUpdate } },
             };
-            try result.createTable(table.name, definitions, constraint_definitions);
+            try result.createTable(table.name, definitions, constraintDefinitions);
             const target = result.find(table.name).?;
             for (table.rows.items) |row| try result.appendRow(target, row.values);
         }
@@ -592,12 +592,12 @@ fn valuesEqual(left: Value, right: Value) bool {
 
 fn indexValuesEqual(table: *const Table, left: []const Value, right: []const Value, columns: []const []const u8) bool {
     for (columns) |name| {
-        var column_index: ?usize = null;
+        var columnIndex: ?usize = null;
         for (table.columns, 0..) |column, index| if (std.ascii.eqlIgnoreCase(column.name, name)) {
-            column_index = index;
+            columnIndex = index;
             break;
         };
-        const index = column_index orelse return false;
+        const index = columnIndex orelse return false;
         if (left[index] == .null or right[index] == .null) continue;
         if (!valuesEqual(left[index], right[index])) return false;
     }
@@ -607,7 +607,7 @@ fn indexValuesEqual(table: *const Table, left: []const Value, right: []const Val
 test "schema owns tables and rows" {
     var schema = Schema.init(std.testing.allocator);
     defer schema.deinit();
-    const defs = [_]ast.ColumnDef{ .{ .name = "id", .type_name = "INTEGER" }, .{ .name = "name", .type_name = "TEXT" } };
+    const defs = [_]ast.ColumnDef{ .{ .name = "id", .typeName = "INTEGER" }, .{ .name = "name", .typeName = "TEXT" } };
     try schema.createTable("users", &defs, &.{});
     var values = [_]Value{ .{ .integer = 1 }, .{ .text = "A" } };
     try schema.appendRow(schema.find("users").?, &values);

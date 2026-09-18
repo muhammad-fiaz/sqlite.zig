@@ -73,8 +73,8 @@ application.deinit();
 Foreign-key checks and cascading actions can be controlled per connection:
 
 ```zig
-var foreign_keys = try db.exec("PRAGMA foreign_keys = ON;");
-foreign_keys.deinit();
+var foreignKeys = try db.exec("PRAGMA foreign_keys = ON;");
+foreignKeys.deinit();
 ```
 
 ## DSL Query Interface
@@ -83,20 +83,20 @@ foreign_keys.deinit();
 const User = sqlite.table("users", struct { id: i64, name: []const u8 });
 
 // Create table
-try db.createTable(User, .{ .if_not_exists = true });
+try db.createTable(User, .{ .ifNotExists = true });
 
 // Insert
 var result = try db.from(User).insert(.{ .id = 1, .name = "Alice" });
 result.deinit();
 
 // Select
-var rows = try db.from(User).fetchAll();
+var rows = try db.from(User).fetch();
 defer rows.deinit();
 
 // With WHERE
 var filtered = try db.from(User)
-    .where(User.column("id").eq(1))
-    .fetchAll();
+    .where(User.columns.id.eq(1))
+    .fetch();
 defer filtered.deinit();
 ```
 
@@ -127,8 +127,8 @@ try db.commit();
 ```zig
 // Create table
 try db.createTable(User, .{
-    .if_not_exists = true,
-    .primary_key = User.key("id"),
+    .ifNotExists = true,
+    .primaryKey = User.columns.id,
 });
 
 // Truncate table

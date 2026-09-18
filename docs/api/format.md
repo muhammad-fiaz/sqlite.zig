@@ -56,7 +56,7 @@ var buf: [9]u8 = undefined;
 const len = varint.encode(&buf, value);
 
 // Decode
-const decoded = varint.decode(buf, &bytes_read);
+const decoded = varint.decode(buf, &bytesRead);
 ```
 
 ## Header

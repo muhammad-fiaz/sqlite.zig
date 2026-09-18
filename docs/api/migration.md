@@ -16,8 +16,12 @@ The migration module provides tools for applying schema changes safely, includin
 ```zig
 const migration = @import("migration");
 
-// Track schema version
-var current_version = try migration.getVersion(&connection);
+var set = migration.Set.init(allocator);
+defer set.deinit();
+try set.add(.{ .version = 1, .upSql = "CREATE TABLE users (id INTEGER);" });
+
+const runner = migration.Runner.init(allocator, set.items.items);
+const currentVersion = try runner.apply(db);
 ```
 
 ## Applying Migrations

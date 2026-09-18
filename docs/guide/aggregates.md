@@ -17,13 +17,13 @@ defer rows.deinit();
 
 The grouped executor supports `COUNT`, `SUM`, `AVG`, `MIN`, and `MAX`. The
 typed DSL continues to support scalar aggregates through its aggregate methods,
-plus grouped aggregate filters with `groupByColumn(...).havingCount(...)`.
+plus grouped aggregate filters with `groupBy(...).havingCount(...)`.
 
 ```zig
 var rows = try db.from(Sale)
-    .sumColumn(Sale.key("amount"))
-    .groupByColumn(Sale.key("category"))
+    .select(.{Sale.columns.amount.sum()})
+    .groupBy(Sale.columns.category)
     .havingCount(">", 1)
-    .fetchAll();
+    .fetch();
 defer rows.deinit();
 ```

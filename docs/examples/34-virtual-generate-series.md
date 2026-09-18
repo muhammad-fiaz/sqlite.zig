@@ -25,9 +25,9 @@ const sqlite = @import("sqlite");
 const Series = sqlite.table("numbers_series", struct { value: i64 });
 
 fn verify(db: *sqlite.Connection) !void {
-    var rows = try db.from(Series).selectAll().fetchAll();
+    var rows = try db.from(Series).selectAll().fetch();
     defer rows.deinit();
-    if (rows.rowCount() != 5 or rows.rows[0][0].integer != 1 or rows.rows[4][0].integer != 5) return error.VirtualTableVerificationFailed;
+    if (rows.rowCount() != 5 or rows.rows[0].value != 1 or rows.rows[4].value != 5) return error.VirtualTableVerificationFailed;
 }
 
 pub fn main() !void {

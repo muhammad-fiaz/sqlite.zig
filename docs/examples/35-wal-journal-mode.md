@@ -29,11 +29,11 @@ const sqlite = @import("sqlite");
 const WalEvent = sqlite.table("wal_events", struct { id: i64, message: []const u8 });
 
 fn checkRows(db: *sqlite.Connection) !void {
-    var rows = try db.from(WalEvent).selectAll().fetchAll();
+    var rows = try db.from(WalEvent).selectAll().fetch();
     defer rows.deinit();
     if (rows.rowCount() != 1) return error.WalReadbackFailed;
-    if (rows.rows[0][0].integer != 1) return error.WalReadbackFailed;
-    if (!std.mem.eql(u8, rows.rows[0][1].text, "written through wal")) return error.WalReadbackFailed;
+    if (rows.rows[0].id != 1) return error.WalReadbackFailed;
+    if (!std.mem.eql(u8, rows.rows[0].message, "written through wal")) return error.WalReadbackFailed;
 }
 
 pub fn main() !void {

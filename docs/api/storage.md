@@ -57,9 +57,9 @@ var j = try journal.Journal.init("my.db-journal");
 The on-disk format representation:
 
 ```zig
-const sqlite_image = @import("sqlite_image");
+const sqliteImage = @import("sqlite_image");
 
-var img = try sqlite_image.Image.init("my.db");
+var img = try sqliteImage.Image.init("my.db");
 ```
 
 ## Page Format
