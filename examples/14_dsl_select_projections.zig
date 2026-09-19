@@ -4,9 +4,9 @@ const sqlite = @import("sqlite");
 const Product = sqlite.table("select_products", struct { id: i64, name: []const u8, price: i64 });
 
 pub fn main() !void {
-    var db = try sqlite.open(std.heap.page_allocator, "valid_14.db");
+    var db = try sqlite.open(std.heap.page_allocator, "example_14.db");
     defer db.close();
-    try db.createTable(Product, .{ .ifNotExists = true });
+    try db.createTable(Product, .{ .overWrite = true });
     try db.truncate(Product);
 
     var first = try db.from(Product).insert(.{ .id = 1, .name = "keyboard", .price = 80 });

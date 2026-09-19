@@ -78,6 +78,7 @@ pub fn encode(allocator: std.mem.Allocator, schema: *const Schema) ![]u8 {
 pub fn decode(allocator: std.mem.Allocator, data: []const u8) !Schema {
     var schema = Schema.init(allocator);
     errdefer schema.deinit();
+    schema.foreignKeysEnabled = false;
     var offset: usize = 0;
     const tableCount = try readU32(data, &offset);
     var tableIndex: u32 = 0;
@@ -127,6 +128,7 @@ pub fn decode(allocator: std.mem.Allocator, data: []const u8) !Schema {
             };
         }
     }
+    schema.foreignKeysEnabled = true;
     return schema;
 }
 

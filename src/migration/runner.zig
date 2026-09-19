@@ -18,7 +18,7 @@ pub const Runner = struct {
             const check = try std.fmt.allocPrint(self.allocator, "SELECT version FROM _zig_migrations WHERE version = {d};", .{migration.version});
             defer self.allocator.free(check);
             var existing = try connection.exec(check);
-            const alreadyApplied = existing.rowCount() != 0;
+            const alreadyApplied = existing.count() != 0;
             existing.deinit();
             if (alreadyApplied) {
                 applied = @max(applied, migration.version);
@@ -47,7 +47,7 @@ pub const Runner = struct {
             const check = try std.fmt.allocPrint(self.allocator, "SELECT version FROM _zig_migrations WHERE version = {d};", .{migration.version});
             defer self.allocator.free(check);
             var existing = try connection.exec(check);
-            const isApplied = existing.rowCount() != 0;
+            const isApplied = existing.count() != 0;
             existing.deinit();
             if (!isApplied) continue;
             var result = try connection.exec(migration.downSql);

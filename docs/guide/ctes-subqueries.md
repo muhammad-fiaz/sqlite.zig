@@ -60,7 +60,8 @@ var rows = try db.exec(
 defer rows.deinit();
 ```
 
-Table aliases (`FROM nodes n`) are not supported; use full table names.
+Table aliases (`FROM nodes n`, `FROM nodes AS n`) are supported, including
+in joins and correlated references.
 
 ## Subqueries
 
@@ -86,10 +87,10 @@ defer rows.deinit();
 
 ### Subqueries in FROM and SELECT lists
 
-Derived tables (`FROM (SELECT ...)`) and scalar subqueries in the projection
-list are not supported by the engine. Express them with CTEs plus joins, or
-with `IN` / `EXISTS` predicates (all supported, including correlated
-`EXISTS`):
+Derived tables (`FROM (SELECT ...) AS sub`) work with outer
+WHERE/GROUP BY/HAVING/ORDER BY/LIMIT, aggregates, nesting, and joins, and
+scalar subqueries work in the projection list. The DSL exposes derived
+tables via `asSubquery(alias)`:
 
 ```zig
 var rows = try db.exec(

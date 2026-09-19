@@ -21,7 +21,7 @@ pub const Result = struct {
         self.allocator.free(self.columns);
     }
 
-    pub fn rowCount(self: Result) usize {
+    pub fn count(self: Result) usize {
         return self.rows.len;
     }
 };

@@ -58,7 +58,7 @@ pub fn build(b: *std.Build) void {
         "04_dsl_query_builder",
         "05_migrations",
         "06_error_handling",
-        "07_python_interop",
+        "07_file_format",
         "08_repair_legacy_example",
         "09_dsl_crud",
         "10_dsl_advanced",
@@ -105,6 +105,17 @@ pub fn build(b: *std.Build) void {
         "51_dsl_ctes",
         "52_column_mapping",
         "53_expression_operators",
+        "54_derived_tables",
+        "55_returning",
+        "56_upsert_dsl",
+        "57_before_triggers",
+        "58_case_dsl",
+        "59_using_natural_joins",
+        "60_multi_column_using",
+        "61_compound_dsl",
+        "62_pragma_checks",
+        "63_derived_dsl",
+        "64_window_dsl",
     };
 
     inline for (examples) |name| {

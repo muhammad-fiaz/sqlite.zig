@@ -5,7 +5,7 @@ const Users = sqlite.table("exists_users", struct { id: i64 });
 const Marker = sqlite.table("exists_marker", struct { id: i64 });
 
 pub fn main() !void {
-    var db = try sqlite.open(std.heap.page_allocator, "valid_44.db");
+    var db = try sqlite.open(std.heap.page_allocator, "example_44.db");
     defer db.close();
     db.dropTable(Users) catch {};
     db.dropTable(Marker) catch {};
@@ -15,17 +15,17 @@ pub fn main() !void {
     result.deinit();
     var present = try db.exec("SELECT id FROM exists_users WHERE EXISTS (SELECT id FROM exists_marker) ORDER BY id;");
     defer present.deinit();
-    if (present.rowCount() != 2) return error.ExistsVerificationFailed;
+    if (present.count() != 2) return error.ExistsVerificationFailed;
     var correlated = try db.exec("SELECT id FROM exists_users WHERE EXISTS (SELECT id FROM exists_marker WHERE exists_marker.id = exists_users.id) ORDER BY id;");
     defer correlated.deinit();
-    if (correlated.rowCount() != 1 or correlated.rows[0][0].integer != 1) return error.CorrelatedExistsVerificationFailed;
+    if (correlated.count() != 1 or correlated.rows[0][0].integer != 1) return error.CorrelatedExistsVerificationFailed;
     var typed = try db.from(Users).whereExists(Marker, Marker.columns.id.eq(Users.columns.id)).fetch();
     defer typed.deinit();
-    if (typed.rowCount() != 1 or typed.rows[0].id != 1) return error.TypedExistsVerificationFailed;
+    if (typed.count() != 1 or typed.rows[0].id != 1) return error.TypedExistsVerificationFailed;
     result = try db.exec("DELETE FROM exists_marker;");
     result.deinit();
     var absent = try db.exec("SELECT id FROM exists_users WHERE NOT EXISTS (SELECT id FROM exists_marker) ORDER BY id;");
     defer absent.deinit();
-    if (absent.rowCount() != 2) return error.NotExistsVerificationFailed;
+    if (absent.count() != 2) return error.NotExistsVerificationFailed;
     std.debug.print("44 EXISTS: raw EXISTS and NOT EXISTS verified\n", .{});
 }

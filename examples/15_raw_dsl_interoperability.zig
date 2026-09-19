@@ -4,9 +4,9 @@ const sqlite = @import("sqlite");
 const Task = sqlite.table("interop_tasks", struct { id: i64, title: []const u8, done: i64 });
 
 pub fn main() !void {
-    var db = try sqlite.open(std.heap.page_allocator, "valid_15.db");
+    var db = try sqlite.open(std.heap.page_allocator, "example_15.db");
     defer db.close();
-    try db.createTable(Task, .{ .ifNotExists = true });
+    try db.createTable(Task, .{ .overWrite = true });
     try db.truncate(Task);
 
     var rawInsert = try db.exec("INSERT INTO interop_tasks (id, title, done) VALUES (1, 'write docs', 0), (2, 'ship release', 1);");

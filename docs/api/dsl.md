@@ -6,8 +6,9 @@ description: "Raw SQL, the dynamic (runtime) DSL, and the typed (compile-time) D
 # DSL API
 
 `sqlite.zig` offers three interfaces over one engine. Raw SQL is unrestricted;
-the two DSL modes share one expression model, one SQL generator (bound
-parameters, quoted identifiers), and one executor.
+the two DSL modes share Raw SQL's expression model and executor: builders
+construct the same internal query representation directly, with no SQL
+string round-trip.
 
 ```zig
 // Raw SQL: any SQLite the engine parses.
@@ -142,7 +143,7 @@ One builder, one method chain:
 
 One execution operation for every mode. The return type is inferred: typed
 full-row queries map into structs, everything else returns raw rows. Both
-provide `rows`, `rowCount()`, and `deinit()`.
+provide `rows`, `count()`, and `deinit()`.
 
 ```zig
 var dyn = try db.from("users").where(db.col("age").gte(18)).fetch();
@@ -179,9 +180,12 @@ expression:
 ## Mutations
 
 ```zig
-try db.from(User).insert(.{ .id = 1, .name = "Alice", .age = 30 });
-try db.from(User).insertOrIgnore(.{ .id = 1, .name = "Alice", .age = 30 });
-try db.from(User).insertOrReplace(.{ .id = 1, .name = "Alice", .age = 30 });
+var inserted = try db.from(User).insert(.{ .id = 1, .name = "Alice", .age = 30 });
+inserted.deinit();
+var ignored = try db.from(User).insertOrIgnore(.{ .id = 1, .name = "Alice", .age = 30 });
+ignored.deinit();
+var replaced = try db.from(User).insertOrReplace(.{ .id = 1, .name = "Alice", .age = 30 });
+replaced.deinit();
 
 var mutation = try db.from(User).update(.{ .name = "Bob" });
 var updated = try mutation.where(User.columns.id.eq(1)).execute();
@@ -191,7 +195,9 @@ var deleted = try db.from(User).delete().where(User.columns.id.eq(1)).execute();
 defer deleted.deinit();
 ```
 
-Advanced upserts (`ON CONFLICT ... DO UPDATE ... WHERE`) belong in raw SQL.
+Advanced upserts use `onConflict` with `doNothing` / `doUpdate` (plus
+`onConflictWhere`, `excluded` values, and `returning`); see the UPSERT
+examples.
 
 ## Schema
 
@@ -239,13 +245,17 @@ Clients use `sqlite.table`, `sqlite.tableWith`, `sqlite.column`,
 `Operator`: those are internal implementation types reached by inference.
 
 Foreign-key actions are the engine's own: `.restrict`, `.cascade`,
-`.setNull`. There is no `MATCH`/`REGEXP` support, no partial/expression
-indexes, no window functions, and no `RETURNING`: the DSL only exposes what
-the engine implements. Raw SQL covers everything else the parser accepts.
+`.setNull`, `.setDefault`, `.noAction`. Predicates include
+`like`/`glob`/`regexp`/`match`; window functions, compound selects, CTEs,
+derived tables, and `RETURNING` all have DSL builders. Features without a
+builder stay in Raw SQL: `VACUUM` is supported there, while partial
+(`WHERE`) and expression indexes, `INSTEAD OF` triggers, and
+`ATTACH`/`DETACH` are not supported and fail with an explicit error.
 
 Builder limits (misuse panics instead of silently truncating): at most 32
 projections, 16 `where`/`andWhere`/`orWhere` predicates, 32 literal `IN`
 values, 16 key columns, 8 foreign keys, and 8 composite unique groups.
 
-See the [coverage matrix](/guide/coverage) for the honest per-feature
-status across Raw SQL, Dynamic DSL, and Typed DSL.
+Raw SQL, Dynamic DSL, and Typed DSL share the same underlying engine. Use
+Raw SQL for anything without a DSL builder; the
+[SQL engine guide](/guide/sql-engine) describes what Raw SQL supports.

@@ -5,7 +5,7 @@ const TypedParent = sqlite.table("typed_fk_parents", struct { part_a: i64, part_
 const TypedChild = sqlite.table("typed_fk_children", struct { id: i64, parent_a: i64, parent_b: i64 });
 
 pub fn main() !void {
-    var db = try sqlite.open(std.heap.page_allocator, "valid_31.db");
+    var db = try sqlite.open(std.heap.page_allocator, "example_31.db");
     defer db.close();
 
     var setup = try db.exec("CREATE TABLE IF NOT EXISTS raw_fk_parents (part_a INTEGER, part_b INTEGER, label TEXT, PRIMARY KEY (part_a, part_b));");
@@ -26,8 +26,8 @@ pub fn main() !void {
     defer rawChild.deinit();
     if (rawChild.rows[0][0].integer != 2 or rawChild.rows[0][1].integer != 20) return error.CompositeForeignKeyUpdateFailed;
 
-    try db.createTable(TypedParent, .{ .ifNotExists = true, .primaryKey = &.{ TypedParent.columns.part_a, TypedParent.columns.part_b } });
-    try db.createTable(TypedChild, .{ .ifNotExists = true, .foreignKeys = &.{.{ .columns = &.{ TypedChild.columns.parent_a, TypedChild.columns.parent_b }, .references = &.{ TypedParent.columns.part_a, TypedParent.columns.part_b }, .onDelete = .cascade, .onUpdate = .cascade }} });
+    try db.createTable(TypedParent, .{ .overWrite = true, .primaryKey = &.{ TypedParent.columns.part_a, TypedParent.columns.part_b } });
+    try db.createTable(TypedChild, .{ .overWrite = true, .foreignKeys = &.{.{ .columns = &.{ TypedChild.columns.parent_a, TypedChild.columns.parent_b }, .references = &.{ TypedParent.columns.part_a, TypedParent.columns.part_b }, .onDelete = .cascade, .onUpdate = .cascade }} });
     try db.truncate(TypedChild);
     try db.truncate(TypedParent);
     var parent = try db.from(TypedParent).insert(.{ .part_a = 1, .part_b = 10, .label = "typed" });

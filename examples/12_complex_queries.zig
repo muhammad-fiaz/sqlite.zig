@@ -7,10 +7,10 @@ const User = sqlite.table("complex_users", UserRow);
 const Order = sqlite.table("complex_orders", OrderRow);
 
 pub fn main() !void {
-    var db = try sqlite.open(std.heap.page_allocator, "valid_12.db");
+    var db = try sqlite.open(std.heap.page_allocator, "example_12.db");
     defer db.close();
-    try db.createTable(User, .{ .ifNotExists = true, .primaryKey = User.columns.id });
-    try db.createTable(Order, .{ .ifNotExists = true, .primaryKey = Order.columns.id });
+    try db.createTable(User, .{ .overWrite = true, .primaryKey = User.columns.id });
+    try db.createTable(Order, .{ .overWrite = true, .primaryKey = Order.columns.id });
     try db.truncate(Order);
     try db.truncate(User);
 

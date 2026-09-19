@@ -5,7 +5,7 @@ const MembershipRow = struct { user_id: i64, group_id: i64, label: []const u8 };
 const Membership = sqlite.table("typed_composite_memberships", MembershipRow);
 
 pub fn main() !void {
-    var db = try sqlite.open(std.heap.page_allocator, "valid_30.db");
+    var db = try sqlite.open(std.heap.page_allocator, "example_30.db");
     defer db.close();
 
     var rawSetup = try db.exec("CREATE TABLE IF NOT EXISTS raw_composite_items (left_id INTEGER, right_id INTEGER, label TEXT, PRIMARY KEY (left_id, right_id), UNIQUE (right_id, label));");
@@ -16,7 +16,7 @@ pub fn main() !void {
     rawInsert.deinit();
     try std.testing.expectError(error.ConstraintViolation, db.exec("INSERT INTO raw_composite_items VALUES (1, 10, 'duplicate');"));
 
-    try db.createTable(Membership, .{ .ifNotExists = true, .primaryKey = &.{ Membership.columns.user_id, Membership.columns.group_id }, .unique = &.{&.{ Membership.columns.group_id, Membership.columns.label }} });
+    try db.createTable(Membership, .{ .overWrite = true, .primaryKey = &.{ Membership.columns.user_id, Membership.columns.group_id }, .unique = &.{&.{ Membership.columns.group_id, Membership.columns.label }} });
     try db.truncate(Membership);
     var typed = try db.from(Membership).insert(.{ .user_id = 1, .group_id = 10, .label = "alpha" });
     typed.deinit();

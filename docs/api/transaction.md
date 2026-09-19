@@ -1,11 +1,11 @@
 ---
 title: "Transaction API"
-description: "Transaction and locking support for concurrent access, including ACID properties, deferred/immediate/exclusive modes, and savepoints."
+description: "Transactions, savepoints, and locking in sqlite.zig, including deferred, immediate, and exclusive begin modes."
 ---
 
 # Transaction API
 
-Transaction and locking support for concurrent access.
+Transactions, savepoints, and per-connection locking.
 
 ## Overview
 
@@ -21,15 +21,19 @@ The transaction module manages ACID properties and locking for safe concurrent d
 
 ## Locking
 
-SQLite uses file-level locks to coordinate concurrent access:
+The engine tracks per-connection lock state (`unlocked`, `shared`,
+`reserved`, `exclusive` in `src/txn/locking.zig`):
 
 | Lock | Description |
 |------|-------------|
-| UNLOCKED | No lock held |
-| SHARED | One or more readers, no writers |
-| RESERVED | Intent to write, readers still allowed |
-| PENDING | Waiting for exclusive, no new readers |
-| EXCLUSIVE | One writer, no readers |
+| unlocked | No lock held |
+| shared | Reading; compatible with other readers |
+| reserved | Intent to write |
+| exclusive | Writing; held alone |
+
+Full multi-process file locking and VFS parity are still in progress (see
+the [SQL engine guide](/guide/sql-engine)); do not rely on cross-process
+coordination yet.
 
 ## Transaction Lifecycle
 
@@ -63,7 +67,10 @@ try db.commit();
 
 ## Concurrent Access
 
-Multiple connections can read simultaneously. Writers must wait for readers to finish and vice versa.
+Transactions are tracked per connection with nested savepoint support.
+Cross-process lock coordination is not implemented yet, so multiple writers
+must be coordinated by the application.
 
 > [!WARNING]
-> Always commit or rollback transactions promptly to avoid blocking other connections.
+> Always commit or rollback transactions promptly. An open transaction holds
+> the connection's state and blocks `VACUUM`.

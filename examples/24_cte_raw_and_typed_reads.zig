@@ -6,9 +6,9 @@ const User = sqlite.table("cte_users", UserRow);
 const Active = sqlite.table("active_cte", UserRow);
 
 pub fn main() !void {
-    var db = try sqlite.open(std.heap.page_allocator, "valid_24.db");
+    var db = try sqlite.open(std.heap.page_allocator, "example_24.db");
     defer db.close();
-    try db.createTable(User, .{ .ifNotExists = true, .primaryKey = User.columns.id });
+    try db.createTable(User, .{ .overWrite = true, .primaryKey = User.columns.id });
     try db.truncate(User);
     var one = try db.from(User).insert(.{ .id = 1, .name = "Alice", .active = 1 });
     one.deinit();
@@ -21,6 +21,6 @@ pub fn main() !void {
     defer db.dropView("active_cte") catch {};
     var typed = try db.from(Active).selectAll().fetch();
     defer typed.deinit();
-    if (raw.rowCount() != 1 or typed.rowCount() != 1 or typed.rows[0].id != 1) return error.CteVerificationFailed;
+    if (raw.count() != 1 or typed.count() != 1 or typed.rows[0].id != 1) return error.CteVerificationFailed;
     std.debug.print("24 CTE: raw materialization and typed read verified\n", .{});
 }

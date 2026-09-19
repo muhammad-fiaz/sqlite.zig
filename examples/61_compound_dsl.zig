@@ -1,0 +1,106 @@
+const std = @import("std");
+const sqlite = @import("sqlite");
+
+const Left = sqlite.table("cp_left", struct { id: ?i64, label: ?[]const u8 });
+const Right = sqlite.table("cp_right", struct { id: ?i64, label: ?[]const u8 });
+
+pub fn main() !void {
+    var db = try sqlite.open(std.heap.page_allocator, "example_61.db");
+    errdefer db.close();
+    var setup = try db.exec("DROP TABLE IF EXISTS cp_left; DROP TABLE IF EXISTS cp_right; CREATE TABLE cp_left (id INTEGER, label TEXT); CREATE TABLE cp_right (id INTEGER, label TEXT); INSERT INTO cp_left VALUES (1, 'alpha'), (2, 'beta'), (2, 'beta'), (NULL, 'null'), (4, 'delta'); INSERT INTO cp_right VALUES (2, 'beta'), (3, 'gamma'), (NULL, 'null'), (5, 'eps');");
+    setup.deinit();
+    try db.schema(Left).validate();
+    try db.schema(Right).validate();
+    var rawUnion = try db.exec("SELECT id FROM cp_left UNION SELECT id FROM cp_right ORDER BY id;");
+    defer rawUnion.deinit();
+    if (rawUnion.count() != 6) return error.VerificationFailed;
+    if (rawUnion.rows[0][0] != .null) return error.VerificationFailed;
+    if (rawUnion.rows[5][0].integer != 5) return error.VerificationFailed;
+    var dynUnion = try db.from("cp_left").select(.{db.col("id")}).unionDistinct(db.from("cp_right").select(.{db.col("id")})).orderBy(db.col("id").asc()).fetch();
+    defer dynUnion.deinit();
+    if (dynUnion.count() != rawUnion.count()) return error.VerificationFailed;
+    for (rawUnion.rows, 0..) |row, i| {
+        if (row[0] == .null) {
+            if (dynUnion.rows[i][0] != .null) return error.VerificationFailed;
+        } else if (dynUnion.rows[i][0].integer != row[0].integer) return error.VerificationFailed;
+    }
+    var rawAll = try db.exec("SELECT id FROM cp_left UNION ALL SELECT id FROM cp_right;");
+    defer rawAll.deinit();
+    if (rawAll.count() != 9) return error.VerificationFailed;
+    var dynAll = try db.from("cp_left").select(.{db.col("id")}).unionAll(db.from("cp_right").select(.{db.col("id")})).fetch();
+    defer dynAll.deinit();
+    if (dynAll.count() != 9) return error.VerificationFailed;
+    var rawIntersect = try db.exec("SELECT id FROM cp_left INTERSECT SELECT id FROM cp_right;");
+    defer rawIntersect.deinit();
+    if (rawIntersect.count() != 2) return error.VerificationFailed;
+    var dynIntersect = try db.from("cp_left").select(.{db.col("id")}).intersect(db.from("cp_right").select(.{db.col("id")})).fetch();
+    defer dynIntersect.deinit();
+    if (dynIntersect.count() != 2) return error.VerificationFailed;
+    if (dynIntersect.rows[0][0].integer != 2) return error.VerificationFailed;
+    if (dynIntersect.rows[1][0] != .null) return error.VerificationFailed;
+    var rawExcept = try db.exec("SELECT id FROM cp_left EXCEPT SELECT id FROM cp_right;");
+    defer rawExcept.deinit();
+    if (rawExcept.count() != 2) return error.VerificationFailed;
+    var dynExcept = try db.from("cp_left").select(.{db.col("id")}).except(db.from("cp_right").select(.{db.col("id")})).fetch();
+    defer dynExcept.deinit();
+    if (dynExcept.count() != 2) return error.VerificationFailed;
+    if (dynExcept.rows[0][0].integer != 1) return error.VerificationFailed;
+    if (dynExcept.rows[1][0].integer != 4) return error.VerificationFailed;
+    var crossType = try db.exec("SELECT 1 UNION SELECT 1.0;");
+    defer crossType.deinit();
+    if (crossType.count() != 1) return error.VerificationFailed;
+    var rawPaged = try db.exec("SELECT id FROM cp_left UNION SELECT id FROM cp_right ORDER BY id LIMIT 2 OFFSET 1;");
+    defer rawPaged.deinit();
+    if (rawPaged.count() != 2) return error.VerificationFailed;
+    if (rawPaged.rows[0][0].integer != 1) return error.VerificationFailed;
+    var dynPaged = try db.from("cp_left").select(.{db.col("id")}).unionDistinct(db.from("cp_right").select(.{db.col("id")})).orderBy(db.col("id").asc()).limit(2).offset(1).fetch();
+    defer dynPaged.deinit();
+    if (dynPaged.count() != 2) return error.VerificationFailed;
+    if (dynPaged.rows[0][0].integer != 1) return error.VerificationFailed;
+    var rawChain = try db.exec("SELECT id FROM cp_left EXCEPT SELECT id FROM cp_right UNION SELECT id FROM cp_right ORDER BY id;");
+    defer rawChain.deinit();
+    if (rawChain.count() != 6) return error.VerificationFailed;
+    var dynChain = try db.from("cp_left").select(.{db.col("id")}).except(db.from("cp_right").select(.{db.col("id")})).unionDistinct(db.from("cp_right").select(.{db.col("id")})).orderBy(db.col("id").asc()).fetch();
+    defer dynChain.deinit();
+    if (dynChain.count() != 6) return error.VerificationFailed;
+    var typedUnion = try db.from(Left).unionDistinct(db.from(Right)).fetch();
+    defer typedUnion.deinit();
+    if (typedUnion.count() != 6) return error.VerificationFailed;
+    if (typedUnion.rows[0].id.? != 1) return error.VerificationFailed;
+    var typedIds = try db.from(Left).select(.{Left.columns.id}).unionDistinct(db.from(Right).select(.{Right.columns.id})).orderBy(Left.columns.id.asc()).fetch();
+    defer typedIds.deinit();
+    if (typedIds.count() != 6) return error.VerificationFailed;
+    if (typedIds.rows[0][0] != .null) return error.VerificationFailed;
+    var one = (try db.from(Left).unionDistinct(db.from(Right).where(Right.columns.id.gt(100))).fetchOne()).?;
+    if (one.id.? != 1) return error.VerificationFailed;
+    db.from(Left).freeRow(&one);
+    var inserted = try db.from(Left).insert(.{ .id = 6, .label = "zeta" });
+    inserted.deinit();
+    var afterInsert = try db.exec("SELECT id FROM cp_left UNION SELECT id FROM cp_right ORDER BY id;");
+    defer afterInsert.deinit();
+    if (afterInsert.count() != 7) return error.VerificationFailed;
+    var dynAfter = try db.from("cp_left").select(.{db.col("id")}).unionDistinct(db.from("cp_right").select(.{db.col("id")})).orderBy(db.col("id").asc()).fetch();
+    defer dynAfter.deinit();
+    if (dynAfter.count() != 7) return error.VerificationFailed;
+    if (db.exec("SELECT id FROM cp_left UNION SELECT id, label FROM cp_right;")) |r| {
+        var owned = r;
+        owned.deinit();
+        return error.VerificationFailed;
+    } else |_| {}
+    var intactLeft = try db.exec("SELECT count(*) FROM cp_left;");
+    defer intactLeft.deinit();
+    if (intactLeft.rows[0][0].integer != 6) return error.VerificationFailed;
+    var intactRight = try db.exec("SELECT count(*) FROM cp_right;");
+    defer intactRight.deinit();
+    if (intactRight.rows[0][0].integer != 4) return error.VerificationFailed;
+    db.close();
+    var reopened = try sqlite.open(std.heap.page_allocator, "example_61.db");
+    defer reopened.close();
+    var persisted = try reopened.exec("SELECT id FROM cp_left UNION SELECT id FROM cp_right ORDER BY id;");
+    defer persisted.deinit();
+    if (persisted.count() != 7) return error.VerificationFailed;
+    var persistedDyn = try reopened.from("cp_left").select(.{reopened.col("id")}).unionDistinct(reopened.from("cp_right").select(.{reopened.col("id")})).orderBy(reopened.col("id").asc()).fetch();
+    defer persistedDyn.deinit();
+    if (persistedDyn.count() != 7) return error.VerificationFailed;
+    std.debug.print("61 compound dsl: raw dynamic typed verified with persistence\n", .{});
+}

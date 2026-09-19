@@ -13,9 +13,9 @@ fn transfer(db: *sqlite.Connection) !void {
 }
 
 pub fn main() !void {
-    var db = try sqlite.open(std.heap.page_allocator, "valid_10.db");
+    var db = try sqlite.open(std.heap.page_allocator, "example_10.db");
     defer db.close();
-    try db.createTable(Account, .{ .ifNotExists = true });
+    try db.createTable(Account, .{ .overWrite = true });
 
     var first = try db.from(Account).insert(.{ .id = 1, .owner = "Alice", .balance = 100 });
     first.deinit();

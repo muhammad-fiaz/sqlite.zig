@@ -14,35 +14,41 @@ The migration module provides tools for applying schema changes safely, includin
 ## Schema Versioning
 
 ```zig
-const migration = @import("migration");
+const sqlite = @import("sqlite");
 
-var set = migration.Set.init(allocator);
+var set = sqlite.migration.Set.init(allocator);
 defer set.deinit();
 try set.add(.{ .version = 1, .upSql = "CREATE TABLE users (id INTEGER);" });
 
-const runner = migration.Runner.init(allocator, set.items.items);
+const runner = sqlite.migration.Runner.init(allocator, set.items.items);
 const currentVersion = try runner.apply(db);
+```
+
+`apply` records progress in a `_zig_migrations` table
+(`version INTEGER PRIMARY KEY`), skipping versions already recorded, and
+returns the highest applied version. Each migration is a
+`sqlite.migration.Migration`:
+
+```zig
+pub const Migration = struct {
+    version: u32,
+    upSql: []const u8,
+    downSql: []const u8 = "",
+};
 ```
 
 ## Applying Migrations
 
 ```zig
-// Create migration table
-var result = try db.exec("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY);");
-result.deinit();
+// Runner creates and maintains _zig_migrations automatically.
+const applied = try runner.apply(db);
 
-// Check current version
-var rows = try db.exec("SELECT MAX(version) FROM schema_version;");
-defer rows.deinit();
-
-// Apply migration if needed
-const current = rows.rows[0][0].integer;
-if (current < 2) {
-    // Apply migration 2
-    try db.exec("ALTER TABLE users ADD COLUMN email TEXT;");
-    try db.exec("INSERT INTO schema_version VALUES (2);");
-}
+// Roll back the most recent migration that defines downSql.
+const rolledBack = try runner.rollback(db);
 ```
+
+Migrations without `downSql` are skipped by `rollback`, which removes the
+version row from `_zig_migrations` after running the down SQL.
 
 ## Migration Patterns
 
@@ -51,22 +57,26 @@ if (current < 2) {
 Each migration runs once and the version number increases monotonically:
 
 ```zig
-const migrations = [_][]const u8{
-    "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);",
-    "ALTER TABLE users ADD COLUMN email TEXT;",
-    "CREATE INDEX idx_users_email ON users (email);",
+const migrations = [_]sqlite.migration.Migration{
+    .{ .version = 1, .upSql = "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);" },
+    .{ .version = 2, .upSql = "ALTER TABLE users ADD COLUMN email TEXT;" },
+    .{ .version = 3, .upSql = "CREATE INDEX idx_users_email ON users (email);" },
 };
+const runner = sqlite.migration.Runner.init(allocator, &migrations);
+_ = try runner.apply(db);
 ```
 
 ### Rollback Support
 
-Track both forward and rollback SQL:
+Provide `downSql` for every migration that must be reversible:
 
 ```zig
-const Migration = struct {
-    version: i64,
-    up: []const u8,
-    down: []const u8,
+const migrations = [_]sqlite.migration.Migration{
+    .{
+        .version = 1,
+        .upSql = "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);",
+        .downSql = "DROP TABLE users;",
+    },
 };
 ```
 

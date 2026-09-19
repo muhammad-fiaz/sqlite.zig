@@ -1,7 +1,17 @@
 import { defineConfig } from "vitepress";
 import llmstxt from "vitepress-plugin-llms";
 
-export const SITE_URL = "https://muhammad-fiaz.github.io/sqlite.zig";
+export const SITE_ORIGIN = "https://muhammad-fiaz.github.io";
+export const SITE_BASE = "/sqlite.zig";
+export const SITE_URL = `${SITE_ORIGIN}${SITE_BASE}`;
+
+export const ICON_ICO = `${SITE_BASE}/favicon.ico`;
+export const ICON_16 = `${SITE_BASE}/favicon-16x16.png`;
+export const ICON_32 = `${SITE_BASE}/favicon-32x32.png`;
+export const ICON_APPLE = `${SITE_BASE}/apple-touch-icon.png`;
+export const ICON_192 = `${SITE_BASE}/android-chrome-192x192.png`;
+export const ICON_512 = `${SITE_BASE}/android-chrome-512x512.png`;
+export const OG_IMAGE = `${SITE_URL}/android-chrome-512x512.png`;
 export const SITE_NAME = "sqlite.zig";
 export const SITE_TAGLINE = "Native SQLite-Compatible Database Engine in Zig";
 export const SITE_DESCRIPTION =
@@ -24,7 +34,12 @@ export default defineConfig({
   cleanUrls: false,
 
   sitemap: {
-    hostname: SITE_URL,
+    hostname: SITE_ORIGIN,
+    transformItems: (items) =>
+      items.map((item) => ({
+        ...item,
+        url: `${SITE_BASE}${item.url.startsWith("/") ? item.url : `/${item.url}`}`,
+      })),
   },
 
   vite: {
@@ -51,9 +66,10 @@ export default defineConfig({
     ["meta", { property: "og:url", content: SITE_URL }],
     ["meta", { property: "og:title", content: `${SITE_TAGLINE} | ${SITE_NAME}` }],
     ["meta", { property: "og:description", content: SITE_DESCRIPTION }],
-    ["meta", { property: "og:image", content: `${SITE_URL}/favicon.png` }],
+    ["meta", { property: "og:image", content: OG_IMAGE }],
     ["meta", { property: "og:image:width", content: "512" }],
     ["meta", { property: "og:image:height", content: "512" }],
+    ["meta", { property: "og:image:type", content: "image/png" }],
     ["meta", { property: "og:image:alt", content: `${SITE_TAGLINE} | ${SITE_NAME}` }],
     ["meta", { property: "og:site_name", content: SITE_NAME }],
     ["meta", { property: "og:locale", content: "en_US" }],
@@ -70,15 +86,17 @@ export default defineConfig({
 
     // Microsoft
     ["meta", { name: "msapplication-TileColor", content: "#76b900" }],
-    ["meta", { name: "msapplication-TileImage", content: "/sqlite.zig/favicon.png" }],
+    ["meta", { name: "msapplication-TileImage", content: ICON_192 }],
     ["meta", { name: "msapplication-tooltip", content: SITE_TAGLINE }],
 
     // Canonical
     ["link", { rel: "canonical", href: SITE_URL }],
 
-    // Favicon
-    ["link", { rel: "icon", href: "/sqlite.zig/favicon.png", type: "image/png" }],
-    ["link", { rel: "apple-touch-icon", href: "/sqlite.zig/favicon.png" }],
+    // Favicons & icons
+    ["link", { rel: "icon", href: ICON_ICO, type: "image/x-icon" }],
+    ["link", { rel: "icon", href: ICON_32, type: "image/png", sizes: "32x32" }],
+    ["link", { rel: "icon", href: ICON_16, type: "image/png", sizes: "16x16" }],
+    ["link", { rel: "apple-touch-icon", href: ICON_APPLE, sizes: "180x180" }],
     ["link", { rel: "manifest", href: "/sqlite.zig/site.webmanifest" }],
 
     // Theme
@@ -135,13 +153,15 @@ export default defineConfig({
       ["meta", { property: "og:title", content: fullTitle }],
       ["meta", { property: "og:description", content: pageDescription }],
       ["meta", { property: "og:url", content: canonicalUrl }],
-      ["meta", { property: "og:image", content: `${SITE_URL}/favicon.png` }],
+      ["meta", { property: "og:image", content: OG_IMAGE }],
+      ["meta", { property: "og:image:width", content: "512" }],
+      ["meta", { property: "og:image:height", content: "512" }],
       ["meta", { property: "og:site_name", content: SITE_NAME }],
       ["meta", { property: "og:locale", content: "en_US" }],
       ["meta", { name: "twitter:card", content: "summary_large_image" }],
       ["meta", { name: "twitter:title", content: fullTitle }],
       ["meta", { name: "twitter:description", content: pageDescription }],
-      ["meta", { name: "twitter:image", content: `${SITE_URL}/favicon.png` }],
+    ["meta", { name: "twitter:image", content: OG_IMAGE }],
     );
 
     // JSON-LD structured data
@@ -164,7 +184,9 @@ export default defineConfig({
       url: SITE_URL,
       logo: {
         "@type": "ImageObject",
-        url: `${SITE_URL}/favicon.png`,
+        url: OG_IMAGE,
+        width: 512,
+        height: 512,
       },
     };
 
@@ -176,7 +198,7 @@ export default defineConfig({
         description: SITE_DESCRIPTION,
         author: authorSchema,
         publisher: publisherSchema,
-        image: `${SITE_URL}/favicon.png`,
+        image: OG_IMAGE,
         datePublished: "2026-01-01T00:00:00Z",
         dateModified: lastUpdated,
       });
@@ -187,7 +209,7 @@ export default defineConfig({
       name: isHome ? SITE_NAME : pageTitle,
       description: pageDescription,
       url: canonicalUrl,
-      image: `${SITE_URL}/favicon.png`,
+      image: OG_IMAGE,
       author: authorSchema,
       publisher: publisherSchema,
     };
@@ -252,8 +274,6 @@ export default defineConfig({
       { text: "Home", link: "/" },
       { text: "Guide", link: "/guide/getting-started" },
       { text: "API", link: "/api/" },
-      { text: "Examples", link: "/examples/" },
-      { text: "Projects", link: "/guide/related-projects" },
       {
         text: "Support",
         items: [
@@ -277,7 +297,6 @@ export default defineConfig({
           text: "Core Concepts",
           items: [
             { text: "SQL Engine", link: "/guide/sql-engine" },
-            { text: "Coverage Matrix", link: "/guide/coverage" },
             { text: "DSL Query Builder", link: "/guide/dsl-query-builder" },
             { text: "Transactions", link: "/guide/transactions" },
             { text: "Foreign Keys", link: "/guide/foreign-keys" },
@@ -288,7 +307,6 @@ export default defineConfig({
             { text: "Insert...Select", link: "/guide/insert-select" },
             { text: "Subqueries", link: "/guide/subqueries" },
             { text: "Update...From", link: "/guide/update-from" },
-            { text: "Related Projects", link: "/guide/related-projects" },
           ],
         },
       ],
@@ -310,67 +328,6 @@ export default defineConfig({
             { text: "Migration", link: "/api/migration" },
             { text: "Errors", link: "/api/errors" },
             { text: "Version", link: "/api/version" },
-          ],
-        },
-      ],
-      "/examples/": [
-        {
-          text: "Examples",
-          items: [
-            { text: "All Examples", link: "/examples/" },
-            { text: "01 — Open & Exec", link: "/examples/01-open-and-exec" },
-            { text: "02 — Prepared Statement", link: "/examples/02-prepared-statement" },
-            { text: "03 — Transactions", link: "/examples/03-transactions" },
-            { text: "04 — DSL Query Builder", link: "/examples/04-dsl-query-builder" },
-            { text: "05 — Migrations", link: "/examples/05-migrations" },
-            { text: "06 — Error Handling", link: "/examples/06-error-handling" },
-            { text: "07 — Python Interop", link: "/examples/07-python-interop" },
-            { text: "08 — Repair Legacy", link: "/examples/08-repair-legacy" },
-            { text: "09 — DSL CRUD", link: "/examples/09-dsl-crud" },
-            { text: "10 — DSL Advanced", link: "/examples/10-dsl-advanced" },
-            { text: "11 — Keys & Joins", link: "/examples/11-keys-and-joins" },
-            { text: "12 — Complex Queries", link: "/examples/12-complex-queries" },
-            { text: "13 — Edge Cases", link: "/examples/13-edge-cases" },
-            { text: "14 — Select Projections", link: "/examples/14-dsl-select-projections" },
-            { text: "15 — Raw & DSL Interop", link: "/examples/15-raw-dsl-interoperability" },
-            { text: "16 — Predicates & Pagination", link: "/examples/16-dsl-predicates-pagination" },
-            { text: "17 — Persistence", link: "/examples/17-persistence-reopen" },
-            { text: "18 — Schema Lifecycle", link: "/examples/18-schema-lifecycle" },
-            { text: "19 — Prepared Parameters", link: "/examples/19-prepared-parameter" },
-            { text: "20 — Scalar Functions", link: "/examples/20-scalar-functions" },
-            { text: "21 — Indexed Queries", link: "/examples/21-indexed-queries" },
-            { text: "22 — Views", link: "/examples/22-views" },
-            { text: "23 — Triggers", link: "/examples/23-triggers" },
-            { text: "24 — CTEs", link: "/examples/24-ctes" },
-            { text: "25 — Subqueries", link: "/examples/25-subqueries" },
-            { text: "26 — FK Actions", link: "/examples/26-foreign-key-actions" },
-            { text: "27 — Composite Unique", link: "/examples/27-composite-unique" },
-            { text: "28 — FK Update Actions", link: "/examples/28-fk-update-actions" },
-            { text: "29 — Multiple CTEs", link: "/examples/29-multiple-ctes" },
-            { text: "30 — Composite Constraints", link: "/examples/30-composite-constraints" },
-            { text: "31 — Composite FKs", link: "/examples/31-composite-foreign-keys" },
-            { text: "32 — Recursive CTEs", link: "/examples/32-recursive-ctes" },
-            { text: "33 — EXPLAIN QUERY PLAN", link: "/examples/33-explain-query-plan" },
-            { text: "34 — GENERATE_SERIES", link: "/examples/34-virtual-generate-series" },
-            { text: "35 — WAL Journal Mode", link: "/examples/35-wal-journal-mode" },
-            { text: "36 — Grouped Aggregates", link: "/examples/36-grouped-aggregates" },
-            { text: "37 — Insert...Select Copy", link: "/examples/37-insert-select-copy" },
-            { text: "38 — Insert OR IGNORE", link: "/examples/38-insert-or-ignore" },
-            { text: "39 — UPSERT DO NOTHING", link: "/examples/39-upsert-do-nothing" },
-            { text: "40 — UPSERT DO UPDATE", link: "/examples/40-upsert-do-update" },
-            { text: "41 — Insert OR REPLACE", link: "/examples/41-insert-or-replace" },
-            { text: "42 — UPDATE...FROM JOIN", link: "/examples/42-update-from-join" },
-            { text: "43 — NOT IN Subqueries", link: "/examples/43-not-in-subqueries" },
-            { text: "44 — EXISTS Subqueries", link: "/examples/44-exists-subqueries" },
-            { text: "45 — Literal IN Lists", link: "/examples/45-literal-in-lists" },
-            { text: "46 — Raw ALTER TABLE", link: "/examples/46-raw-alter-table" },
-            { text: "47 — Column Defaults", link: "/examples/47-column-defaults" },
-            { text: "48 — Raw DSL", link: "/examples/48-raw-dsl" },
-            { text: "49 — Coverage Layers", link: "/examples/49-sqlite-coverage-layers" },
-            { text: "50 — Schema Validation", link: "/examples/50-schema-validation-interop" },
-            { text: "51 — DSL CTEs", link: "/examples/51-dsl-ctes" },
-            { text: "52 — Column Mapping", link: "/examples/52-column-mapping" },
-            { text: "53 — Expression Operators", link: "/examples/53-expression-operators" },
           ],
         },
       ],

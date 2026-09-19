@@ -6,10 +6,10 @@ const Event = sqlite.table("trigger_events", EventRow);
 const Audit = sqlite.table("trigger_audit", struct { id: i64, message: []const u8 });
 
 pub fn main() !void {
-    var db = try sqlite.open(std.heap.page_allocator, "valid_23.db");
+    var db = try sqlite.open(std.heap.page_allocator, "example_23.db");
     defer db.close();
-    try db.createTable(Event, .{ .ifNotExists = true, .primaryKey = Event.columns.id });
-    try db.createTable(Audit, .{ .ifNotExists = true });
+    try db.createTable(Event, .{ .overWrite = true, .primaryKey = Event.columns.id });
+    try db.createTable(Audit, .{ .overWrite = true });
     try db.truncate(Event);
     try db.truncate(Audit);
     db.dropTrigger("events_after_insert") catch {};
@@ -20,6 +20,6 @@ pub fn main() !void {
     inserted.deinit();
     var audit = try db.from(Audit).selectAll().fetch();
     defer audit.deinit();
-    if (audit.rowCount() != 1 or audit.rows[0].id != 1 or !std.mem.eql(u8, audit.rows[0].message, "created by DSL")) return error.TriggerVerificationFailed;
+    if (audit.count() != 1 or audit.rows[0].id != 1 or !std.mem.eql(u8, audit.rows[0].message, "created by DSL")) return error.TriggerVerificationFailed;
     std.debug.print("23 triggers: raw trigger DDL, NEW references, and typed DSL mutation verified\n", .{});
 }

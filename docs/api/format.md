@@ -38,25 +38,25 @@ Records are encoded using SQLite's variable-length encoding:
 | 16-bit int | 2 | 2 bytes |
 | 24-bit int | 3 | 3 bytes |
 | 32-bit int | 4 | 4 bytes |
-| 48-bit int | 6 | 6 bytes |
-| 64-bit int | 8 | 8 bytes |
+| 48-bit int | 5 | 6 bytes |
+| 64-bit int | 6 | 8 bytes |
 | Float64 | 7 | 8 bytes |
+| Integer 0 | 8 | 0 bytes |
+| Integer 1 | 9 | 0 bytes |
 | Blob | N >= 12, even | N-12 bytes |
 | Text | N >= 13, odd | N-13 bytes |
 
 ## Varint Encoding
 
-Variable-length integers for compact storage:
+Variable-length integers for compact storage. The `varint` module is
+internal; its signatures are `encode(value: u64, out: []u8) !u8` and
+`decode(input: []const u8) !struct { value: u64, length: u8 }`:
 
 ```zig
-const varint = @import("varint");
-
-// Encode
 var buf: [9]u8 = undefined;
-const len = varint.encode(&buf, value);
-
-// Decode
-const decoded = varint.decode(buf, &bytesRead);
+const len = try varint.encode(value, &buf);
+const decoded = try varint.decode(buf[0..len]);
+// decoded.value, decoded.length
 ```
 
 ## Header

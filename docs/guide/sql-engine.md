@@ -17,15 +17,27 @@ description: "The hand-written SQL lexer, parser, and bytecode compiler supporti
 | **SELECT** | `SELECT [DISTINCT] columns FROM table [JOIN ...] [WHERE ...] [GROUP BY ...] [HAVING ...] [ORDER BY ...] [LIMIT ... [OFFSET ...]]` |
 | **UPDATE** | `UPDATE name SET col = expr [WHERE ...]` |
 | **DELETE** | `DELETE FROM name [WHERE ...]` |
-| **BEGIN** | `BEGIN [DEFERRED\|IMMEDIATE\|EXCLUSIVE]` |
-| **COMMIT** | `COMMIT` or `END` |
+| **BEGIN** | `BEGIN [DEFERRED\|IMMEDIATE\|EXCLUSIVE]` or `START TRANSACTION` |
+| **COMMIT** | `COMMIT` |
 | **ROLLBACK** | `ROLLBACK [TO [SAVEPOINT] name]` |
 | **SAVEPOINT** | `SAVEPOINT name` |
 | **RELEASE** | `RELEASE [SAVEPOINT] name` |
 | **CREATE VIEW** | `CREATE VIEW [IF NOT EXISTS] name AS SELECT ...` |
-| **CREATE TRIGGER** | `CREATE TRIGGER [IF NOT EXISTS] name AFTER INSERT\|UPDATE\|DELETE ON table ...` |
+| **CREATE TRIGGER** | `CREATE TRIGGER [IF NOT EXISTS] name [BEFORE\|AFTER] INSERT\|UPDATE\|DELETE ON table [WHEN ...] ...` |
 | **CREATE INDEX** | `CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (columns)` |
 | **ALTER TABLE** | `ADD COLUMN`, `RENAME TO`, `RENAME COLUMN ... TO`, and `DROP COLUMN` |
+| **UPSERT** | `INSERT ... ON CONFLICT [(cols)] [WHERE ...] DO NOTHING` / `DO UPDATE SET ...` with `excluded` |
+| **RETURNING** | `INSERT/UPDATE/DELETE ... RETURNING ...` |
+| **Compound SELECT** | `UNION [ALL]`, `INTERSECT`, `EXCEPT` with `ORDER BY` / `LIMIT` / `OFFSET` |
+| **CTE** | `WITH ...` / `WITH RECURSIVE ...` |
+| **VACUUM** | `VACUUM [main]` rebuilds the database; `VACUUM INTO 'file'` writes a copy |
+| **EXPLAIN QUERY PLAN** | `EXPLAIN QUERY PLAN SELECT ...` reports index use vs table scans |
+| **CREATE VIRTUAL TABLE** | `generate_series` module only; other modules return an explicit error |
+| **DROP** | `DROP TABLE/INDEX/VIEW/TRIGGER [IF EXISTS] name` |
+| **PRAGMA** | `foreign_keys`, `user_version`, `application_id`, `journal_mode`, `synchronous`, `cache_size`, `page_size`, `encoding`, `busy_timeout`, `locking_mode`, `auto_vacuum`, `integrity_check`, `foreign_key_check` |
+
+`ATTACH` and `DETACH` parse but return an explicit unsupported-feature error;
+partial (`WHERE`) and expression indexes are not accepted by the parser.
 
 ## JOIN Types
 
@@ -34,6 +46,10 @@ description: "The hand-written SQL lexer, parser, and bytecode compiler supporti
 - `RIGHT [OUTER] JOIN`
 - `FULL [OUTER] JOIN`
 - `CROSS JOIN`
+- `... USING (col[, ...])` and `NATURAL [...] JOIN` with merged-column output
+
+Joins chain across 3+ tables, and `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`,
+`LIMIT`, and `OFFSET` all apply over join results.
 
 Comparison predicates include `LIKE` and `NOT LIKE`; a NULL operand produces no
 match, following SQLite's three-valued predicate behavior. The typed DSL exposes
@@ -67,13 +83,16 @@ wrappers `.replace(search, replacement)` and `.substr(start, length)`.
 The numeric `ROUND(value, digits)` function is available in raw SQL and as
 `.round(digits)` in the DSL.
 
-Common casts are supported with `CAST(value AS INTEGER|REAL|TEXT)`; the DSL
-exposes `.cast("INTEGER")` with compile-time column validation.
+Common casts are supported with `CAST(value AS <type>)` for every SQLite
+type name (affinity-routed, so `BIGINT`, `VARCHAR(10)`, `DOUBLE PRECISION`,
+`DECIMAL`, and `BOOLEAN` all convert correctly); the DSL exposes
+`.cast("INTEGER")` with compile-time column validation.
 
-The initial JSON support includes `json_extract(json_text, '$.key')` and
-`json_set(json_text, '$.key', 'value')` for simple top-level scalar fields,
-exposed as `.jsonExtract(path)` / `.jsonSet(path, value)`. Nested objects,
-arrays, and the complete JSON1 function family are not yet implemented.
+The JSON1 family includes `json`, `json_extract`, `json_set`,
+`json_insert`, `json_replace`, `json_remove`, `json_array`, `json_object`,
+`json_type`, and `json_valid` over nested objects and arrays with `$.a[0]`
+style paths, exposed in the DSL as `.jsonExtract(path)` /
+`.jsonSet(path, value)`.
 
 Function expressions such as `WHERE LOWER(name) = 'alice'` and
 `WHERE TRIM(name) = 'alice'` are supported on the left side of comparison
@@ -94,11 +113,76 @@ Standard comparison operators: `=`, `!=`, `<>`, `<`, `>`, `<=`, `>=`, `LIKE`, `N
 
 ## Aggregate Functions
 
-`COUNT(*)`, `SUM(column)`, `AVG(column)`, `MIN(column)`, `MAX(column)`.
+`COUNT(*)` (incl. `COUNT(DISTINCT col)`), `SUM(column)`, `AVG(column)`,
+`TOTAL(column)`, `MIN(column)`, `MAX(column)`, `GROUP_CONCAT`.
+Date/time (`date`, `time`, `datetime`, `julianday`, `unixepoch`,
+`strftime`), math (`ceil`, `floor`, `sqrt`, `log`, `pow`, `sin`, `cos`,
+…), and window functions (`ROW_NUMBER`, `RANK`, `LAG`, `LEAD`, …) are
+supported in Raw SQL. The DSL provides column wrappers for scalar helpers
+(`abs`, `length`, `upper`, `lower`, `jsonExtract`, `jsonSet`), aggregates,
+and window functions; date/time and math functions have no DSL wrappers yet,
+so call them through Raw SQL.
 
 ## Scalar Functions
 
-`ABS(x)`, `LENGTH(x)`, `UPPER(x)`, `LOWER(x)`, `SUBSTR(x, start, length)`.
+`ABS(x)`, `LENGTH(x)`, `UPPER(x)`, `LOWER(x)`, `SUBSTR(x, start, length)`,
+`REPLACE`, `TRIM`/`LTRIM`/`RTRIM`, `INSTR`, `HEX`, `UNHEX`, `QUOTE`, `CHAR`,
+`UNICODE`, `PRINTF`/`FORMAT`, `ROUND`, `TYPEOF`, `COALESCE`, `IFNULL`,
+`NULLIF`.
+
+## Storage Classes vs Declared Types
+
+SQLite has exactly five runtime storage classes:
+
+```text
+NULL, INTEGER, REAL, TEXT, BLOB
+```
+
+Declared column types such as `INTEGER`, `INT`, `TEXT`, `VARCHAR(255)`,
+`DECIMAL(10,2)`, `BOOLEAN`, `DATE`, `DATETIME`, or `BLOB` are *declared type
+names*, not storage classes. The engine maps each declared name to a type
+affinity (`INTEGER`, `TEXT`, `BLOB`, `REAL`, or `NUMERIC`) following SQLite's
+rules — a name containing `INT` gets `INTEGER` affinity, one containing
+`CHAR`/`CLOB`/`TEXT` gets `TEXT` affinity, and so on — and coerces values
+accordingly. There are no separate `DATE`, `BOOLEAN`, or `DECIMAL` storage
+classes: a `DATETIME` column stores whatever value affinity rules produce
+(usually `TEXT` or `INTEGER`), and the declared type string is preserved in
+the schema.
+
+## CREATE TABLE Support
+
+Table definitions support declared types with full SQLite type names
+(including precision such as `DECIMAL(10,2)`), plus:
+
+- `PRIMARY KEY` and composite `PRIMARY KEY (a, b)`
+- `UNIQUE` and composite `UNIQUE`
+- `NOT NULL`, `DEFAULT <literal>`
+- `CHECK (...)` enforced on `INSERT`/`UPDATE` with SQLite `NULL` semantics
+- `FOREIGN KEY` (column- and table-level, incl. composite) with `CASCADE`,
+  `SET NULL`, `SET DEFAULT`, `RESTRICT`, and `NO ACTION`
+- Generated columns: `GENERATED ALWAYS AS (...) VIRTUAL` / `STORED`
+- `STRICT` tables (values outside the declared type are rejected) and
+  `WITHOUT ROWID` tables (keyed by primary key)
+
+Partial (`WHERE`) and expression indexes are not accepted by the parser;
+plain and `UNIQUE` column indexes are supported.
+
+## Architecture
+
+SQL text flows through the native pipeline:
+
+```text
+SQL → lexer/parser → AST → resolver → planner → executor → storage → transactions
+```
+
+The hand-written lexer and parser produce an AST. The connection resolves
+names against the schema catalog, consults the planner for index selection
+(see `EXPLAIN QUERY PLAN`), evaluates the shared expression and function
+subsystem (`IS`, `BETWEEN`, `CASE`, `CAST`, aggregates, window functions),
+and persists through the SQLite-compatible on-disk image with journal/WAL
+durability. A bytecode compiler and VM (`src/vm/`) implement the same
+execution model for compiled programs. Triggers, views, foreign-key actions,
+and constraints all run inside this same engine — never as a second pass.
 
 ## Example
 

@@ -1,6 +1,6 @@
 ---
 title: "Grouped Aggregates"
-description: "Grouped aggregate projections with GROUP BY using COUNT, SUM, AVG, MIN, and MAX functions."
+description: "Aggregate projections with GROUP BY in sqlite.zig: COUNT, SUM, AVG, TOTAL, MIN, MAX, and GROUP_CONCAT."
 ---
 
 # Grouped Aggregates
@@ -15,9 +15,12 @@ var rows = try db.exec(
 defer rows.deinit();
 ```
 
-The grouped executor supports `COUNT`, `SUM`, `AVG`, `MIN`, and `MAX`. The
-typed DSL continues to support scalar aggregates through its aggregate methods,
-plus grouped aggregate filters with `groupBy(...).havingCount(...)`.
+Aggregates work with and without `GROUP BY`: `COUNT` (including
+`COUNT(DISTINCT col)`), `SUM`, `AVG`, `TOTAL`, `MIN`, `MAX`, and
+`GROUP_CONCAT`. The typed DSL exposes the same set through column aggregate
+methods (`.sum()`, `.avg()`, `.min()`, `.max()`, `.count()`,
+`.countDistinct()`), plus grouped aggregate filters with
+`groupBy(...).havingCount(...)`.
 
 ```zig
 var rows = try db.from(Sale)

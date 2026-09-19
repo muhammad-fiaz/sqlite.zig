@@ -32,3 +32,112 @@
   border-color: rgba(118, 185, 0, 0.45) !important;
   box-shadow: 0 4px 20px rgba(118, 185, 0, 0.1);
 }
+.dark .VPFeature:hover {
+  box-shadow: 0 4px 24px rgba(118, 185, 0, 0.22);
+}
+
+/* Responsive hero: fluid type, scalable logo, stacked layout */
+.VPHero .name {
+  font-size: clamp(2rem, 6vw, 3.5rem);
+  line-height: 1.1;
+}
+.VPHero .text {
+  font-size: clamp(1.15rem, 3.4vw, 1.75rem);
+  line-height: 1.3;
+}
+.VPHero .tagline {
+  font-size: clamp(0.95rem, 2.4vw, 1.15rem);
+  line-height: 1.55;
+  max-width: 48rem;
+}
+.VPHero .image img,
+.VPHero .VPImage {
+  width: clamp(96px, 18vw, 192px);
+  height: auto;
+}
+@media (max-width: 960px) {
+  .VPHero .container {
+    flex-direction: column;
+  }
+  .VPHero .main {
+    max-width: 100%;
+  }
+  .VPFeatures .items {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Tables: never break layout on small screens */
+.vp-doc table {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  font-size: 0.9rem;
+}
+.vp-doc th,
+.vp-doc td {
+  white-space: nowrap;
+}
+.vp-doc td:last-child,
+.vp-doc th:last-child {
+  white-space: normal;
+  min-width: 12rem;
+}
+
+/* Code blocks: readable on mobile, no page-level overflow */
+.vp-doc div[class*="language-"] {
+  max-width: 100%;
+  border-radius: 8px;
+}
+.vp-doc div[class*="language-"] pre,
+.vp-doc div[class*="language-"] code {
+  font-size: 0.85rem;
+  line-height: 1.6;
+  tab-size: 2;
+}
+@media (max-width: 640px) {
+  .vp-doc div[class*="language-"] pre,
+  .vp-doc div[class*="language-"] code {
+    font-size: 0.8rem;
+  }
+  .vp-doc h1 {
+    font-size: 1.65rem;
+    line-height: 1.25;
+  }
+}
+
+/* Custom containers keep comfortable measure */
+.vp-doc .custom-block {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+/* Accessible keyboard focus (SEO-neutral, a11y-positive) */
+:focus-visible {
+  outline: 2px solid #76b900;
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* Touch targets on small screens */
+@media (max-width: 640px) {
+  .VPNavBarMenuLink,
+  .VPNavBar .VPNavBarMenu a {
+    min-height: 44px;
+    display: inline-flex;
+    align-items: center;
+  }
+}
+
+/* Respect reduced-motion preferences */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

@@ -1,0 +1,74 @@
+const std = @import("std");
+const sqlite = @import("sqlite");
+
+const Left = sqlite.table("mu_left", struct { id: i64, grp: []const u8, val: []const u8 });
+const Right = sqlite.table("mu_right", struct { id: i64, grp: []const u8, info: []const u8 });
+
+pub fn main() !void {
+    var db = try sqlite.open(std.heap.page_allocator, "example_60.db");
+    errdefer db.close();
+    var setup = try db.exec("DROP TABLE IF EXISTS mu_left; DROP TABLE IF EXISTS mu_right; CREATE TABLE mu_left (id INTEGER NOT NULL, grp TEXT NOT NULL, val TEXT NOT NULL); CREATE TABLE mu_right (id INTEGER NOT NULL, grp TEXT NOT NULL, info TEXT NOT NULL); INSERT INTO mu_left VALUES (1, 'g1', 'L1'), (2, 'g2', 'L2'), (3, 'g1', 'L3'); INSERT INTO mu_right VALUES (2, 'g2', 'R2'), (3, 'g9', 'R3'), (4, 'g4', 'R4');");
+    setup.deinit();
+    try db.schema(Left).validate();
+    try db.schema(Right).validate();
+    var rawMulti = try db.exec("SELECT * FROM mu_left JOIN mu_right USING (id, grp) ORDER BY id;");
+    defer rawMulti.deinit();
+    if (rawMulti.count() != 1) return error.VerificationFailed;
+    if (rawMulti.columns.len != 4) return error.VerificationFailed;
+    if (rawMulti.rows[0][0].integer != 2) return error.VerificationFailed;
+    if (!std.mem.eql(u8, rawMulti.rows[0][1].text, "g2")) return error.VerificationFailed;
+    if (!std.mem.eql(u8, rawMulti.rows[0][2].text, "L2")) return error.VerificationFailed;
+    if (!std.mem.eql(u8, rawMulti.rows[0][3].text, "R2")) return error.VerificationFailed;
+    var dynMulti = try db.from("mu_left").joinUsing("mu_right", .{ db.col("id"), db.col("grp") }).orderBy(db.col("id").asc()).fetch();
+    defer dynMulti.deinit();
+    if (dynMulti.count() != 1) return error.VerificationFailed;
+    if (dynMulti.columns.len != 4) return error.VerificationFailed;
+    if (dynMulti.rows[0][0].integer != 2) return error.VerificationFailed;
+    if (!std.mem.eql(u8, dynMulti.rows[0][3].text, "R2")) return error.VerificationFailed;
+    var typedMulti = try db.from(Left).joinUsing(Right, .{ Left.columns.id, Left.columns.grp }).orderBy(Left.columns.id.asc()).fetch();
+    defer typedMulti.deinit();
+    if (typedMulti.count() != 1) return error.VerificationFailed;
+    if (typedMulti.rows[0].id != 2) return error.VerificationFailed;
+    if (!std.mem.eql(u8, typedMulti.rows[0].grp, "g2")) return error.VerificationFailed;
+    if (!std.mem.eql(u8, typedMulti.rows[0].val, "L2")) return error.VerificationFailed;
+    var rawLeft = try db.exec("SELECT * FROM mu_left LEFT JOIN mu_right USING (id, grp) ORDER BY id;");
+    defer rawLeft.deinit();
+    if (rawLeft.count() != 3) return error.VerificationFailed;
+    var dynLeft = try db.from("mu_left").leftJoinUsing("mu_right", .{ db.col("id"), db.col("grp") }).orderBy(db.col("id").asc()).fetch();
+    defer dynLeft.deinit();
+    if (dynLeft.count() != rawLeft.count()) return error.VerificationFailed;
+    if (dynLeft.rows[0][3] != .null) return error.VerificationFailed;
+    if (!std.mem.eql(u8, dynLeft.rows[1][3].text, "R2")) return error.VerificationFailed;
+    var inserted = try db.from(Left).insert(.{ .id = 4, .grp = "g4", .val = "L4" });
+    inserted.deinit();
+    var afterInsert = try db.exec("SELECT * FROM mu_left JOIN mu_right USING (id, grp) ORDER BY id;");
+    defer afterInsert.deinit();
+    if (afterInsert.count() != 2) return error.VerificationFailed;
+    if (afterInsert.rows[1][0].integer != 4) return error.VerificationFailed;
+    if (!std.mem.eql(u8, afterInsert.rows[1][3].text, "R4")) return error.VerificationFailed;
+    var dynAfter = try db.from("mu_left").joinUsing("mu_right", .{ db.col("id"), db.col("grp") }).orderBy(db.col("id").asc()).fetch();
+    defer dynAfter.deinit();
+    if (dynAfter.count() != 2) return error.VerificationFailed;
+    if (db.exec("SELECT * FROM mu_left JOIN mu_right USING (nope);")) |r| {
+        var owned = r;
+        owned.deinit();
+        return error.VerificationFailed;
+    } else |_| {}
+    var intactLeft = try db.exec("SELECT count(*) FROM mu_left;");
+    defer intactLeft.deinit();
+    if (intactLeft.rows[0][0].integer != 4) return error.VerificationFailed;
+    var intactRight = try db.exec("SELECT count(*) FROM mu_right;");
+    defer intactRight.deinit();
+    if (intactRight.rows[0][0].integer != 3) return error.VerificationFailed;
+    db.close();
+    var reopened = try sqlite.open(std.heap.page_allocator, "example_60.db");
+    defer reopened.close();
+    var persisted = try reopened.exec("SELECT * FROM mu_left JOIN mu_right USING (id, grp) ORDER BY id;");
+    defer persisted.deinit();
+    if (persisted.count() != 2) return error.VerificationFailed;
+    if (persisted.columns.len != 4) return error.VerificationFailed;
+    var persistedDyn = try reopened.from("mu_left").joinUsing("mu_right", .{ reopened.col("id"), reopened.col("grp") }).fetch();
+    defer persistedDyn.deinit();
+    if (persistedDyn.count() != 2) return error.VerificationFailed;
+    std.debug.print("60 multi-column using: raw dynamic typed verified with persistence\n", .{});
+}

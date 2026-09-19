@@ -1,0 +1,392 @@
+const std = @import("std");
+const Value = @import("../../vm/value.zig").Value;
+
+const PathStep = union(enum) {
+    key: []const u8,
+    index: i64,
+};
+
+fn parsePath(allocator: std.mem.Allocator, pathStr: []const u8) ![]PathStep {
+    var trimmed = std.mem.trim(u8, pathStr, " \t\r\n");
+    if (std.mem.startsWith(u8, trimmed, "$")) {
+        trimmed = trimmed[1..];
+    }
+    var steps = std.ArrayList(PathStep).empty;
+    errdefer steps.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < trimmed.len) {
+        if (trimmed[i] == '.') {
+            i += 1;
+            if (i >= trimmed.len) break;
+            if (trimmed[i] == '"') {
+                i += 1;
+                const start = i;
+                while (i < trimmed.len and trimmed[i] != '"') : (i += 1) {}
+                const key = trimmed[start..i];
+                if (i < trimmed.len and trimmed[i] == '"') i += 1;
+                try steps.append(allocator, .{ .key = key });
+            } else {
+                const start = i;
+                while (i < trimmed.len and trimmed[i] != '.' and trimmed[i] != '[') : (i += 1) {}
+                try steps.append(allocator, .{ .key = trimmed[start..i] });
+            }
+        } else if (trimmed[i] == '[') {
+            i += 1;
+            var isHash = false;
+            if (i < trimmed.len and trimmed[i] == '#') {
+                isHash = true;
+                i += 1;
+            }
+            const start = i;
+            while (i < trimmed.len and trimmed[i] != ']') : (i += 1) {}
+            const numStr = trimmed[start..i];
+            if (i < trimmed.len and trimmed[i] == ']') i += 1;
+            var idx = std.fmt.parseInt(i64, numStr, 10) catch 0;
+            if (isHash and idx <= 0) {
+                idx = idx - 1;
+            }
+            try steps.append(allocator, .{ .index = idx });
+        } else {
+            const start = i;
+            while (i < trimmed.len and trimmed[i] != '.' and trimmed[i] != '[') : (i += 1) {}
+            try steps.append(allocator, .{ .key = trimmed[start..i] });
+        }
+    }
+    return steps.toOwnedSlice(allocator);
+}
+
+fn jsonTypeString(val: std.json.Value) []const u8 {
+    return switch (val) {
+        .null => "null",
+        .bool => |b| if (b) "true" else "false",
+        .integer => "integer",
+        .float => "real",
+        .number_string => "real",
+        .string => "text",
+        .array => "array",
+        .object => "object",
+    };
+}
+
+fn jsonValueToSql(allocator: std.mem.Allocator, val: std.json.Value) !Value {
+    return switch (val) {
+        .null => .null,
+        .bool => |b| .{ .integer = if (b) 1 else 0 },
+        .integer => |i| .{ .integer = i },
+        .float => |f| .{ .real = f },
+        .number_string => |s| blk: {
+            if (std.fmt.parseInt(i64, s, 10)) |i| break :blk .{ .integer = i } else |_| {}
+            if (std.fmt.parseFloat(f64, s)) |f| break :blk .{ .real = f } else |_| {}
+            break :blk .{ .text = try allocator.dupe(u8, s) };
+        },
+        .string => |s| .{ .text = try allocator.dupe(u8, s) },
+        .array, .object => .{ .text = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(val, .{})}) },
+    };
+}
+
+fn sqlValueToJson(arena: std.mem.Allocator, val: Value) !std.json.Value {
+    return switch (val) {
+        .null => .null,
+        .integer => |i| .{ .integer = i },
+        .real => |r| .{ .float = r },
+        .text => |t| blk: {
+            const parsed = std.json.parseFromSlice(std.json.Value, arena, t, .{}) catch {
+                break :blk .{ .string = t };
+            };
+            break :blk parsed.value;
+        },
+        .blob => .null,
+    };
+}
+
+fn cloneJson(arena: std.mem.Allocator, val: std.json.Value) !std.json.Value {
+    return switch (val) {
+        .null => .null,
+        .bool => |b| .{ .bool = b },
+        .integer => |i| .{ .integer = i },
+        .float => |f| .{ .float = f },
+        .number_string => |ns| .{ .number_string = try arena.dupe(u8, ns) },
+        .string => |s| .{ .string = try arena.dupe(u8, s) },
+        .array => |arr| {
+            var newArr = std.json.Array.init(arena);
+            for (arr.items) |item| {
+                try newArr.append(try cloneJson(arena, item));
+            }
+            return .{ .array = newArr };
+        },
+        .object => |obj| {
+            var newObj: std.json.ObjectMap = .empty;
+            var it = obj.iterator();
+            while (it.next()) |entry| {
+                const k = try arena.dupe(u8, entry.key_ptr.*);
+                const v = try cloneJson(arena, entry.value_ptr.*);
+                try newObj.put(arena, k, v);
+            }
+            return .{ .object = newObj };
+        },
+    };
+}
+
+fn getPath(root: std.json.Value, steps: []const PathStep) ?std.json.Value {
+    var cur = root;
+    for (steps) |step| {
+        switch (step) {
+            .key => |k| {
+                if (cur != .object) return null;
+                cur = cur.object.get(k) orelse return null;
+            },
+            .index => |idx| {
+                if (cur != .array) return null;
+                const items = cur.array.items;
+                const actualIdx: usize = if (idx >= 0)
+                    @as(usize, @intCast(idx))
+                else blk: {
+                    const fromEnd = @as(usize, @intCast(-idx));
+                    if (fromEnd > items.len) return null;
+                    break :blk items.len - fromEnd;
+                };
+                if (actualIdx >= items.len) return null;
+                cur = items[actualIdx];
+            },
+        }
+    }
+    return cur;
+}
+
+pub const ModifyMode = enum { set, insert, replace };
+
+fn setPath(arena: std.mem.Allocator, root: *std.json.Value, steps: []const PathStep, newVal: std.json.Value, mode: ModifyMode) !void {
+    if (steps.len == 0) {
+        if (mode != .insert) root.* = newVal;
+        return;
+    }
+    var cur = root;
+    for (steps[0 .. steps.len - 1]) |step| {
+        switch (step) {
+            .key => |k| {
+                if (cur.* != .object) return;
+                var obj = &cur.object;
+                if (!obj.contains(k)) {
+                    if (mode == .replace) return;
+                    try obj.put(arena, try arena.dupe(u8, k), .{ .object = .empty });
+                }
+                cur = obj.getPtr(k) orelse return;
+            },
+            .index => |idx| {
+                if (cur.* != .array) return;
+                const items = cur.array.items;
+                const actualIdx: usize = if (idx >= 0)
+                    @as(usize, @intCast(idx))
+                else blk: {
+                    const fromEnd = @as(usize, @intCast(-idx));
+                    if (fromEnd > items.len) return;
+                    break :blk items.len - fromEnd;
+                };
+                if (actualIdx >= items.len) return;
+                cur = &cur.array.items[actualIdx];
+            },
+        }
+    }
+    const lastStep = steps[steps.len - 1];
+    switch (lastStep) {
+        .key => |k| {
+            if (cur.* != .object) return;
+            const exists = cur.object.contains(k);
+            if (exists and mode == .insert) return;
+            if (!exists and mode == .replace) return;
+            try cur.object.put(arena, try arena.dupe(u8, k), newVal);
+        },
+        .index => |idx| {
+            if (cur.* != .array) return;
+            const items = cur.array.items;
+            if (idx < 0) return;
+            const uIdx: usize = @intCast(idx);
+            if (uIdx < items.len) {
+                if (mode == .insert) return;
+                cur.array.items[uIdx] = newVal;
+            } else if (uIdx == items.len) {
+                if (mode == .replace) return;
+                try cur.array.append(newVal);
+            }
+        },
+    }
+}
+
+fn removePath(root: *std.json.Value, steps: []const PathStep) void {
+    if (steps.len == 0) return;
+    var cur = root;
+    for (steps[0 .. steps.len - 1]) |step| {
+        switch (step) {
+            .key => |k| {
+                if (cur.* != .object) return;
+                cur = cur.object.getPtr(k) orelse return;
+            },
+            .index => |idx| {
+                if (cur.* != .array) return;
+                const items = cur.array.items;
+                const actualIdx: usize = if (idx >= 0)
+                    @as(usize, @intCast(idx))
+                else blk: {
+                    const fromEnd = @as(usize, @intCast(-idx));
+                    if (fromEnd > items.len) return;
+                    break :blk items.len - fromEnd;
+                };
+                if (actualIdx >= items.len) return;
+                cur = &cur.array.items[actualIdx];
+            },
+        }
+    }
+    const lastStep = steps[steps.len - 1];
+    switch (lastStep) {
+        .key => |k| {
+            if (cur.* != .object) return;
+            _ = cur.object.orderedRemove(k);
+        },
+        .index => |idx| {
+            if (cur.* != .array) return;
+            const items = cur.array.items;
+            const actualIdx: usize = if (idx >= 0)
+                @as(usize, @intCast(idx))
+            else blk: {
+                const fromEnd = @as(usize, @intCast(-idx));
+                if (fromEnd > items.len) return;
+                break :blk items.len - fromEnd;
+            };
+            if (actualIdx < items.len) {
+                _ = cur.array.orderedRemove(actualIdx);
+            }
+        },
+    }
+}
+
+pub fn evalJson(allocator: std.mem.Allocator, arg: Value) !Value {
+    if (arg == .null or arg != .text) return .null;
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, arg.text, .{}) catch return .null;
+    defer parsed.deinit();
+    const str = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(parsed.value, .{})});
+    return .{ .text = str };
+}
+
+pub fn evalJsonValid(allocator: std.mem.Allocator, arg: Value) Value {
+    if (arg == .null or arg != .text) return .{ .integer = 0 };
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, arg.text, .{}) catch return .{ .integer = 0 };
+    parsed.deinit();
+    return .{ .integer = 1 };
+}
+
+pub fn evalJsonType(allocator: std.mem.Allocator, args: []const Value) !Value {
+    if (args.len == 0 or args[0] == .null or args[0] != .text) return .null;
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, args[0].text, .{}) catch return .null;
+    defer parsed.deinit();
+    if (args.len >= 2 and args[1] != .null and args[1] == .text) {
+        const steps = try parsePath(allocator, args[1].text);
+        defer allocator.free(steps);
+        const node = getPath(parsed.value, steps) orelse return .null;
+        return .{ .text = try allocator.dupe(u8, jsonTypeString(node)) };
+    }
+    return .{ .text = try allocator.dupe(u8, jsonTypeString(parsed.value)) };
+}
+
+pub fn evalJsonExtract(allocator: std.mem.Allocator, args: []const Value) !Value {
+    if (args.len < 2 or args[0] == .null or args[0] != .text) return .null;
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, args[0].text, .{}) catch return .null;
+    defer parsed.deinit();
+
+    if (args.len == 2) {
+        if (args[1] == .null or args[1] != .text) return .null;
+        const steps = try parsePath(allocator, args[1].text);
+        defer allocator.free(steps);
+        const node = getPath(parsed.value, steps) orelse return .null;
+        return try jsonValueToSql(allocator, node);
+    }
+
+    var resultList = std.json.Array.init(allocator);
+    defer resultList.deinit();
+    for (args[1..]) |pathVal| {
+        if (pathVal == .null or pathVal != .text) {
+            try resultList.append(.null);
+            continue;
+        }
+        const steps = try parsePath(allocator, pathVal.text);
+        defer allocator.free(steps);
+        if (getPath(parsed.value, steps)) |node| {
+            try resultList.append(try cloneJson(allocator, node));
+        } else {
+            try resultList.append(.null);
+        }
+    }
+    const resStr = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(std.json.Value{ .array = resultList }, .{})});
+    return .{ .text = resStr };
+}
+
+pub fn evalJsonArray(allocator: std.mem.Allocator, args: []const Value) !Value {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arenaAlloc = arena.allocator();
+
+    var arr = std.json.Array.init(arenaAlloc);
+    for (args) |a| {
+        try arr.append(try sqlValueToJson(arenaAlloc, a));
+    }
+    const resStr = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(std.json.Value{ .array = arr }, .{})});
+    return .{ .text = resStr };
+}
+
+pub fn evalJsonObject(allocator: std.mem.Allocator, args: []const Value) !Value {
+    if (args.len % 2 != 0) return error.InvalidArgumentCount;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arenaAlloc = arena.allocator();
+
+    var obj: std.json.ObjectMap = .empty;
+    var i: usize = 0;
+    while (i < args.len) : (i += 2) {
+        const kVal = args[i];
+        if (kVal != .text) return error.InvalidArgument;
+        const vVal = args[i + 1];
+        try obj.put(arenaAlloc, try arenaAlloc.dupe(u8, kVal.text), try sqlValueToJson(arenaAlloc, vVal));
+    }
+    const resStr = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(std.json.Value{ .object = obj }, .{})});
+    return .{ .text = resStr };
+}
+
+pub fn evalJsonModify(allocator: std.mem.Allocator, args: []const Value, mode: ModifyMode) !Value {
+    if (args.len < 3 or args[0] == .null or args[0] != .text) return .null;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arenaAlloc = arena.allocator();
+
+    const parsed = std.json.parseFromSlice(std.json.Value, arenaAlloc, args[0].text, .{}) catch return .null;
+    var root = try cloneJson(arenaAlloc, parsed.value);
+
+    var i: usize = 1;
+    while (i + 1 < args.len) : (i += 2) {
+        const pathVal = args[i];
+        if (pathVal != .text) continue;
+        const valVal = args[i + 1];
+        const steps = try parsePath(arenaAlloc, pathVal.text);
+        const jVal = try sqlValueToJson(arenaAlloc, valVal);
+        try setPath(arenaAlloc, &root, steps, jVal, mode);
+    }
+    const resStr = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(root, .{})});
+    return .{ .text = resStr };
+}
+
+pub fn evalJsonRemove(allocator: std.mem.Allocator, args: []const Value) !Value {
+    if (args.len < 2 or args[0] == .null or args[0] != .text) return .null;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arenaAlloc = arena.allocator();
+
+    const parsed = std.json.parseFromSlice(std.json.Value, arenaAlloc, args[0].text, .{}) catch return .null;
+    var root = try cloneJson(arenaAlloc, parsed.value);
+
+    for (args[1..]) |pathVal| {
+        if (pathVal != .text) continue;
+        const steps = try parsePath(arenaAlloc, pathVal.text);
+        removePath(&root, steps);
+    }
+    const resStr = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(root, .{})});
+    return .{ .text = resStr };
+}

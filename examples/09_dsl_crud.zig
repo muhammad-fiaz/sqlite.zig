@@ -4,9 +4,9 @@ const sqlite = @import("sqlite");
 const User = sqlite.table("dsl_users", struct { id: i64, name: []const u8 });
 
 pub fn main() !void {
-    var db = try sqlite.open(std.heap.page_allocator, "valid_09.db");
+    var db = try sqlite.open(std.heap.page_allocator, "example_09.db");
     defer db.close();
-    try db.createTable(User, .{ .ifNotExists = true });
+    try db.createTable(User, .{ .overWrite = true });
     var inserted = try db.from(User).insert(.{ .id = 1, .name = "before" });
     inserted.deinit();
     var mutation = try db.from(User).update(.{ .name = "after" });

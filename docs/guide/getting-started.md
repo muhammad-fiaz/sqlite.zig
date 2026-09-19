@@ -33,7 +33,7 @@ pub fn main() !void {
     defer db.close();
 
     // Create a table using the typed DSL
-    try db.createTable(User, .{ .ifNotExists = true });
+    try db.createTable(User, .{});
 
     // Insert a row
     var inserted = try db.from(User).insert(.{ .id = 1, .name = "Alice" });
@@ -43,7 +43,7 @@ pub fn main() !void {
     var result = try db.from(User).fetch();
     defer result.deinit();
 
-    std.debug.print("Rows: {d}\n", .{result.rowCount()});
+    std.debug.print("Rows: {d}\n", .{result.count()});
 }
 ```
 
@@ -67,4 +67,31 @@ defer rows.deinit();
 - [Installation](/guide/installation) — Add sqlite.zig to your project
 - [SQL Engine](/guide/sql-engine) — Learn about raw SQL support
 - [DSL Query Builder](/guide/dsl-query-builder) — Type-safe query construction
-- [Transactions](/guide/transactions) — ACID transaction support
+- [Transactions](/guide/transactions) — Transaction and savepoint support
+
+## FAQ
+
+**What is SQLite.zig?**
+A native, zero-dependency SQLite-compatible database engine written entirely
+in Zig: storage engine, SQL parser, planner, and virtual machine included.
+
+**Does SQLite.zig use the SQLite C library?**
+No. It is a ground-up Zig reimplementation with no C bindings and no
+link-time dependencies.
+
+**What SQLite storage types are supported?**
+The five runtime storage classes `NULL`, `INTEGER`, `REAL`, `TEXT`, and
+`BLOB`, with SQLite type affinity mapping declared column types onto them.
+
+**How do transactions work?**
+`BEGIN` / `COMMIT` / `ROLLBACK` plus `SAVEPOINT` / `RELEASE` /
+`ROLLBACK TO`, in both Raw SQL and the Zig API. Writes persist on commit;
+rollback discards the transaction's changes.
+
+**Can Raw SQL and the DSL use the same database?**
+Yes. Raw SQL, the Dynamic DSL, and the Typed DSL share one underlying
+engine, so rows written through one interface read back through the others.
+
+**How are SQLite databases persisted?**
+Databases use the real SQLite on-disk format (100-byte header, B-tree
+pages), so files reopen losslessly and can be inspected with SQLite tooling.

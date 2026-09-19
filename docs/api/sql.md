@@ -1,77 +1,53 @@
 ---
 title: "SQL API"
-description: "Parsing and executing raw SQL strings, including the lexer, parser, AST, and compiler for SQL statements."
+description: "Executing raw SQL with sqlite.zig: db.exec for statements and queries, plus prepared statements with parameter binding."
 ---
 
 # SQL API
 
-The SQL module handles parsing and executing raw SQL strings.
+Raw SQL is a first-class interface. Every statement is executed through the
+same native engine that backs the DSLs.
 
-## Lexer
-
-Tokenizes SQL input into tokens:
-
-```zig
-const lexer = @import("lexer");
-
-var lex = lexer.Lexer.init(allocator, "SELECT * FROM users;");
-const tokens = try lex.tokenize();
-```
-
-## Parser
-
-Parses tokens into an AST:
+## Executing SQL
 
 ```zig
-const parser = @import("parser");
+// Any statement: DDL, DML, PRAGMA, transactions, ...
+var result = try db.exec("CREATE TABLE users (id INTEGER, name TEXT);");
+result.deinit();
 
-var p = parser.Parser.init(allocator, tokens);
-const statement = try p.parse();
+var rows = try db.exec("SELECT id, name FROM users ORDER BY id;");
+defer rows.deinit();
 ```
 
-## AST (Abstract Syntax Tree)
+`exec` accepts multiple semicolon-separated statements and returns the result
+of the final statement. For `?` placeholders with bound values, use prepared
+statements below.
 
-The parsed representation of SQL statements:
+## Prepared statements
 
 ```zig
-const ast = @import("ast");
-
-// Statement types
-switch (statement) {
-    .createTable => |ct| { /* ... */ },
-    .insert => |ins| { /* ... */ },
-    .select => |sel| { /* ... */ },
-    .update => |upd| { /* ... */ },
-    .delete => |del| { /* ... */ },
-    .begin => { /* ... */ },
-    .commit => { /* ... */ },
-    .rollback => { /* ... */ },
-    // ...
-}
+var statement = try db.prepare("INSERT INTO users VALUES (?, ?);");
+try statement.bind(1, 4);
+try statement.bind(2, "saved");
+try statement.step();
+statement.finalize();
 ```
 
-## Compiler
+- `bind` uses **1-based** indexes. Integers and booleans bind as `INTEGER`,
+  floats as `REAL`, strings as `TEXT`, `null` and null optionals as `NULL`.
+- `step` executes the statement with the current parameters.
+- `reset` clears bound parameters for reuse; `finalize` frees the statement.
 
-Compiles AST into bytecode for the VM:
+## How it works
 
-```zig
-const compiler = @import("compiler");
-
-var comp = compiler.Compiler.init(allocator);
-const bytecode = try comp.compile(statement);
-```
-
-## Virtual Machine
-
-Executes bytecode against the storage engine:
-
-```zig
-const vm = @import("vm");
-
-var machine = vm.VM.init(allocator, &connection);
-const result = try machine.execute(bytecode);
-```
+Under the hood, SQL text flows through the native pipeline described in the
+[SQL engine guide](/guide/sql-engine): lexer and hand-written parser produce
+an AST, which the connection executes (planning, function evaluation, and
+storage updates included). The lexer, parser, AST, compiler, and VM modules
+under `src/` are internal implementation details — client code should use
+`db.exec` and `db.prepare`, not import them directly.
 
 ## Supported SQL
 
-See the [SQL Engine](/guide/sql-engine) guide for the full list of supported SQL statements and syntax.
+See the [SQL Engine](/guide/sql-engine) guide for the full list of supported
+SQL statements and syntax.

@@ -5,10 +5,10 @@ const Balance = sqlite.table("update_from_balances", struct { id: i64, amount: i
 const Adjustment = sqlite.table("update_from_adjustments", struct { id: i64, amount: i64 });
 
 pub fn main() !void {
-    var db = try sqlite.open(std.heap.page_allocator, "valid_42.db");
+    var db = try sqlite.open(std.heap.page_allocator, "example_42.db");
     defer db.close();
-    try db.createTable(Balance, .{ .ifNotExists = true, .primaryKey = Balance.columns.id });
-    try db.createTable(Adjustment, .{ .ifNotExists = true });
+    try db.createTable(Balance, .{ .overWrite = true, .primaryKey = Balance.columns.id });
+    try db.createTable(Adjustment, .{ .overWrite = true });
     try db.truncate(Balance);
     try db.truncate(Adjustment);
     var balance = try db.from(Balance).insert(.{ .id = 1, .amount = 10 });
@@ -19,6 +19,6 @@ pub fn main() !void {
     defer result.deinit();
     var rows = try db.from(Balance).selectAll().fetch();
     defer rows.deinit();
-    if (rows.rowCount() != 1 or rows.rows[0].amount != 99) return error.UpdateFromVerificationFailed;
+    if (rows.count() != 1 or rows.rows[0].amount != 99) return error.UpdateFromVerificationFailed;
     std.debug.print("42 UPDATE FROM: equi-join source assignment verified\n", .{});
 }

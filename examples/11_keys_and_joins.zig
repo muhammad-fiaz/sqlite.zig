@@ -5,10 +5,10 @@ const User = sqlite.table("relation_users", struct { id: i64, email: []const u8 
 const Order = sqlite.table("relation_orders", struct { id: i64, user_id: i64 });
 
 pub fn main() !void {
-    var db = try sqlite.open(std.heap.page_allocator, "valid_11.db");
+    var db = try sqlite.open(std.heap.page_allocator, "example_11.db");
     defer db.close();
-    try db.createTable(User, .{ .ifNotExists = true, .primaryKey = User.columns.id, .unique = &.{User.columns.email} });
-    try db.createTable(Order, .{ .ifNotExists = true, .primaryKey = Order.columns.id, .foreignKeys = &.{.{ .column = Order.columns.user_id, .references = User.columns.id }} });
+    try db.createTable(User, .{ .overWrite = true, .primaryKey = User.columns.id, .unique = &.{User.columns.email} });
+    try db.createTable(Order, .{ .overWrite = true, .primaryKey = Order.columns.id, .foreignKeys = &.{.{ .column = Order.columns.user_id, .references = User.columns.id }} });
     try db.truncate(Order);
     try db.truncate(User);
 

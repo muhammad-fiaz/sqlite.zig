@@ -4,9 +4,9 @@ const sqlite = @import("sqlite");
 const Item = sqlite.table("edge_items", struct { id: i64, label: ?[]const u8 });
 
 pub fn main() !void {
-    var db = try sqlite.open(std.heap.page_allocator, "valid_13.db");
+    var db = try sqlite.open(std.heap.page_allocator, "example_13.db");
     defer db.close();
-    try db.createTable(Item, .{ .ifNotExists = true, .primaryKey = Item.columns.id, .unique = &.{Item.columns.label} });
+    try db.createTable(Item, .{ .overWrite = true, .primaryKey = Item.columns.id, .unique = &.{Item.columns.label} });
     try db.truncate(Item);
     var first = try db.from(Item).insert(.{ .id = 1, .label = "alpha" });
     first.deinit();

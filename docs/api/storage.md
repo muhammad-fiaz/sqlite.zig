@@ -6,24 +6,20 @@ description: "Low-level file I/O, page management, and durability for the SQLite
 # Storage API
 
 The storage module handles low-level file I/O, page management, and durability.
+These modules are internal: client code reaches them through `Connection`,
+not by importing them directly.
 
 ## File I/O
 
-```zig
-const file = @import("file");
-
-var f = try file.File.open("my.db");
-```
+`DatabaseFile.open(allocator, path)` opens (or creates) the database file,
+reads the 100-byte header, and exposes page reads/writes plus image
+readback (`readImage`) and `user_version` / `application_id` accessors.
 
 ## Pager
 
-Manages database pages in memory:
-
-```zig
-const pager = @import("pager");
-
-var p = try pager.Pager.init(allocator, "my.db");
-```
+`Pager.init(allocator, file)` caches pages from a `DatabaseFile` in memory,
+with `get`, `allocatePage` (reusing freed pages first), `freePage`,
+`markDirty`, and `flush`.
 
 ## Write-Ahead Log (WAL)
 
@@ -44,23 +40,17 @@ and full SQLite concurrency semantics remain under development.
 
 ## Rollback Journal
 
-Traditional durability mode:
-
-```zig
-const journal = @import("journal");
-
-var j = try journal.Journal.init("my.db-journal");
-```
+The `journal` module encodes the rollback-journal header (page geometry);
+durability itself is managed by the connection, which persists the rebuilt
+database image on every write outside a transaction.
 
 ## SQLite Image
 
-The on-disk format representation:
-
-```zig
-const sqliteImage = @import("sqlite_image");
-
-var img = try sqliteImage.Image.init("my.db");
-```
+The `sqlite_image` module converts between the live schema and the on-disk
+format: `encode` / `encodeWithPageSize` build the header, schema-table
+B-tree, table/index B-trees, views, and triggers into pages, while `decode`
+reconstructs the schema (tables with rows, indexes, views, triggers) when a
+database is opened.
 
 ## Page Format
 

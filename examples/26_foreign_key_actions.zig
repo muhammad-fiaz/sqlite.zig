@@ -7,10 +7,10 @@ const Parent = sqlite.table("cascade_parents", ParentRow);
 const Child = sqlite.table("cascade_children", ChildRow);
 
 pub fn main() !void {
-    var db = try sqlite.open(std.heap.page_allocator, "valid_26.db");
+    var db = try sqlite.open(std.heap.page_allocator, "example_26.db");
     defer db.close();
-    try db.createTable(Parent, .{ .ifNotExists = true, .primaryKey = Parent.columns.id });
-    try db.createTable(Child, .{ .ifNotExists = true, .primaryKey = Child.columns.id, .foreignKeys = &.{.{ .column = Child.columns.parent_id, .references = Parent.columns.id, .onDelete = .cascade }} });
+    try db.createTable(Parent, .{ .overWrite = true, .primaryKey = Parent.columns.id });
+    try db.createTable(Child, .{ .overWrite = true, .primaryKey = Child.columns.id, .foreignKeys = &.{.{ .column = Child.columns.parent_id, .references = Parent.columns.id, .onDelete = .cascade }} });
     try db.truncate(Child);
     try db.truncate(Parent);
     var parent = try db.from(Parent).insert(.{ .id = 1, .name = "parent" });
@@ -22,6 +22,6 @@ pub fn main() !void {
     result.deinit();
     var remaining = try db.from(Child).selectAll().fetch();
     defer remaining.deinit();
-    if (remaining.rowCount() != 0) return error.CascadeVerificationFailed;
+    if (remaining.count() != 0) return error.CascadeVerificationFailed;
     std.debug.print("26 foreign keys: typed CASCADE delete verified\n", .{});
 }

@@ -11,12 +11,12 @@ const NullableChild = sqlite.table("update_nullable_children", NullableChildRow)
 const RestrictedChild = sqlite.table("update_restricted_children", RestrictedChildRow);
 
 pub fn main() !void {
-    var db = try sqlite.open(std.heap.page_allocator, "valid_28.db");
+    var db = try sqlite.open(std.heap.page_allocator, "example_28.db");
     defer db.close();
-    try db.createTable(Parent, .{ .ifNotExists = true, .primaryKey = Parent.columns.id });
-    try db.createTable(CascadeChild, .{ .ifNotExists = true, .primaryKey = CascadeChild.columns.id, .foreignKeys = &.{.{ .column = CascadeChild.columns.parent_id, .references = Parent.columns.id, .onUpdate = .cascade }} });
-    try db.createTable(NullableChild, .{ .ifNotExists = true, .primaryKey = NullableChild.columns.id, .foreignKeys = &.{.{ .column = NullableChild.columns.parent_id, .references = Parent.columns.id, .onUpdate = .setNull }} });
-    try db.createTable(RestrictedChild, .{ .ifNotExists = true, .primaryKey = RestrictedChild.columns.id, .foreignKeys = &.{.{ .column = RestrictedChild.columns.parent_id, .references = Parent.columns.id, .onUpdate = .restrict }} });
+    try db.createTable(Parent, .{ .overWrite = true, .primaryKey = Parent.columns.id });
+    try db.createTable(CascadeChild, .{ .overWrite = true, .primaryKey = CascadeChild.columns.id, .foreignKeys = &.{.{ .column = CascadeChild.columns.parent_id, .references = Parent.columns.id, .onUpdate = .cascade }} });
+    try db.createTable(NullableChild, .{ .overWrite = true, .primaryKey = NullableChild.columns.id, .foreignKeys = &.{.{ .column = NullableChild.columns.parent_id, .references = Parent.columns.id, .onUpdate = .setNull }} });
+    try db.createTable(RestrictedChild, .{ .overWrite = true, .primaryKey = RestrictedChild.columns.id, .foreignKeys = &.{.{ .column = RestrictedChild.columns.parent_id, .references = Parent.columns.id, .onUpdate = .restrict }} });
     try db.truncate(RestrictedChild);
     try db.truncate(NullableChild);
     try db.truncate(CascadeChild);

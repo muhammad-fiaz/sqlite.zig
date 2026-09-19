@@ -16,6 +16,7 @@ fn putU16(bytes: []u8, offset: usize, value: u16) void {
     bytes[offset] = @truncate(value >> 8);
     bytes[offset + 1] = @truncate(value);
 }
+
 fn getU16(bytes: []const u8, offset: usize) u16 {
     return (@as(u16, bytes[offset]) << 8) | bytes[offset + 1];
 }
@@ -55,25 +56,126 @@ fn appendVarint(list: *std.ArrayList(u8), allocator: std.mem.Allocator, value: u
     try list.appendSlice(allocator, buffer[0..length]);
 }
 
-fn cell(allocator: std.mem.Allocator, rowid: u64, values: []const Value) ![]u8 {
-    const payload = try record.encode(allocator, values);
-    defer allocator.free(payload);
-    var result = std.ArrayList(u8).empty;
-    errdefer result.deinit(allocator);
-    try appendVarint(&result, allocator, payload.len);
-    try appendVarint(&result, allocator, rowid);
-    try result.appendSlice(allocator, payload);
-    return result.toOwnedSlice(allocator);
+const PageBuilder = struct {
+    allocator: std.mem.Allocator,
+    pageSize: usize,
+    pages: std.ArrayList([]u8),
+
+    fn init(allocator: std.mem.Allocator, ps: usize) PageBuilder {
+        return .{ .allocator = allocator, .pageSize = ps, .pages = .empty };
+    }
+
+    fn deinit(self: *PageBuilder) void {
+        for (self.pages.items) |p| self.allocator.free(p);
+        self.pages.deinit(self.allocator);
+    }
+
+    fn newPage(self: *PageBuilder) !u32 {
+        const page = try self.allocator.alloc(u8, self.pageSize);
+        @memset(page, 0);
+        try self.pages.append(self.allocator, page);
+        return @intCast(self.pages.items.len);
+    }
+
+    fn getPage(self: *PageBuilder, pageNumber: u32) []u8 {
+        return self.pages.items[pageNumber - 1];
+    }
+};
+
+fn buildCell(pageBuilder: *PageBuilder, rowid: u64, values: []const Value, databasePageSize: usize) ![]u8 {
+    const payload = try record.encode(pageBuilder.allocator, values);
+    defer pageBuilder.allocator.free(payload);
+
+    const maxLeaf = databasePageSize - 35;
+    const minLeaf = ((databasePageSize - 12) * 32 / 255) - 23;
+
+    if (payload.len <= maxLeaf) {
+        var result = std.ArrayList(u8).empty;
+        errdefer result.deinit(pageBuilder.allocator);
+        try appendVarint(&result, pageBuilder.allocator, payload.len);
+        try appendVarint(&result, pageBuilder.allocator, rowid);
+        try result.appendSlice(pageBuilder.allocator, payload);
+        return result.toOwnedSlice(pageBuilder.allocator);
+    } else {
+        const usableMinus4 = databasePageSize - 4;
+        const surplus = minLeaf + (payload.len - minLeaf) % usableMinus4;
+        const localBytes = if (surplus <= maxLeaf) surplus else minLeaf;
+        const overflowBytes = payload.len - localBytes;
+
+        const numOverflowPages = (overflowBytes + usableMinus4 - 1) / usableMinus4;
+        const overflowPageNums = try pageBuilder.allocator.alloc(u32, numOverflowPages);
+        defer pageBuilder.allocator.free(overflowPageNums);
+        for (overflowPageNums) |*pNum| {
+            pNum.* = try pageBuilder.newPage();
+        }
+
+        var offset = localBytes;
+        for (overflowPageNums, 0..) |pNum, i| {
+            const nextPageNum: u32 = if (i + 1 < numOverflowPages) overflowPageNums[i + 1] else 0;
+            const chunkLen = @min(usableMinus4, payload.len - offset);
+            const pageData = pageBuilder.getPage(pNum);
+            std.mem.writeInt(u32, pageData[0..4], nextPageNum, .big);
+            @memcpy(pageData[4 .. 4 + chunkLen], payload[offset .. offset + chunkLen]);
+            offset += chunkLen;
+        }
+
+        var result = std.ArrayList(u8).empty;
+        errdefer result.deinit(pageBuilder.allocator);
+        try appendVarint(&result, pageBuilder.allocator, payload.len);
+        try appendVarint(&result, pageBuilder.allocator, rowid);
+        try result.appendSlice(pageBuilder.allocator, payload[0..localBytes]);
+        var pBuf: [4]u8 = undefined;
+        std.mem.writeInt(u32, &pBuf, overflowPageNums[0], .big);
+        try result.appendSlice(pageBuilder.allocator, &pBuf);
+        return result.toOwnedSlice(pageBuilder.allocator);
+    }
 }
 
-fn indexCell(allocator: std.mem.Allocator, values: []const Value) ![]u8 {
-    const payload = try record.encode(allocator, values);
-    defer allocator.free(payload);
-    var result = std.ArrayList(u8).empty;
-    errdefer result.deinit(allocator);
-    try appendVarint(&result, allocator, payload.len);
-    try result.appendSlice(allocator, payload);
-    return result.toOwnedSlice(allocator);
+fn buildIndexCell(pageBuilder: *PageBuilder, values: []const Value, databasePageSize: usize) ![]u8 {
+    const payload = try record.encode(pageBuilder.allocator, values);
+    defer pageBuilder.allocator.free(payload);
+
+    const maxLocal = ((databasePageSize - 12) * 64 / 255) - 23;
+    const minLocal = ((databasePageSize - 12) * 32 / 255) - 23;
+
+    if (payload.len <= maxLocal) {
+        var result = std.ArrayList(u8).empty;
+        errdefer result.deinit(pageBuilder.allocator);
+        try appendVarint(&result, pageBuilder.allocator, payload.len);
+        try result.appendSlice(pageBuilder.allocator, payload);
+        return result.toOwnedSlice(pageBuilder.allocator);
+    } else {
+        const usableMinus4 = databasePageSize - 4;
+        const surplus = minLocal + (payload.len - minLocal) % usableMinus4;
+        const localBytes = if (surplus <= maxLocal) surplus else minLocal;
+        const overflowBytes = payload.len - localBytes;
+
+        const numOverflowPages = (overflowBytes + usableMinus4 - 1) / usableMinus4;
+        const overflowPageNums = try pageBuilder.allocator.alloc(u32, numOverflowPages);
+        defer pageBuilder.allocator.free(overflowPageNums);
+        for (overflowPageNums) |*pNum| {
+            pNum.* = try pageBuilder.newPage();
+        }
+
+        var offset = localBytes;
+        for (overflowPageNums, 0..) |pNum, i| {
+            const nextPageNum: u32 = if (i + 1 < numOverflowPages) overflowPageNums[i + 1] else 0;
+            const chunkLen = @min(usableMinus4, payload.len - offset);
+            const pageData = pageBuilder.getPage(pNum);
+            std.mem.writeInt(u32, pageData[0..4], nextPageNum, .big);
+            @memcpy(pageData[4 .. 4 + chunkLen], payload[offset .. offset + chunkLen]);
+            offset += chunkLen;
+        }
+
+        var result = std.ArrayList(u8).empty;
+        errdefer result.deinit(pageBuilder.allocator);
+        try appendVarint(&result, pageBuilder.allocator, payload.len);
+        try result.appendSlice(pageBuilder.allocator, payload[0..localBytes]);
+        var pBuf: [4]u8 = undefined;
+        std.mem.writeInt(u32, &pBuf, overflowPageNums[0], .big);
+        try result.appendSlice(pageBuilder.allocator, &pBuf);
+        return result.toOwnedSlice(pageBuilder.allocator);
+    }
 }
 
 fn addLeafPage(page: []u8, pageStart: usize, headerOffset: usize, pageType: u8, cells: []const []const u8, databasePageSize: usize) !void {
@@ -95,6 +197,180 @@ fn addLeafPage(page: []u8, pageStart: usize, headerOffset: usize, pageType: u8, 
         content -= item.len;
         putU16(page, header + 8 + index * 2, @intCast(content - pageStart));
     }
+}
+
+fn addInteriorTablePage(allocator: std.mem.Allocator, page: []u8, pageStart: usize, headerOffset: usize, leftChildren: []const u32, keys: []const u64, rightChild: u32, databasePageSize: usize) !void {
+    const header = pageStart + headerOffset;
+    if (leftChildren.len != keys.len) return error.InvalidParam;
+    if (leftChildren.len > 0xffff) return error.PageOverflow;
+    var content = pageStart + databasePageSize;
+    const offsets = try allocator.alloc(u16, leftChildren.len);
+    defer allocator.free(offsets);
+
+    for (leftChildren, 0..) |child, idx| {
+        var keyBuf: [9]u8 = undefined;
+        const keyLen = try varint.encode(keys[idx], &keyBuf);
+        const cellSize = 4 + keyLen;
+        if (cellSize > content - (header + 12 + leftChildren.len * 2)) return error.PageOverflow;
+        content -= cellSize;
+        std.mem.writeInt(u32, page[content .. content + 4][0..4], child, .big);
+        @memcpy(page[content + 4 .. content + 4 + keyLen], keyBuf[0..keyLen]);
+        offsets[idx] = @intCast(content - pageStart);
+    }
+
+    page[header] = 0x05;
+    putU16(page, header + 1, 0);
+    putU16(page, header + 3, @intCast(leftChildren.len));
+    putU16(page, header + 5, @intCast(content - pageStart));
+    page[header + 7] = 0;
+    std.mem.writeInt(u32, page[header + 8 .. header + 12][0..4], rightChild, .big);
+
+    for (offsets, 0..) |off, idx| {
+        putU16(page, header + 12 + idx * 2, off);
+    }
+}
+
+fn addInteriorIndexPage(allocator: std.mem.Allocator, page: []u8, pageStart: usize, headerOffset: usize, leftChildren: []const u32, payloads: []const []const u8, rightChild: u32, databasePageSize: usize) !void {
+    const header = pageStart + headerOffset;
+    if (leftChildren.len != payloads.len) return error.InvalidParam;
+    if (leftChildren.len > 0xffff) return error.PageOverflow;
+    var content = pageStart + databasePageSize;
+    const offsets = try allocator.alloc(u16, leftChildren.len);
+    defer allocator.free(offsets);
+
+    for (leftChildren, 0..) |child, idx| {
+        var lenBuf: [9]u8 = undefined;
+        const lenBytes = try varint.encode(payloads[idx].len, &lenBuf);
+        const cellSize = 4 + lenBytes + payloads[idx].len;
+        if (cellSize > content - (header + 12 + leftChildren.len * 2)) return error.PageOverflow;
+        content -= cellSize;
+        std.mem.writeInt(u32, page[content .. content + 4][0..4], child, .big);
+        @memcpy(page[content + 4 .. content + 4 + lenBytes], lenBuf[0..lenBytes]);
+        @memcpy(page[content + 4 + lenBytes .. content + 4 + lenBytes + payloads[idx].len], payloads[idx]);
+        offsets[idx] = @intCast(content - pageStart);
+    }
+
+    page[header] = 0x02;
+    putU16(page, header + 1, 0);
+    putU16(page, header + 3, @intCast(leftChildren.len));
+    putU16(page, header + 5, @intCast(content - pageStart));
+    page[header + 7] = 0;
+    std.mem.writeInt(u32, page[header + 8 .. header + 12][0..4], rightChild, .big);
+
+    for (offsets, 0..) |off, idx| {
+        putU16(page, header + 12 + idx * 2, off);
+    }
+}
+
+fn buildTableBtree(allocator: std.mem.Allocator, pageBuilder: *PageBuilder, table: anytype, databasePageSize: usize) !u32 {
+    var cellsList = std.ArrayList([]u8).empty;
+    defer {
+        for (cellsList.items) |c| allocator.free(c);
+        cellsList.deinit(allocator);
+    }
+    var rowids = std.ArrayList(u64).empty;
+    defer rowids.deinit(allocator);
+
+    for (table.rows.items, 0..) |row, rowIndex| {
+        const rowid: u64 = @intCast(rowIndex + 1);
+        const item = try buildCell(pageBuilder, rowid, row.values, databasePageSize);
+        try cellsList.append(allocator, item);
+        try rowids.append(allocator, rowid);
+    }
+
+    var totalBytes: usize = 0;
+    for (cellsList.items) |c| totalBytes += c.len + 2;
+
+    if (totalBytes <= databasePageSize - 8) {
+        const rootPage = try pageBuilder.newPage();
+        try addLeafPage(pageBuilder.getPage(rootPage), 0, 0, 0x0d, cellsList.items, databasePageSize);
+        return rootPage;
+    }
+
+    var leafPages = std.ArrayList(u32).empty;
+    defer leafPages.deinit(allocator);
+    var leafMaxKeys = std.ArrayList(u64).empty;
+    defer leafMaxKeys.deinit(allocator);
+
+    var startIdx: usize = 0;
+    while (startIdx < cellsList.items.len) {
+        var chunkBytes: usize = 0;
+        var endIdx = startIdx;
+        while (endIdx < cellsList.items.len) : (endIdx += 1) {
+            const itemSize = cellsList.items[endIdx].len + 2;
+            if (chunkBytes + itemSize > databasePageSize - 8 and endIdx > startIdx) break;
+            chunkBytes += itemSize;
+        }
+        const leafPageNum = try pageBuilder.newPage();
+        try addLeafPage(pageBuilder.getPage(leafPageNum), 0, 0, 0x0d, cellsList.items[startIdx..endIdx], databasePageSize);
+        try leafPages.append(allocator, leafPageNum);
+        try leafMaxKeys.append(allocator, rowids.items[endIdx - 1]);
+        startIdx = endIdx;
+    }
+
+    const rootPage = try pageBuilder.newPage();
+    const leftKids = leafPages.items[0 .. leafPages.items.len - 1];
+    const keys = leafMaxKeys.items[0 .. leafPages.items.len - 1];
+    const rightKid = leafPages.items[leafPages.items.len - 1];
+    try addInteriorTablePage(allocator, pageBuilder.getPage(rootPage), 0, 0, leftKids, keys, rightKid, databasePageSize);
+    return rootPage;
+}
+
+fn buildIndexBtree(allocator: std.mem.Allocator, pageBuilder: *PageBuilder, schema: *const Schema, index: anytype, databasePageSize: usize) !u32 {
+    const table = schema.findConst(index.table) orelse return error.UnknownTable;
+    var indexCells = std.ArrayList([]u8).empty;
+    defer {
+        for (indexCells.items) |item| allocator.free(item);
+        indexCells.deinit(allocator);
+    }
+
+    for (table.rows.items, 0..) |row, rowPosition| {
+        var values = try allocator.alloc(Value, index.columns.len + 1);
+        defer allocator.free(values);
+        for (index.columns, 0..) |column, position| {
+            values[position] = row.values[columnIndex(table, column) orelse return error.UnknownColumn];
+        }
+        values[index.columns.len] = .{ .integer = @intCast(rowPosition + 1) };
+        const item = try buildIndexCell(pageBuilder, values, databasePageSize);
+        try indexCells.append(allocator, item);
+    }
+
+    var totalBytes: usize = 0;
+    for (indexCells.items) |c| totalBytes += c.len + 2;
+
+    if (totalBytes <= databasePageSize - 8) {
+        const rootPage = try pageBuilder.newPage();
+        try addLeafPage(pageBuilder.getPage(rootPage), 0, 0, 0x0a, indexCells.items, databasePageSize);
+        return rootPage;
+    }
+
+    var leafPages = std.ArrayList(u32).empty;
+    defer leafPages.deinit(allocator);
+    var dividerPayloads = std.ArrayList([]const u8).empty;
+    defer dividerPayloads.deinit(allocator);
+
+    var startIdx: usize = 0;
+    while (startIdx < indexCells.items.len) {
+        var chunkBytes: usize = 0;
+        var endIdx = startIdx;
+        while (endIdx < indexCells.items.len) : (endIdx += 1) {
+            const itemSize = indexCells.items[endIdx].len + 2;
+            if (chunkBytes + itemSize > databasePageSize - 8 and endIdx > startIdx) break;
+            chunkBytes += itemSize;
+        }
+        const leafPageNum = try pageBuilder.newPage();
+        try addLeafPage(pageBuilder.getPage(leafPageNum), 0, 0, 0x0a, indexCells.items[startIdx..endIdx], databasePageSize);
+        try leafPages.append(allocator, leafPageNum);
+        try dividerPayloads.append(allocator, indexCells.items[endIdx - 1]);
+        startIdx = endIdx;
+    }
+
+    const rootPage = try pageBuilder.newPage();
+    const leftKids = leafPages.items[0 .. leafPages.items.len - 1];
+    const payloads = dividerPayloads.items[0 .. leafPages.items.len - 1];
+    const rightKid = leafPages.items[leafPages.items.len - 1];
+    try addInteriorIndexPage(allocator, pageBuilder.getPage(rootPage), 0, 0, leftKids, payloads, rightKid, databasePageSize);
+    return rootPage;
 }
 
 fn createSql(allocator: std.mem.Allocator, table: anytype) ![]u8 {
@@ -137,25 +413,28 @@ fn createSql(allocator: std.mem.Allocator, table: anytype) ![]u8 {
             try sql.appendSlice(allocator, column.foreignColumn.?);
             try sql.append(allocator, ')');
             switch (column.onDelete) {
-                .restrict => {},
+                .restrict, .noAction => {},
                 .cascade => try sql.appendSlice(allocator, " ON DELETE CASCADE"),
                 .setNull => try sql.appendSlice(allocator, " ON DELETE SET NULL"),
+                .setDefault => try sql.appendSlice(allocator, " ON DELETE SET DEFAULT"),
             }
             switch (column.onUpdate) {
-                .restrict => {},
+                .restrict, .noAction => {},
                 .cascade => try sql.appendSlice(allocator, " ON UPDATE CASCADE"),
                 .setNull => try sql.appendSlice(allocator, " ON UPDATE SET NULL"),
+                .setDefault => try sql.appendSlice(allocator, " ON UPDATE SET DEFAULT"),
             }
         }
     }
     for (table.constraints) |constraint| {
+        if (constraint.kind == .check) continue;
         try sql.appendSlice(allocator, ", ");
         if (constraint.kind == .foreignKey) {
             try sql.appendSlice(allocator, "FOREIGN KEY (");
         } else try sql.appendSlice(allocator, switch (constraint.kind) {
             .primaryKey => "PRIMARY KEY (",
             .unique => "UNIQUE (",
-            .foreignKey => unreachable,
+            .foreignKey, .check => unreachable,
         });
         for (constraint.columns, 0..) |column, position| {
             if (position != 0) try sql.appendSlice(allocator, ", ");
@@ -172,14 +451,16 @@ fn createSql(allocator: std.mem.Allocator, table: anytype) ![]u8 {
             }
             try sql.append(allocator, ')');
             switch (constraint.onDelete) {
-                .restrict => {},
+                .restrict, .noAction => {},
                 .cascade => try sql.appendSlice(allocator, " ON DELETE CASCADE"),
                 .setNull => try sql.appendSlice(allocator, " ON DELETE SET NULL"),
+                .setDefault => try sql.appendSlice(allocator, " ON DELETE SET DEFAULT"),
             }
             switch (constraint.onUpdate) {
-                .restrict => {},
+                .restrict, .noAction => {},
                 .cascade => try sql.appendSlice(allocator, " ON UPDATE CASCADE"),
                 .setNull => try sql.appendSlice(allocator, " ON UPDATE SET NULL"),
+                .setDefault => try sql.appendSlice(allocator, " ON UPDATE SET DEFAULT"),
             }
         }
     }
@@ -218,7 +499,10 @@ fn createTriggerSql(allocator: std.mem.Allocator, trigger: anytype) ![]u8 {
     errdefer sql.deinit(allocator);
     try sql.appendSlice(allocator, "CREATE TRIGGER ");
     try sql.appendSlice(allocator, trigger.name);
-    try sql.appendSlice(allocator, " AFTER ");
+    try sql.appendSlice(allocator, switch (trigger.timing) {
+        .before => " BEFORE ",
+        .after => " AFTER ",
+    });
     try sql.appendSlice(allocator, switch (trigger.event) {
         .insert => "INSERT",
         .update => "UPDATE",
@@ -226,20 +510,52 @@ fn createTriggerSql(allocator: std.mem.Allocator, trigger: anytype) ![]u8 {
     });
     try sql.appendSlice(allocator, " ON ");
     try sql.appendSlice(allocator, trigger.table);
+    if (trigger.whenSql) |whenSql| {
+        try sql.appendSlice(allocator, " WHEN ");
+        try sql.appendSlice(allocator, whenSql);
+    }
     try sql.appendSlice(allocator, " BEGIN ");
     try sql.appendSlice(allocator, trigger.body);
     try sql.appendSlice(allocator, " END;");
     return sql.toOwnedSlice(allocator);
 }
 
+fn buildSchemaCell(allocator: std.mem.Allocator, rowid: u64, values: []const Value) ![]u8 {
+    const payload = try record.encode(allocator, values);
+    defer allocator.free(payload);
+    var result = std.ArrayList(u8).empty;
+    errdefer result.deinit(allocator);
+    try appendVarint(&result, allocator, payload.len);
+    try appendVarint(&result, allocator, rowid);
+    try result.appendSlice(allocator, payload);
+    return result.toOwnedSlice(allocator);
+}
+
 pub fn encodeWithPageSize(allocator: std.mem.Allocator, schema: *const Schema, databasePageSize: usize) ![]u8 {
     if (databasePageSize < 512 or databasePageSize > 65536 or (databasePageSize & (databasePageSize - 1)) != 0) return error.InvalidPageSize;
-    const pageCount = 1 + schema.tables.items.len + schema.indexes.items.len;
-    const bytes = try allocator.alloc(u8, pageCount * databasePageSize);
-    errdefer allocator.free(bytes);
-    @memset(bytes, 0);
-    var header = Header{ .pageSize = @intCast(databasePageSize), .databaseSizePages = @intCast(pageCount), .changeCounter = 1, .schemaCookie = 1 };
-    header.encode(@ptrCast(bytes[0..headerSize].ptr));
+
+    var pageBuilder = PageBuilder.init(allocator, databasePageSize);
+    defer pageBuilder.deinit();
+
+    _ = try pageBuilder.newPage();
+
+    var tableRootPages = try allocator.alloc(u32, schema.tables.items.len);
+    defer allocator.free(tableRootPages);
+
+    for (schema.tables.items, 0..) |table, index| {
+        if (table.virtualModule != null) {
+            tableRootPages[index] = 0;
+        } else {
+            tableRootPages[index] = try buildTableBtree(allocator, &pageBuilder, table, databasePageSize);
+        }
+    }
+
+    var indexRootPages = try allocator.alloc(u32, schema.indexes.items.len);
+    defer allocator.free(indexRootPages);
+
+    for (schema.indexes.items, 0..) |index, position| {
+        indexRootPages[position] = try buildIndexBtree(allocator, &pageBuilder, schema, index, databasePageSize);
+    }
 
     var schemaCells = try allocator.alloc([]const u8, schema.tables.items.len + schema.indexes.items.len + schema.views.items.len + schema.triggers.items.len);
     defer allocator.free(schemaCells);
@@ -256,13 +572,14 @@ pub fn encodeWithPageSize(allocator: std.mem.Allocator, schema: *const Schema, d
             .{ .text = "table" },
             .{ .text = table.name },
             .{ .text = table.name },
-            .{ .integer = if (table.virtualModule != null) 0 else @intCast(index + 2) },
+            .{ .integer = @intCast(tableRootPages[index]) },
             .{ .text = sql },
         };
-        const item = try cell(allocator, index + 1, &values);
+        const item = try buildSchemaCell(allocator, index + 1, &values);
         try schemaOwned.append(allocator, item);
         schemaCells[index] = item;
     }
+
     for (schema.indexes.items, 0..) |index, position| {
         const sql = if (std.mem.startsWith(u8, index.name, "sqlite_autoindex_")) null else try createIndexSql(allocator, index);
         defer if (sql) |ownedSql| allocator.free(ownedSql);
@@ -270,13 +587,14 @@ pub fn encodeWithPageSize(allocator: std.mem.Allocator, schema: *const Schema, d
             .{ .text = "index" },
             .{ .text = index.name },
             .{ .text = index.table },
-            .{ .integer = @intCast(schema.tables.items.len + position + 2) },
+            .{ .integer = @intCast(indexRootPages[position]) },
             if (sql) |ownedSql| .{ .text = ownedSql } else .null,
         };
-        const item = try cell(allocator, schema.tables.items.len + position + 1, &values);
+        const item = try buildSchemaCell(allocator, schema.tables.items.len + position + 1, &values);
         try schemaOwned.append(allocator, item);
         schemaCells[schema.tables.items.len + position] = item;
     }
+
     for (schema.views.items, 0..) |view, position| {
         const sql = try createViewSql(allocator, view);
         defer allocator.free(sql);
@@ -287,10 +605,11 @@ pub fn encodeWithPageSize(allocator: std.mem.Allocator, schema: *const Schema, d
             .{ .integer = 0 },
             .{ .text = sql },
         };
-        const item = try cell(allocator, schema.tables.items.len + schema.indexes.items.len + position + 1, &values);
+        const item = try buildSchemaCell(allocator, schema.tables.items.len + schema.indexes.items.len + position + 1, &values);
         try schemaOwned.append(allocator, item);
         schemaCells[schema.tables.items.len + schema.indexes.items.len + position] = item;
     }
+
     for (schema.triggers.items, 0..) |trigger, position| {
         const sql = try createTriggerSql(allocator, trigger);
         defer allocator.free(sql);
@@ -301,58 +620,30 @@ pub fn encodeWithPageSize(allocator: std.mem.Allocator, schema: *const Schema, d
             .{ .integer = 0 },
             .{ .text = sql },
         };
-        const item = try cell(allocator, schema.tables.items.len + schema.indexes.items.len + schema.views.items.len + position + 1, &values);
+        const item = try buildSchemaCell(allocator, schema.tables.items.len + schema.indexes.items.len + schema.views.items.len + position + 1, &values);
         try schemaOwned.append(allocator, item);
         schemaCells[schema.tables.items.len + schema.indexes.items.len + schema.views.items.len + position] = item;
     }
-    addLeafPage(bytes, 0, headerSize, 0x0d, schemaCells, databasePageSize) catch |err| {
-        if (err == error.PageOverflow) return error.DatabaseTooLarge;
-        return err;
-    };
 
-    for (schema.tables.items, 0..) |table, index| {
-        if (table.virtualModule != null) continue;
-        var tableCells = try allocator.alloc([]const u8, table.rows.items.len);
-        defer allocator.free(tableCells);
-        var owned = std.ArrayList([]u8).empty;
-        defer {
-            for (owned.items) |item| allocator.free(item);
-            owned.deinit(allocator);
-        }
-        for (table.rows.items, 0..) |row, rowIndex| {
-            const item = try cell(allocator, rowIndex + 1, row.values);
-            try owned.append(allocator, item);
-            tableCells[rowIndex] = item;
-        }
-        addLeafPage(bytes, (index + 1) * databasePageSize, 0, 0x0d, tableCells, databasePageSize) catch |err| {
-            if (err == error.PageOverflow) return error.DatabaseTooLarge;
-            return err;
-        };
+    try addLeafPage(pageBuilder.getPage(1), 0, headerSize, 0x0d, schemaCells, databasePageSize);
+
+    var header = Header{
+        .pageSize = @intCast(databasePageSize),
+        .databaseSizePages = @intCast(pageBuilder.pages.items.len),
+        .changeCounter = 1,
+        .schemaCookie = 1,
+    };
+    header.encode(@ptrCast(pageBuilder.getPage(1)[0..headerSize].ptr));
+
+    const totalBytes = pageBuilder.pages.items.len * databasePageSize;
+    const finalBytes = try allocator.alloc(u8, totalBytes);
+    errdefer allocator.free(finalBytes);
+
+    for (pageBuilder.pages.items, 0..) |pData, pIdx| {
+        @memcpy(finalBytes[pIdx * databasePageSize .. (pIdx + 1) * databasePageSize], pData);
     }
-    for (schema.indexes.items, 0..) |index, indexPosition| {
-        const table = schema.findConst(index.table) orelse return error.UnknownTable;
-        var indexCells = try allocator.alloc([]const u8, table.rows.items.len);
-        defer allocator.free(indexCells);
-        var owned = std.ArrayList([]u8).empty;
-        defer {
-            for (owned.items) |item| allocator.free(item);
-            owned.deinit(allocator);
-        }
-        for (table.rows.items, 0..) |row, rowPosition| {
-            var values = try allocator.alloc(Value, index.columns.len + 1);
-            defer allocator.free(values);
-            for (index.columns, 0..) |column, position| values[position] = row.values[columnIndex(table, column) orelse return error.UnknownColumn];
-            values[index.columns.len] = .{ .integer = @intCast(rowPosition + 1) };
-            const item = try indexCell(allocator, values);
-            try owned.append(allocator, item);
-            indexCells[rowPosition] = item;
-        }
-        addLeafPage(bytes, (schema.tables.items.len + indexPosition + 1) * databasePageSize, 0, 0x0a, indexCells, databasePageSize) catch |err| {
-            if (err == error.PageOverflow) return error.DatabaseTooLarge;
-            return err;
-        };
-    }
-    return bytes;
+
+    return finalBytes;
 }
 
 pub fn encode(allocator: std.mem.Allocator, schema: *const Schema) ![]u8 {
@@ -361,30 +652,113 @@ pub fn encode(allocator: std.mem.Allocator, schema: *const Schema) ![]u8 {
 
 const SchemaEntry = struct { rootPage: u32, sql: []const u8 };
 
-fn readCell(allocator: std.mem.Allocator, bytes: []const u8, offset: *usize) !Cell {
-    const payloadLength = try varint.decode(bytes[offset.*..]);
-    offset.* += payloadLength.length;
-    const rowid = try varint.decode(bytes[offset.*..]);
-    offset.* += rowid.length;
-    const payloadEnd = offset.* + @as(usize, @intCast(payloadLength.value));
-    if (payloadEnd > bytes.len) return error.InvalidHeader;
-    const values = try record.decode(allocator, bytes[offset.*..payloadEnd]);
-    offset.* = payloadEnd;
-    return .{ .rowid = rowid.value, .values = values };
+fn freeCellValues(allocator: std.mem.Allocator, values: []const Value) void {
+    for (values) |v| {
+        if (v == .text) {
+            allocator.free(v.text);
+        } else if (v == .blob) {
+            allocator.free(v.blob);
+        }
+    }
+    allocator.free(values);
 }
 
-fn leafCells(allocator: std.mem.Allocator, bytes: []const u8, pageNumber: u32) ![]Cell {
-    const offset: usize = if (pageNumber == 1) headerSize else 0;
-    if (bytes[offset] != 0x0d) return error.InvalidHeader;
-    const count = getU16(bytes, offset + 3);
-    const result = try allocator.alloc(Cell, count);
-    errdefer allocator.free(result);
-    for (result, 0..) |*item, index| {
-        const cellOffset = getU16(bytes, offset + 8 + index * 2);
-        var cursor: usize = cellOffset;
-        item.* = try readCell(allocator, bytes, &cursor);
+fn readCell(allocator: std.mem.Allocator, bytes: []const u8, cellOffset: usize, databasePageSize: usize) !Cell {
+    var cursor = cellOffset;
+    const payloadLengthDec = try varint.decode(bytes[cursor..]);
+    cursor += payloadLengthDec.length;
+    const rowidDec = try varint.decode(bytes[cursor..]);
+    cursor += rowidDec.length;
+
+    const totalPayload = @as(usize, @intCast(payloadLengthDec.value));
+    const maxLeaf = databasePageSize - 35;
+
+    var fullPayload: ?[]u8 = null;
+    defer if (fullPayload) |fp| allocator.free(fp);
+
+    var rawValues: []Value = undefined;
+    if (totalPayload <= maxLeaf) {
+        if (cursor + totalPayload > bytes.len) return error.InvalidHeader;
+        rawValues = try record.decode(allocator, bytes[cursor .. cursor + totalPayload]);
+    } else {
+        const minLeaf = ((databasePageSize - 12) * 32 / 255) - 23;
+        const usableMinus4 = databasePageSize - 4;
+        const surplus = minLeaf + (totalPayload - minLeaf) % usableMinus4;
+        const localBytes = if (surplus <= maxLeaf) surplus else minLeaf;
+
+        if (cursor + localBytes + 4 > bytes.len) return error.InvalidHeader;
+        const firstOverflow = std.mem.readInt(u32, bytes[cursor + localBytes .. cursor + localBytes + 4][0..4], .big);
+
+        const fp = try allocator.alloc(u8, totalPayload);
+        fullPayload = fp;
+        @memcpy(fp[0..localBytes], bytes[cursor .. cursor + localBytes]);
+
+        var assembled = localBytes;
+        var currentOverflow = firstOverflow;
+        while (currentOverflow != 0 and assembled < totalPayload) {
+            const pageOffset = (@as(usize, currentOverflow) - 1) * databasePageSize;
+            if (pageOffset + databasePageSize > bytes.len) return error.InvalidHeader;
+            const nextPage = std.mem.readInt(u32, bytes[pageOffset .. pageOffset + 4][0..4], .big);
+            const chunkLen = @min(usableMinus4, totalPayload - assembled);
+            @memcpy(fp[assembled .. assembled + chunkLen], bytes[pageOffset + 4 .. pageOffset + 4 + chunkLen]);
+            assembled += chunkLen;
+            currentOverflow = nextPage;
+        }
+
+        rawValues = try record.decode(allocator, fp);
     }
-    return result;
+
+    var processed: usize = 0;
+    errdefer {
+        for (rawValues[0..processed]) |v| {
+            if (v == .text) allocator.free(v.text) else if (v == .blob) allocator.free(v.blob);
+        }
+        allocator.free(rawValues);
+    }
+
+    for (rawValues) |*v| {
+        if (v.* == .text) {
+            v.* = .{ .text = try allocator.dupe(u8, v.text) };
+        } else if (v.* == .blob) {
+            v.* = .{ .blob = try allocator.dupe(u8, v.blob) };
+        }
+        processed += 1;
+    }
+
+    return .{ .rowid = rowidDec.value, .values = rawValues };
+}
+
+fn readTableBtree(allocator: std.mem.Allocator, bytes: []const u8, pageNumber: u32, databasePageSize: usize, rowsOut: *std.ArrayList(Cell)) anyerror!void {
+    if (pageNumber == 0) return;
+    const pageStart = (@as(usize, pageNumber) - 1) * databasePageSize;
+    if (pageStart + databasePageSize > bytes.len) return error.InvalidHeader;
+    const hOffset: usize = if (pageNumber == 1) headerSize else 0;
+    const header = pageStart + hOffset;
+    const pageType = bytes[header];
+
+    if (pageType == 0x0d) {
+        const cellCount = getU16(bytes, header + 3);
+        var i: usize = 0;
+        while (i < cellCount) : (i += 1) {
+            const cellOffset = pageStart + getU16(bytes, header + 8 + i * 2);
+            const cellData = try readCell(allocator, bytes, cellOffset, databasePageSize);
+            errdefer freeCellValues(allocator, cellData.values);
+            try rowsOut.append(allocator, cellData);
+        }
+    } else if (pageType == 0x05) {
+        const cellCount = getU16(bytes, header + 3);
+        const rightChild = std.mem.readInt(u32, bytes[header + 8 .. header + 12][0..4], .big);
+        var i: usize = 0;
+        while (i < cellCount) : (i += 1) {
+            const cellOffset = pageStart + getU16(bytes, header + 12 + i * 2);
+            if (cellOffset + 4 > bytes.len) return error.InvalidHeader;
+            const leftChild = std.mem.readInt(u32, bytes[cellOffset .. cellOffset + 4][0..4], .big);
+            try readTableBtree(allocator, bytes, leftChild, databasePageSize, rowsOut);
+        }
+        try readTableBtree(allocator, bytes, rightChild, databasePageSize, rowsOut);
+    } else {
+        return error.InvalidHeader;
+    }
 }
 
 pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Schema {
@@ -394,18 +768,30 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Schema {
     if (databasePageSize < 512 or databasePageSize > 65536 or (databasePageSize & (databasePageSize - 1)) != 0 or bytes.len < databasePageSize) return error.InvalidPageSize;
     const databasePages = std.mem.readInt(u32, bytes[28..32], .big);
     if (databasePages == 0 or @as(u64, databasePages) * databasePageSize > bytes.len) return error.InvalidHeader;
+
     var schema = Schema.init(allocator);
     errdefer schema.deinit();
-    const schemaRows = try leafCells(allocator, bytes[0..databasePageSize], 1);
-    defer allocator.free(schemaRows);
+    schema.foreignKeysEnabled = false;
+
+    var schemaRows = std.ArrayList(Cell).empty;
+    defer {
+        for (schemaRows.items) |row| {
+            freeCellValues(allocator, row.values);
+        }
+        schemaRows.deinit(allocator);
+    }
+
+    try readTableBtree(allocator, bytes, 1, databasePageSize, &schemaRows);
+
     var entries = std.ArrayList(SchemaEntry).empty;
     defer entries.deinit(allocator);
-    for (schemaRows) |row| {
-        defer allocator.free(row.values);
+
+    for (schemaRows.items) |row| {
         if (row.values.len < 5 or row.values[0] != .text) continue;
         if (row.values[3] != .integer or row.values[4] != .text) continue;
         try entries.append(allocator, .{ .rootPage = @intCast(row.values[3].integer), .sql = row.values[4].text });
     }
+
     for (entries.items) |entry| {
         var parser = try Parser.init(allocator, entry.sql);
         defer parser.deinit();
@@ -418,15 +804,22 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Schema {
         if (statement != .createTable) continue;
         try schema.createTable(statement.createTable.name, statement.createTable.columns, statement.createTable.constraints);
         const table = schema.find(statement.createTable.name).?;
-        const start = (@as(usize, entry.rootPage) - 1) * databasePageSize;
-        if (start + databasePageSize > bytes.len) return error.InvalidHeader;
-        const rows = try leafCells(allocator, bytes[start .. start + databasePageSize], entry.rootPage);
-        defer allocator.free(rows);
-        for (rows) |row| {
-            defer allocator.free(row.values);
+
+        var tableRows = std.ArrayList(Cell).empty;
+        defer {
+            for (tableRows.items) |row| {
+                freeCellValues(allocator, row.values);
+            }
+            tableRows.deinit(allocator);
+        }
+
+        try readTableBtree(allocator, bytes, entry.rootPage, databasePageSize, &tableRows);
+
+        for (tableRows.items) |row| {
             try schema.appendRow(table, row.values);
         }
     }
+
     for (entries.items) |entry| {
         var parser = try Parser.init(allocator, entry.sql);
         defer parser.deinit();
@@ -434,6 +827,7 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Schema {
         defer ast.deinit(allocator, &statement);
         if (statement == .createIndex and schema.findIndexConst(statement.createIndex.name) == null) try schema.createIndex(statement.createIndex);
     }
+
     for (entries.items) |entry| {
         var parser = try Parser.init(allocator, entry.sql);
         defer parser.deinit();
@@ -441,6 +835,7 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Schema {
         defer ast.deinit(allocator, &statement);
         if (statement == .createView) try schema.createView(statement.createView.name, statement.createView.sql);
     }
+
     for (entries.items) |entry| {
         var parser = try Parser.init(allocator, entry.sql);
         defer parser.deinit();
@@ -448,10 +843,12 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Schema {
         defer ast.deinit(allocator, &statement);
         if (statement == .createTrigger) try schema.createTrigger(statement.createTrigger);
     }
+
+    schema.foreignKeysEnabled = true;
     return schema;
 }
 
-test "SQLite image writes a Python-compatible page-one b-tree" {
+test "SQLite image writes a compatible page-one b-tree" {
     var schema = Schema.init(std.testing.allocator);
     defer schema.deinit();
     const definitions = [_]ast.ColumnDef{ .{ .name = "id", .typeName = "INTEGER" }, .{ .name = "name", .typeName = "TEXT" } };
@@ -479,4 +876,71 @@ test "SQLite image round trips with an 8192-byte page size" {
     defer decoded.deinit();
     try std.testing.expectEqual(@as(usize, 1), decoded.findConst("wide_pages").?.rows.items.len);
     try std.testing.expectEqual(@as(i64, 7), decoded.findConst("wide_pages").?.rows.items[0].values[0].integer);
+}
+
+test "SQLite image handles multi-page tables with interior nodes and overflow pages" {
+    var schema = Schema.init(std.testing.allocator);
+    defer schema.deinit();
+    const definitions = [_]ast.ColumnDef{
+        .{ .name = "id", .typeName = "INTEGER", .primaryKey = true },
+        .{ .name = "data", .typeName = "TEXT" },
+    };
+    try schema.createTable("big_table", &definitions, &.{});
+    const table = schema.find("big_table").?;
+
+    var i: usize = 0;
+    while (i < 300) : (i += 1) {
+        var row = [_]Value{
+            .{ .integer = @intCast(i + 1) },
+            .{ .text = "some long textual content stored to fill up b-tree pages and cause leaf splits into interior pages" },
+        };
+        try schema.appendRow(table, &row);
+    }
+
+    const bytes = try encodeWithPageSize(std.testing.allocator, &schema, 1024);
+    defer std.testing.allocator.free(bytes);
+
+    try std.testing.expect(bytes.len > 1024 * 3);
+
+    var decoded = try decode(std.testing.allocator, bytes);
+    defer decoded.deinit();
+
+    const decodedTable = decoded.findConst("big_table").?;
+    try std.testing.expectEqual(@as(usize, 300), decodedTable.rows.items.len);
+    try std.testing.expectEqual(@as(i64, 1), decodedTable.rows.items[0].values[0].integer);
+    try std.testing.expectEqual(@as(i64, 300), decodedTable.rows.items[299].values[0].integer);
+}
+
+test "SQLite image handles overflow pages for large records" {
+    var schema = Schema.init(std.testing.allocator);
+    defer schema.deinit();
+    const definitions = [_]ast.ColumnDef{
+        .{ .name = "id", .typeName = "INTEGER", .primaryKey = true },
+        .{ .name = "large_payload", .typeName = "TEXT" },
+    };
+    try schema.createTable("overflow_table", &definitions, &.{});
+    const table = schema.find("overflow_table").?;
+
+    const largeString = try std.testing.allocator.alloc(u8, 5000);
+    defer std.testing.allocator.free(largeString);
+    @memset(largeString, 'A');
+
+    var row = [_]Value{
+        .{ .integer = 1 },
+        .{ .text = largeString },
+    };
+    try schema.appendRow(table, &row);
+
+    const bytes = try encodeWithPageSize(std.testing.allocator, &schema, 1024);
+    defer std.testing.allocator.free(bytes);
+
+    try std.testing.expect(bytes.len >= 1024 * 6);
+
+    var decoded = try decode(std.testing.allocator, bytes);
+    defer decoded.deinit();
+
+    const decodedTable = decoded.findConst("overflow_table").?;
+    try std.testing.expectEqual(@as(usize, 1), decodedTable.rows.items.len);
+    try std.testing.expectEqual(@as(i64, 1), decodedTable.rows.items[0].values[0].integer);
+    try std.testing.expectEqualStrings(largeString, decodedTable.rows.items[0].values[1].text);
 }

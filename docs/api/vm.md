@@ -9,62 +9,53 @@ The bytecode virtual machine executes compiled SQL operations.
 
 ## Overview
 
-The VM takes bytecode programs produced by the compiler and executes them against the storage engine, producing query results.
+The VM takes bytecode programs produced by the compiler and executes them
+against the schema, producing query results. These modules are internal:
+client code reaches them through `Connection`, not by importing them
+directly.
 
 ## Components
 
 | Module | Description |
 |--------|-------------|
-| `vm` | Main VM execution loop |
-| `compiler` | Compiles AST/plan to bytecode |
-| `opcode` | Bytecode instruction definitions |
+| `vm` | `VirtualMachine` execution loop over a `Program` |
+| `compiler` | `Compiler` turning statements into a `Program` |
+| `opcode` | `OpCode` instruction set plus `Instruction` / `Program` |
 
 ## Execution Flow
 
 ```
-SQL String → Lexer → Parser → AST → Compiler → Bytecode → VM → Results
+SQL String → Lexer → Parser → AST → Compiler → Program → VM → Results
 ```
 
 ## Bytecode Opcodes
 
 | Opcode | Description |
 |--------|-------------|
-| `Open` | Open a B-tree cursor on a table or index |
-| `Rewind` | Move cursor to first row |
-| `Next` | Move cursor to next row |
-| `Column` | Extract column value from current row |
-| `ResultRow` | Return a row of results |
-| `Insert` | Insert a new row |
-| `Update` | Update current row |
-| `Delete` | Delete current row |
-| `Eq` | Compare for equality, jump if false |
-| `Ne` | Compare for not-equal, jump if false |
-| `Lt` / `Gt` | Comparison operators |
-| `Goto` | Unconditional jump |
-| `Halt` | Stop execution |
-| `Transaction` | Begin a transaction |
-| `CreateBtree` | Create a new B-tree |
-| `Parse` | Parse SQL inline (for triggers) |
+| `halt` | Stop execution |
+| `gotoOp` / `ifOp` / `ifNotOp` | Jumps and conditional jumps |
+| `returnOp` | Return from a subroutine |
+| `loadNull` / `loadInteger` / `loadReal` / `loadText` / `loadBlob` | Load constants into registers |
+| `move` / `copy` | Move values between registers |
+| `add` / `subtract` / `multiply` / `divide` / `remainder` / `concat` | Arithmetic and string concatenation |
+| `bitAnd` / `bitOr` / `shiftLeft` / `shiftRight` / `bitNot` | Bitwise operators |
+| `eq` / `ne` / `lt` / `le` / `gt` / `ge` | Comparisons |
+| `isOp` / `isNotOp` / `isNull` / `notNull` | `IS` / `NULL` tests |
+| `openRead` / `openWrite` / `openEphemeral` / `close` | Cursor lifecycle |
+| `rewind` / `next` / `prev` | Cursor movement |
+| `seekGE` / `seekGT` / `seekLE` / `seekLT` / `seekEQ` | Cursor seeks |
+| `column` / `rowid` | Read the current row |
+| `makeRecord` / `insert` / `delete` / `newRowid` | Write paths |
+| `resultRow` | Emit a result row |
+| `function` / `aggStep` / `aggFinal` | Scalar and aggregate evaluation |
+
+Instructions carry `p1`–`p5` operands plus a target register, mirroring the
+operand style of SQLite's own VDBE.
 
 ## Running the VM
 
-```zig
-const vm = @import("vm");
-
-var machine = vm.VM.init(allocator, &connection);
-const result = try machine.execute(bytecode);
-```
-
-## Example Bytecode
-
-For `SELECT id, name FROM users WHERE id = 1`:
-
-```
-Open 0 users
-Rewind 0 -> End
-  Column 0 0        # id
-  Column 0 1        # name
-  ResultRow 2
-  Next 0 -> End
-Halt
-```
+The connection compiles statements with
+`Compiler.init(allocator, &store)` and runs them with
+`VirtualMachine.init(allocator, &store)` followed by
+`execute(&program, columnNames)`. Client code uses `db.exec` instead of
+driving these types directly.

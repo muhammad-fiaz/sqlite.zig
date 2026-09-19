@@ -4,9 +4,9 @@ const sqlite = @import("sqlite");
 const Account = sqlite.table("lifecycle_accounts", struct { id: i64, name: []const u8 });
 
 pub fn main() !void {
-    var db = try sqlite.open(std.heap.page_allocator, "valid_18.db");
+    var db = try sqlite.open(std.heap.page_allocator, "example_18.db");
     defer db.close();
-    try db.createTable(Account, .{ .ifNotExists = true });
+    try db.createTable(Account, .{ .overWrite = true });
     if (!db.tableExists(Account)) return error.TableWasNotCreated;
     try db.addColumn(Account, "active", i64);
     try db.renameColumn(Account, "active", "enabled");

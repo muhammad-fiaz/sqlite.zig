@@ -10,27 +10,38 @@ Database and library version information.
 ## Library Version
 
 ```zig
-const version = @import("version");
+const sqlite = @import("sqlite");
 
-// SQLite source snapshot this engine implements (mirrors sqlite/VERSION)
-const engine = version.sqliteEngineVersion;
-const source = version.sqliteSourceVersion;
+// Engine version string, e.g. "3.54.0".
+const engine = sqlite.version.sqliteEngineVersion;
+// Exact contents of the sqlite/VERSION snapshot this engine implements.
+const source = sqlite.version.sqliteSourceVersion;
 ```
 
 ## Database Version
 
-The SQLite file format includes version information in the database header:
+The 100-byte database header (`src/format/header.zig`) carries the fields
+the engine actually reads and writes:
 
 | Header Field | Description |
 |--------------|-------------|
-| Version-valid-for | Schema cookie when this version was written |
-| SQLite version number | SQLite version that last modified the database |
+| page size | Database page size in bytes |
+| change counter | Incremented on each write transaction |
+| database size | Size of the database in pages |
+| freelist | First freelist page and freelist page count |
+| schema cookie | Schema version cookie |
+| schema format | Schema format number |
+| text encoding | Text encoding (`1` for UTF-8) |
+| user version | Value of `PRAGMA user_version` |
+| application id | Value of `PRAGMA application_id` |
 
 ## Schema Version
 
 Implemented PRAGMAs are `foreign_keys`, `user_version`, `application_id`,
-and `journal_mode`. Other PRAGMAs, including `schema_version`, return an
-unsupported-feature error rather than a fabricated value.
+`journal_mode`, `synchronous`, `cache_size`, `page_size`, `encoding`,
+`busy_timeout`, `locking_mode`, `auto_vacuum`, `integrity_check`, and
+`foreign_key_check`. Other PRAGMAs return an unsupported-feature error
+rather than a fabricated value.
 
 ## User Version
 

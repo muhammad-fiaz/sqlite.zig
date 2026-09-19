@@ -5,9 +5,9 @@ const CustomerRow = struct { id: i64, email: []const u8, name: []const u8 };
 const Customer = sqlite.table("indexed_customers", CustomerRow);
 
 pub fn main() !void {
-    var db = try sqlite.open(std.heap.page_allocator, "valid_21.db");
+    var db = try sqlite.open(std.heap.page_allocator, "example_21.db");
     defer db.close();
-    try db.createTable(Customer, .{ .ifNotExists = true, .primaryKey = Customer.columns.id });
+    try db.createTable(Customer, .{ .overWrite = true, .primaryKey = Customer.columns.id });
     try db.truncate(Customer);
     db.dropIndex("indexed_customers_email") catch {};
     db.dropIndex("indexed_customers_name") catch {};
@@ -21,6 +21,6 @@ pub fn main() !void {
     rawIndex.deinit();
     var rows = try db.from(Customer).select(&.{ Customer.columns.id, Customer.columns.email }).fetch();
     defer rows.deinit();
-    if (rows.rowCount() != 1) return error.IndexedQueryVerificationFailed;
+    if (rows.count() != 1) return error.IndexedQueryVerificationFailed;
     std.debug.print("21 indexes: typed unique and raw non-unique indexes verified\n", .{});
 }

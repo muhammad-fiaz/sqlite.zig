@@ -2,7 +2,7 @@ const std = @import("std");
 const sqlite = @import("sqlite");
 
 pub fn main() !void {
-    var db = try sqlite.open(std.heap.page_allocator, "valid_19.db");
+    var db = try sqlite.open(std.heap.page_allocator, "example_19.db");
     defer db.close();
     var setup = try db.exec("CREATE TABLE IF NOT EXISTS prepared_items (id INTEGER, label TEXT);");
     setup.deinit();
@@ -15,6 +15,6 @@ pub fn main() !void {
     statement.finalize();
     var result = try db.exec("SELECT id, label FROM prepared_items WHERE id = 7;");
     defer result.deinit();
-    if (result.rowCount() != 1 or result.rows[0][0].integer != 7 or !std.mem.eql(u8, result.rows[0][1].text, "bound value")) return error.PreparedValueVerificationFailed;
-    std.debug.print("19 prepared parameters: prepared_items contains {d} verified row\n", .{result.rowCount()});
+    if (result.count() != 1 or result.rows[0][0].integer != 7 or !std.mem.eql(u8, result.rows[0][1].text, "bound value")) return error.PreparedValueVerificationFailed;
+    std.debug.print("19 prepared parameters: prepared_items contains {d} verified row\n", .{result.count()});
 }

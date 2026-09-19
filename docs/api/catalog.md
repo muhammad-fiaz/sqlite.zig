@@ -83,4 +83,5 @@ indexes). Use `db.createIndex(Table, name, cols, unique)`.
 ```
 
 Single-column keys live on the column definition; composite keys become
-table constraints. Actions are `.restrict`, `.cascade`, `.setNull`.
+table constraints. Actions are `.restrict`, `.cascade`, `.setNull`,
+`.setDefault`, and `.noAction`.

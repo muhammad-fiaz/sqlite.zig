@@ -47,8 +47,8 @@ var result = try db.exec(
 result.deinit();
 ```
 
-Only `AFTER` triggers are supported; `BEFORE` and `INSTEAD OF` are rejected
-by the parser.
+`BEFORE` and `AFTER` triggers are supported, with optional `WHEN` filters;
+`INSTEAD OF` is rejected by the parser.
 
 ### AFTER DELETE Trigger
 
@@ -67,8 +67,11 @@ result.deinit();
 
 | Event | Description |
 |-------|-------------|
+| `BEFORE INSERT` | Fires before a new row is inserted |
 | `AFTER INSERT` | Fires after a new row is inserted |
+| `BEFORE UPDATE` | Fires before a row is updated |
 | `AFTER UPDATE` | Fires after a row is updated |
+| `BEFORE DELETE` | Fires before a row is deleted |
 | `AFTER DELETE` | Fires after a row is deleted |
 
 ### OLD and NEW References

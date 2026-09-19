@@ -16,12 +16,10 @@ const User = sqlite.table("users", struct { id: i64, name: []const u8 });
 const Order = sqlite.table("orders", struct { id: i64, user_id: i64, amount: i64 });
 
 try db.createTable(User, .{
-    .ifNotExists = true,
     .primaryKey = User.columns.id,
 });
 
 try db.createTable(Order, .{
-    .ifNotExists = true,
     .primaryKey = Order.columns.id,
     .foreignKeys = &.{.{
         .column = Order.columns.user_id,
@@ -54,9 +52,9 @@ try db.createTable("orders", .{
 |--------|----------|
 | `.cascade` | Delete/update matching rows in the child table |
 | `.setNull` | Set foreign key columns to NULL |
+| `.setDefault` | Set foreign key columns to their column defaults |
 | `.restrict` | Reject the delete/update if children exist (default) |
-
-`SET DEFAULT` and `NO ACTION` are not implemented by the engine.
+| `.noAction` | Reject at statement end if children exist |
 
 ## Composite Foreign Keys
 

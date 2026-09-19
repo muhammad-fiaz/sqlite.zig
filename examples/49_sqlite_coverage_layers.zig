@@ -8,7 +8,7 @@ const User = sqlite.table("coverage_users", struct {
 });
 
 pub fn main() !void {
-    var db = try sqlite.open(std.heap.page_allocator, "valid_49.db");
+    var db = try sqlite.open(std.heap.page_allocator, "example_49.db");
     defer db.close();
 
     var setup = try db.exec(
@@ -22,7 +22,7 @@ pub fn main() !void {
         "SELECT name, age FROM coverage_users WHERE age >= 18 ORDER BY age DESC LIMIT 2;",
     );
     defer raw.deinit();
-    if (raw.rowCount() != 2) return error.UnexpectedResult;
+    if (raw.count() != 2) return error.UnexpectedResult;
 
     var rawDsl = try db.from("coverage_users")
         .select(.{ db.col("id"), db.col("name") })
@@ -30,27 +30,27 @@ pub fn main() !void {
         .andWhere(db.col("name").glob("A*"))
         .fetch();
     defer rawDsl.deinit();
-    if (rawDsl.rowCount() != 1) return error.UnexpectedResult;
+    if (rawDsl.count() != 1) return error.UnexpectedResult;
 
     var text = try db.from("coverage_users")
         .where(db.col("name").like("Al%"))
         .andWhere(db.col("name").like("%ce"))
         .fetch();
     defer text.deinit();
-    if (text.rowCount() != 1) return error.UnexpectedResult;
+    if (text.count() != 1) return error.UnexpectedResult;
 
     var ranged = try db.from("coverage_users")
         .where(db.col("age").between(18, 40))
         .fetch();
     defer ranged.deinit();
-    if (ranged.rowCount() != 1) return error.UnexpectedResult;
+    if (ranged.count() != 1) return error.UnexpectedResult;
 
     var typed = try db.from(User)
         .where(User.columns.age.gte(18))
         .orderBy(User.columns.id.asc())
         .fetch();
     defer typed.deinit();
-    if (typed.rowCount() != 2) return error.UnexpectedResult;
+    if (typed.count() != 2) return error.UnexpectedResult;
 
-    std.debug.print("raw={d} raw_dsl={d} typed={d}\n", .{ raw.rowCount(), rawDsl.rowCount(), typed.rowCount() });
+    std.debug.print("raw={d} raw_dsl={d} typed={d}\n", .{ raw.count(), rawDsl.count(), typed.count() });
 }

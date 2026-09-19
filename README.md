@@ -76,22 +76,28 @@
 | **SQL Lexer & Parser** | Hand-written SQL lexer and parser supporting CREATE TABLE, INSERT, SELECT, UPDATE, DELETE, BEGIN, COMMIT, ROLLBACK, JOINs, subqueries, CTEs, views, triggers, and more. |
 | **Bytecode Compiler & VM** | A bytecode virtual machine that compiles parsed SQL into opcodes and executes them against the storage engine, modeled on SQLite's own architecture. |
 | **WAL & Rollback Journal** | SQLite-compatible WAL page headers/frames, native WAL readback, checkpointing through `PRAGMA journal_mode=DELETE`, and rollback-journal persistence. Multi-process locking/VFS parity is still in progress. |
-| **Typed DSL Query Builder** | A comptime, type-safe Zig query builder that generates SQL under the hood, ensuring compile-time validation of table names, column names, and types. |
+| **Typed DSL Query Builder** | A comptime, type-safe Zig query builder that builds the same internal query representation as Raw SQL directly, ensuring compile-time validation of table names, column names, and types. |
 | **DISTINCT Joins** | Full DISTINCT support for JOIN queries with automatic deduplication of result rows. |
 | **Transaction Modes** | BEGIN DEFERRED, BEGIN IMMEDIATE, BEGIN EXCLUSIVE, START TRANSACTION, COMMIT, ROLLBACK, SAVEPOINT, RELEASE, and ROLLBACK TO SAVEPOINT. |
-| **Foreign Key Actions** | CASCADE DELETE, CASCADE UPDATE, SET NULL, and RESTRICT (plus composite foreign keys). SET DEFAULT / NO ACTION are not implemented. |
+| **Foreign Key Actions** | CASCADE DELETE, CASCADE UPDATE, SET NULL, SET DEFAULT, RESTRICT, and NO ACTION (plus composite foreign keys). |
 | **Composite Constraints** | Composite PRIMARY KEY, composite UNIQUE, and composite FOREIGN KEY constraints across multiple columns. |
-| **Views & Triggers** | CREATE VIEW and CREATE TRIGGER (AFTER INSERT/UPDATE/DELETE) with NEW/OLD references. |
+| **Views & Triggers** | CREATE VIEW and CREATE TRIGGER (BEFORE/AFTER INSERT/UPDATE/DELETE, WHEN filters) with NEW/OLD references. |
 | **CTEs & Recursive CTEs** | Common Table Expressions including recursive CTEs for hierarchical data traversal (tree/graph structures). |
-| **Subqueries** | EXISTS/NOT EXISTS (incl. correlated), IN/NOT IN (lists and subqueries), and CTEs (incl. recursive). No derived tables in FROM. |
+| **Subqueries** | EXISTS/NOT EXISTS (incl. correlated), IN/NOT IN (lists and subqueries), scalar subqueries, derived tables in FROM, and CTEs (incl. recursive). |
 | **Expression Operators** | `= == != <> < <= > >=`, `AND OR NOT`, `LIKE NOT LIKE` (`% _ ESCAPE`), `GLOB NOT GLOB` (`* ? []`), `REGEXP NOT REGEXP`, `MATCH NOT MATCH`, `||`, `IS IS NOT IS DISTINCT FROM`, `IN NOT IN`, `BETWEEN NOT BETWEEN`, `CASE`, `CAST`, `COLLATE NOCASE`, `+ - * / %`, `& | << >> ~`, all with correct NULL and precedence semantics. |
 | **Scalar Functions** | ABS, LENGTH, UPPER, LOWER, SUBSTR/SUBSTRING, REPLACE, TRIM/LTRIM/RTRIM (incl. custom chars), INSTR, HEX, QUOTE, UNICODE, CHAR, PRINTF/FORMAT, ROUND, TYPEOF, CAST, COALESCE/IFNULL, NULLIF, JSON_EXTRACT/JSON_SET in raw SQL, dynamic DSL, and typed DSL. |
+| **UPSERT & RETURNING** | `ON CONFLICT DO NOTHING / DO UPDATE` with `excluded`, partial targets, and `RETURNING` on INSERT/UPDATE/DELETE across all three interfaces. |
+| **Compound SELECT** | UNION, UNION ALL, INTERSECT, and EXCEPT with duplicate elimination, ORDER BY, and LIMIT/OFFSET. |
+| **Multi-Table JOINs** | 3+ table chains across INNER/LEFT/RIGHT/FULL/CROSS/ON/USING/NATURAL with WHERE, GROUP BY, HAVING, and pagination. |
+| **CASE & Windows** | Simple/searched CASE plus 11 window functions (ROW_NUMBER, RANK, LAG/LEAD, NTILE, FIRST/LAST/NTH_VALUE, …) with PARTITION BY, ORDER BY, and ROWS/RANGE/GROUPS frames. |
+| **Constraints** | CHECK, UNIQUE, NOT NULL, DEFAULT, full SQLite type names, generated columns (VIRTUAL/STORED), STRICT tables, and WITHOUT ROWID tables. |
+| **PRAGMAs** | foreign_keys, user_version, application_id, journal_mode, synchronous, cache_size, integrity_check, and foreign_key_check. |
 | **Indexed Queries** | CREATE INDEX and optimized indexed lookups for performance-critical queries. |
 | **Query Planning** | `EXPLAIN QUERY PLAN` reports index-backed equality searches and table scans. |
 | **Virtual Tables** | Native `generate_series` virtual tables support raw creation, typed DSL reads, and native reopen. Other modules return `Unsupported`. |
 | **Prepared Statements** | Parameterized queries with typed binding and automatic memory management. |
 | **Schema Lifecycle** | CREATE TABLE, ALTER TABLE ADD COLUMN, DROP TABLE with full schema persistence and verification. |
-| **Python Interop** | Databases created by sqlite.zig can be read by Python's `sqlite3` module and vice versa. |
+| **On-Disk Format** | Databases use the real SQLite file format (100-byte header, B-tree pages) and reopen losslessly. |
 | **Cross-Platform** | Runs on Linux, Windows, and macOS with the same source code. |
 
 </details>
@@ -209,7 +215,7 @@ pub fn main() !void {
     var db = try sqlite.open(std.heap.page_allocator, "my_database.db");
     defer db.close();
 
-    try db.createTable(User, .{ .ifNotExists = true });
+    try db.createTable(User, .{});
 
     var inserted = try db.from(User).insert(.{ .id = 1, .name = "Alice" });
     inserted.deinit();
@@ -218,7 +224,7 @@ pub fn main() !void {
     defer result.deinit();
 
     for (result.rows) |row| {
-        std.debug.print("User: id={d}, name={s}\n", .{ row[0].integer, row[1].text });
+        std.debug.print("User: id={d}, name={s}\n", .{ row.id, row.name });
     }
 }
 ```
@@ -236,8 +242,8 @@ pub fn main() !void {
     var db = try sqlite.open(std.heap.page_allocator, "shop.db");
     defer db.close();
 
-    try db.createTable(User, .{ .ifNotExists = true });
-    try db.createTable(Order, .{ .ifNotExists = true });
+    try db.createTable(User, .{});
+    try db.createTable(Order, .{});
 
     // Transaction with rollback safety
     try db.begin();
@@ -253,7 +259,7 @@ pub fn main() !void {
         .fetch();
     defer joined.deinit();
 
-    std.debug.print("Found {d} rows\n", .{joined.rowCount()});
+    std.debug.print("Found {d} rows\n", .{joined.count()});
 }
 ```
 
@@ -287,8 +293,9 @@ for (typed.rows) |user| {
 ```
 
 Typed keys use the same descriptors (`.primaryKey = User.columns.id`);
-dynamic keys use strings (`.primaryKey = "id"`). All values are bound as
-parameters; identifiers are quoted. See `docs/api/dsl.md`.
+dynamic keys use strings (`.primaryKey = "id"`). The DSL builds the same
+internal query representation as Raw SQL directly, without generating SQL
+strings. See `docs/api/dsl.md`.
 
 ### Raw SQL
 
@@ -309,13 +316,13 @@ pub fn main() !void {
     var rows = try db.exec("SELECT * FROM items WHERE id = 1;");
     defer rows.deinit();
 
-    std.debug.print("Row count: {d}\n", .{rows.rowCount()});
+    std.debug.print("Row count: {d}\n", .{rows.count()});
 }
 ```
 
 ## Examples
 
-The `examples/` directory contains **53 runnable examples**:
+The `examples/` directory contains **64 runnable examples**:
 
 | # | Example | Description |
 |---|---------|-------------|
@@ -325,7 +332,7 @@ The `examples/` directory contains **53 runnable examples**:
 | 04 | [`dsl_query_builder`](examples/04_dsl_query_builder.zig) | Type-safe comptime query builder basics |
 | 05 | [`migrations`](examples/05_migrations.zig) | Schema migration patterns |
 | 06 | [`error_handling`](examples/06_error_handling.zig) | Error handling and recovery |
-| 07 | [`python_interop`](examples/07_python_interop.zig) | Interop with Python sqlite3 module |
+| 07 | [`file_format`](examples/07_file_format.zig) | On-disk image verification with close/reopen |
 | 08 | [`repair_legacy_example`](examples/08_repair_legacy_example.zig) | Repair and legacy database handling |
 | 09 | [`dsl_crud`](examples/09_dsl_crud.zig) | Full CRUD operations via typed DSL |
 | 10 | [`dsl_advanced`](examples/10_dsl_advanced.zig) | Advanced DSL queries and predicates |
@@ -372,6 +379,17 @@ The `examples/` directory contains **53 runnable examples**:
 | 51 | [`dsl_ctes`](examples/51_dsl_ctes.zig) | WITH and WITH RECURSIVE in the DSL |
 | 52 | [`column_mapping`](examples/52_column_mapping.zig) | camelCase Zig fields over SQL names |
 | 53 | [`expression_operators`](examples/53_expression_operators.zig) | Full operator coverage across raw, dynamic, and typed DSL |
+| 54 | [`derived_tables`](examples/54_derived_tables.zig) | Subqueries in FROM with aliases and persistence |
+| 55 | [`returning`](examples/55_returning.zig) | RETURNING rows from INSERT, UPDATE, and DELETE |
+| 56 | [`upsert_dsl`](examples/56_upsert_dsl.zig) | ON CONFLICT targets and excluded values in the DSL |
+| 57 | [`before_triggers`](examples/57_before_triggers.zig) | BEFORE timing, WHEN filters, and abort behavior |
+| 58 | [`case_dsl`](examples/58_case_dsl.zig) | Searched and simple CASE in SELECT and RETURNING |
+| 59 | [`using_natural_joins`](examples/59_using_natural_joins.zig) | USING and NATURAL joins across Raw, Dynamic, and Typed |
+| 60 | [`multi_column_using`](examples/60_multi_column_using.zig) | Multi-column USING joins with tuple targets |
+| 61 | [`compound_dsl`](examples/61_compound_dsl.zig) | UNION, INTERSECT, and EXCEPT in the DSL |
+| 62 | [`pragma_checks`](examples/62_pragma_checks.zig) | integrity_check, foreign_key_check, and settings |
+| 63 | [`derived_dsl`](examples/63_derived_dsl.zig) | Derived tables in Dynamic and Typed DSL |
+| 64 | [`window_dsl`](examples/64_window_dsl.zig) | Window functions in Dynamic and Typed DSL |
 
 Run any example:
 

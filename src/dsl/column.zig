@@ -48,6 +48,262 @@ fn isTypedColumn(comptime T: type) bool {
     return @hasDecl(T, "isDslColumn") and T.isDslColumn;
 }
 
+pub fn toRhs(value: anytype) dslExpr.Rhs {
+    return rhsFrom(value);
+}
+
+pub fn toColumnRef(col: anytype) dslExpr.ColumnRef {
+    const T = @TypeOf(col);
+    if (T == DynamicColumn) return splitRef(col.name);
+    if (comptime isTypedColumn(T)) return .{ .table = T.dslTable, .name = T.dslName };
+    @compileError("expected a column descriptor (User.columns.x or db.col(\"x\"))");
+}
+
+pub const CaseWhen = struct { cond: ?Expr = null, operand: dslExpr.Rhs, result: dslExpr.Rhs, simple: bool };
+
+pub const CaseBuilder = struct {
+    base: ?dslExpr.ColumnRef = null,
+    baseFunc: ?FuncCall = null,
+    whens: [8]CaseWhen = undefined,
+    count: usize = 0,
+    otherwise: dslExpr.Rhs = .{ .value = .null },
+    hasOtherwise: bool = false,
+
+    pub fn when(self: @This(), cond: Expr, result: anytype) @This() {
+        var copy = self;
+        if (copy.base != null or copy.baseFunc != null) @panic("when() needs searched case; use whenValue() with caseValue()");
+        if (copy.count != 0 and copy.whens[0].simple) @panic("cannot mix when() and whenValue() branches");
+        if (copy.count >= copy.whens.len) @panic("too many CASE branches");
+        copy.whens[copy.count] = .{ .cond = cond, .operand = .{ .value = .null }, .result = toRhs(result), .simple = false };
+        copy.count += 1;
+        return copy;
+    }
+
+    pub fn whenValue(self: @This(), operand: anytype, result: anytype) @This() {
+        var copy = self;
+        if (copy.base == null and copy.baseFunc == null) @panic("whenValue() needs simple case; use caseValue()");
+        if (copy.count != 0 and !copy.whens[0].simple) @panic("cannot mix when() and whenValue() branches");
+        if (copy.count >= copy.whens.len) @panic("too many CASE branches");
+        copy.whens[copy.count] = .{ .operand = toRhs(operand), .result = toRhs(result), .simple = true };
+        copy.count += 1;
+        return copy;
+    }
+
+    pub fn else_(self: @This(), result: anytype) @This() {
+        var copy = self;
+        copy.otherwise = toRhs(result);
+        copy.hasOtherwise = true;
+        return copy;
+    }
+};
+
+pub fn caseWhen(cond: Expr, result: anytype) CaseBuilder {
+    var builder = CaseBuilder{};
+    return builder.when(cond, result);
+}
+
+pub fn caseValue(col: anytype) CaseBuilder {
+    const T = @TypeOf(col);
+    if (T == DynamicColumn) {
+        const ref = splitRef(col.name);
+        return .{ .base = ref, .baseFunc = col.func };
+    }
+    if (comptime isTypedColumn(T)) {
+        return .{ .base = .{ .table = T.dslTable, .name = T.dslName }, .baseFunc = col.func };
+    }
+    @compileError("caseValue() needs a column descriptor");
+}
+
+pub const WindowBound = union(enum) {
+    unboundedPreceding,
+    preceding: usize,
+    currentRow,
+    following: usize,
+    unboundedFollowing,
+};
+
+pub const WindowFrameKind = enum { rows, range, groups };
+
+pub const WindowFrameSpec = struct {
+    kind: WindowFrameKind = .rows,
+    start: WindowBound = .unboundedPreceding,
+    end: WindowBound = .currentRow,
+};
+
+pub fn unboundedPreceding() WindowBound {
+    return .unboundedPreceding;
+}
+
+pub fn preceding(offset: usize) WindowBound {
+    return .{ .preceding = offset };
+}
+
+pub fn currentRow() WindowBound {
+    return .currentRow;
+}
+
+pub fn following(offset: usize) WindowBound {
+    return .{ .following = offset };
+}
+
+pub fn unboundedFollowing() WindowBound {
+    return .unboundedFollowing;
+}
+
+pub const WindowBuilder = struct {
+    func: []const u8,
+    arg: ?ColumnRef = null,
+    argInt: i64 = 0,
+    hasArgInt: bool = false,
+    defaultRhs: dslExpr.Rhs = .{ .value = .null },
+    hasDefault: bool = false,
+    partitions: [4]ColumnRef = undefined,
+    partitionCount: usize = 0,
+    orders: [2]Order = undefined,
+    orderCount: usize = 0,
+    frame: ?WindowFrameSpec = null,
+
+    fn withArg(col: anytype, func: []const u8) WindowBuilder {
+        return .{ .func = func, .arg = toColumnRef(col) };
+    }
+
+    pub fn partitionBy(self: @This(), cols: anytype) @This() {
+        var copy = self;
+        const T = @TypeOf(cols);
+        if (T == DynamicColumn) {
+            if (copy.partitionCount >= copy.partitions.len) @panic("too many window partition columns");
+            copy.partitions[copy.partitionCount] = splitRef(cols.name);
+            copy.partitionCount += 1;
+        } else if (comptime isTypedColumn(T)) {
+            if (copy.partitionCount >= copy.partitions.len) @panic("too many window partition columns");
+            copy.partitions[copy.partitionCount] = .{ .table = T.dslTable, .name = T.dslName };
+            copy.partitionCount += 1;
+        } else if (comptime @typeInfo(T) == .@"struct" and @typeInfo(T).@"struct".is_tuple) {
+            inline for (cols) |item| {
+                if (copy.partitionCount >= copy.partitions.len) @panic("too many window partition columns");
+                copy.partitions[copy.partitionCount] = toColumnRef(item);
+                copy.partitionCount += 1;
+            }
+            if (copy.partitionCount == 0) @panic("partitionBy requires at least one column");
+        } else {
+            @compileError("partitionBy() needs a column descriptor or a tuple of column descriptors");
+        }
+        return copy;
+    }
+
+    pub fn orderBy(self: @This(), orders: anytype) @This() {
+        var copy = self;
+        const T = @TypeOf(orders);
+        if (T == Order) {
+            if (copy.orderCount >= copy.orders.len) @panic("too many window order columns");
+            copy.orders[copy.orderCount] = orders;
+            copy.orderCount += 1;
+        } else if (comptime @typeInfo(T) == .@"struct" and @typeInfo(T).@"struct".is_tuple) {
+            inline for (orders) |item| {
+                if (@TypeOf(item) != Order) @compileError("orderBy() needs column orders such as db.col(\"x\").asc()");
+                if (copy.orderCount >= copy.orders.len) @panic("too many window order columns");
+                copy.orders[copy.orderCount] = item;
+                copy.orderCount += 1;
+            }
+            if (copy.orderCount == 0) @panic("orderBy() requires at least one order");
+        } else {
+            @compileError("orderBy() needs a column order such as db.col(\"x\").asc() or a tuple of orders");
+        }
+        return copy;
+    }
+
+    pub fn offset(self: @This(), amount: i64) @This() {
+        var copy = self;
+        copy.argInt = amount;
+        copy.hasArgInt = true;
+        return copy;
+    }
+
+    pub fn defaultValue(self: @This(), value: anytype) @This() {
+        var copy = self;
+        copy.defaultRhs = toRhs(value);
+        copy.hasDefault = true;
+        return copy;
+    }
+
+    fn frameBetween(self: @This(), kind: WindowFrameKind, start: WindowBound, end: WindowBound) @This() {
+        var copy = self;
+        copy.frame = .{ .kind = kind, .start = start, .end = end };
+        return copy;
+    }
+
+    pub fn rowsBetween(self: @This(), start: WindowBound, end: WindowBound) @This() {
+        return self.frameBetween(.rows, start, end);
+    }
+
+    pub fn rangeBetween(self: @This(), start: WindowBound, end: WindowBound) @This() {
+        return self.frameBetween(.range, start, end);
+    }
+
+    pub fn groupsBetween(self: @This(), start: WindowBound, end: WindowBound) @This() {
+        return self.frameBetween(.groups, start, end);
+    }
+
+    pub fn rowsFrom(self: @This(), start: WindowBound) @This() {
+        return self.frameBetween(.rows, start, .currentRow);
+    }
+
+    pub fn rangeFrom(self: @This(), start: WindowBound) @This() {
+        return self.frameBetween(.range, start, .currentRow);
+    }
+
+    pub fn groupsFrom(self: @This(), start: WindowBound) @This() {
+        return self.frameBetween(.groups, start, .currentRow);
+    }
+};
+
+pub fn rowNumber() WindowBuilder {
+    return .{ .func = "row_number" };
+}
+
+pub fn rank() WindowBuilder {
+    return .{ .func = "rank" };
+}
+
+pub fn denseRank() WindowBuilder {
+    return .{ .func = "dense_rank" };
+}
+
+pub fn percentRank() WindowBuilder {
+    return .{ .func = "percent_rank" };
+}
+
+pub fn cumeDist() WindowBuilder {
+    return .{ .func = "cume_dist" };
+}
+
+pub fn ntile(buckets: i64) WindowBuilder {
+    return .{ .func = "ntile", .argInt = buckets, .hasArgInt = true };
+}
+
+pub fn lag(col: anytype) WindowBuilder {
+    return WindowBuilder.withArg(col, "lag");
+}
+
+pub fn lead(col: anytype) WindowBuilder {
+    return WindowBuilder.withArg(col, "lead");
+}
+
+pub fn firstValue(col: anytype) WindowBuilder {
+    return WindowBuilder.withArg(col, "first_value");
+}
+
+pub fn lastValue(col: anytype) WindowBuilder {
+    return WindowBuilder.withArg(col, "last_value");
+}
+
+pub fn nthValue(col: anytype, n: i64) WindowBuilder {
+    var builder = WindowBuilder.withArg(col, "nth_value");
+    builder.argInt = n;
+    builder.hasArgInt = true;
+    return builder;
+}
+
 fn rhsFrom(value: anytype) dslExpr.Rhs {
     const T = @TypeOf(value);
     if (T == DynamicColumn) return .{ .column = splitRef(value.name) };
@@ -510,6 +766,98 @@ pub const DynamicColumn = struct {
     }
 };
 
+pub const ExcludedColumn = struct {
+    name: []const u8,
+
+    fn ref(self: @This()) dslExpr.ColumnRef {
+        return .{ .table = "excluded", .name = self.name };
+    }
+
+    fn pred(self: @This(), op: Operator, value: anytype) Expr {
+        return .{ .column = self.ref(), .operator = op, .rhs = rhsFrom(value) };
+    }
+
+    pub fn eq(self: @This(), value: anytype) Expr {
+        return self.pred(.equal, value);
+    }
+    pub fn ne(self: @This(), value: anytype) Expr {
+        return self.pred(.notEqual, value);
+    }
+    pub fn lt(self: @This(), value: anytype) Expr {
+        return self.pred(.less, value);
+    }
+    pub fn lte(self: @This(), value: anytype) Expr {
+        return self.pred(.lessEqual, value);
+    }
+    pub fn gt(self: @This(), value: anytype) Expr {
+        return self.pred(.greater, value);
+    }
+    pub fn gte(self: @This(), value: anytype) Expr {
+        return self.pred(.greaterEqual, value);
+    }
+    pub fn like(self: @This(), value: anytype) Expr {
+        return self.pred(.like, value);
+    }
+    pub fn notLike(self: @This(), value: anytype) Expr {
+        return self.pred(.notLike, value);
+    }
+    pub fn glob(self: @This(), value: anytype) Expr {
+        return self.pred(.glob, value);
+    }
+    pub fn notGlob(self: @This(), value: anytype) Expr {
+        return self.pred(.notGlob, value);
+    }
+    pub fn regexp(self: @This(), value: anytype) Expr {
+        return self.pred(.regexp, value);
+    }
+    pub fn notRegexp(self: @This(), value: anytype) Expr {
+        return self.pred(.notRegexp, value);
+    }
+    pub fn matchPattern(self: @This(), value: anytype) Expr {
+        return self.pred(.match, value);
+    }
+    pub fn match(self: @This(), value: anytype) Expr {
+        return self.pred(.match, value);
+    }
+    pub fn notMatch(self: @This(), value: anytype) Expr {
+        return self.pred(.notMatch, value);
+    }
+    pub fn is(self: @This(), value: anytype) Expr {
+        return self.pred(.isValue, value);
+    }
+    pub fn isNot(self: @This(), value: anytype) Expr {
+        return self.pred(.isNotValue, value);
+    }
+    pub fn isDistinctFrom(self: @This(), value: anytype) Expr {
+        return self.pred(.isDistinct, value);
+    }
+    pub fn isNotDistinctFrom(self: @This(), value: anytype) Expr {
+        return self.pred(.isNotDistinct, value);
+    }
+    pub fn isNull(self: @This()) Expr {
+        return .{ .column = self.ref(), .operator = .isNull };
+    }
+    pub fn isNotNull(self: @This()) Expr {
+        return .{ .column = self.ref(), .operator = .isNotNull };
+    }
+    pub fn between(self: @This(), lo: anytype, hi: anytype) Expr {
+        return .{
+            .column = self.ref(),
+            .operator = .between,
+            .rhs = rhsFrom(lo),
+            .rhs2 = rhsFrom(hi),
+        };
+    }
+    pub fn notBetween(self: @This(), lo: anytype, hi: anytype) Expr {
+        return .{
+            .column = self.ref(),
+            .operator = .notBetween,
+            .rhs = rhsFrom(lo),
+            .rhs2 = rhsFrom(hi),
+        };
+    }
+};
+
 test "typed predicates carry table identity and bound values" {
     const Age = Column("users", "age", i64);
     const age = Age{};
@@ -571,4 +919,16 @@ test "dynamic predicates mirror typed predicates at runtime" {
     try std.testing.expect(splitRef("age").table.len == 0);
     const missing = (DynamicColumn{ .name = "x" }).isNotNull();
     try std.testing.expect(missing.operator == .isNotNull);
+}
+
+test "excluded columns address the proposed upsert row" {
+    const label = ExcludedColumn{ .name = "label" };
+    const pred = label.eq("alpha");
+    try std.testing.expectEqualStrings("excluded", pred.column.table);
+    try std.testing.expectEqualStrings("label", pred.column.name);
+    try std.testing.expect(pred.operator == .equal);
+    try std.testing.expectEqualStrings("alpha", pred.rhs.value.text);
+    const range = (ExcludedColumn{ .name = "stock" }).between(1, 9);
+    try std.testing.expect(range.operator == .between);
+    try std.testing.expect((ExcludedColumn{ .name = "x" }).isNull().operator == .isNull);
 }

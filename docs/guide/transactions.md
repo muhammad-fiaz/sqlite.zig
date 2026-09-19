@@ -1,11 +1,11 @@
 ---
 title: "Transactions"
-description: "Full ACID transaction semantics with BEGIN, COMMIT, ROLLBACK, SAVEPOINT, and RELEASE support."
+description: "Transactions with BEGIN, COMMIT, ROLLBACK, SAVEPOINT, and RELEASE support in sqlite.zig."
 ---
 
 # Transactions
 
-`sqlite.zig` supports full ACID transaction semantics with BEGIN, COMMIT, ROLLBACK, SAVEPOINT, and RELEASE.
+`sqlite.zig` supports transactions with BEGIN, COMMIT, ROLLBACK, SAVEPOINT, and RELEASE. Writes persist to the database file on commit (and on every write outside a transaction); rollback discards the transaction's changes.
 
 ## Basic Transactions
 

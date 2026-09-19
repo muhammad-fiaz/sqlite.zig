@@ -103,7 +103,7 @@ pub const Order = struct {
 };
 
 pub const Projection = struct {
-    kind: enum { column, aggregate, scalar, star, countStar },
+    kind: enum { column, aggregate, scalar, star, countStar, caseExpr, window },
     column: ColumnRef = .{ .name = "" },
     function: []const u8 = "",
     argument: Value = .null,
@@ -111,6 +111,8 @@ pub const Projection = struct {
     hasArgument: bool = false,
     hasArgument2: bool = false,
     distinct: bool = false,
+    caseSlot: u8 = 0,
+    windowSlot: u8 = 0,
 };
 
 pub fn countStar() Projection {

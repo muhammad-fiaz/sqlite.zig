@@ -5,10 +5,10 @@ const Source = sqlite.table("copy_source", struct { id: i64, label: []const u8 }
 const Destination = sqlite.table("copy_destination", struct { id: i64, label: []const u8 });
 
 pub fn main() !void {
-    var db = try sqlite.open(std.heap.page_allocator, "valid_37.db");
+    var db = try sqlite.open(std.heap.page_allocator, "example_37.db");
     defer db.close();
-    try db.createTable(Source, .{ .ifNotExists = true });
-    try db.createTable(Destination, .{ .ifNotExists = true });
+    try db.createTable(Source, .{ .overWrite = true });
+    try db.createTable(Destination, .{ .overWrite = true });
     try db.truncate(Source);
     try db.truncate(Destination);
     var first = try db.from(Source).insert(.{ .id = 1, .label = "skip" });
@@ -19,6 +19,6 @@ pub fn main() !void {
     copied.deinit();
     var rows = try db.from(Destination).selectAll().fetch();
     defer rows.deinit();
-    if (rows.rowCount() != 1 or rows.rows[0].id != 2) return error.InsertSelectVerificationFailed;
+    if (rows.count() != 1 or rows.rows[0].id != 2) return error.InsertSelectVerificationFailed;
     std.debug.print("37 INSERT SELECT: filtered query results copied and verified\n", .{});
 }

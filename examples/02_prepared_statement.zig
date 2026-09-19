@@ -2,7 +2,7 @@ const std = @import("std");
 const sqlite = @import("sqlite");
 
 pub fn main() !void {
-    var db = try sqlite.open(std.heap.page_allocator, "valid_02.db");
+    var db = try sqlite.open(std.heap.page_allocator, "example_02.db");
     defer db.close();
     var setup = try db.exec("CREATE TABLE IF NOT EXISTS users (id INTEGER, name TEXT);");
     setup.deinit();

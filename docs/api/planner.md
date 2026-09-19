@@ -9,7 +9,9 @@ The query planner optimizes SQL queries for efficient execution.
 
 ## Overview
 
-The planner analyzes parsed SQL statements and generates an optimal execution plan by considering available indexes, table statistics, and join strategies.
+The planner analyzes parsed SQL statements and generates an execution plan
+by considering available indexes, equality/range constraints, and join
+order, with cost estimates comparing candidate plans.
 
 ## Components
 
@@ -31,9 +33,8 @@ The planner analyzes parsed SQL statements and generates an optimal execution pl
 
 | Strategy | Description |
 |----------|-------------|
-| Nested Loop | For each row in left, scan right. Simple but can be slow. |
-| Index Lookup | Use index on right table for each left row. Fast for selective joins. |
-| Hash Join | Build hash table on smaller side, probe with larger. Good for large joins. |
+| Nested Loop | For each row in left, scan right. |
+| Index Lookup | Use an index on the inner table for each outer row. Fast for selective joins. |
 
 ## Index Usage
 
@@ -53,6 +54,6 @@ var result = try db.exec("SELECT * FROM orders WHERE user_id = 1;");
 Inspect the execution plan:
 
 ```zig
-var result = try db.exec("EXPLAIN QUERY PLAN SELECT * FROM orders WHERE user_id = 1;");
-defer rows.deinit();
+var plan = try db.exec("EXPLAIN QUERY PLAN SELECT * FROM orders WHERE user_id = 1;");
+defer plan.deinit();
 ```

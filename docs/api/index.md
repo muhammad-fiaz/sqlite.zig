@@ -1,6 +1,6 @@
 ---
 title: "API Reference"
-description: "Overview of the sqlite.zig public API, including core types, top-level functions, and module references for Connection, DSL, SQL, and storage."
+description: "Overview of the sqlite.zig public API: core types, top-level functions, and references for every documented module."
 ---
 
 # API Reference
@@ -12,10 +12,9 @@ Overview of the `sqlite.zig` public API.
 | Type | Description |
 |------|-------------|
 | `Connection` | Database connection handle — open, close, exec, and manage transactions |
-| `Result` | Query result set — rows, columns, and row count |
+| `Result` | Query result set — rows, columns, and count |
 | `Statement` | Prepared statement with parameter binding |
 | `Value` | Union type for column values (integer, real, text, blob, null) |
-| `Expr` | DSL expression for WHERE clauses and conditions |
 
 ## Top-Level Functions
 
@@ -44,8 +43,16 @@ const User = sqlite.table("users", struct {
 
 | Module | Description |
 |--------|-------------|
-| [Connection](/api/connection) | Database open/close, exec, transactions, schema management |
+| [Connection](/api/connection) | Database open/close, exec, prepared statements, schema management |
 | [DSL](/api/dsl) | Type-safe query builder — table, insert, select, update, delete, joins |
-| [SQL](/api/sql) | Raw SQL execution — lexer, parser, AST, compiler |
-| [Storage](/api/storage) | Low-level storage — file I/O, pager, WAL, journal, image format |
+| [SQL](/api/sql) | Raw SQL execution — lexer, parser, AST, expressions, functions |
+| [B-Tree](/api/btree) | B-tree structures — cursors, balancing, index B-trees |
+| [VM](/api/vm) | Bytecode compiler, opcodes, values, virtual machine |
+| [Planner](/api/planner) | Query planner — plans, cost model, optimizer |
+| [Storage](/api/storage) | File I/O, pager, WAL, journal, image format |
+| [Format](/api/format) | On-disk encoding — header, pages, records, varints |
 | [Catalog](/api/catalog) | Schema catalog — table definitions, indexes, type affinity |
+| [Transaction](/api/transaction) | Transactions, savepoints, locking |
+| [Migration](/api/migration) | Schema migrations — sets and runner |
+| [Errors](/api/errors) | Error values and handling |
+| [Version](/api/version) | Library version |

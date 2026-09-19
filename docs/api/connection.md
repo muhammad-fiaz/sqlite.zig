@@ -31,7 +31,7 @@ result.deinit();
 var rows = try db.exec("SELECT * FROM users;");
 defer rows.deinit();
 
-std.debug.print("Rows: {d}\n", .{rows.rowCount()});
+std.debug.print("Rows: {d}\n", .{rows.count()});
 for (rows.rows) |row| {
     std.debug.print("id={d} name={s}\n", .{ row[0].integer, row[1].text });
 }
@@ -83,7 +83,7 @@ foreignKeys.deinit();
 const User = sqlite.table("users", struct { id: i64, name: []const u8 });
 
 // Create table
-try db.createTable(User, .{ .ifNotExists = true });
+try db.createTable(User, .{});
 
 // Insert
 var result = try db.from(User).insert(.{ .id = 1, .name = "Alice" });
@@ -127,8 +127,13 @@ try db.commit();
 ```zig
 // Create table
 try db.createTable(User, .{
-    .ifNotExists = true,
     .primaryKey = User.columns.id,
+});
+
+// Replace an existing table (drops and recreates it, discarding its rows)
+try db.createTable(User, .{
+    .primaryKey = User.columns.id,
+    .overWrite = true,
 });
 
 // Truncate table
@@ -142,7 +147,7 @@ var result = try db.exec("SELECT * FROM users;");
 defer result.deinit();
 
 // Number of rows
-const count = result.rowCount();
+const count = result.count();
 
 // Access rows
 for (result.rows) |row| {

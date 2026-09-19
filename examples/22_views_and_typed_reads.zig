@@ -6,9 +6,9 @@ const User = sqlite.table("view_users", UserRow);
 const ActiveUser = sqlite.table("active_users", struct { id: i64, name: []const u8, active: i64 });
 
 pub fn main() !void {
-    var db = try sqlite.open(std.heap.page_allocator, "valid_22.db");
+    var db = try sqlite.open(std.heap.page_allocator, "example_22.db");
     defer db.close();
-    try db.createTable(User, .{ .ifNotExists = true, .primaryKey = User.columns.id });
+    try db.createTable(User, .{ .overWrite = true, .primaryKey = User.columns.id });
     try db.truncate(User);
     db.dropView("active_users") catch {};
     var first = try db.from(User).insert(.{ .id = 1, .name = "Alice", .active = 1 });
@@ -20,14 +20,14 @@ pub fn main() !void {
 
     var typed = try db.from(ActiveUser).selectAll().fetch();
     defer typed.deinit();
-    if (typed.rowCount() != 1 or typed.rows[0].id != 1) return error.ViewVerificationFailed;
+    if (typed.count() != 1 or typed.rows[0].id != 1) return error.ViewVerificationFailed;
     var raw = try db.exec("SELECT * FROM active_users;");
     defer raw.deinit();
-    if (raw.rowCount() != typed.rowCount()) return error.ViewInteropVerificationFailed;
-    var reopened = try sqlite.open(std.heap.page_allocator, "valid_22.db");
+    if (raw.count() != typed.count()) return error.ViewInteropVerificationFailed;
+    var reopened = try sqlite.open(std.heap.page_allocator, "example_22.db");
     defer reopened.close();
     var persisted = try reopened.from(ActiveUser).selectAll().fetch();
     defer persisted.deinit();
-    if (persisted.rowCount() != 1) return error.ViewPersistenceVerificationFailed;
+    if (persisted.count() != 1) return error.ViewPersistenceVerificationFailed;
     std.debug.print("22 views: raw and typed view reads verified\n", .{});
 }

@@ -11,42 +11,28 @@ The B-Tree module manages the hierarchical tree structure used for indexing and 
 
 SQLite stores all table and index data in B-tree structures. Each B-tree consists of pages linked together, with interior pages containing keys and child pointers, and leaf pages containing actual data records.
 
+These modules are internal: client code reaches them through `Connection`,
+not by importing them directly.
+
 ## Core Types
 
 | Type | Description |
 |------|-------------|
-| `BTree` | Main B-tree handle for traversal and modification |
-| `Cursor` | Position pointer for iterating through B-tree nodes |
-| `IndexBTree` | Specialized B-tree for index data |
+| `BTree` | Ordered key-to-payload container (`init`, `put`, `get`, `remove`) |
+| `Cursor` | Position pointer over a `BTree` (`first`, `last`, `next`, `prev`, `seekGE`, `seekLE`, `seekEQ`, `key`, `value`) |
+| `Index` | Key-to-rowid map for index data (`insert`, `rowid`, `remove`, `count`) |
 
 ## B-Tree Operations
 
-### Insert
+The container API works on `u64` keys with byte payloads:
 
-```zig
-try btree.insert(key, record);
-```
+- insert or replace a payload: `put(key, payload)`
+- look up a payload: `get(key)`
+- remove a key: `remove(key)`
 
-### Delete
-
-```zig
-try btree.delete(key);
-```
-
-### Lookup
-
-```zig
-var cursor = try btree.find(key);
-```
-
-### Scan
-
-```zig
-var cursor = try btree.beginScan();
-while (try cursor.next()) |record| {
-    // process record
-}
-```
+Cursors walk entries forwards and backwards (`first`/`last`, then
+`next`/`prev` while `valid()` holds), or seek directly with `seekGE`,
+`seekLE`, and `seekEQ`.
 
 ## Page Types
 
@@ -59,8 +45,9 @@ while (try cursor.next()) |record| {
 
 ## Balancing
 
-The `balance` module handles page splitting and merging when inserts or deletes cause pages to exceed or fall below the fill factor:
-
-```zig
-try btree.balance(page);
-```
+The `balance` module computes bounded split points and SQLite-compatible
+payload fragmentation (`splitPoint`, `splitPointByBytes`, `maxLocalPayload`,
+`minLocalPayload`, `localPayloadSize`). Page headers encode and decode
+through `PageHeader`, and page images are constructed with
+`formatLeafTablePage`, `formatInteriorTablePage`, `formatLeafIndexPage`, and
+`formatInteriorIndexPage`.

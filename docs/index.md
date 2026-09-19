@@ -8,7 +8,7 @@ hero:
   text: "Native SQLite-Compatible Database Engine in Zig"
   tagline: A fully native, zero-dependency SQLite-compatible database engine written entirely in Zig
   image:
-    src: /favicon.png
+    src: /sqlite.zig/android-chrome-192x192.png
     alt: sqlite.zig logo
   actions:
     - theme: brand
@@ -30,7 +30,7 @@ features:
     details: Hand-written SQL lexer, parser, and bytecode compiler/VM modeled on SQLite's own architecture. Supports CREATE, INSERT, SELECT, UPDATE, DELETE, JOINs, and more.
   - icon: "\u26a1"
     title: Typed DSL Query Builder
-    details: A comptime, type-safe Zig query builder that generates SQL under the hood, ensuring compile-time validation of table names, column names, and types.
+    details: A comptime, type-safe Zig query builder that constructs the same internal query representation as Raw SQL directly, ensuring compile-time validation of table names, column names, and types.
   - icon: "\U0001f504"
     title: WAL & Rollback Journal
     details: Native SQLite-compatible WAL page frames, reopen/readback, and checkpointing, plus rollback-journal persistence. Full multi-process locking/VFS parity is still in progress.
@@ -45,6 +45,7 @@ features:
 ## Quick Example
 
 ```zig
+const std = @import("std");
 const sqlite = @import("sqlite");
 
 const User = sqlite.table("users", struct { id: i64, name: []const u8 });
@@ -53,7 +54,7 @@ pub fn main() !void {
     var db = try sqlite.open(std.heap.page_allocator, "my.db");
     defer db.close();
 
-    try db.createTable(User, .{ .ifNotExists = true });
+    try db.createTable(User, .{});
 
     var inserted = try db.from(User).insert(.{ .id = 1, .name = "Alice" });
     inserted.deinit();

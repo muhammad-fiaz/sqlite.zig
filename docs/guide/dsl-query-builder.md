@@ -85,8 +85,16 @@ var partial = try db.from(User).insert(.{ .id = 1, .name = "Alice" });
 partial.deinit();
 ```
 
-Conflict handling: `insertOrIgnore` / `insertOrReplace`. Advanced
-`ON CONFLICT ... DO UPDATE` belongs in raw SQL.
+Conflict handling: `insertOrIgnore` / `insertOrReplace`, plus full
+`ON CONFLICT` support in the DSL:
+
+```zig
+var upserted = try db.from(User)
+    .onConflict(User.columns.id)
+    .doUpdate(.{ .name = "Alice" })
+    .insert(.{ .id = 1, .name = "Alice", .email = "alice@example.com" });
+upserted.deinit();
+```
 
 ### Update
 
@@ -143,8 +151,8 @@ defer result.deinit();
 
 ## Aggregates
 
-Aggregates are column projections used with `select` (one per statement,
-matching what the engine evaluates):
+Aggregates are column projections used with `select`, freely combined in
+one statement:
 
 ```zig
 var total = try db.from(Order).select(.{Order.columns.amount.sum()}).fetch();
@@ -177,7 +185,7 @@ var prefix = try db.from(User)
 defer prefix.deinit();
 
 var labels = try db.from(User)
-    .select(.{User.columns.nickname.coalesce("anonymous")})
+    .select(.{User.columns.name.coalesce("anonymous")})
     .fetch();
 defer labels.deinit();
 
@@ -202,7 +210,7 @@ var names = try db.from(User)
 defer names.deinit();
 
 var matching = try db.from(User)
-    .where(User.columns.profile.jsonExtract("$.city").eq("London"))
+    .where(User.columns.email.jsonExtract("$.city").eq("London"))
     .fetch();
 defer matching.deinit();
 ```
@@ -265,5 +273,6 @@ const User = sqlite.table("users", .{
 ```
 
 Inserts, validation, and typed mapping translate both ways; key options
-use SQL names. See the [coverage matrix](/guide/coverage) for the honest
-per-feature status of Raw SQL, Dynamic DSL, and Typed DSL.
+use SQL names. All three interfaces — Raw SQL, Dynamic DSL, and Typed DSL —
+share the same underlying engine; anything without a DSL builder is available
+through Raw SQL as described in the [SQL engine guide](/guide/sql-engine).
