@@ -575,6 +575,35 @@ pub const Schema = struct {
             }
             try self.indexes.append(self.allocator, .{ .name = indexName, .table = indexTable, .columns = indexColumns, .unique = true });
         }
+        const created = self.find(name).?;
+        for (created.columns, 0..) |column, columnIdx| {
+            if (!column.unique and !column.primaryKey) continue;
+            if (rowidAliasColumn(created)) |alias| if (alias == columnIdx) continue;
+            if (column.primaryKey) {
+                var composite = false;
+                for (constraints) |constraint| if (constraint.kind == .primaryKey and constraint.columns.len > 1) {
+                    composite = true;
+                    break;
+                };
+                if (composite) continue;
+            }
+            var covered = false;
+            for (self.indexes.items) |existing| {
+                if (!std.ascii.eqlIgnoreCase(existing.table, name)) continue;
+                if (existing.columns.len != 1 or existing.keyExpr(0) != null) continue;
+                if (std.ascii.eqlIgnoreCase(existing.columns[0], column.name)) {
+                    covered = true;
+                    break;
+                }
+            }
+            if (covered) continue;
+            autoindexNumber += 1;
+            const indexName = try std.fmt.allocPrint(self.allocator, "sqlite_autoindex_{s}_{d}", .{ name, autoindexNumber });
+            const indexTable = try self.allocator.dupe(u8, name);
+            const indexColumns = try self.allocator.alloc([]u8, 1);
+            indexColumns[0] = try self.allocator.dupe(u8, column.name);
+            try self.indexes.append(self.allocator, .{ .name = indexName, .table = indexTable, .columns = indexColumns, .unique = true });
+        }
     }
 
     pub fn createVirtualTable(self: *Schema, name: []const u8, module: []const u8, arguments: []const []const u8) !void {
@@ -657,6 +686,24 @@ pub const Schema = struct {
                 trg.table = try self.allocator.dupe(u8, newName);
             }
         }
+        for (self.tables.items) |*other| {
+            for (other.columns) |*column| {
+                if (column.foreignTable) |foreignTable| {
+                    if (std.ascii.eqlIgnoreCase(foreignTable, oldName)) {
+                        self.allocator.free(foreignTable);
+                        column.foreignTable = try self.allocator.dupe(u8, newName);
+                    }
+                }
+            }
+            for (other.constraints) |*constraint| {
+                if (constraint.foreignTable) |foreignTable| {
+                    if (std.ascii.eqlIgnoreCase(foreignTable, oldName)) {
+                        self.allocator.free(foreignTable);
+                        constraint.foreignTable = try self.allocator.dupe(u8, newName);
+                    }
+                }
+            }
+        }
     }
 
     pub fn truncateTable(self: *Schema, name: []const u8) !void {
@@ -692,8 +739,8 @@ pub const Schema = struct {
             .defaultValue = if (definition.defaultValue) |value| try self.copyValue(value) else null,
             .foreignTable = if (definition.foreignKey) |foreignKey| try self.allocator.dupe(u8, foreignKey.table) else null,
             .foreignColumn = if (definition.foreignKey) |foreignKey| try self.allocator.dupe(u8, foreignKey.column) else null,
-            .onDelete = if (definition.foreignKey) |foreignKey| foreignKey.onDelete else .restrict,
-            .onUpdate = if (definition.foreignKey) |foreignKey| foreignKey.onUpdate else .restrict,
+            .onDelete = if (definition.foreignKey) |foreignKey| foreignKey.onDelete else .noAction,
+            .onUpdate = if (definition.foreignKey) |foreignKey| foreignKey.onUpdate else .noAction,
             .checkExpr = clonedCheck,
             .generatedExpr = clonedGen,
             .generatedStored = definition.generatedStored,
@@ -758,6 +805,32 @@ pub const Schema = struct {
                 if (std.ascii.eqlIgnoreCase(col, oldName)) {
                     self.allocator.free(col);
                     constraint.columns[cIdx] = try self.allocator.dupe(u8, newName);
+                }
+            }
+        }
+        for (self.tables.items) |*other| {
+            for (other.columns) |*column| {
+                if (column.foreignTable) |foreignTable| {
+                    if (std.ascii.eqlIgnoreCase(foreignTable, tableName)) {
+                        if (column.foreignColumn) |foreignColumn| {
+                            if (std.ascii.eqlIgnoreCase(foreignColumn, oldName)) {
+                                self.allocator.free(foreignColumn);
+                                column.foreignColumn = try self.allocator.dupe(u8, newName);
+                            }
+                        }
+                    }
+                }
+            }
+            for (other.constraints) |*constraint| {
+                if (constraint.foreignTable) |foreignTable| {
+                    if (std.ascii.eqlIgnoreCase(foreignTable, tableName)) {
+                        for (constraint.referencedColumns, 0..) |referenced, rIdx| {
+                            if (std.ascii.eqlIgnoreCase(referenced, oldName)) {
+                                self.allocator.free(referenced);
+                                constraint.referencedColumns[rIdx] = try self.allocator.dupe(u8, newName);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -866,6 +939,44 @@ pub const Schema = struct {
         self.allocator.free(table.name);
     }
 
+    fn rowidAliasColumn(table: *const Table) ?usize {
+        if (table.withoutRowid) return null;
+        var found: ?usize = null;
+        for (table.columns, 0..) |column, index| {
+            if (!column.primaryKey) continue;
+            if (found != null) return null;
+            found = index;
+        }
+        const alias = found orelse return null;
+        for (table.constraints) |constraint| {
+            if (constraint.kind == .primaryKey and constraint.columns.len > 1) return null;
+        }
+        const declared = std.mem.trim(u8, table.columns[alias].typeName, " \t\n\r");
+        if (!std.ascii.eqlIgnoreCase(declared, "integer")) return null;
+        return alias;
+    }
+
+    fn assignRowidAlias(table: *const Table, values: []Value) !void {
+        const alias = rowidAliasColumn(table) orelse return;
+        if (values[alias] != .null) return;
+        var max: ?i64 = null;
+        for (table.rows.items) |existing| {
+            switch (existing.values[alias]) {
+                .integer => |current| {
+                    if (max) |best| {
+                        if (current > best) max = current;
+                    } else max = current;
+                },
+                else => {},
+            }
+        }
+        const next = if (max) |best| blk: {
+            if (best == std.math.maxInt(i64)) return error.ConstraintViolation;
+            break :blk best + 1;
+        } else 1;
+        values[alias] = .{ .integer = next };
+    }
+
     pub fn appendRow(self: *Schema, table: *Table, values: []const Value) !void {
         if (values.len != table.columns.len) return error.ColumnCountMismatch;
         const owned = try self.allocator.alloc(Value, values.len);
@@ -876,6 +987,7 @@ pub const Schema = struct {
             owned[index] = try self.copyValue(value);
             count += 1;
         }
+        try assignRowidAlias(table, owned);
         var colNames = try self.allocator.alloc([]const u8, table.columns.len);
         defer self.allocator.free(colNames);
         for (table.columns, 0..) |col, idx| colNames[idx] = col.name;
@@ -909,7 +1021,8 @@ pub const Schema = struct {
         try table.rows.append(self.allocator, .{ .values = owned });
     }
 
-    pub fn validateUpdate(self: *const Schema, table: *const Table, rowIndex: usize, values: []const Value) !void {
+    pub fn validateUpdate(self: *const Schema, table: *const Table, rowIndex: usize, values: []Value) !void {
+        try assignRowidAlias(table, values);
         if (table.strict) {
             for (table.columns, 0..) |col, index| {
                 _ = try coerceStrict(col.typeName, values[index]);
@@ -1237,7 +1350,7 @@ fn indexValuesEqual(table: *const Table, left: []const Value, right: []const Val
             break;
         };
         const index = columnIndex orelse return false;
-        if (left[index] == .null or right[index] == .null) continue;
+        if (left[index] == .null or right[index] == .null) return false;
         if (!valuesEqual(left[index], right[index])) return false;
     }
     return true;

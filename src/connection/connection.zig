@@ -351,8 +351,12 @@ pub const Connection = struct {
         return null;
     }
 
-    pub fn dropTable(self: *Connection, comptime TableType: type) !void {
-        try self.store.dropTable(TableType.tableName);
+    pub fn dropTable(self: *Connection, target: anytype) !void {
+        const tableName: []const u8 = if (@TypeOf(target) == type) blk: {
+            if (!@hasDecl(target, "tableName")) @compileError("dropTable expects a sqlite.table(...) type or a table-name string");
+            break :blk target.tableName;
+        } else target;
+        try self.store.dropTable(tableName);
         if (!self.transactionActive) try self.persist();
     }
 
@@ -367,7 +371,7 @@ pub const Connection = struct {
         if (!self.transactionActive) try self.persist();
     }
 
-    pub fn dropIndex(self: *Connection, comptime name: []const u8) !void {
+    pub fn dropIndex(self: *Connection, name: []const u8) !void {
         try self.store.dropIndex(name);
         if (!self.transactionActive) try self.persist();
     }
@@ -428,33 +432,45 @@ pub const Connection = struct {
         result.deinit();
     }
 
-    pub fn createView(self: *Connection, comptime name: []const u8, sql: []const u8) !void {
+    pub fn createView(self: *Connection, name: []const u8, sql: []const u8) !void {
         try self.store.createView(name, sql);
         if (!self.transactionActive) try self.persist();
     }
 
-    pub fn dropView(self: *Connection, comptime name: []const u8) !void {
+    pub fn dropView(self: *Connection, name: []const u8) !void {
         try self.store.dropView(name);
         if (!self.transactionActive) try self.persist();
     }
 
-    pub fn dropTrigger(self: *Connection, comptime name: []const u8) !void {
+    pub fn dropTrigger(self: *Connection, name: []const u8) !void {
         try self.store.dropTrigger(name);
         if (!self.transactionActive) try self.persist();
     }
 
-    pub fn renameTable(self: *Connection, comptime TableType: type, comptime newName: []const u8) !void {
-        try self.store.renameTable(TableType.tableName, newName);
+    pub fn renameTable(self: *Connection, target: anytype, newName: []const u8) !void {
+        const tableName: []const u8 = if (@TypeOf(target) == type) blk: {
+            if (!@hasDecl(target, "tableName")) @compileError("renameTable expects a sqlite.table(...) type or a table-name string");
+            break :blk target.tableName;
+        } else target;
+        try self.store.renameTable(tableName, newName);
         if (!self.transactionActive) try self.persist();
     }
 
-    pub fn truncate(self: *Connection, comptime TableType: type) !void {
-        try self.store.truncateTable(TableType.tableName);
+    pub fn truncate(self: *Connection, target: anytype) !void {
+        const tableName: []const u8 = if (@TypeOf(target) == type) blk: {
+            if (!@hasDecl(target, "tableName")) @compileError("truncate expects a sqlite.table(...) type or a table-name string");
+            break :blk target.tableName;
+        } else target;
+        try self.store.truncateTable(tableName);
         if (!self.transactionActive) try self.persist();
     }
 
-    pub fn addColumn(self: *Connection, comptime TableType: type, comptime field: []const u8, comptime FieldType: type) !void {
-        try self.store.addColumn(TableType.tableName, .{ .name = field, .typeName = keys.dslTypeName(FieldType) });
+    pub fn addColumn(self: *Connection, target: anytype, field: []const u8, FieldType: type) !void {
+        const tableName: []const u8 = if (@TypeOf(target) == type) blk: {
+            if (!@hasDecl(target, "tableName")) @compileError("addColumn expects a sqlite.table(...) type or a table-name string");
+            break :blk target.tableName;
+        } else target;
+        try self.store.addColumn(tableName, .{ .name = field, .typeName = keys.dslTypeName(FieldType) });
         if (!self.transactionActive) try self.persist();
     }
 
@@ -1241,6 +1257,11 @@ pub const Connection = struct {
                 }
             }
             if (columnsMatch) return if (constraint.kind == .primaryKey) "pk" else "u";
+        }
+        if (index.columns.len == 1 and index.keyExpr(0) == null) {
+            if (columnIndex(table, index.columns[0])) |position| {
+                if (table.columns[position].primaryKey) return "pk";
+            } else |_| {}
         }
         return "u";
     }
@@ -3786,6 +3807,7 @@ pub const Connection = struct {
         for (columns, expressions) |name, expression| {
             const index = try columnIndex(table, name);
             var newValue = try self.evalContext(table, row.values, expression, parameters, &excludedOuter);
+            if (newValue == .null and candidate[index] != .null) newValue = candidate[index];
             if (table.strict) newValue = try Schema.coerceStrict(table.columns[index].typeName, newValue);
             if (row.values[index] == .text) self.allocator.free(row.values[index].text);
             if (row.values[index] == .blob) self.allocator.free(row.values[index].blob);
@@ -5060,6 +5082,7 @@ pub const Connection = struct {
             for (value.columns, value.values) |name, expr| {
                 const index = try columnIndex(table, name);
                 var newValue = try self.eval(table, row.values, expr, parameters);
+                if (newValue == .null and candidate[index] != .null) newValue = candidate[index];
                 if (table.strict) newValue = try Schema.coerceStrict(table.columns[index].typeName, newValue);
                 if (row.values[index] == .text) self.allocator.free(row.values[index].text);
                 if (row.values[index] == .blob) self.allocator.free(row.values[index].blob);
@@ -11210,4 +11233,224 @@ test "schema introspection pragmas report catalog state" {
     var filtered = try db.exec("PRAGMA table_list(users);");
     defer filtered.deinit();
     try std.testing.expectEqual(@as(usize, 1), filtered.count());
+}
+
+test "integer primary key null auto assigns rowid alias" {
+    const path = "sqlite_zig_rowid_alias_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    var setup = try db.exec("CREATE TABLE r (id INTEGER PRIMARY KEY, v TEXT); INSERT INTO r VALUES (NULL, 'a'), (NULL, 'b');");
+    setup.deinit();
+    var ids = try db.exec("SELECT id, v FROM r ORDER BY id;");
+    defer ids.deinit();
+    try std.testing.expectEqual(@as(i64, 1), ids.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 2), ids.rows[1][0].integer);
+    var gap = try db.exec("INSERT INTO r VALUES (10, 'j'); INSERT INTO r(v) VALUES ('k');");
+    gap.deinit();
+    var next = try db.exec("SELECT id FROM r WHERE v = 'k';");
+    defer next.deinit();
+    try std.testing.expectEqual(@as(i64, 11), next.rows[0][0].integer);
+    var wipe = try db.exec("DELETE FROM r WHERE id = 11; INSERT INTO r(v) VALUES ('reuse');");
+    wipe.deinit();
+    var reused = try db.exec("SELECT id FROM r WHERE v = 'reuse';");
+    defer reused.deinit();
+    try std.testing.expectEqual(@as(i64, 11), reused.rows[0][0].integer);
+    var updated = try db.exec("UPDATE r SET id = NULL WHERE v = 'a';");
+    updated.deinit();
+    var moved = try db.exec("SELECT id FROM r WHERE v = 'a';");
+    defer moved.deinit();
+    try std.testing.expectEqual(@as(i64, 12), moved.rows[0][0].integer);
+    var defaults = try db.exec("INSERT INTO r DEFAULT VALUES;");
+    defaults.deinit();
+    var defaulted = try db.exec("SELECT max(id) FROM r;");
+    defer defaulted.deinit();
+    try std.testing.expectEqual(@as(i64, 13), defaulted.rows[0][0].integer);
+    var intAlias = try db.exec("CREATE TABLE ia (id INT PRIMARY KEY, v TEXT);");
+    intAlias.deinit();
+    try std.testing.expectError(error.ConstraintViolation, db.exec("INSERT INTO ia VALUES (NULL, 'x');"));
+    var textPk = try db.exec("CREATE TABLE tp (id TEXT PRIMARY KEY, v TEXT); INSERT INTO tp VALUES ('k', 'x');");
+    textPk.deinit();
+    try std.testing.expectError(error.ConstraintViolation, db.exec("INSERT INTO tp VALUES (NULL, 'y');"));
+    try std.testing.expectError(error.ConstraintViolation, db.exec("UPDATE tp SET id = NULL WHERE v = 'x';"));
+    var composite = try db.exec("CREATE TABLE cp (a INTEGER, b INTEGER, PRIMARY KEY (a, b));");
+    composite.deinit();
+    try std.testing.expectError(error.ConstraintViolation, db.exec("INSERT INTO cp VALUES (NULL, 1);"));
+    try std.testing.expectError(error.ConstraintViolation, db.exec("INSERT INTO cp VALUES (1, NULL);"));
+    var wr = try db.exec("CREATE TABLE w (id INTEGER PRIMARY KEY, v TEXT) WITHOUT ROWID;");
+    wr.deinit();
+    try std.testing.expectError(error.ConstraintViolation, db.exec("INSERT INTO w VALUES (NULL, 'x');"));
+    var dup = try db.exec("INSERT INTO r VALUES (1, 'dupe');");
+    dup.deinit();
+    try std.testing.expectError(error.ConstraintViolation, db.exec("INSERT INTO r VALUES (1, 'dupe2');"));
+}
+
+test "unique nulls and actions hold across raw and dsl" {
+    const path = "sqlite_zig_key_matrix_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    var setup = try db.exec("CREATE TABLE p (id INTEGER PRIMARY KEY, v TEXT); INSERT INTO p VALUES (1, 'a'), (2, 'b'); CREATE TABLE uq (id INTEGER PRIMARY KEY, email TEXT UNIQUE, a INTEGER, b INTEGER, UNIQUE(a, b)); INSERT INTO uq VALUES (1, NULL, 1, 1), (2, NULL, 1, 2), (3, 'x@y.test', NULL, 1), (4, NULL, NULL, NULL);");
+    setup.deinit();
+    try std.testing.expectError(error.ConstraintViolation, db.exec("INSERT INTO uq VALUES (5, 'x@y.test', 9, 9);"));
+    try std.testing.expectError(error.ConstraintViolation, db.exec("INSERT INTO uq VALUES (5, 'fresh@y.test', 1, 1);"));
+    var keepUnique = try db.exec("UPDATE uq SET a = 1, b = 2 WHERE id = 2;");
+    keepUnique.deinit();
+    try std.testing.expectError(error.ConstraintViolation, db.exec("UPDATE uq SET a = 1, b = 1 WHERE id = 2;"));
+    try std.testing.expectError(error.ConstraintViolation, db.exec("UPDATE uq SET email = 'x@y.test' WHERE id = 1;"));
+    var actions = try db.exec("CREATE TABLE c_cas (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id) ON DELETE CASCADE ON UPDATE CASCADE); CREATE TABLE c_null (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id) ON DELETE SET NULL ON UPDATE SET NULL); CREATE TABLE c_def (id INTEGER PRIMARY KEY, pid INTEGER DEFAULT 0 REFERENCES p(id) ON DELETE SET DEFAULT ON UPDATE SET DEFAULT); CREATE TABLE c_res (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id) ON DELETE RESTRICT); INSERT INTO c_cas VALUES (1, 1); INSERT INTO c_null VALUES (1, 1); INSERT INTO c_def VALUES (1, 1); INSERT INTO c_res VALUES (1, 1);");
+    actions.deinit();
+    try std.testing.expectError(error.ConstraintViolation, db.exec("INSERT INTO c_cas VALUES (2, 99);"));
+    try std.testing.expectError(error.ConstraintViolation, db.exec("DELETE FROM p WHERE id = 1;"));
+    var wipeRes = try db.exec("DELETE FROM c_res;");
+    wipeRes.deinit();
+    var updateParent = try db.exec("UPDATE p SET id = 10 WHERE id = 1;");
+    updateParent.deinit();
+    var followed = try db.exec("SELECT pid FROM c_cas;");
+    defer followed.deinit();
+    try std.testing.expectEqual(@as(i64, 10), followed.rows[0][0].integer);
+    var nulled = try db.exec("SELECT pid FROM c_null;");
+    defer nulled.deinit();
+    try std.testing.expect(nulled.rows[0][0] == .null);
+    var defaulted = try db.exec("SELECT pid FROM c_def;");
+    defer defaulted.deinit();
+    try std.testing.expectEqual(@as(i64, 0), defaulted.rows[0][0].integer);
+    var wipeParent = try db.exec("DELETE FROM p WHERE id = 10;");
+    wipeParent.deinit();
+    var casGone = try db.exec("SELECT count(*) FROM c_cas;");
+    defer casGone.deinit();
+    try std.testing.expectEqual(@as(i64, 0), casGone.rows[0][0].integer);
+    const Emp = @import("../dsl/table.zig").table("matrix_emp", struct { id: i64, mgr: ?i64, email: ?[]const u8 });
+    try db.createTable(Emp, .{
+        .primaryKey = Emp.columns.id,
+        .unique = &.{Emp.columns.email},
+        .foreignKeys = &.{.{ .column = Emp.columns.mgr, .references = Emp.columns.id, .onDelete = .cascade }},
+    });
+    var ceo = try db.from(Emp).insert(.{ .id = 1, .mgr = null, .email = null });
+    ceo.deinit();
+    var staff = try db.from(Emp).insert(.{ .id = 2, .mgr = 1, .email = null });
+    staff.deinit();
+    try std.testing.expectError(error.ConstraintViolation, db.from(Emp).insert(.{ .id = 3, .mgr = 99, .email = null }));
+    var dupeMail = try db.from(Emp).insert(.{ .id = 4, .mgr = 1, .email = "boss@x.test" });
+    dupeMail.deinit();
+    try std.testing.expectError(error.ConstraintViolation, db.from(Emp).insert(.{ .id = 5, .mgr = 1, .email = "boss@x.test" }));
+    var dropCeo = try db.from(Emp).delete().where(Emp.columns.id.eq(1)).execute();
+    dropCeo.deinit();
+    var reports = try db.from(Emp).selectAll().fetch();
+    defer reports.deinit();
+    try std.testing.expectEqual(@as(usize, 0), reports.count());
+    try db.createTable("matrix_dyn", .{
+        .columns = &.{ .{ .name = "id", .type = "INTEGER" }, .{ .name = "email", .type = "TEXT" }, .{ .name = "mgr", .type = "INTEGER" } },
+        .primaryKey = "id",
+        .unique = &.{"email"},
+        .foreignKeys = &.{.{
+            .column = "mgr",
+            .references = .{ .table = "matrix_dyn", .column = "id" },
+            .onDelete = .cascade,
+        }},
+    });
+    var d1 = try db.from("matrix_dyn").insert(.{ .id = 1, .email = null, .mgr = null });
+    d1.deinit();
+    var d2 = try db.from("matrix_dyn").insert(.{ .id = 2, .email = null, .mgr = 1 });
+    d2.deinit();
+    try std.testing.expectError(error.ConstraintViolation, db.from("matrix_dyn").insert(.{ .id = 3, .email = null, .mgr = 42 }));
+    var dwipe = try db.from("matrix_dyn").delete().where(db.col("id").eq(1)).execute();
+    dwipe.deinit();
+    var dleft = try db.from("matrix_dyn").selectAll().fetch();
+    defer dleft.deinit();
+    try std.testing.expectEqual(@as(usize, 0), dleft.count());
+    var off = try db.exec("PRAGMA foreign_keys = OFF;");
+    off.deinit();
+    var orphan = try db.exec("INSERT INTO c_cas VALUES (9, 4242); DELETE FROM p;");
+    orphan.deinit();
+    var orphans = try db.exec("SELECT count(*) FROM c_cas;");
+    defer orphans.deinit();
+    try std.testing.expectEqual(@as(i64, 1), orphans.rows[0][0].integer);
+    var on = try db.exec("PRAGMA foreign_keys = ON;");
+    on.deinit();
+    try std.testing.expectError(error.ConstraintViolation, db.exec("INSERT INTO c_cas VALUES (10, 4243);"));
+}
+
+test "table operations hold across raw and dsl" {
+    const path = "sqlite_zig_table_ops_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    var setup = try db.exec("CREATE TABLE ops (id INTEGER PRIMARY KEY, name TEXT UNIQUE, age INTEGER); INSERT INTO ops VALUES (1, 'a', 10), (2, 'b', 20); CREATE INDEX ops_age_idx ON ops(age); CREATE TABLE ops_child (id INTEGER PRIMARY KEY, oid INTEGER REFERENCES ops(id)); INSERT INTO ops_child VALUES (1, 1);");
+    setup.deinit();
+    var add = try db.exec("ALTER TABLE ops ADD COLUMN score INTEGER DEFAULT 7;");
+    add.deinit();
+    var scored = try db.exec("SELECT score FROM ops ORDER BY id;");
+    defer scored.deinit();
+    try std.testing.expectEqual(@as(i64, 7), scored.rows[0][0].integer);
+    try std.testing.expectError(error.ConstraintViolation, db.exec("ALTER TABLE ops ADD COLUMN nick TEXT NOT NULL;"));
+    var addNn = try db.exec("ALTER TABLE ops ADD COLUMN nick TEXT NOT NULL DEFAULT 'x';");
+    addNn.deinit();
+    try std.testing.expectError(error.ColumnExists, db.exec("ALTER TABLE ops ADD COLUMN id INTEGER;"));
+    var renameCol = try db.exec("ALTER TABLE ops RENAME COLUMN age TO years;");
+    renameCol.deinit();
+    var renamed = try db.exec("SELECT years FROM ops ORDER BY id;");
+    defer renamed.deinit();
+    try std.testing.expectEqual(@as(i64, 10), renamed.rows[0][0].integer);
+    var idxFollow = try db.exec("PRAGMA index_list(ops);");
+    defer idxFollow.deinit();
+    try std.testing.expectEqual(@as(usize, 2), idxFollow.count());
+    var renameTable = try db.exec("ALTER TABLE ops RENAME TO people;");
+    renameTable.deinit();
+    try std.testing.expectError(error.UnknownTable, db.exec("SELECT count(*) FROM ops;"));
+    var people = try db.exec("SELECT count(*) FROM people;");
+    defer people.deinit();
+    try std.testing.expectEqual(@as(i64, 2), people.rows[0][0].integer);
+    var fkFollow = try db.exec("INSERT INTO ops_child VALUES (2, 2);");
+    fkFollow.deinit();
+    try std.testing.expectError(error.ConstraintViolation, db.exec("INSERT INTO ops_child VALUES (3, 99);"));
+    var fkListFollow = try db.exec("PRAGMA foreign_key_list(ops_child);");
+    defer fkListFollow.deinit();
+    try std.testing.expectEqualStrings("people", fkListFollow.rows[0][2].text);
+    var renameRef = try db.exec("ALTER TABLE people RENAME COLUMN id TO pid;");
+    renameRef.deinit();
+    var refFollow = try db.exec("INSERT INTO ops_child VALUES (4, 1);");
+    refFollow.deinit();
+    try std.testing.expectError(error.ConstraintViolation, db.exec("INSERT INTO ops_child VALUES (5, 98);"));
+    var refList = try db.exec("PRAGMA foreign_key_list(ops_child);");
+    defer refList.deinit();
+    try std.testing.expectEqualStrings("pid", refList.rows[0][4].text);
+    try std.testing.expectError(error.ConstraintViolation, db.exec("ALTER TABLE people DROP COLUMN pid;"));
+    try std.testing.expectError(error.ConstraintViolation, db.exec("ALTER TABLE people DROP COLUMN name;"));
+    try std.testing.expectError(error.ConstraintViolation, db.exec("ALTER TABLE people DROP COLUMN years;"));
+    try std.testing.expectError(error.UnknownColumn, db.exec("ALTER TABLE people DROP COLUMN oid;"));
+    var dropScore = try db.exec("ALTER TABLE people DROP COLUMN score;");
+    dropScore.deinit();
+    var kept = try db.exec("SELECT nick FROM people ORDER BY pid;");
+    defer kept.deinit();
+    try std.testing.expectEqualStrings("x", kept.rows[0][0].text);
+    try std.testing.expectError(error.UnknownColumn, db.exec("SELECT score FROM people;"));
+    var dropParent = try db.exec("DROP TABLE people;");
+    dropParent.deinit();
+    try std.testing.expectError(error.ConstraintViolation, db.exec("INSERT INTO ops_child VALUES (6, 1);"));
+    var ifExists = try db.exec("DROP TABLE IF EXISTS nosuch; DROP INDEX IF EXISTS nosuch; DROP VIEW IF EXISTS nosuch; DROP TRIGGER IF EXISTS nosuch;");
+    ifExists.deinit();
+    try std.testing.expectError(error.InvalidSql, db.exec("TRUNCATE TABLE ops_child;"));
+    const Widget = @import("../dsl/table.zig").table("ops_widget", struct { id: i64, label: []const u8 });
+    try db.createTable(Widget, .{ .primaryKey = Widget.columns.id });
+    var w1 = try db.from(Widget).insert(.{ .id = 1, .label = "a" });
+    w1.deinit();
+    try db.addColumn(Widget, "stock", i64);
+    try db.renameTable(Widget, "ops_gadget");
+    try db.renameTable("ops_gadget", "ops_widget");
+    try db.addColumn("ops_widget", "price", f64);
+    var w2 = try db.from("ops_widget").insert(.{ .id = 2, .label = "b" });
+    w2.deinit();
+    try db.truncate("ops_widget");
+    var empty = try db.from("ops_widget").selectAll().fetch();
+    defer empty.deinit();
+    try std.testing.expectEqual(@as(usize, 0), empty.count());
+    var w3 = try db.from("ops_widget").insert(.{ .id = 3, .label = "c" });
+    w3.deinit();
+    try db.createView("ops_view", "SELECT id FROM ops_widget");
+    try db.dropView("ops_view");
+    try std.testing.expectError(error.UnknownView, db.dropView("ops_view"));
+    try db.createIndex("ops_widget", "ops_widget_label_idx", .{db.col("label")}, false);
+    try db.dropIndex("ops_widget_label_idx");
+    try std.testing.expectError(error.UnknownIndex, db.dropIndex("ops_widget_label_idx"));
+    try db.truncate(Widget);
+    try db.dropTable("ops_widget");
+    try std.testing.expectError(error.UnknownTable, db.dropTable("ops_widget"));
 }

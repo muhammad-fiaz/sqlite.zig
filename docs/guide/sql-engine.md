@@ -18,14 +18,14 @@ description: "The hand-written SQL lexer, parser, and bytecode compiler supporti
 | **UPDATE** | `UPDATE name SET col = expr [WHERE ...]` and `UPDATE name SET ... FROM source WHERE join [AND ...]` |
 | **DELETE** | `DELETE FROM name [WHERE ...]` |
 | **BEGIN** | `BEGIN [DEFERRED\|IMMEDIATE\|EXCLUSIVE]` or `START TRANSACTION` |
-| **COMMIT** | `COMMIT` |
+| **COMMIT** | `COMMIT` (or `END`) |
 | **ROLLBACK** | `ROLLBACK [TO [SAVEPOINT] name]` |
 | **SAVEPOINT** | `SAVEPOINT name` |
 | **RELEASE** | `RELEASE [SAVEPOINT] name` |
 | **CREATE VIEW** | `CREATE VIEW [IF NOT EXISTS] name AS SELECT ...` |
 | **CREATE TRIGGER** | `CREATE TRIGGER [IF NOT EXISTS] name [BEFORE\|AFTER] INSERT\|UPDATE\|DELETE ON table [WHEN ...] ...` |
 | **CREATE INDEX** | `CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (columns)` |
-| **ALTER TABLE** | `ADD COLUMN`, `RENAME TO`, `RENAME COLUMN ... TO`, and `DROP COLUMN` |
+| **ALTER TABLE** | `ADD COLUMN`, `RENAME TO`, `RENAME COLUMN ... TO`, and `DROP COLUMN`; renames follow indexes, triggers, and foreign-key references; drops are refused while a column backs a key, index, or foreign key |
 | **UPSERT** | `INSERT ... ON CONFLICT [(cols)] [WHERE ...] DO NOTHING` / `DO UPDATE SET ...` with `excluded` |
 | **RETURNING** | `INSERT/UPDATE/DELETE ... RETURNING ...` |
 | **Compound SELECT** | `UNION [ALL]`, `INTERSECT`, `EXCEPT` with `ORDER BY` / `LIMIT` / `OFFSET` |
@@ -176,7 +176,13 @@ Table definitions support declared types with full SQLite type names
 Plain and `UNIQUE` column indexes are supported, as are partial indexes
 (`CREATE INDEX ... WHERE predicate`, uniqueness enforced among matching rows
 only) and expression index keys (`CREATE INDEX ... ON t (lower(email))`,
-uniqueness enforced on computed values).
+uniqueness enforced on computed values). Column-level `UNIQUE` and
+non-`INTEGER` primary keys get automatic unique indexes (visible in
+`PRAGMA index_list` with `u`/`pk` origins); a single `INTEGER PRIMARY KEY`
+is the rowid alias, so `NULL` inserts and `SET ... = NULL` updates assign
+`max(id) + 1`. `UNIQUE` constraints ignore `NULL` (several nulls coexist),
+while any `NULL` in a primary key is rejected. There is no `TRUNCATE TABLE`
+statement (matching SQLite); use `DELETE FROM` or the DSL `truncate` helper.
 
 ## Architecture
 
