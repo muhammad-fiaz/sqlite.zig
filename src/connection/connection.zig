@@ -4,6 +4,8 @@ const image = @import("../storage/image.zig");
 const sqliteImage = @import("../storage/sqlite_image.zig");
 const Schema = @import("../catalog/schema.zig").Schema;
 const Table = @import("../catalog/schema.zig").Table;
+const View = @import("../catalog/schema.zig").View;
+const Index = @import("../catalog/schema.zig").Index;
 const Value = @import("../vm/value.zig").Value;
 const ast = @import("../sql/ast.zig");
 const Parser = @import("../sql/parser.zig").Parser;
@@ -792,6 +794,9 @@ pub const Connection = struct {
     }
 
     fn executePragma(self: *Connection, value: anytype) !Result {
+        if (value.schema) |schemaName| {
+            if (!std.ascii.eqlIgnoreCase(schemaName, "main") and !std.ascii.eqlIgnoreCase(schemaName, "temp")) return error.Unsupported;
+        }
         if (std.ascii.eqlIgnoreCase(value.name, "foreign_keys")) {
             if (value.value) |setting| {
                 if (std.ascii.eqlIgnoreCase(setting, "on") or std.mem.eql(u8, setting, "1")) {
@@ -1012,7 +1017,393 @@ pub const Connection = struct {
             rows[0][2] = .{ .integer = checkpoint.checkpointed };
             return .{ .allocator = self.allocator, .columns = columns, .rows = rows };
         }
+        if (std.ascii.eqlIgnoreCase(value.name, "table_info")) return try self.pragmaTableInfo(value, false);
+        if (std.ascii.eqlIgnoreCase(value.name, "table_xinfo")) return try self.pragmaTableInfo(value, true);
+        if (std.ascii.eqlIgnoreCase(value.name, "index_list")) return try self.pragmaIndexList(value);
+        if (std.ascii.eqlIgnoreCase(value.name, "index_info")) return try self.pragmaIndexInfo(value, false);
+        if (std.ascii.eqlIgnoreCase(value.name, "index_xinfo")) return try self.pragmaIndexInfo(value, true);
+        if (std.ascii.eqlIgnoreCase(value.name, "foreign_key_list")) return try self.pragmaForeignKeyList(value);
+        if (std.ascii.eqlIgnoreCase(value.name, "database_list")) return try self.pragmaDatabaseList();
+        if (std.ascii.eqlIgnoreCase(value.name, "table_list")) return try self.pragmaTableList(value);
         return error.Unsupported;
+    }
+
+    fn pragmaTargetName(text: ?[]const u8) ?[]const u8 {
+        const raw = text orelse return null;
+        if (raw.len == 0) return null;
+        var name = raw;
+        if (name.len >= 2) {
+            const first = name[0];
+            const last = name[name.len - 1];
+            if ((first == '\'' and last == '\'') or (first == '"' and last == '"') or (first == '`' and last == '`') or (first == '[' and last == ']')) name = name[1 .. name.len - 1];
+        }
+        if (std.mem.indexOfScalar(u8, name, '.')) |dot| {
+            if (std.ascii.eqlIgnoreCase(name[0..dot], "main") or std.ascii.eqlIgnoreCase(name[0..dot], "temp")) name = name[dot + 1 ..];
+        }
+        if (name.len == 0) return null;
+        return name;
+    }
+
+    fn pragmaArgumentName(value: anytype) ?[]const u8 {
+        if (pragmaTargetName(value.argument)) |name| return name;
+        return pragmaTargetName(value.value);
+    }
+
+    fn pragmaSchemaIsTemp(value: anytype) bool {
+        if (value.schema) |schemaName| return std.ascii.eqlIgnoreCase(schemaName, "temp");
+        return false;
+    }
+
+    fn fkActionName(action: ast.ReferentialAction) []const u8 {
+        return switch (action) {
+            .cascade => "CASCADE",
+            .restrict => "RESTRICT",
+            .setNull => "SET NULL",
+            .setDefault => "SET DEFAULT",
+            .noAction => "NO ACTION",
+        };
+    }
+
+    fn defaultValueSql(self: *Connection, value: Value) !?[]u8 {
+        return switch (value) {
+            .null => null,
+            .integer => |i| try std.fmt.allocPrint(self.allocator, "{d}", .{i}),
+            .real => |r| try std.fmt.allocPrint(self.allocator, "{d}", .{r}),
+            .text => |text| blk: {
+                var out = std.ArrayList(u8).empty;
+                errdefer out.deinit(self.allocator);
+                try out.append(self.allocator, '\'');
+                for (text) |c| {
+                    if (c == '\'') try out.appendSlice(self.allocator, "''") else try out.append(self.allocator, c);
+                }
+                try out.append(self.allocator, '\'');
+                break :blk try out.toOwnedSlice(self.allocator);
+            },
+            .blob => |blob| blk: {
+                const hex = "0123456789ABCDEF";
+                var out = std.ArrayList(u8).empty;
+                errdefer out.deinit(self.allocator);
+                try out.appendSlice(self.allocator, "X'");
+                for (blob) |c| {
+                    try out.append(self.allocator, hex[c >> 4]);
+                    try out.append(self.allocator, hex[c & 15]);
+                }
+                try out.append(self.allocator, '\'');
+                break :blk try out.toOwnedSlice(self.allocator);
+            },
+        };
+    }
+
+    fn pragmaTableInfo(self: *Connection, value: anytype, extended: bool) !Result {
+        const headers: []const []const u8 = if (extended) &[_][]const u8{ "cid", "name", "type", "notnull", "dflt_value", "pk", "hidden" } else &[_][]const u8{ "cid", "name", "type", "notnull", "dflt_value", "pk" };
+        const columns = try self.ownedColumns(headers);
+        var rows = std.ArrayList([]Value).empty;
+        errdefer {
+            for (rows.items) |row| {
+                for (row) |item| self.freeConcatText(item);
+                self.allocator.free(row);
+            }
+            rows.deinit(self.allocator);
+        }
+        const target = pragmaArgumentName(value);
+        if (target) |name| {
+            if (!pragmaSchemaIsTemp(value)) {
+                if (self.store.find(name)) |table| {
+                    var pkOrder: [64][]const u8 = undefined;
+                    var pkCount: usize = 0;
+                    for (table.columns) |column| {
+                        if (column.primaryKey and pkCount < pkOrder.len) {
+                            pkOrder[pkCount] = column.name;
+                            pkCount += 1;
+                        }
+                    }
+                    if (pkCount == 0) {
+                        for (table.constraints) |constraint| {
+                            if (constraint.kind != .primaryKey) continue;
+                            for (constraint.columns) |columnName| {
+                                if (pkCount >= pkOrder.len) break;
+                                pkOrder[pkCount] = columnName;
+                                pkCount += 1;
+                            }
+                        }
+                    }
+                    var cid: i64 = 0;
+                    for (table.columns) |column| {
+                        const generated = column.generatedExpr != null;
+                        if (generated and !extended) continue;
+                        const row = try self.allocator.alloc(Value, headers.len);
+                        errdefer self.allocator.free(row);
+                        row[0] = .{ .integer = cid };
+                        row[1] = .{ .text = try self.allocator.dupe(u8, column.name) };
+                        row[2] = .{ .text = try self.allocator.dupe(u8, column.typeName) };
+                        row[3] = .{ .integer = if (column.notNull) 1 else 0 };
+                        if (generated) {
+                            row[4] = .null;
+                        } else if (column.defaultValue) |default| {
+                            row[4] = if (try self.defaultValueSql(default)) |sql| .{ .text = sql } else .null;
+                        } else row[4] = .null;
+                        var pk: i64 = 0;
+                        for (pkOrder[0..pkCount], 0..) |pkName, position| if (std.ascii.eqlIgnoreCase(pkName, column.name)) {
+                            pk = @intCast(position + 1);
+                            break;
+                        };
+                        row[5] = .{ .integer = pk };
+                        if (extended) row[6] = .{ .integer = if (!generated) 0 else if (column.generatedStored) 3 else 2 };
+                        try rows.append(self.allocator, row);
+                        cid += 1;
+                    }
+                } else if (self.store.findView(name)) |view| {
+                    const viewColumns = try self.viewColumnNames(view);
+                    defer {
+                        for (viewColumns) |columnName| self.allocator.free(columnName);
+                        self.allocator.free(viewColumns);
+                    }
+                    for (viewColumns, 0..) |columnName, position| {
+                        const row = try self.allocator.alloc(Value, headers.len);
+                        errdefer self.allocator.free(row);
+                        row[0] = .{ .integer = @intCast(position) };
+                        row[1] = .{ .text = try self.allocator.dupe(u8, columnName) };
+                        row[2] = .{ .text = try self.allocator.dupe(u8, "") };
+                        row[3] = .{ .integer = 0 };
+                        row[4] = .null;
+                        row[5] = .{ .integer = 0 };
+                        if (extended) row[6] = .{ .integer = 0 };
+                        try rows.append(self.allocator, row);
+                    }
+                }
+            }
+        }
+        return .{ .allocator = self.allocator, .columns = columns, .rows = try rows.toOwnedSlice(self.allocator) };
+    }
+
+    fn viewColumnNames(self: *Connection, view: *const View) ![][]const u8 {
+        var quoted = std.ArrayList(u8).empty;
+        defer quoted.deinit(self.allocator);
+        try quoted.append(self.allocator, '"');
+        for (view.name) |c| {
+            if (c == '"') try quoted.appendSlice(self.allocator, "\"\"") else try quoted.append(self.allocator, c);
+        }
+        try quoted.appendSlice(self.allocator, "\" LIMIT 0");
+        const sql = try std.fmt.allocPrint(self.allocator, "SELECT * FROM {s}", .{quoted.items});
+        defer self.allocator.free(sql);
+        var result = try self.exec(sql);
+        defer result.deinit();
+        const names = try self.allocator.alloc([]const u8, result.columns.len);
+        errdefer self.allocator.free(names);
+        for (result.columns, 0..) |column, index| names[index] = try self.allocator.dupe(u8, column);
+        return names;
+    }
+
+    fn pragmaIndexList(self: *Connection, value: anytype) !Result {
+        const names = [_][]const u8{ "seq", "name", "unique", "origin", "partial" };
+        const columns = try self.ownedColumns(&names);
+        var rows = std.ArrayList([]Value).empty;
+        errdefer {
+            for (rows.items) |row| {
+                for (row) |item| self.freeConcatText(item);
+                self.allocator.free(row);
+            }
+            rows.deinit(self.allocator);
+        }
+        if (pragmaArgumentName(value)) |name| {
+            if (!pragmaSchemaIsTemp(value)) {
+                if (self.store.find(name)) |table| {
+                    var seq: i64 = 0;
+                    for (self.store.indexes.items) |index| {
+                        if (!std.ascii.eqlIgnoreCase(index.table, table.name)) continue;
+                        const row = try self.allocator.alloc(Value, names.len);
+                        errdefer self.allocator.free(row);
+                        row[0] = .{ .integer = seq };
+                        row[1] = .{ .text = try self.allocator.dupe(u8, index.name) };
+                        row[2] = .{ .integer = if (index.unique) 1 else 0 };
+                        row[3] = .{ .text = try self.allocator.dupe(u8, self.indexOrigin(table, &index)) };
+                        row[4] = .{ .integer = if (index.whereExpr != null) 1 else 0 };
+                        try rows.append(self.allocator, row);
+                        seq += 1;
+                    }
+                }
+            }
+        }
+        return .{ .allocator = self.allocator, .columns = columns, .rows = try rows.toOwnedSlice(self.allocator) };
+    }
+
+    fn indexOrigin(self: *Connection, table: *const Table, index: *const Index) []const u8 {
+        _ = self;
+        if (!std.mem.startsWith(u8, index.name, "sqlite_autoindex_")) return "c";
+        for (table.constraints) |constraint| {
+            if (constraint.kind != .primaryKey and constraint.kind != .unique) continue;
+            if (constraint.columns.len != index.columns.len) continue;
+            var columnsMatch = true;
+            for (constraint.columns, 0..) |constraintColumn, position| {
+                if (index.keyExpr(position) != null or !std.ascii.eqlIgnoreCase(constraintColumn, index.columns[position])) {
+                    columnsMatch = false;
+                    break;
+                }
+            }
+            if (columnsMatch) return if (constraint.kind == .primaryKey) "pk" else "u";
+        }
+        return "u";
+    }
+
+    fn pragmaIndexInfo(self: *Connection, value: anytype, extended: bool) !Result {
+        const headers: []const []const u8 = if (extended) &[_][]const u8{ "seqno", "cid", "name", "desc", "coll", "key" } else &[_][]const u8{ "seqno", "cid", "name" };
+        const columns = try self.ownedColumns(headers);
+        var rows = std.ArrayList([]Value).empty;
+        errdefer {
+            for (rows.items) |row| {
+                for (row) |item| self.freeConcatText(item);
+                self.allocator.free(row);
+            }
+            rows.deinit(self.allocator);
+        }
+        if (pragmaArgumentName(value)) |name| {
+            if (!pragmaSchemaIsTemp(value)) {
+                if (self.store.findIndexConst(name)) |index| {
+                    if (self.store.findConst(index.table)) |table| {
+                        for (index.columns, 0..) |keyColumn, position| {
+                            const row = try self.allocator.alloc(Value, headers.len);
+                            errdefer self.allocator.free(row);
+                            row[0] = .{ .integer = @intCast(position) };
+                            if (index.keyExpr(position) != null) {
+                                row[1] = .{ .integer = -1 };
+                                row[2] = .null;
+                            } else if (columnIndex(table, keyColumn)) |columnPosition| {
+                                row[1] = .{ .integer = @intCast(columnPosition) };
+                                row[2] = .{ .text = try self.allocator.dupe(u8, table.columns[columnPosition].name) };
+                            } else |_| {
+                                row[1] = .{ .integer = -1 };
+                                row[2] = .null;
+                            }
+                            if (extended) {
+                                row[3] = .{ .integer = 0 };
+                                row[4] = .{ .text = try self.allocator.dupe(u8, "BINARY") };
+                                row[5] = .{ .integer = 1 };
+                            }
+                            try rows.append(self.allocator, row);
+                        }
+                    }
+                }
+            }
+        }
+        return .{ .allocator = self.allocator, .columns = columns, .rows = try rows.toOwnedSlice(self.allocator) };
+    }
+
+    fn pragmaForeignKeyList(self: *Connection, value: anytype) !Result {
+        const names = [_][]const u8{ "id", "seq", "table", "from", "to", "on_update", "on_delete", "match" };
+        const columns = try self.ownedColumns(&names);
+        var rows = std.ArrayList([]Value).empty;
+        errdefer {
+            for (rows.items) |row| {
+                for (row) |item| self.freeConcatText(item);
+                self.allocator.free(row);
+            }
+            rows.deinit(self.allocator);
+        }
+        if (pragmaArgumentName(value)) |name| {
+            if (!pragmaSchemaIsTemp(value)) {
+                if (self.store.find(name)) |table| {
+                    var id: i64 = 0;
+                    for (table.columns) |column| {
+                        const foreignTable = column.foreignTable orelse continue;
+                        const row = try self.allocator.alloc(Value, names.len);
+                        errdefer self.allocator.free(row);
+                        row[0] = .{ .integer = id };
+                        row[1] = .{ .integer = 0 };
+                        row[2] = .{ .text = try self.allocator.dupe(u8, foreignTable) };
+                        row[3] = .{ .text = try self.allocator.dupe(u8, column.name) };
+                        row[4] = if (column.foreignColumn) |foreignColumn| .{ .text = try self.allocator.dupe(u8, foreignColumn) } else .null;
+                        row[5] = .{ .text = try self.allocator.dupe(u8, fkActionName(column.onUpdate)) };
+                        row[6] = .{ .text = try self.allocator.dupe(u8, fkActionName(column.onDelete)) };
+                        row[7] = .{ .text = try self.allocator.dupe(u8, "NONE") };
+                        try rows.append(self.allocator, row);
+                        id += 1;
+                    }
+                    for (table.constraints) |constraint| {
+                        if (constraint.kind != .foreignKey) continue;
+                        const foreignTable = constraint.foreignTable orelse continue;
+                        for (constraint.columns, 0..) |childColumn, position| {
+                            const row = try self.allocator.alloc(Value, names.len);
+                            errdefer self.allocator.free(row);
+                            row[0] = .{ .integer = id };
+                            row[1] = .{ .integer = @intCast(position) };
+                            row[2] = .{ .text = try self.allocator.dupe(u8, foreignTable) };
+                            row[3] = .{ .text = try self.allocator.dupe(u8, childColumn) };
+                            if (position < constraint.referencedColumns.len) {
+                                row[4] = .{ .text = try self.allocator.dupe(u8, constraint.referencedColumns[position]) };
+                            } else row[4] = .null;
+                            row[5] = .{ .text = try self.allocator.dupe(u8, fkActionName(constraint.onUpdate)) };
+                            row[6] = .{ .text = try self.allocator.dupe(u8, fkActionName(constraint.onDelete)) };
+                            row[7] = .{ .text = try self.allocator.dupe(u8, "NONE") };
+                            try rows.append(self.allocator, row);
+                        }
+                        id += 1;
+                    }
+                }
+            }
+        }
+        return .{ .allocator = self.allocator, .columns = columns, .rows = try rows.toOwnedSlice(self.allocator) };
+    }
+
+    fn pragmaDatabaseList(self: *Connection) !Result {
+        const names = [_][]const u8{ "seq", "name", "file" };
+        const columns = try self.ownedColumns(&names);
+        const rows = try self.allocator.alloc([]Value, 2);
+        errdefer self.allocator.free(rows);
+        rows[0] = try self.allocator.alloc(Value, names.len);
+        rows[0][0] = .{ .integer = 0 };
+        rows[0][1] = .{ .text = try self.allocator.dupe(u8, "main") };
+        rows[0][2] = .{ .text = try self.allocator.dupe(u8, self.file.path) };
+        rows[1] = try self.allocator.alloc(Value, names.len);
+        rows[1][0] = .{ .integer = 1 };
+        rows[1][1] = .{ .text = try self.allocator.dupe(u8, "temp") };
+        rows[1][2] = .{ .text = try self.allocator.dupe(u8, "") };
+        return .{ .allocator = self.allocator, .columns = columns, .rows = rows };
+    }
+
+    fn pragmaTableList(self: *Connection, value: anytype) !Result {
+        const names = [_][]const u8{ "schema", "name", "type", "ncol", "wr", "strict" };
+        const columns = try self.ownedColumns(&names);
+        var rows = std.ArrayList([]Value).empty;
+        errdefer {
+            for (rows.items) |row| {
+                for (row) |item| self.freeConcatText(item);
+                self.allocator.free(row);
+            }
+            rows.deinit(self.allocator);
+        }
+        const filter = pragmaArgumentName(value);
+        if (!pragmaSchemaIsTemp(value)) {
+            for (self.store.tables.items) |table| {
+                if (filter) |wanted| if (!std.ascii.eqlIgnoreCase(wanted, table.name)) continue;
+                const row = try self.allocator.alloc(Value, names.len);
+                errdefer self.allocator.free(row);
+                row[0] = .{ .text = try self.allocator.dupe(u8, "main") };
+                row[1] = .{ .text = try self.allocator.dupe(u8, table.name) };
+                row[2] = .{ .text = try self.allocator.dupe(u8, if (table.virtualModule != null) "virtual" else "table") };
+                row[3] = .{ .integer = @intCast(table.columns.len) };
+                row[4] = .{ .integer = if (table.withoutRowid) 1 else 0 };
+                row[5] = .{ .integer = if (table.strict) 1 else 0 };
+                try rows.append(self.allocator, row);
+            }
+            for (self.store.views.items) |view| {
+                if (filter) |wanted| if (!std.ascii.eqlIgnoreCase(wanted, view.name)) continue;
+                const viewColumns = try self.viewColumnNames(&view);
+                defer {
+                    for (viewColumns) |columnName| self.allocator.free(columnName);
+                    self.allocator.free(viewColumns);
+                }
+                const row = try self.allocator.alloc(Value, names.len);
+                errdefer self.allocator.free(row);
+                row[0] = .{ .text = try self.allocator.dupe(u8, "main") };
+                row[1] = .{ .text = try self.allocator.dupe(u8, view.name) };
+                row[2] = .{ .text = try self.allocator.dupe(u8, "view") };
+                row[3] = .{ .integer = @intCast(viewColumns.len) };
+                row[4] = .{ .integer = 0 };
+                row[5] = .{ .integer = 0 };
+                try rows.append(self.allocator, row);
+            }
+        }
+        return .{ .allocator = self.allocator, .columns = columns, .rows = try rows.toOwnedSlice(self.allocator) };
     }
 
     fn vacuumCommand(self: *Connection, schemaName: ?[]const u8, into: ?ast.Expr) !Result {
@@ -10606,4 +10997,217 @@ test "wal checkpoint merges frames and reports counts" {
     var reopened = try db.exec("SELECT count(*) FROM chk;");
     defer reopened.deinit();
     try std.testing.expectEqual(@as(i64, 2), reopened.rows[0][0].integer);
+}
+
+test "distinct aggregates work bare grouped and joined" {
+    const path = "sqlite_zig_distinct_agg_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    var setup = try db.exec("CREATE TABLE d (x INTEGER, g TEXT); INSERT INTO d VALUES (1, 'a'), (2, 'a'), (2, 'a'), (NULL, 'a'), (3, 'b'), (3, 'b');");
+    setup.deinit();
+    var bare = try db.exec("SELECT count(DISTINCT x), sum(DISTINCT x), avg(DISTINCT x), min(DISTINCT x), max(DISTINCT x), total(DISTINCT x), group_concat(DISTINCT x), group_concat(DISTINCT x, ';') FROM d;");
+    defer bare.deinit();
+    try std.testing.expectEqual(@as(i64, 3), bare.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 6), bare.rows[0][1].integer);
+    try std.testing.expectEqual(@as(f64, 2.0), bare.rows[0][2].real);
+    try std.testing.expectEqual(@as(i64, 1), bare.rows[0][3].integer);
+    try std.testing.expectEqual(@as(i64, 3), bare.rows[0][4].integer);
+    try std.testing.expectEqual(@as(f64, 6.0), bare.rows[0][5].real);
+    try std.testing.expectEqualStrings("1,2,3", bare.rows[0][6].text);
+    try std.testing.expectEqualStrings("1;2;3", bare.rows[0][7].text);
+    var grouped = try db.exec("SELECT g, count(DISTINCT x), sum(DISTINCT x) FROM d GROUP BY g ORDER BY g;");
+    defer grouped.deinit();
+    try std.testing.expectEqual(@as(usize, 2), grouped.count());
+    try std.testing.expectEqualStrings("a", grouped.rows[0][0].text);
+    try std.testing.expectEqual(@as(i64, 2), grouped.rows[0][1].integer);
+    try std.testing.expectEqual(@as(i64, 3), grouped.rows[0][2].integer);
+    try std.testing.expectEqualStrings("b", grouped.rows[1][0].text);
+    try std.testing.expectEqual(@as(i64, 1), grouped.rows[1][1].integer);
+    var having = try db.exec("SELECT g FROM d GROUP BY g HAVING count(DISTINCT x) > 1;");
+    defer having.deinit();
+    try std.testing.expectEqual(@as(usize, 1), having.count());
+    try std.testing.expectEqualStrings("a", having.rows[0][0].text);
+    var sub = try db.exec("SELECT c FROM (SELECT count(DISTINCT x) AS c FROM d);");
+    defer sub.deinit();
+    try std.testing.expectEqual(@as(i64, 3), sub.rows[0][0].integer);
+    var tables = try db.exec("CREATE TABLE e (y INTEGER); INSERT INTO e VALUES (2), (3), (3);");
+    tables.deinit();
+    var joined = try db.exec("SELECT count(DISTINCT d.x), sum(DISTINCT e.y) FROM d JOIN e ON d.x = e.y;");
+    defer joined.deinit();
+    try std.testing.expectEqual(@as(i64, 2), joined.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 5), joined.rows[0][1].integer);
+    try std.testing.expectError(error.UnexpectedToken, db.exec("SELECT count(DISTINCT *) FROM d;"));
+}
+
+test "schema introspection pragmas report catalog state" {
+    const path = "sqlite_zig_pragma_info_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    var setup = try db.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL DEFAULT 'anon', age INTEGER DEFAULT 18, score REAL DEFAULT 1.5, data BLOB, parent_id INTEGER REFERENCES users(id) ON DELETE CASCADE, extra TEXT GENERATED ALWAYS AS (name) VIRTUAL, backup TEXT GENERATED ALWAYS AS (name) STORED, UNIQUE(name, age));");
+    setup.deinit();
+    var composite = try db.exec("CREATE TABLE composite (a INTEGER, b INTEGER, c TEXT, PRIMARY KEY (a, b), FOREIGN KEY (a, b) REFERENCES users(id, age) ON UPDATE SET NULL ON DELETE RESTRICT);");
+    composite.deinit();
+    var wr = try db.exec("CREATE TABLE wr (k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID, STRICT;");
+    wr.deinit();
+    var indexes = try db.exec("CREATE INDEX idx_users_age ON users(age); CREATE UNIQUE INDEX idx_users_name ON users(name); CREATE INDEX idx_partial ON users(age) WHERE age > 18; CREATE INDEX idx_expr ON users(lower(name));");
+    indexes.deinit();
+    var view = try db.exec("CREATE VIEW names AS SELECT id, name FROM users;");
+    view.deinit();
+
+    var info = try db.exec("PRAGMA table_info(users);");
+    defer info.deinit();
+    try std.testing.expectEqual(@as(usize, 6), info.count());
+    try std.testing.expectEqualStrings("cid", info.columns[0]);
+    try std.testing.expectEqualStrings("dflt_value", info.columns[4]);
+    try std.testing.expectEqualStrings("pk", info.columns[5]);
+    try std.testing.expectEqual(@as(i64, 0), info.rows[0][0].integer);
+    try std.testing.expectEqualStrings("id", info.rows[0][1].text);
+    try std.testing.expectEqualStrings("INTEGER", info.rows[0][2].text);
+    try std.testing.expectEqual(@as(i64, 0), info.rows[0][3].integer);
+    try std.testing.expect(info.rows[0][4] == .null);
+    try std.testing.expectEqual(@as(i64, 1), info.rows[0][5].integer);
+    try std.testing.expectEqualStrings("name", info.rows[1][1].text);
+    try std.testing.expectEqual(@as(i64, 1), info.rows[1][3].integer);
+    try std.testing.expectEqualStrings("'anon'", info.rows[1][4].text);
+    try std.testing.expectEqualStrings("18", info.rows[2][4].text);
+    try std.testing.expectEqualStrings("1.5", info.rows[3][4].text);
+    try std.testing.expect(info.rows[4][4] == .null);
+    try std.testing.expect(info.rows[5][4] == .null);
+
+    var xinfo = try db.exec("PRAGMA table_xinfo(users);");
+    defer xinfo.deinit();
+    try std.testing.expectEqual(@as(usize, 8), xinfo.count());
+    try std.testing.expectEqualStrings("hidden", xinfo.columns[6]);
+    try std.testing.expectEqual(@as(i64, 0), xinfo.rows[0][6].integer);
+    try std.testing.expectEqualStrings("extra", xinfo.rows[6][1].text);
+    try std.testing.expectEqual(@as(i64, 2), xinfo.rows[6][6].integer);
+    try std.testing.expect(xinfo.rows[6][4] == .null);
+    try std.testing.expectEqualStrings("backup", xinfo.rows[7][1].text);
+    try std.testing.expectEqual(@as(i64, 3), xinfo.rows[7][6].integer);
+
+    var compInfo = try db.exec("PRAGMA table_info(composite);");
+    defer compInfo.deinit();
+    try std.testing.expectEqual(@as(i64, 1), compInfo.rows[0][5].integer);
+    try std.testing.expectEqual(@as(i64, 2), compInfo.rows[1][5].integer);
+    try std.testing.expectEqual(@as(i64, 0), compInfo.rows[2][5].integer);
+
+    var viewInfo = try db.exec("PRAGMA table_info(names);");
+    defer viewInfo.deinit();
+    try std.testing.expectEqual(@as(usize, 2), viewInfo.count());
+    try std.testing.expectEqualStrings("id", viewInfo.rows[0][1].text);
+    try std.testing.expectEqualStrings("name", viewInfo.rows[1][1].text);
+
+    var missing = try db.exec("PRAGMA table_info(nosuch);");
+    defer missing.deinit();
+    try std.testing.expectEqual(@as(usize, 0), missing.count());
+    try std.testing.expectEqual(@as(usize, 6), missing.columns.len);
+    var bare = try db.exec("PRAGMA table_info;");
+    defer bare.deinit();
+    try std.testing.expectEqual(@as(usize, 0), bare.count());
+    var valueForm = try db.exec("PRAGMA table_info=users;");
+    defer valueForm.deinit();
+    try std.testing.expectEqual(@as(usize, 6), valueForm.count());
+    var schemaForm = try db.exec("PRAGMA main.table_info(users);");
+    defer schemaForm.deinit();
+    try std.testing.expectEqual(@as(usize, 6), schemaForm.count());
+    var tempForm = try db.exec("PRAGMA temp.table_info(users);");
+    defer tempForm.deinit();
+    try std.testing.expectEqual(@as(usize, 0), tempForm.count());
+    try std.testing.expectError(error.Unsupported, db.exec("PRAGMA bogus.table_info(users);"));
+
+    var indexList = try db.exec("PRAGMA index_list(users);");
+    defer indexList.deinit();
+    try std.testing.expectEqual(@as(usize, 5), indexList.count());
+    try std.testing.expectEqualStrings("seq", indexList.columns[0]);
+    try std.testing.expectEqualStrings("origin", indexList.columns[3]);
+    try std.testing.expectEqualStrings("partial", indexList.columns[4]);
+    try std.testing.expectEqual(@as(i64, 0), indexList.rows[0][0].integer);
+    try std.testing.expectEqualStrings("sqlite_autoindex_users_1", indexList.rows[0][1].text);
+    try std.testing.expectEqual(@as(i64, 1), indexList.rows[0][2].integer);
+    try std.testing.expectEqualStrings("u", indexList.rows[0][3].text);
+    try std.testing.expectEqualStrings("c", indexList.rows[1][3].text);
+    try std.testing.expectEqual(@as(i64, 0), indexList.rows[1][4].integer);
+    try std.testing.expectEqualStrings("idx_partial", indexList.rows[3][1].text);
+    try std.testing.expectEqual(@as(i64, 1), indexList.rows[3][4].integer);
+    var compIndexes = try db.exec("PRAGMA index_list(composite);");
+    defer compIndexes.deinit();
+    try std.testing.expectEqual(@as(usize, 1), compIndexes.count());
+    try std.testing.expectEqualStrings("pk", compIndexes.rows[0][3].text);
+    var viewIndexes = try db.exec("PRAGMA index_list(names);");
+    defer viewIndexes.deinit();
+    try std.testing.expectEqual(@as(usize, 0), viewIndexes.count());
+
+    var indexInfo = try db.exec("PRAGMA index_info(idx_users_age);");
+    defer indexInfo.deinit();
+    try std.testing.expectEqual(@as(usize, 1), indexInfo.count());
+    try std.testing.expectEqual(@as(i64, 0), indexInfo.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 2), indexInfo.rows[0][1].integer);
+    try std.testing.expectEqualStrings("age", indexInfo.rows[0][2].text);
+    var exprInfo = try db.exec("PRAGMA index_info(idx_expr);");
+    defer exprInfo.deinit();
+    try std.testing.expectEqual(@as(usize, 1), exprInfo.count());
+    try std.testing.expectEqual(@as(i64, -1), exprInfo.rows[0][1].integer);
+    try std.testing.expect(exprInfo.rows[0][2] == .null);
+    var xindex = try db.exec("PRAGMA index_xinfo(idx_users_age);");
+    defer xindex.deinit();
+    try std.testing.expectEqual(@as(usize, 6), xindex.columns.len);
+    try std.testing.expectEqual(@as(i64, 0), xindex.rows[0][3].integer);
+    try std.testing.expectEqualStrings("BINARY", xindex.rows[0][4].text);
+    try std.testing.expectEqual(@as(i64, 1), xindex.rows[0][5].integer);
+    var missingIndex = try db.exec("PRAGMA index_info(nosuch);");
+    defer missingIndex.deinit();
+    try std.testing.expectEqual(@as(usize, 0), missingIndex.count());
+
+    var fkList = try db.exec("PRAGMA foreign_key_list(users);");
+    defer fkList.deinit();
+    try std.testing.expectEqual(@as(usize, 1), fkList.count());
+    try std.testing.expectEqual(@as(i64, 0), fkList.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 0), fkList.rows[0][1].integer);
+    try std.testing.expectEqualStrings("users", fkList.rows[0][2].text);
+    try std.testing.expectEqualStrings("parent_id", fkList.rows[0][3].text);
+    try std.testing.expectEqualStrings("id", fkList.rows[0][4].text);
+    try std.testing.expectEqualStrings("NO ACTION", fkList.rows[0][5].text);
+    try std.testing.expectEqualStrings("CASCADE", fkList.rows[0][6].text);
+    try std.testing.expectEqualStrings("NONE", fkList.rows[0][7].text);
+    var compFk = try db.exec("PRAGMA foreign_key_list(composite);");
+    defer compFk.deinit();
+    try std.testing.expectEqual(@as(usize, 2), compFk.count());
+    try std.testing.expectEqual(@as(i64, 0), compFk.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 0), compFk.rows[0][1].integer);
+    try std.testing.expectEqualStrings("a", compFk.rows[0][3].text);
+    try std.testing.expectEqualStrings("id", compFk.rows[0][4].text);
+    try std.testing.expectEqualStrings("SET NULL", compFk.rows[0][5].text);
+    try std.testing.expectEqualStrings("RESTRICT", compFk.rows[0][6].text);
+    try std.testing.expectEqual(@as(i64, 1), compFk.rows[1][1].integer);
+    try std.testing.expectEqualStrings("b", compFk.rows[1][3].text);
+    try std.testing.expectEqualStrings("age", compFk.rows[1][4].text);
+    var noFk = try db.exec("PRAGMA foreign_key_list(wr);");
+    defer noFk.deinit();
+    try std.testing.expectEqual(@as(usize, 0), noFk.count());
+
+    var dbList = try db.exec("PRAGMA database_list;");
+    defer dbList.deinit();
+    try std.testing.expectEqual(@as(usize, 2), dbList.count());
+    try std.testing.expectEqual(@as(i64, 0), dbList.rows[0][0].integer);
+    try std.testing.expectEqualStrings("main", dbList.rows[0][1].text);
+    try std.testing.expectEqualStrings(path, dbList.rows[0][2].text);
+    try std.testing.expectEqualStrings("temp", dbList.rows[1][1].text);
+    try std.testing.expectEqualStrings("", dbList.rows[1][2].text);
+
+    var tableList = try db.exec("PRAGMA table_list;");
+    defer tableList.deinit();
+    try std.testing.expectEqual(@as(usize, 4), tableList.count());
+    try std.testing.expectEqualStrings("users", tableList.rows[0][1].text);
+    try std.testing.expectEqualStrings("table", tableList.rows[0][2].text);
+    try std.testing.expectEqual(@as(i64, 8), tableList.rows[0][3].integer);
+    try std.testing.expectEqual(@as(i64, 0), tableList.rows[0][4].integer);
+    try std.testing.expectEqualStrings("wr", tableList.rows[2][1].text);
+    try std.testing.expectEqual(@as(i64, 1), tableList.rows[2][4].integer);
+    try std.testing.expectEqual(@as(i64, 1), tableList.rows[2][5].integer);
+    try std.testing.expectEqualStrings("names", tableList.rows[3][1].text);
+    try std.testing.expectEqualStrings("view", tableList.rows[3][2].text);
+    try std.testing.expectEqual(@as(i64, 2), tableList.rows[3][3].integer);
+    var filtered = try db.exec("PRAGMA table_list(users);");
+    defer filtered.deinit();
+    try std.testing.expectEqual(@as(usize, 1), filtered.count());
 }

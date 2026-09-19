@@ -152,7 +152,7 @@ pub const Parser = struct {
     }
 
     fn isAggregateName(name: []const u8) bool {
-        return std.ascii.eqlIgnoreCase(name, "count") or std.ascii.eqlIgnoreCase(name, "sum") or std.ascii.eqlIgnoreCase(name, "avg") or std.ascii.eqlIgnoreCase(name, "average") or std.ascii.eqlIgnoreCase(name, "min") or std.ascii.eqlIgnoreCase(name, "max");
+        return std.ascii.eqlIgnoreCase(name, "count") or std.ascii.eqlIgnoreCase(name, "sum") or std.ascii.eqlIgnoreCase(name, "total") or std.ascii.eqlIgnoreCase(name, "avg") or std.ascii.eqlIgnoreCase(name, "average") or std.ascii.eqlIgnoreCase(name, "min") or std.ascii.eqlIgnoreCase(name, "max") or std.ascii.eqlIgnoreCase(name, "group_concat") or std.ascii.eqlIgnoreCase(name, "string_agg");
     }
 
     fn qualifiedName(self: *Parser) !struct { table: []const u8, column: []const u8 } {
@@ -183,14 +183,26 @@ pub const Parser = struct {
     pub fn parse(self: *Parser) !ast.Statement {
         var statement: ast.Statement = undefined;
         if (self.acceptWord("pragma")) {
-            const pragmaName = try self.word();
+            var pragmaName = try self.word();
+            var pragmaSchema: ?[]const u8 = null;
+            if (self.acceptTag(.dot)) {
+                pragmaSchema = pragmaName;
+                pragmaName = try self.word();
+            }
             var pragmaValue: ?[]const u8 = null;
             var pragmaArgument: ?[]const u8 = null;
             if (self.acceptTag(.lparen)) {
                 const token = self.current();
-                if (token.tag != .word and token.tag != .number) return Error.UnexpectedToken;
+                if (token.tag != .word and token.tag != .number and token.tag != .string) return Error.UnexpectedToken;
                 _ = self.advance();
-                pragmaArgument = token.text;
+                if (self.acceptTag(.dot)) {
+                    const second = try self.word();
+                    const combined = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ token.text, second });
+                    defer self.allocator.free(combined);
+                    pragmaArgument = try self.copy(combined);
+                } else {
+                    pragmaArgument = token.text;
+                }
                 try self.requireTag(.rparen);
             } else if (self.acceptTag(.equal)) {
                 const token = self.current();
@@ -206,7 +218,7 @@ pub const Parser = struct {
                     pragmaValue = token.text;
                 }
             }
-            statement = .{ .pragma = .{ .name = pragmaName, .value = pragmaValue, .argument = pragmaArgument } };
+            statement = .{ .pragma = .{ .name = pragmaName, .value = pragmaValue, .argument = pragmaArgument, .schema = pragmaSchema } };
         } else if (self.acceptWord("with")) statement = try self.parseWith() else if (self.acceptWord("explain")) {
             try self.requireWord("query");
             try self.requireWord("plan");
@@ -433,8 +445,8 @@ pub const Parser = struct {
                 try self.requireTag(.lparen);
                 const foreignColumn = try self.word();
                 try self.requireTag(.rparen);
-                var onDelete: ast.ReferentialAction = .restrict;
-                var onUpdate: ast.ReferentialAction = .restrict;
+                var onDelete: ast.ReferentialAction = .noAction;
+                var onUpdate: ast.ReferentialAction = .noAction;
                 while (self.acceptWord("on")) {
                     const action = if (self.acceptWord("delete")) blk: {
                         break :blk &onDelete;
@@ -556,8 +568,8 @@ pub const Parser = struct {
                     }
                     try self.requireTag(.rparen);
                     if (childColumns.items.len == 0 or childColumns.items.len != parentColumns.items.len) return Error.InvalidSql;
-                    var onDelete: ast.ReferentialAction = .restrict;
-                    var onUpdate: ast.ReferentialAction = .restrict;
+                    var onDelete: ast.ReferentialAction = .noAction;
+                    var onUpdate: ast.ReferentialAction = .noAction;
                     while (self.acceptWord("on")) {
                         const action = if (self.acceptWord("delete")) blk: {
                             break :blk &onDelete;

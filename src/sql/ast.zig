@@ -82,7 +82,7 @@ pub const Statement = union(enum) {
     withSelect: WithSelect,
     compoundSelect: CompoundSelect,
     explainQueryPlan: []const u8,
-    pragma: struct { name: []const u8, value: ?[]const u8 = null, argument: ?[]const u8 = null },
+    pragma: struct { name: []const u8, value: ?[]const u8 = null, argument: ?[]const u8 = null, schema: ?[]const u8 = null },
     alterTable: AlterTable,
     dropTable: struct { name: []const u8, ifExists: bool = false },
     dropIndex: struct { name: []const u8, ifExists: bool = false },

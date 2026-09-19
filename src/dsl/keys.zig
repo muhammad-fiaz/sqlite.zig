@@ -112,8 +112,8 @@ pub const ForeignKeySpec = struct {
     refTable: []const u8 = "",
     refCols: [16][]const u8 = undefined,
     refCount: usize = 0,
-    onDelete: ast.ReferentialAction = .restrict,
-    onUpdate: ast.ReferentialAction = .restrict,
+    onDelete: ast.ReferentialAction = .noAction,
+    onUpdate: ast.ReferentialAction = .noAction,
 };
 
 fn normalizeRefList(ref: anytype, outTable: *[]const u8, outCols: *[16][]const u8) !usize {
@@ -472,7 +472,7 @@ test "parseFkSpec funnels every key shape into one spec" {
     try std.testing.expectEqualStrings("users", single.refTable);
     try std.testing.expectEqualStrings("id", single.refCols[0]);
     try std.testing.expect(single.onDelete == .cascade);
-    try std.testing.expect(single.onUpdate == .restrict);
+    try std.testing.expect(single.onUpdate == .noAction);
     const dyn = try parseFkSpec(.{ .column = "user_id", .references = .{ .table = "users", .column = "id" } }, "orders");
     try std.testing.expectEqualStrings("users", dyn.refTable);
     const A = dslColumn.Column("c", "a", i64);
