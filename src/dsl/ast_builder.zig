@@ -713,7 +713,7 @@ pub fn buildInsert(allocator: std.mem.Allocator, table: []const u8, columns: []c
     return .{ .stmt = stmt, .ownedStrings = ctx.takeStrings(), .allocator = allocator };
 }
 
-pub fn buildUpdate(allocator: std.mem.Allocator, table: []const u8, setNames: []const []const u8, setValues: []const Value, conditions: []const CondEntry, returning: []const dslExpr.Projection, cases: []const CaseBuilder, caseWhens: []const CaseWhereArgs) !BuiltStatement {
+pub fn buildUpdate(allocator: std.mem.Allocator, table: []const u8, setNames: []const []const u8, setValues: []const Value, conditions: []const CondEntry, returning: []const dslExpr.Projection, cases: []const CaseBuilder, caseWhens: []const CaseWhereArgs, from: ?ast.UpdateFrom) !BuiltStatement {
     if (setNames.len == 0 or setNames.len != setValues.len) return error.InvalidSql;
     var ctx = Ctx.init(allocator);
     var condList = std.ArrayList(ast.Condition).empty;
@@ -734,6 +734,7 @@ pub fn buildUpdate(allocator: std.mem.Allocator, table: []const u8, setNames: []
         .columns = ownedColumns,
         .values = assigned,
         .condition = if (condList.items.len == 0) null else try condList.toOwnedSlice(allocator),
+        .from = from,
         .returning = returningProjs,
     } };
     ctx.nodes.deinit(allocator);

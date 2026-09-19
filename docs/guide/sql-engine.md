@@ -15,7 +15,7 @@ description: "The hand-written SQL lexer, parser, and bytecode compiler supporti
 | **DROP TABLE** | `DROP TABLE [IF EXISTS] name` |
 | **INSERT** | `INSERT INTO name VALUES (...)` or `INSERT INTO name (cols) VALUES (...)` |
 | **SELECT** | `SELECT [DISTINCT] columns FROM table [JOIN ...] [WHERE ...] [GROUP BY ...] [HAVING ...] [ORDER BY ...] [LIMIT ... [OFFSET ...]]` |
-| **UPDATE** | `UPDATE name SET col = expr [WHERE ...]` |
+| **UPDATE** | `UPDATE name SET col = expr [WHERE ...]` and `UPDATE name SET ... FROM source WHERE join [AND ...]` |
 | **DELETE** | `DELETE FROM name [WHERE ...]` |
 | **BEGIN** | `BEGIN [DEFERRED\|IMMEDIATE\|EXCLUSIVE]` or `START TRANSACTION` |
 | **COMMIT** | `COMMIT` |
@@ -36,8 +36,15 @@ description: "The hand-written SQL lexer, parser, and bytecode compiler supporti
 | **DROP** | `DROP TABLE/INDEX/VIEW/TRIGGER [IF EXISTS] name` |
 | **PRAGMA** | `foreign_keys`, `user_version`, `application_id`, `journal_mode`, `synchronous`, `cache_size`, `page_size`, `encoding`, `busy_timeout`, `locking_mode`, `auto_vacuum`, `integrity_check`, `foreign_key_check` |
 
-`ATTACH` and `DETACH` parse but return an explicit unsupported-feature error;
-partial (`WHERE`) and expression indexes are not accepted by the parser.
+`ATTACH` and `DETACH` parse but return an explicit unsupported-feature error.
+
+Partial (`WHERE`) and expression indexes are supported: `CREATE [UNIQUE]
+INDEX name ON table (columns) WHERE predicate` indexes only matching rows
+(enforcing uniqueness among them), and index keys accept expressions such as
+`lower(email)`. Predicates and keys must reference the indexed table's
+columns; subqueries, aggregates, and window functions are rejected with an
+explicit error. The planner uses a partial index only when the query implies
+its predicate, and an expression index only for matching expressions.
 
 ## JOIN Types
 
@@ -164,8 +171,10 @@ Table definitions support declared types with full SQLite type names
 - `STRICT` tables (values outside the declared type are rejected) and
   `WITHOUT ROWID` tables (keyed by primary key)
 
-Partial (`WHERE`) and expression indexes are not accepted by the parser;
-plain and `UNIQUE` column indexes are supported.
+Plain and `UNIQUE` column indexes are supported, as are partial indexes
+(`CREATE INDEX ... WHERE predicate`, uniqueness enforced among matching rows
+only) and expression index keys (`CREATE INDEX ... ON t (lower(email))`,
+uniqueness enforced on computed values).
 
 ## Architecture
 

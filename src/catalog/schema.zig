@@ -2,12 +2,26 @@ const std = @import("std");
 const Value = @import("../vm/value.zig").Value;
 const ast = @import("../sql/ast.zig");
 const exprEvaluator = @import("../sql/expr.zig");
+const functions = @import("../sql/functions.zig");
 
 pub const Column = struct { name: []u8, typeName: []u8, primaryKey: bool, notNull: bool, unique: bool = false, defaultValue: ?Value = null, foreignTable: ?[]u8 = null, foreignColumn: ?[]u8 = null, onDelete: ast.ReferentialAction = .restrict, onUpdate: ast.ReferentialAction = .restrict, checkExpr: ?ast.Expr = null, generatedExpr: ?ast.Expr = null, generatedStored: bool = false };
 pub const Row = struct { values: []Value };
 pub const Constraint = struct { kind: enum { primaryKey, unique, foreignKey, check }, columns: [][]u8, foreignTable: ?[]u8 = null, referencedColumns: [][]u8 = &.{}, onDelete: ast.ReferentialAction = .restrict, onUpdate: ast.ReferentialAction = .restrict, checkExpr: ?ast.Expr = null };
 pub const Table = struct { name: []u8, columns: []Column, constraints: []Constraint, rows: std.ArrayList(Row), virtualModule: ?[]u8 = null, virtualArguments: [][]u8 = &.{}, strict: bool = false, withoutRowid: bool = false };
-pub const Index = struct { name: []u8, table: []u8, columns: [][]u8, unique: bool = false };
+pub const Index = struct {
+    name: []u8,
+    table: []u8,
+    columns: [][]u8,
+    keyExprs: []?ast.Expr = &.{},
+    unique: bool = false,
+    whereExpr: ?ast.Expr = null,
+    whereSql: ?[]u8 = null,
+
+    pub fn keyExpr(self: *const Index, position: usize) ?ast.Expr {
+        if (position >= self.keyExprs.len) return null;
+        return self.keyExprs[position];
+    }
+};
 pub const View = struct { name: []u8, sql: []u8 };
 pub const Trigger = struct { name: []u8, table: []u8, timing: ast.TriggerTiming = .after, event: ast.TriggerEvent, whenSql: ?[]u8 = null, body: []u8 };
 
@@ -60,6 +74,10 @@ pub const Schema = struct {
             self.allocator.free(index.table);
             for (index.columns) |column| self.allocator.free(column);
             self.allocator.free(index.columns);
+            for (index.keyExprs) |maybeKey| if (maybeKey) |key| ast.freeOwnedExpr(self.allocator, key);
+            self.allocator.free(index.keyExprs);
+            if (index.whereExpr) |predicate| ast.freeOwnedExpr(self.allocator, predicate);
+            if (index.whereSql) |sql| self.allocator.free(sql);
         }
         self.indexes.deinit(self.allocator);
         for (self.views.items) |view| {
@@ -165,11 +183,96 @@ pub const Schema = struct {
         return error.UnknownTrigger;
     }
 
+    fn validateIndexPredicate(self: *const Schema, table: *const Table, tableName: []const u8, expr: ast.Expr, sawColumn: *bool) !void {
+        switch (expr) {
+            .literal => {},
+            .identifier => |id| {
+                const clean = if (std.mem.indexOfScalar(u8, id, '.')) |dot| blk: {
+                    if (!std.ascii.eqlIgnoreCase(id[0..dot], tableName)) return error.UnknownColumn;
+                    break :blk id[dot + 1 ..];
+                } else id;
+                if (self.columnIndex(table, clean) == null) return error.UnknownColumn;
+                sawColumn.* = true;
+            },
+            .parameter => return error.InvalidSql,
+            .wildcard => return error.InvalidSql,
+            .binary => |bin| {
+                try self.validateIndexPredicate(table, tableName, bin.left.*, sawColumn);
+                try self.validateIndexPredicate(table, tableName, bin.right.*, sawColumn);
+            },
+            .unary => |un| try self.validateIndexPredicate(table, tableName, un.expr.*, sawColumn),
+            .collate => |col| try self.validateIndexPredicate(table, tableName, col.expr.*, sawColumn),
+            .patternMatch => |match| {
+                try self.validateIndexPredicate(table, tableName, match.value.*, sawColumn);
+                try self.validateIndexPredicate(table, tableName, match.pattern.*, sawColumn);
+                if (match.escape) |escape| try self.validateIndexPredicate(table, tableName, escape.*, sawColumn);
+            },
+            .caseExpr => |caseBlock| {
+                if (caseBlock.base) |base| try self.validateIndexPredicate(table, tableName, base.*, sawColumn);
+                for (caseBlock.whens) |when| {
+                    try self.validateIndexPredicate(table, tableName, when.condition, sawColumn);
+                    try self.validateIndexPredicate(table, tableName, when.result, sawColumn);
+                }
+                if (caseBlock.otherwise) |otherwise| try self.validateIndexPredicate(table, tableName, otherwise.*, sawColumn);
+            },
+            .inList => |list| {
+                try self.validateIndexPredicate(table, tableName, list.expr.*, sawColumn);
+                for (list.list) |item| try self.validateIndexPredicate(table, tableName, item, sawColumn);
+            },
+            .function => |call| {
+                if (functions.aggregate.AggKind.fromName(call.name) != null) return error.InvalidSql;
+                if (functions.isWindowOnly(call.name)) return error.InvalidSql;
+                try self.validateIndexPredicate(table, tableName, call.argument.*, sawColumn);
+                if (call.argument2) |argument| try self.validateIndexPredicate(table, tableName, argument.*, sawColumn);
+                if (call.argument3) |argument| try self.validateIndexPredicate(table, tableName, argument.*, sawColumn);
+                for (call.extraArgs) |argument| try self.validateIndexPredicate(table, tableName, argument, sawColumn);
+            },
+            .scalarSubquery, .existsSubquery, .inSubquery, .window => return error.InvalidSql,
+        }
+    }
+
+    pub fn indexPredicateHolds(self: *const Schema, table: *const Table, index: *const Index, values: []const Value) !bool {
+        const predicate = index.whereExpr orelse return true;
+        var colNames = try self.allocator.alloc([]const u8, table.columns.len);
+        defer self.allocator.free(colNames);
+        for (table.columns, 0..) |col, idx| colNames[idx] = col.name;
+        return exprEvaluator.evalPredicate(self.allocator, colNames, values, predicate);
+    }
+
+    pub fn indexKeysEqual(self: *const Schema, table: *const Table, index: *const Index, colNames: []const []const u8, left: []const Value, right: []const Value) !bool {
+        for (index.columns, 0..) |_, position| {
+            if (index.keyExpr(position)) |key| {
+                const leftVal = try exprEvaluator.evalTemp(self.allocator, colNames, left, key);
+                defer exprEvaluator.freeValue(self.allocator, leftVal);
+                const rightVal = try exprEvaluator.evalTemp(self.allocator, colNames, right, key);
+                defer exprEvaluator.freeValue(self.allocator, rightVal);
+                if (leftVal == .null or rightVal == .null) return false;
+                if (!valuesEqual(leftVal, rightVal)) return false;
+                continue;
+            }
+            const columnIdx = self.columnIndex(table, index.columns[position]) orelse return false;
+            if (left[columnIdx] == .null or right[columnIdx] == .null) return false;
+            if (!valuesEqual(left[columnIdx], right[columnIdx])) return false;
+        }
+        return true;
+    }
+
     pub fn createIndex(self: *Schema, definition: ast.IndexDef) !void {
         if (self.findIndex(definition.name) != null) return error.IndexExists;
         const table = self.find(definition.table) orelse return error.UnknownTable;
         if (definition.columns.len == 0) return error.InvalidSql;
-        for (definition.columns) |name| if (self.columnIndex(table, name) == null) return error.UnknownColumn;
+        if (definition.keyExprs.len != 0 and definition.keyExprs.len != definition.columns.len) return error.InvalidSql;
+        for (definition.columns, 0..) |name, position| {
+            if (position < definition.keyExprs.len and definition.keyExprs[position] != null) continue;
+            if (self.columnIndex(table, name) == null) return error.UnknownColumn;
+        }
+        for (definition.keyExprs) |maybeKey| if (maybeKey) |key| {
+            var sawColumn = false;
+            try self.validateIndexPredicate(table, definition.table, key, &sawColumn);
+            if (!sawColumn) return error.InvalidSql;
+        };
+        var predicateColumn = false;
+        if (definition.whereExpr) |predicate| try self.validateIndexPredicate(table, definition.table, predicate, &predicateColumn);
         const name = try self.allocator.dupe(u8, definition.name);
         errdefer self.allocator.free(name);
         const tableName = try self.allocator.dupe(u8, definition.table);
@@ -182,13 +285,34 @@ pub const Schema = struct {
             columns[index] = try self.allocator.dupe(u8, column);
             copied += 1;
         }
-        try self.indexes.append(self.allocator, .{ .name = name, .table = tableName, .columns = columns, .unique = definition.unique });
+        const keyExprs = try self.allocator.alloc(?ast.Expr, definition.columns.len);
+        errdefer self.allocator.free(keyExprs);
+        var cloned: usize = 0;
+        errdefer {
+            for (keyExprs[0..cloned]) |maybeKey| if (maybeKey) |key| ast.freeOwnedExpr(self.allocator, key);
+        }
+        for (definition.columns, 0..) |_, index| {
+            keyExprs[index] = if (index < definition.keyExprs.len and definition.keyExprs[index] != null) try ast.cloneOwnedExpr(self.allocator, definition.keyExprs[index].?) else null;
+            cloned += 1;
+        }
+        const ownedPredicate = if (definition.whereExpr) |predicate| try ast.cloneOwnedExpr(self.allocator, predicate) else null;
+        errdefer if (ownedPredicate) |predicate| ast.freeOwnedExpr(self.allocator, predicate);
+        const ownedWhereSql = if (definition.whereSql) |sql| try self.allocator.dupe(u8, sql) else null;
+        errdefer if (ownedWhereSql) |sql| self.allocator.free(sql);
         if (definition.unique) {
-            errdefer _ = self.indexes.pop();
+            const pending = Index{ .name = name, .table = tableName, .columns = columns, .keyExprs = keyExprs, .unique = true, .whereExpr = ownedPredicate, .whereSql = ownedWhereSql };
+            var colNames = try self.allocator.alloc([]const u8, table.columns.len);
+            defer self.allocator.free(colNames);
+            for (table.columns, 0..) |col, idx| colNames[idx] = col.name;
             for (table.rows.items, 0..) |row, rowIndex| {
-                for (table.rows.items[rowIndex + 1 ..]) |other| if (indexValuesEqual(table, row.values, other.values, definition.columns)) return error.ConstraintViolation;
+                if (!try self.indexPredicateHolds(table, &pending, row.values)) continue;
+                for (table.rows.items[rowIndex + 1 ..]) |other| {
+                    if (!try self.indexPredicateHolds(table, &pending, other.values)) continue;
+                    if (try self.indexKeysEqual(table, &pending, colNames, row.values, other.values)) return error.ConstraintViolation;
+                }
             }
         }
+        try self.indexes.append(self.allocator, .{ .name = name, .table = tableName, .columns = columns, .keyExprs = keyExprs, .unique = definition.unique, .whereExpr = ownedPredicate, .whereSql = ownedWhereSql });
     }
 
     pub fn dropIndex(self: *Schema, name: []const u8) !void {
@@ -198,6 +322,10 @@ pub const Schema = struct {
             self.allocator.free(removed.table);
             for (removed.columns) |column| self.allocator.free(column);
             self.allocator.free(removed.columns);
+            for (removed.keyExprs) |maybeKey| if (maybeKey) |key| ast.freeOwnedExpr(self.allocator, key);
+            self.allocator.free(removed.keyExprs);
+            if (removed.whereExpr) |predicate| ast.freeOwnedExpr(self.allocator, predicate);
+            if (removed.whereSql) |sql| self.allocator.free(sql);
             return;
         };
         return error.UnknownIndex;
@@ -453,6 +581,10 @@ pub const Schema = struct {
                         self.allocator.free(removed.table);
                         for (removed.columns) |column| self.allocator.free(column);
                         self.allocator.free(removed.columns);
+                        for (removed.keyExprs) |maybeKey| if (maybeKey) |key| ast.freeOwnedExpr(self.allocator, key);
+                        self.allocator.free(removed.keyExprs);
+                        if (removed.whereExpr) |predicate| ast.freeOwnedExpr(self.allocator, predicate);
+                        if (removed.whereSql) |sql| self.allocator.free(sql);
                     } else indexPosition += 1;
                 }
                 var triggerPosition: usize = 0;
@@ -833,15 +965,12 @@ pub const Schema = struct {
             }
         }
         for (self.indexes.items) |index| if (index.unique and std.ascii.eqlIgnoreCase(index.table, table.name)) {
-            var hasNull = false;
-            for (index.columns) |name| {
-                const columnIdx = self.columnIndex(table, name) orelse continue;
-                if (values[columnIdx] == .null) hasNull = true;
-            }
-            if (!hasNull) for (table.rows.items, 0..) |existing, existingIndex| {
+            if (!try self.indexPredicateHolds(table, &index, values)) continue;
+            for (table.rows.items, 0..) |existing, existingIndex| {
                 if (ignoredRow != null and ignoredRow.? == existingIndex) continue;
-                if (indexValuesEqual(table, values, existing.values, index.columns)) return error.ConstraintViolation;
-            };
+                if (!try self.indexPredicateHolds(table, &index, existing.values)) continue;
+                if (try self.indexKeysEqual(table, &index, colNames, values, existing.values)) return error.ConstraintViolation;
+            }
         };
     }
 
@@ -885,7 +1014,7 @@ pub const Schema = struct {
             const columns = try self.allocator.alloc([]const u8, index.columns.len);
             defer self.allocator.free(columns);
             for (index.columns, 0..) |column, position| columns[position] = column;
-            try result.createIndex(.{ .name = index.name, .table = index.table, .columns = columns, .unique = index.unique });
+            try result.createIndex(.{ .name = index.name, .table = index.table, .columns = columns, .keyExprs = index.keyExprs, .unique = index.unique, .whereExpr = index.whereExpr, .whereSql = index.whereSql });
         }
         for (self.views.items) |view| try result.createView(view.name, view.sql);
         for (self.triggers.items) |trigger| try result.createTrigger(.{ .name = trigger.name, .table = trigger.table, .timing = trigger.timing, .event = trigger.event, .whenSql = trigger.whenSql, .body = trigger.body });

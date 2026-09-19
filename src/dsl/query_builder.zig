@@ -564,6 +564,65 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
             return self.insertWithMode(row, "OR REPLACE");
         }
 
+        pub fn insertSelect(self: Self, source: anytype) !Result {
+            return self.insertSelectWithMode(source, "");
+        }
+
+        pub fn insertSelectOrIgnore(self: Self, source: anytype) !Result {
+            return self.insertSelectWithMode(source, "OR IGNORE");
+        }
+
+        pub fn insertSelectOrReplace(self: Self, source: anytype) !Result {
+            return self.insertSelectWithMode(source, "OR REPLACE");
+        }
+
+        fn insertSelectWithMode(self: Self, source: anytype, comptime mode: []const u8) !Result {
+            const conflict: ast.InsertConflict = if (comptime std.mem.eql(u8, mode, "")) .none else if (comptime std.mem.eql(u8, mode, "OR IGNORE")) .ignore else if (comptime std.mem.eql(u8, mode, "OR REPLACE")) .replace else @compileError("unknown insert mode");
+            const Source = @TypeOf(source);
+            if (!@hasDecl(Source, "isMapped")) @compileError("insertSelect source must be a query builder from db.from(...)");
+            if (Source.isMapped) @compileError("insertSelect source must return raw rows: project columns with .select(...)");
+            var data = try source.fetch();
+            defer data.deinit();
+            if (data.columns.len == 0) return error.InvalidSql;
+            var merged = std.ArrayList([]Value).empty;
+            errdefer {
+                for (merged.items) |row| {
+                    for (row) |item| switch (item) {
+                        .text => |text| self.allocator.free(text),
+                        .blob => |blob| self.allocator.free(blob),
+                        else => {},
+                    };
+                    self.allocator.free(row);
+                }
+                merged.deinit(self.allocator);
+            }
+            var outColumns: []const []const u8 = try self.allocator.alloc([]const u8, 0);
+            var adoptedColumns = false;
+            errdefer {
+                for (outColumns) |name| self.allocator.free(name);
+                self.allocator.free(outColumns);
+            }
+            var changes: usize = 0;
+            for (data.rows) |row| {
+                var built = try astBuilder.buildInsert(self.allocator, self.table, data.columns, row, conflict, self.returningCols[0..self.returningCount], self.cases[0..self.caseCount], .{});
+                defer built.deinit();
+                const one = try self.executeFn(self.connection, &built.stmt, &.{}, false);
+                changes += one.changes;
+                if (!adoptedColumns) {
+                    self.allocator.free(outColumns);
+                    outColumns = one.columns;
+                    adoptedColumns = true;
+                } else {
+                    for (one.columns) |name| self.allocator.free(name);
+                    self.allocator.free(one.columns);
+                }
+                try merged.appendSlice(self.allocator, one.rows);
+                self.allocator.free(one.rows);
+            }
+            const rows = try merged.toOwnedSlice(self.allocator);
+            return .{ .allocator = self.allocator, .columns = outColumns, .rows = rows, .changes = changes };
+        }
+
         fn upsertBase(self: Self) UpsertBuilder(Row, Columns) {
             return .{
                 .allocator = self.allocator,
@@ -1440,6 +1499,22 @@ pub const Mutation = struct {
     caseCount: usize = 0,
     returningCols: [16]Projection = undefined,
     returningCount: usize = 0,
+    fromTable: ?[]const u8 = null,
+    fromLeft: dslExpr.ColumnRef = .{ .name = "" },
+    fromRight: dslExpr.ColumnRef = .{ .name = "" },
+
+    pub fn updateFrom(self: Mutation, other: anytype, on: Expr) Mutation {
+        var copy = self;
+        copy.fromTable = tableNameOf(other);
+        if (on.operator != .equal) @panic("updateFrom requires an equality predicate");
+        const rightRef = switch (on.rhs) {
+            .column => |ref| ref,
+            .value => @panic("updateFrom requires a column-to-column equality predicate"),
+        };
+        copy.fromLeft = on.column;
+        copy.fromRight = rightRef;
+        return copy;
+    }
 
     pub fn where(self: Mutation, condition: Expr) Mutation {
         var copy = self;
@@ -1509,10 +1584,12 @@ pub const Mutation = struct {
 
     pub fn execute(self: Mutation) !Result {
         if (self.operation == .update) {
-            var built = try astBuilder.buildUpdate(self.allocator, self.table, self.setNames[0..self.setCount], self.setValues[0..self.setCount], self.conditions[0..self.conditionCount], self.returningCols[0..self.returningCount], self.cases[0..self.caseCount], self.caseWhens[0..self.caseWhenCount]);
+            const fromSpec: ?ast.UpdateFrom = if (self.fromTable) |source| .{ .table = source, .leftTable = self.fromLeft.table, .leftColumn = self.fromLeft.name, .rightTable = self.fromRight.table, .rightColumn = self.fromRight.name } else null;
+            var built = try astBuilder.buildUpdate(self.allocator, self.table, self.setNames[0..self.setCount], self.setValues[0..self.setCount], self.conditions[0..self.conditionCount], self.returningCols[0..self.returningCount], self.cases[0..self.caseCount], self.caseWhens[0..self.caseWhenCount], fromSpec);
             defer built.deinit();
             return self.executeFn(self.connection, &built.stmt, &.{}, false);
         } else {
+            if (self.fromTable != null) return error.InvalidSql;
             var built = try astBuilder.buildDelete(self.allocator, self.table, self.conditions[0..self.conditionCount], self.returningCols[0..self.returningCount], self.cases[0..self.caseCount], self.caseWhens[0..self.caseWhenCount]);
             defer built.deinit();
             return self.executeFn(self.connection, &built.stmt, &.{}, false);

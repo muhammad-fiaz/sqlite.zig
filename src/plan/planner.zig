@@ -2,6 +2,7 @@ const std = @import("std");
 const Cost = @import("cost.zig").Cost;
 const cost = @import("cost.zig");
 const ast = @import("../sql/ast.zig");
+const exprEvaluator = @import("../sql/expr.zig");
 const Schema = @import("../catalog/schema.zig").Schema;
 const Table = @import("../catalog/schema.zig").Table;
 const Index = @import("../catalog/schema.zig").Index;
@@ -216,6 +217,9 @@ pub fn planSelect(allocator: std.mem.Allocator, schema: *const Schema, selectStm
 
         for (schema.indexes.items) |index| {
             if (!std.ascii.eqlIgnoreCase(index.table, table.name)) continue;
+            if (index.whereExpr) |predicate| {
+                if (!exprEvaluator.partialPredicateImpliedBy(predicate, conditions)) continue;
+            }
 
             var eqCols = std.ArrayList([]const u8).empty;
             errdefer eqCols.deinit(allocator);
@@ -224,7 +228,23 @@ pub fn planSelect(allocator: std.mem.Allocator, schema: *const Schema, selectStm
             var rangeOp1: ?ast.CompareOp = null;
             var rangeOp2: ?ast.CompareOp = null;
 
-            for (index.columns) |idxCol| {
+            for (index.columns, 0..) |idxCol, keyPosition| {
+                if (index.keyExpr(keyPosition)) |key| {
+                    var conjunctive = true;
+                    for (conditions, 0..) |cond, condPosition| {
+                        if (condPosition > 0 and cond.joinOr) conjunctive = false;
+                    }
+                    var foundExprEq = false;
+                    if (conjunctive) for (conditions) |cond| {
+                        if (cond.leftExpr == null or cond.op != .equal) continue;
+                        if (exprEvaluator.exprEqual(cond.leftExpr.?, key)) {
+                            try eqCols.append(allocator, idxCol);
+                            foundExprEq = true;
+                            break;
+                        }
+                    };
+                    if (foundExprEq) continue;
+                }
                 var foundEq = false;
                 for (conditions) |cond| {
                     if (std.ascii.eqlIgnoreCase(cond.column, idxCol) and cond.op == .equal) {

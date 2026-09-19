@@ -96,12 +96,34 @@ var upserted = try db.from(User)
 upserted.deinit();
 ```
 
+### Insert...Select
+
+```zig
+var copied = try db.from(Archive)
+    .insertSelect(db.from(Active).select(.{ Active.columns.id, Active.columns.name }));
+defer copied.deinit();
+```
+
+`insertSelectOrIgnore` / `insertSelectOrReplace` apply the matching
+conflict policy per row. The source must project columns with `.select(...)`
+so every value maps positionally, exactly like raw `INSERT ... SELECT`.
+
 ### Update
 
 ```zig
 var mutation = try db.from(User).update(.{ .name = "Bob" });
 var result = try mutation.where(User.columns.id.eq(1)).execute();
 defer result.deinit();
+```
+
+Updates can read a source table with `updateFrom` and an equi-join predicate
+(assignments are literals; combined freely with `where` filters):
+
+```zig
+var joined = try db.from(Bal).update(.{ .flag = 1 })
+    .updateFrom(Adj, Bal.columns.id.eq(Adj.columns.bal_id))
+    .execute();
+defer joined.deinit();
 ```
 
 ### Delete

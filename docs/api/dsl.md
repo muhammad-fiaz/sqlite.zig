@@ -195,6 +195,26 @@ var deleted = try db.from(User).delete().where(User.columns.id.eq(1)).execute();
 defer deleted.deinit();
 ```
 
+Copies run through `insertSelect` (plus `insertSelectOrIgnore` /
+`insertSelectOrReplace`), mapping source columns positionally with the same
+constraint, trigger, and `RETURNING` handling as single-row inserts:
+
+```zig
+var copied = try db.from(Archive)
+    .insertSelect(db.from(Active).select(.{ Active.columns.id, Active.columns.name }));
+defer copied.deinit();
+```
+
+Updates can read a source table through `updateFrom` with an equi-join
+predicate (assignments are literals; `delete` rejects a source table):
+
+```zig
+var updated = try db.from(Bal).update(.{ .flag = 1 })
+    .updateFrom(Adj, Bal.columns.id.eq(Adj.columns.bal_id))
+    .execute();
+defer updated.deinit();
+```
+
 Advanced upserts use `onConflict` with `doNothing` / `doUpdate` (plus
 `onConflictWhere`, `excluded` values, and `returning`); see the UPSERT
 examples.
@@ -219,6 +239,15 @@ try db.createTable("users", .{
 
 try db.createIndex(User, "users_email_idx", .{User.columns.email}, true);
 try db.schema(User).validate(); // error.SchemaMismatch on divergence
+```
+
+Partial and expression indexes use `createIndexWhere` (descriptor columns
+plus a predicate) and `createIndexExpr` (column names or SQL expressions,
+with an optional predicate), covering typed and dynamic tables alike:
+
+```zig
+try db.createIndexWhere(User, "users_active_id", .{User.columns.id}, false, "active = 1");
+try db.createIndexExpr("users", "users_lower_email", &.{ "lower(email)" }, true, null);
 ```
 
 ## Explicit name mapping
@@ -247,10 +276,11 @@ Clients use `sqlite.table`, `sqlite.tableWith`, `sqlite.column`,
 Foreign-key actions are the engine's own: `.restrict`, `.cascade`,
 `.setNull`, `.setDefault`, `.noAction`. Predicates include
 `like`/`glob`/`regexp`/`match`; window functions, compound selects, CTEs,
-derived tables, and `RETURNING` all have DSL builders. Features without a
-builder stay in Raw SQL: `VACUUM` is supported there, while partial
-(`WHERE`) and expression indexes, `INSTEAD OF` triggers, and
-`ATTACH`/`DETACH` are not supported and fail with an explicit error.
+derived tables, `RETURNING`, `insertSelect`, `updateFrom`, and partial /
+expression index creation (`createIndexWhere` / `createIndexExpr`) all have
+DSL builders. Features without a builder stay in Raw SQL: `VACUUM` is
+supported there, while `INSTEAD OF` triggers and `ATTACH`/`DETACH` are not
+supported and fail with an explicit error.
 
 Builder limits (misuse panics instead of silently truncating): at most 32
 projections, 16 `where`/`andWhere`/`orWhere` predicates, 32 literal `IN`

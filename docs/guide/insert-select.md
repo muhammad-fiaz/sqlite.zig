@@ -20,3 +20,14 @@ the destination schema, or it can be specified explicitly:
 ```sql
 INSERT INTO archive (id, label) SELECT item_id, title FROM source_items;
 ```
+
+The typed and dynamic DSL copy through `insertSelect` (plus
+`insertSelectOrIgnore` / `insertSelectOrReplace`), mapping source columns
+positionally and running the same constraint, trigger, and `RETURNING`
+handling as single-row inserts:
+
+```zig
+var copied = try db.from(Archive)
+    .insertSelect(db.from(Active).select(.{ Active.columns.id, Active.columns.label }));
+defer copied.deinit();
+```

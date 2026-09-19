@@ -126,8 +126,17 @@ fn getCurrentTimestamp() ClockError!i64 {
             if (std.os.linux.clock_gettime(.REALTIME, &ts) != 0) return error.ClockUnavailable;
             return ts.sec;
         },
-        .macos, .ios, .tvos, .watchos, .visionos,
-        .freebsd, .netbsd, .openbsd, .dragonfly, .haiku, .illumos,
+        .macos,
+        .ios,
+        .tvos,
+        .watchos,
+        .visionos,
+        .freebsd,
+        .netbsd,
+        .openbsd,
+        .dragonfly,
+        .haiku,
+        .illumos,
         => {
             var tv: CTimeval = undefined;
             if (gettimeofday(&tv, null) != 0) return error.ClockUnavailable;

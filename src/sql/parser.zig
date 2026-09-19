@@ -588,12 +588,33 @@ pub const Parser = struct {
         const table = try self.word();
         try self.requireTag(.lparen);
         var columns = std.ArrayList([]const u8).empty;
+        errdefer columns.deinit(self.allocator);
+        var keyExprs = std.ArrayList(?ast.Expr).empty;
+        errdefer {
+            for (keyExprs.items) |maybeKey| if (maybeKey) |key| freeParserExpr(self.allocator, key);
+            keyExprs.deinit(self.allocator);
+        }
         while (true) {
-            try columns.append(self.allocator, try self.word());
+            if (self.current().tag == .word and self.index + 1 < self.tokens.len and (self.tokens[self.index + 1].tag == .comma or self.tokens[self.index + 1].tag == .rparen)) {
+                try columns.append(self.allocator, try self.word());
+                try keyExprs.append(self.allocator, null);
+            } else {
+                const start = self.current().position;
+                try keyExprs.append(self.allocator, try self.parseExpr());
+                errdefer if (keyExprs.pop()) |maybeKey| if (maybeKey) |key| freeParserExpr(self.allocator, key);
+                try columns.append(self.allocator, try self.copy(self.source[start..self.current().position]));
+            }
             if (!self.acceptTag(.comma)) break;
         }
         try self.requireTag(.rparen);
-        return .{ .createIndex = .{ .name = name, .table = table, .columns = try columns.toOwnedSlice(self.allocator), .unique = unique, .ifNotExists = ifNotExists } };
+        var whereExpr: ?ast.Expr = null;
+        var whereSql: ?[]const u8 = null;
+        if (self.acceptWord("where")) {
+            const start = self.current().position;
+            whereExpr = try self.parseExpr();
+            whereSql = try self.copy(self.source[start..self.current().position]);
+        }
+        return .{ .createIndex = .{ .name = name, .table = table, .columns = try columns.toOwnedSlice(self.allocator), .keyExprs = try keyExprs.toOwnedSlice(self.allocator), .unique = unique, .ifNotExists = ifNotExists, .whereExpr = whereExpr, .whereSql = whereSql } };
     }
 
     fn parseTrigger(self: *Parser) !ast.Statement {
@@ -1358,6 +1379,10 @@ pub const Parser = struct {
 
     fn parseCondition(self: *Parser) anyerror!?ast.Conditions {
         if (!self.acceptWord("where")) return null;
+        return try self.parseConditionRest();
+    }
+
+    fn parseConditionRest(self: *Parser) anyerror!?ast.Conditions {
         var conditions = std.ArrayList(ast.Condition).empty;
         var joinOr = false;
         while (true) {
@@ -1780,13 +1805,50 @@ pub const Parser = struct {
         if (self.acceptWord("from")) {
             const sourceTable = try self.word();
             try self.requireWord("where");
-            const left = try self.qualifiedName();
-            try self.requireTag(.equal);
-            const right = try self.qualifiedName();
-            from = .{ .table = sourceTable, .leftTable = left.table, .leftColumn = left.column, .rightTable = right.table, .rightColumn = right.column };
+            const pairStart = self.index;
+            if (self.tryParseUpdatePair()) |pair| {
+                if (self.acceptWord("and")) {
+                    condition = try self.parseConditionRest();
+                    from = .{ .table = sourceTable, .leftTable = pair.leftTable, .leftColumn = pair.leftColumn, .rightTable = pair.rightTable, .rightColumn = pair.rightColumn };
+                } else {
+                    const next = self.current();
+                    const done = next.tag == .eof or next.tag == .semicolon or (next.tag == .word and std.ascii.eqlIgnoreCase(next.text, "returning"));
+                    if (done) {
+                        from = .{ .table = sourceTable, .leftTable = pair.leftTable, .leftColumn = pair.leftColumn, .rightTable = pair.rightTable, .rightColumn = pair.rightColumn };
+                    } else {
+                        self.index = pairStart;
+                        from = .{ .table = sourceTable, .leftTable = "", .leftColumn = "", .rightTable = "", .rightColumn = "" };
+                        condition = try self.parseConditionRest();
+                    }
+                }
+            } else {
+                from = .{ .table = sourceTable, .leftTable = "", .leftColumn = "", .rightTable = "", .rightColumn = "" };
+                condition = try self.parseConditionRest();
+            }
         } else condition = try self.parseCondition();
         const returning = try self.parseReturning();
         return .{ .update = .{ .table = table, .columns = try columns.toOwnedSlice(self.allocator), .values = try values.toOwnedSlice(self.allocator), .condition = condition, .from = from, .returning = returning } };
+    }
+
+    fn tryParseUpdatePair(self: *Parser) ?struct { leftTable: []const u8, leftColumn: []const u8, rightTable: []const u8, rightColumn: []const u8 } {
+        const saved = self.index;
+        const left = self.qualifiedName() catch {
+            self.index = saved;
+            return null;
+        };
+        if (!self.acceptTag(.equal)) {
+            self.index = saved;
+            return null;
+        }
+        const right = self.qualifiedName() catch {
+            self.index = saved;
+            return null;
+        };
+        if (right.table.len == 0) {
+            self.index = saved;
+            return null;
+        }
+        return .{ .leftTable = left.table, .leftColumn = left.column, .rightTable = right.table, .rightColumn = right.column };
     }
 
     fn parseDelete(self: *Parser) !ast.Statement {

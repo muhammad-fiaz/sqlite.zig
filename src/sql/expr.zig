@@ -114,12 +114,12 @@ fn toFloat(value: Value) ?f64 {
 
 pub fn eval(allocator: std.mem.Allocator, columnNames: []const []const u8, row: []const Value, expr: ast.Expr) anyerror!Value {
     switch (expr) {
-        .literal => |lit| return lit,
+        .literal => |lit| return try lit.clone(allocator),
         .identifier => |id| {
             const cleanId = if (std.mem.indexOfScalar(u8, id, '.')) |dot| id[dot + 1 ..] else id;
             for (columnNames, 0..) |colName, idx| {
                 if (std.ascii.eqlIgnoreCase(colName, cleanId)) {
-                    if (idx < row.len) return row[idx] else return .null;
+                    if (idx < row.len) return try row[idx].clone(allocator) else return .null;
                 }
             }
             return EvalError.UnknownColumn;
@@ -128,6 +128,7 @@ pub fn eval(allocator: std.mem.Allocator, columnNames: []const []const u8, row: 
         .wildcard => return EvalError.InvalidSql,
         .unary => |un| {
             const operand = try eval(allocator, columnNames, row, un.expr.*);
+            defer freeValue(allocator, operand);
             if (operand == .null) return .null;
             return switch (un.op) {
                 .logicalNot => .{ .integer = if (isTruthy(operand)) 0 else 1 },
@@ -164,7 +165,9 @@ pub fn eval(allocator: std.mem.Allocator, columnNames: []const []const u8, row: 
                 return .{ .integer = 0 };
             }
             const left = try eval(allocator, columnNames, row, bin.left.*);
+            defer freeValue(allocator, left);
             const right = try eval(allocator, columnNames, row, bin.right.*);
+            defer freeValue(allocator, right);
             if (bin.op == .concat) {
                 if (left == .null or right == .null) return .null;
                 const leftStr = switch (left) {
@@ -259,8 +262,10 @@ pub fn eval(allocator: std.mem.Allocator, columnNames: []const []const u8, row: 
         .caseExpr => |cs| {
             if (cs.base) |baseExpr| {
                 const baseVal = try eval(allocator, columnNames, row, baseExpr.*);
+                defer freeValue(allocator, baseVal);
                 for (cs.whens) |when| {
                     const condVal = try eval(allocator, columnNames, row, when.condition);
+                    defer freeValue(allocator, condVal);
                     if (compareValues(baseVal, .equal, condVal)) {
                         return try eval(allocator, columnNames, row, when.result);
                     }
@@ -268,6 +273,7 @@ pub fn eval(allocator: std.mem.Allocator, columnNames: []const []const u8, row: 
             } else {
                 for (cs.whens) |when| {
                     const condVal = try eval(allocator, columnNames, row, when.condition);
+                    defer freeValue(allocator, condVal);
                     if (isTruthy(condVal)) {
                         return try eval(allocator, columnNames, row, when.result);
                     }
@@ -278,10 +284,12 @@ pub fn eval(allocator: std.mem.Allocator, columnNames: []const []const u8, row: 
         },
         .inList => |il| {
             const target = try eval(allocator, columnNames, row, il.expr.*);
+            defer freeValue(allocator, target);
             if (target == .null) return .null;
             var matched = false;
             for (il.list) |item| {
                 const itemVal = try eval(allocator, columnNames, row, item);
+                defer freeValue(allocator, itemVal);
                 if (compareValues(target, .equal, itemVal)) {
                     matched = true;
                     break;
@@ -336,6 +344,126 @@ pub fn evalCheck(allocator: std.mem.Allocator, columnNames: []const []const u8, 
     defer freeValue(allocator, val);
     if (val == .null) return true;
     return val.isTruthy();
+}
+
+pub fn evalTemp(allocator: std.mem.Allocator, columnNames: []const []const u8, row: []const Value, expr: ast.Expr) !Value {
+    return eval(allocator, columnNames, row, expr);
+}
+
+pub fn evalPredicate(allocator: std.mem.Allocator, columnNames: []const []const u8, row: []const Value, expr: ast.Expr) !bool {
+    const val = try evalTemp(allocator, columnNames, row, expr);
+    defer freeValue(allocator, val);
+    return val.isTruthy();
+}
+
+fn predicateColumnName(identifier: []const u8) []const u8 {
+    if (std.mem.indexOfScalar(u8, identifier, '.')) |dot| return identifier[dot + 1 ..];
+    return identifier;
+}
+
+fn equalityConjunct(expr: ast.Expr, column: *[]const u8, literal: *Value) bool {
+    if (expr != .binary or expr.binary.op != .equal) return false;
+    if (expr.binary.left.* == .identifier and expr.binary.right.* == .literal) {
+        column.* = predicateColumnName(expr.binary.left.*.identifier);
+        literal.* = expr.binary.right.*.literal;
+        return true;
+    }
+    if (expr.binary.right.* == .identifier and expr.binary.left.* == .literal) {
+        column.* = predicateColumnName(expr.binary.right.*.identifier);
+        literal.* = expr.binary.left.*.literal;
+        return true;
+    }
+    return false;
+}
+
+fn conjunctImplied(expr: ast.Expr, conditions: ast.Conditions) bool {
+    var column: []const u8 = "";
+    var literal: Value = .null;
+    if (!equalityConjunct(expr, &column, &literal)) return false;
+    for (conditions, 0..) |condition, position| {
+        if (position > 0 and condition.joinOr) return false;
+    }
+    for (conditions) |condition| {
+        if (condition.op != .equal) continue;
+        if (condition.value != .literal) continue;
+        if (!condition.value.literal.sameValue(literal)) continue;
+        if (std.ascii.eqlIgnoreCase(predicateColumnName(condition.column), column)) return true;
+    }
+    return false;
+}
+
+fn exprListEqual(left: []const ast.Expr, right: []const ast.Expr) bool {
+    if (left.len != right.len) return false;
+    for (left, right) |l, r| if (!exprEqual(l, r)) return false;
+    return true;
+}
+
+pub fn exprEqual(left: ast.Expr, right: ast.Expr) bool {
+    if (std.meta.activeTag(left) != std.meta.activeTag(right)) return false;
+    switch (left) {
+        .literal => |l| return l.sameValue(right.literal),
+        .identifier => |l| return std.ascii.eqlIgnoreCase(l, right.identifier),
+        .parameter => |l| return l == right.parameter,
+        .wildcard => return true,
+        .binary => |l| return l.op == right.binary.op and exprEqual(l.left.*, right.binary.left.*) and exprEqual(l.right.*, right.binary.right.*),
+        .unary => |l| return l.op == right.unary.op and exprEqual(l.expr.*, right.unary.expr.*),
+        .collate => |l| return std.ascii.eqlIgnoreCase(l.name, right.collate.name) and exprEqual(l.expr.*, right.collate.expr.*),
+        .patternMatch => |l| {
+            const r = right.patternMatch;
+            if (l.negated != r.negated or l.glob != r.glob or l.isRegexp != r.isRegexp or l.isMatch != r.isMatch) return false;
+            if (!exprEqual(l.value.*, r.value.*)) return false;
+            if (!exprEqual(l.pattern.*, r.pattern.*)) return false;
+            if (l.escape == null and r.escape == null) return true;
+            if (l.escape == null or r.escape == null) return false;
+            return exprEqual(l.escape.?.*, r.escape.?.*);
+        },
+        .caseExpr => |l| {
+            const r = right.caseExpr;
+            if ((l.base == null) != (r.base == null)) return false;
+            if (l.base) |base| if (!exprEqual(base.*, r.base.?.*)) return false;
+            if (l.whens.len != r.whens.len) return false;
+            for (l.whens, r.whens) |lw, rw| if (!exprEqual(lw.condition, rw.condition) or !exprEqual(lw.result, rw.result)) return false;
+            if ((l.otherwise == null) != (r.otherwise == null)) return false;
+            if (l.otherwise) |otherwise| if (!exprEqual(otherwise.*, r.otherwise.?.*)) return false;
+            return true;
+        },
+        .inList => |l| {
+            const r = right.inList;
+            if (l.negated != r.negated) return false;
+            if (!exprEqual(l.expr.*, r.expr.*)) return false;
+            return exprListEqual(l.list, r.list);
+        },
+        .function => |l| {
+            const r = right.function;
+            if (!std.ascii.eqlIgnoreCase(l.name, r.name) or l.distinct != r.distinct) return false;
+            if (!exprEqual(l.argument.*, r.argument.*)) return false;
+            if ((l.argument2 == null) != (r.argument2 == null)) return false;
+            if (l.argument2) |a| if (!exprEqual(a.*, r.argument2.?.*)) return false;
+            if ((l.argument3 == null) != (r.argument3 == null)) return false;
+            if (l.argument3) |a| if (!exprEqual(a.*, r.argument3.?.*)) return false;
+            return exprListEqual(l.extraArgs, r.extraArgs);
+        },
+        .scalarSubquery => |l| return std.mem.eql(u8, l, right.scalarSubquery),
+        .existsSubquery => |l| return std.mem.eql(u8, l, right.existsSubquery),
+        .inSubquery => |l| {
+            const r = right.inSubquery;
+            return l.negated == r.negated and exprEqual(l.expr.*, r.expr.*) and std.mem.eql(u8, l.subquery, r.subquery);
+        },
+        .window => return false,
+    }
+}
+
+pub fn partialPredicateImpliedBy(predicate: ast.Expr, conditions: ast.Conditions) bool {
+    if (conditions.len == 0) return false;
+    var current: ast.Expr = predicate;
+    while (true) {
+        if (current == .binary and current.binary.op == .logicalAnd) {
+            if (!conjunctImplied(current.binary.left.*, conditions)) return false;
+            current = current.binary.right.*;
+            continue;
+        }
+        return conjunctImplied(current, conditions);
+    }
 }
 
 test "evaluates arithmetic, logic, and comparisons" {

@@ -360,6 +360,62 @@ pub const Connection = struct {
         if (!self.transactionActive) try self.persist();
     }
 
+    pub fn createIndexWhere(self: *Connection, target: anytype, name: []const u8, cols: anytype, unique: bool, whereSql: []const u8) !void {
+        if (whereSql.len == 0) return error.InvalidSql;
+        const tableName: []const u8 = if (@TypeOf(target) == type) blk: {
+            if (!@hasDecl(target, "tableName")) @compileError("createIndexWhere expects a sqlite.table(...) type or a table-name string");
+            break :blk target.tableName;
+        } else target;
+        var names: [16][]const u8 = undefined;
+        const count = try keys.normalizeKey(cols, tableName, &names);
+        var ddl = std.ArrayList(u8).empty;
+        defer ddl.deinit(self.allocator);
+        try ddl.appendSlice(self.allocator, "CREATE ");
+        if (unique) try ddl.appendSlice(self.allocator, "UNIQUE ");
+        try ddl.appendSlice(self.allocator, "INDEX ");
+        try ddl.appendSlice(self.allocator, name);
+        try ddl.appendSlice(self.allocator, " ON ");
+        try ddl.appendSlice(self.allocator, tableName);
+        try ddl.appendSlice(self.allocator, " (");
+        for (names[0..count], 0..) |column, position| {
+            if (position != 0) try ddl.appendSlice(self.allocator, ", ");
+            try ddl.appendSlice(self.allocator, column);
+        }
+        try ddl.appendSlice(self.allocator, ") WHERE ");
+        try ddl.appendSlice(self.allocator, whereSql);
+        var result = try self.exec(ddl.items);
+        result.deinit();
+    }
+
+    pub fn createIndexExpr(self: *Connection, target: anytype, name: []const u8, indexKeys: []const []const u8, unique: bool, whereSql: ?[]const u8) !void {
+        if (indexKeys.len == 0) return error.InvalidSql;
+        if (whereSql) |predicate| if (predicate.len == 0) return error.InvalidSql;
+        const tableName: []const u8 = if (@TypeOf(target) == type) blk: {
+            if (!@hasDecl(target, "tableName")) @compileError("createIndexExpr expects a sqlite.table(...) type or a table-name string");
+            break :blk target.tableName;
+        } else target;
+        var ddl = std.ArrayList(u8).empty;
+        defer ddl.deinit(self.allocator);
+        try ddl.appendSlice(self.allocator, "CREATE ");
+        if (unique) try ddl.appendSlice(self.allocator, "UNIQUE ");
+        try ddl.appendSlice(self.allocator, "INDEX ");
+        try ddl.appendSlice(self.allocator, name);
+        try ddl.appendSlice(self.allocator, " ON ");
+        try ddl.appendSlice(self.allocator, tableName);
+        try ddl.appendSlice(self.allocator, " (");
+        for (indexKeys, 0..) |key, position| {
+            if (position != 0) try ddl.appendSlice(self.allocator, ", ");
+            try ddl.appendSlice(self.allocator, key);
+        }
+        try ddl.appendSlice(self.allocator, ")");
+        if (whereSql) |predicate| {
+            try ddl.appendSlice(self.allocator, " WHERE ");
+            try ddl.appendSlice(self.allocator, predicate);
+        }
+        var result = try self.exec(ddl.items);
+        result.deinit();
+    }
+
     pub fn createView(self: *Connection, comptime name: []const u8, sql: []const u8) !void {
         try self.store.createView(name, sql);
         if (!self.transactionActive) try self.persist();
@@ -2901,7 +2957,7 @@ pub const Connection = struct {
         return .{ .allocator = self.allocator, .columns = try self.ownedColumns(columns.items), .rows = try rows.toOwnedSlice(self.allocator) };
     }
 
-    fn conflictRow(self: *Connection, table: *const Table, values: []const Value) ?usize {
+    fn conflictRow(self: *Connection, table: *const Table, values: []const Value) anyerror!?usize {
         for (table.rows.items, 0..) |existing, rowIndex| {
             var matched = false;
             for (table.columns, 0..) |column, columnIdx| if ((column.primaryKey or column.unique) and values[columnIdx] != .null and sameValue(existing.values[columnIdx], values[columnIdx])) {
@@ -2924,9 +2980,28 @@ pub const Connection = struct {
                 if (valid and (constraint.kind == .primaryKey or !hasNull)) return rowIndex;
             }
             for (self.store.indexes.items) |index| if (index.unique and std.ascii.eqlIgnoreCase(index.table, table.name)) {
+                var colNames: ?[][]const u8 = null;
+                defer if (colNames) |names| self.allocator.free(names);
                 var valid = true;
                 var hasNull = false;
-                for (index.columns) |name| {
+                for (index.columns, 0..) |name, position| {
+                    if (index.keyExpr(position) != null) {
+                        if (colNames == null) {
+                            const names = try self.allocator.alloc([]const u8, table.columns.len);
+                            for (table.columns, 0..) |tableColumn, idx| names[idx] = tableColumn.name;
+                            colNames = names;
+                        }
+                        const leftVal = try exprEvaluator.evalTemp(self.allocator, colNames.?, existing.values, index.keyExpr(position).?);
+                        defer exprEvaluator.freeValue(self.allocator, leftVal);
+                        const rightVal = try exprEvaluator.evalTemp(self.allocator, colNames.?, values, index.keyExpr(position).?);
+                        defer exprEvaluator.freeValue(self.allocator, rightVal);
+                        if (leftVal == .null or rightVal == .null) {
+                            valid = false;
+                            break;
+                        }
+                        if (!leftVal.sameValue(rightVal)) valid = false;
+                        continue;
+                    }
                     const columnIdx = columnIndex(table, name) catch {
                         valid = false;
                         break;
@@ -2934,7 +3009,10 @@ pub const Connection = struct {
                     if (values[columnIdx] == .null) hasNull = true;
                     if (!sameValue(existing.values[columnIdx], values[columnIdx])) valid = false;
                 }
-                if (valid and !hasNull) return rowIndex;
+                if (!valid or hasNull) continue;
+                if (!try self.store.indexPredicateHolds(table, &index, values)) continue;
+                if (!try self.store.indexPredicateHolds(table, &index, existing.values)) continue;
+                return rowIndex;
             };
         }
         return null;
@@ -2942,7 +3020,7 @@ pub const Connection = struct {
 
     fn conflictRowTarget(self: *Connection, table: *const Table, values: []const Value, targetColumns: []const []const u8, targetWhere: ?ast.Conditions, parameters: []const Value) anyerror!?usize {
         if (targetColumns.len == 0) {
-            const rowIdx = self.conflictRow(table, values) orelse return null;
+            const rowIdx = (try self.conflictRow(table, values)) orelse return null;
             if (targetWhere) |whereCond| {
                 if (!try self.matches(table, table.rows.items[rowIdx].values, whereCond, parameters)) return null;
             }
@@ -3078,7 +3156,7 @@ pub const Connection = struct {
     }
 
     fn replaceConflict(self: *Connection, table: *Table, values: []const Value) anyerror!bool {
-        const rowIndex = self.conflictRow(table, values) orelse return false;
+        const rowIndex = (try self.conflictRow(table, values)) orelse return false;
         try self.applyDeleteActions(table.name, table.rows.items[rowIndex].values);
         try self.fireTriggers(table.name, .before, .delete, null, table.rows.items[rowIndex].values);
         const removed = table.rows.orderedRemove(rowIndex);
@@ -3461,6 +3539,9 @@ pub const Connection = struct {
         var lookup: Value = .null;
         if (condition) |conditions| if (conditions.len == 1 and conditions[0].op == .equal) {
             for (self.store.indexes.items) |index| if (index.columns.len == 1 and std.ascii.eqlIgnoreCase(index.table, table.name) and std.ascii.eqlIgnoreCase(index.columns[0], conditions[0].column)) {
+                if (index.whereExpr) |predicate| {
+                    if (!exprEvaluator.partialPredicateImpliedBy(predicate, conditions)) continue;
+                }
                 indexedColumn = try columnIndex(table, index.columns[0]);
                 lookup = self.resolve(conditions[0].value, parameters) catch .null;
                 break;
@@ -4160,18 +4241,25 @@ pub const Connection = struct {
         }
         const source = self.store.findConst(value.from.?.table) orelse return error.UnknownTable;
         const sourceSpec = value.from.?;
+        const hasPair = sourceSpec.leftColumn.len != 0 and sourceSpec.rightColumn.len != 0;
         const leftTable = if (sourceSpec.leftTable.len == 0) table else if (std.ascii.eqlIgnoreCase(sourceSpec.leftTable, table.name)) table else source;
         const rightTable = if (sourceSpec.rightTable.len == 0) table else if (std.ascii.eqlIgnoreCase(sourceSpec.rightTable, table.name)) table else source;
-        const leftColumn = try columnIndex(leftTable, sourceSpec.leftColumn);
-        const rightColumn = try columnIndex(rightTable, sourceSpec.rightColumn);
+        const leftColumn: usize = if (hasPair) try columnIndex(leftTable, sourceSpec.leftColumn) else 0;
+        const rightColumn: usize = if (hasPair) try columnIndex(rightTable, sourceSpec.rightColumn) else 0;
         var changes: usize = 0;
         var affectedRows = std.ArrayList([]const Value).empty;
         defer affectedRows.deinit(self.allocator);
         for (table.rows.items, 0..) |*row, rowIndex| {
             for (source.rows.items) |sourceRow| {
-                const leftValue = if (leftTable == table) row.values[leftColumn] else sourceRow.values[leftColumn];
-                const rightValue = if (rightTable == table) row.values[rightColumn] else sourceRow.values[rightColumn];
-                if (!compare(leftValue, .equal, rightValue)) continue;
+                if (hasPair) {
+                    const leftValue = if (leftTable == table) row.values[leftColumn] else sourceRow.values[leftColumn];
+                    const rightValue = if (rightTable == table) row.values[rightColumn] else sourceRow.values[rightColumn];
+                    if (!compare(leftValue, .equal, rightValue)) continue;
+                }
+                if (value.condition) |conds| {
+                    const sourceOuter = OuterRow{ .table = source, .alias = null, .values = sourceRow.values, .prev = null };
+                    if (!try self.matchesContext(table, row.values, conds, parameters, &sourceOuter)) continue;
+                }
                 const candidate = try self.allocator.alloc(Value, row.values.len);
                 defer {
                     for (value.columns, value.values) |name, expression| {
@@ -5472,6 +5560,29 @@ test "update from applies source-column assignments through an equi-join" {
     defer rows.deinit();
     try std.testing.expectEqual(@as(i64, 99), rows.rows[0][1].integer);
     try std.testing.expectEqual(@as(i64, 20), rows.rows[1][1].integer);
+}
+
+test "update from applies trailing filters and cartesian sources" {
+    const path = "sqlite_zig_update_from_filter_test.db";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    var db = try Connection.open(std.testing.allocator, path);
+    defer db.close();
+    var setup = try db.exec("CREATE TABLE uf_balances (id INTEGER PRIMARY KEY, amount INTEGER, flag INTEGER); CREATE TABLE uf_adjustments (id INTEGER, bal_id INTEGER, bonus INTEGER); INSERT INTO uf_balances VALUES (1, 10, 0), (2, 20, 0); INSERT INTO uf_adjustments VALUES (1, 1, 5), (2, 2, 7);");
+    setup.deinit();
+    var filtered = try db.exec("UPDATE uf_balances SET flag = 1 FROM uf_adjustments WHERE uf_balances.id = uf_adjustments.bal_id AND uf_adjustments.bonus > 6;");
+    defer filtered.deinit();
+    try std.testing.expectEqual(@as(usize, 1), filtered.changes);
+    var rows = try db.exec("SELECT id, flag FROM uf_balances ORDER BY id;");
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(i64, 0), rows.rows[0][1].integer);
+    try std.testing.expectEqual(@as(i64, 1), rows.rows[1][1].integer);
+    var cartesian = try db.exec("UPDATE uf_balances SET flag = 9 FROM uf_adjustments WHERE uf_balances.id = 1;");
+    defer cartesian.deinit();
+    try std.testing.expectEqual(@as(usize, 1), cartesian.changes);
+    var again = try db.exec("SELECT flag FROM uf_balances WHERE id = 1;");
+    defer again.deinit();
+    try std.testing.expectEqual(@as(i64, 9), again.rows[0][0].integer);
 }
 
 test "NOT IN subqueries work in raw SQL and typed DSL" {
@@ -9239,4 +9350,342 @@ test "pragma connection settings round-trip and reject invalid input" {
     try std.testing.expectError(error.InvalidSql, db.exec("PRAGMA auto_vacuum = 7;"));
     try std.testing.expectError(error.Unsupported, db.exec("PRAGMA no_such_pragma;"));
     try std.testing.expectError(error.Unsupported, db.exec("PRAGMA no_such_pragma = 1;"));
+}
+
+test "partial index creation validates predicates" {
+    const path = "sqlite_zig_partial_create_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    var setup = try db.exec("CREATE TABLE parts (id INTEGER, active INTEGER, amount INTEGER);");
+    setup.deinit();
+    var created = try db.exec("CREATE INDEX parts_active_id ON parts (id) WHERE active = 1;");
+    created.deinit();
+    try std.testing.expect(db.store.findIndexConst("parts_active_id") != null);
+    try std.testing.expectError(error.UnknownColumn, db.exec("CREATE INDEX parts_bad_col ON parts (id) WHERE missing = 1;"));
+    try std.testing.expect(db.store.findIndexConst("parts_bad_col") == null);
+    try std.testing.expectError(error.InvalidSql, db.exec("CREATE INDEX parts_sub ON parts (id) WHERE EXISTS (SELECT 1 FROM parts);"));
+    try std.testing.expect(db.store.findIndexConst("parts_sub") == null);
+    try std.testing.expectError(error.InvalidSql, db.exec("CREATE INDEX parts_agg ON parts (id) WHERE amount > sum(amount);"));
+    try std.testing.expect(db.store.findIndexConst("parts_agg") == null);
+    var dropped = try db.exec("DROP INDEX parts_active_id;");
+    dropped.deinit();
+    try std.testing.expect(db.store.findIndexConst("parts_active_id") == null);
+}
+
+test "partial unique index constrains only matching rows" {
+    const path = "sqlite_zig_partial_unique_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    var setup = try db.exec("CREATE TABLE members (id INTEGER, code TEXT, active INTEGER); CREATE UNIQUE INDEX members_active_code ON members (code) WHERE active = 1;");
+    setup.deinit();
+    var first = try db.exec("INSERT INTO members VALUES (1, 'dup', 1);");
+    first.deinit();
+    try std.testing.expectError(error.ConstraintViolation, db.exec("INSERT INTO members VALUES (2, 'dup', 1);"));
+    var inactive = try db.exec("INSERT INTO members VALUES (3, 'dup', 0);");
+    inactive.deinit();
+    var nullActive = try db.exec("INSERT INTO members VALUES (4, 'dup', NULL);");
+    nullActive.deinit();
+    var rows = try db.exec("SELECT id FROM members ORDER BY id;");
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(usize, 3), rows.count());
+    try std.testing.expectEqual(@as(i64, 1), rows.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 3), rows.rows[1][0].integer);
+    try std.testing.expectEqual(@as(i64, 4), rows.rows[2][0].integer);
+}
+
+test "partial unique index follows updates across the predicate boundary" {
+    const path = "sqlite_zig_partial_update_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    var setup = try db.exec("CREATE TABLE flags (id INTEGER, code TEXT, active INTEGER); CREATE UNIQUE INDEX flags_active_code ON flags (code) WHERE active = 1; INSERT INTO flags VALUES (1, 'dup', 1), (2, 'dup', 0);");
+    setup.deinit();
+    try std.testing.expectError(error.ConstraintViolation, db.exec("UPDATE flags SET active = 1 WHERE id = 2;"));
+    var moved = try db.exec("UPDATE flags SET active = 0 WHERE id = 1;");
+    moved.deinit();
+    var nowAllowed = try db.exec("UPDATE flags SET active = 1 WHERE id = 2;");
+    nowAllowed.deinit();
+    var rows = try db.exec("SELECT id, active FROM flags ORDER BY id;");
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(i64, 0), rows.rows[0][1].integer);
+    try std.testing.expectEqual(@as(i64, 1), rows.rows[1][1].integer);
+}
+
+test "partial unique index interacts with conflict handling" {
+    const path = "sqlite_zig_partial_conflict_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    var setup = try db.exec("CREATE TABLE subs (id INTEGER, email TEXT, active INTEGER); CREATE UNIQUE INDEX subs_active_email ON subs (email) WHERE active = 1; INSERT INTO subs VALUES (1, 'a@test', 1);");
+    setup.deinit();
+    var ignored = try db.exec("INSERT OR IGNORE INTO subs VALUES (2, 'a@test', 1);");
+    ignored.deinit();
+    var inserted = try db.exec("INSERT OR IGNORE INTO subs VALUES (3, 'a@test', 0);");
+    inserted.deinit();
+    var upserted = try db.exec("INSERT INTO subs VALUES (4, 'a@test', 1) ON CONFLICT(email) DO UPDATE SET id = excluded.id;");
+    upserted.deinit();
+    var rows = try db.exec("SELECT id, active FROM subs ORDER BY id;");
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(usize, 2), rows.count());
+    try std.testing.expectEqual(@as(i64, 3), rows.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 0), rows.rows[0][1].integer);
+    try std.testing.expectEqual(@as(i64, 4), rows.rows[1][0].integer);
+    try std.testing.expectEqual(@as(i64, 1), rows.rows[1][1].integer);
+}
+
+test "planner uses partial indexes only when implied" {
+    const path = "sqlite_zig_partial_plan_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    var setup = try db.exec("CREATE TABLE orders (id INTEGER, amount INTEGER, active INTEGER); CREATE INDEX orders_active_id ON orders (id) WHERE active = 1; INSERT INTO orders VALUES (1, 10, 1), (2, 20, 0);");
+    setup.deinit();
+    var implied = try db.exec("EXPLAIN QUERY PLAN SELECT id FROM orders WHERE id = 1 AND active = 1;");
+    defer implied.deinit();
+    try std.testing.expect(implied.count() > 0);
+    try std.testing.expect(std.mem.indexOf(u8, implied.rows[0][0].text, "orders_active_id") != null);
+    var missing = try db.exec("EXPLAIN QUERY PLAN SELECT id FROM orders WHERE id = 1;");
+    defer missing.deinit();
+    try std.testing.expect(missing.count() > 0);
+    try std.testing.expect(std.mem.indexOf(u8, missing.rows[0][0].text, "orders_active_id") == null);
+    var orQuery = try db.exec("EXPLAIN QUERY PLAN SELECT id FROM orders WHERE id = 1 OR active = 1;");
+    defer orQuery.deinit();
+    try std.testing.expect(orQuery.count() > 0);
+    try std.testing.expect(std.mem.indexOf(u8, orQuery.rows[0][0].text, "orders_active_id") == null);
+    var filtered = try db.exec("SELECT amount FROM orders WHERE id = 2 AND active = 0;");
+    defer filtered.deinit();
+    try std.testing.expectEqual(@as(usize, 1), filtered.count());
+    try std.testing.expectEqual(@as(i64, 20), filtered.rows[0][0].integer);
+}
+
+test "partial indexes persist across reopen" {
+    const path = "sqlite_zig_partial_persist_test.db";
+    var db = try freshDb(path);
+    var setup = try db.exec("CREATE TABLE keep (id INTEGER, code TEXT, active INTEGER); CREATE UNIQUE INDEX keep_active_code ON keep (code) WHERE active = 1; INSERT INTO keep VALUES (1, 'k', 1), (2, 'k', 0);");
+    setup.deinit();
+    db.close();
+    db = try Connection.open(std.testing.allocator, path);
+    errdefer db.close();
+    defer dropDb(db, path);
+    try std.testing.expect(db.store.findIndexConst("keep_active_code") != null);
+    try std.testing.expectError(error.ConstraintViolation, db.exec("INSERT INTO keep VALUES (3, 'k', 1);"));
+    var allowed = try db.exec("INSERT INTO keep VALUES (4, 'k', 0);");
+    allowed.deinit();
+    var check = try db.exec("EXPLAIN QUERY PLAN SELECT code FROM keep WHERE code = 'k' AND active = 1;");
+    defer check.deinit();
+    try std.testing.expect(check.count() > 0);
+    try std.testing.expect(std.mem.indexOf(u8, check.rows[0][0].text, "keep_active_code") != null);
+    var rows = try db.exec("SELECT count(*) FROM keep;");
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(i64, 3), rows.rows[0][0].integer);
+}
+
+test "expression index creation validates keys" {
+    const path = "sqlite_zig_expr_create_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    var setup = try db.exec("CREATE TABLE people (id INTEGER, email TEXT, age INTEGER);");
+    setup.deinit();
+    var created = try db.exec("CREATE INDEX people_lower_email ON people (lower(email));");
+    created.deinit();
+    try std.testing.expect(db.store.findIndexConst("people_lower_email") != null);
+    var multi = try db.exec("CREATE INDEX people_multi ON people (age, lower(email));");
+    multi.deinit();
+    try std.testing.expectError(error.UnknownColumn, db.exec("CREATE INDEX people_bad ON people (lower(missing));"));
+    try std.testing.expect(db.store.findIndexConst("people_bad") == null);
+    try std.testing.expectError(error.InvalidSql, db.exec("CREATE INDEX people_const ON people (1 + 1);"));
+    try std.testing.expect(db.store.findIndexConst("people_const") == null);
+    try std.testing.expectError(error.InvalidSql, db.exec("CREATE INDEX people_agg ON people (sum(age));"));
+    try std.testing.expect(db.store.findIndexConst("people_agg") == null);
+    try std.testing.expectError(error.InvalidSql, db.exec("CREATE INDEX people_sub ON people ((SELECT 1));"));
+    try std.testing.expect(db.store.findIndexConst("people_sub") == null);
+    var dropped = try db.exec("DROP INDEX people_lower_email;");
+    dropped.deinit();
+    var droppedMulti = try db.exec("DROP INDEX people_multi;");
+    droppedMulti.deinit();
+}
+
+test "expression unique index constrains computed values" {
+    const path = "sqlite_zig_expr_unique_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    var setup = try db.exec("CREATE TABLE accounts (id INTEGER, email TEXT); CREATE UNIQUE INDEX accounts_lower_email ON accounts (lower(email));");
+    setup.deinit();
+    var first = try db.exec("INSERT INTO accounts VALUES (1, 'A@Test');");
+    first.deinit();
+    try std.testing.expectError(error.ConstraintViolation, db.exec("INSERT INTO accounts VALUES (2, 'a@test');"));
+    var other = try db.exec("INSERT INTO accounts VALUES (3, 'b@test');");
+    other.deinit();
+    var ignored = try db.exec("INSERT OR IGNORE INTO accounts VALUES (4, 'A@TEST');");
+    ignored.deinit();
+    var rows = try db.exec("SELECT id, email FROM accounts ORDER BY id;");
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(usize, 2), rows.count());
+    try std.testing.expectEqualStrings("A@Test", rows.rows[0][1].text);
+    try std.testing.expectEqualStrings("b@test", rows.rows[1][1].text);
+    try std.testing.expectError(error.ConstraintViolation, db.exec("UPDATE accounts SET email = 'B@TEST' WHERE id = 1;"));
+    var moved = try db.exec("UPDATE accounts SET email = 'c@test' WHERE id = 1;");
+    moved.deinit();
+    var after = try db.exec("SELECT email FROM accounts WHERE id = 1;");
+    defer after.deinit();
+    try std.testing.expectEqualStrings("c@test", after.rows[0][0].text);
+}
+
+test "planner uses expression indexes on matching predicates" {
+    const path = "sqlite_zig_expr_plan_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    var setup = try db.exec("CREATE TABLE contacts (id INTEGER, email TEXT); CREATE INDEX contacts_lower_email ON contacts (lower(email)); INSERT INTO contacts VALUES (1, 'A@Test'), (2, 'b@test');");
+    setup.deinit();
+    var matched = try db.exec("EXPLAIN QUERY PLAN SELECT email FROM contacts WHERE lower(email) = 'a@test';");
+    defer matched.deinit();
+    try std.testing.expect(matched.count() > 0);
+    try std.testing.expect(std.mem.indexOf(u8, matched.rows[0][0].text, "contacts_lower_email") != null);
+    var plain = try db.exec("EXPLAIN QUERY PLAN SELECT email FROM contacts WHERE email = 'a@test';");
+    defer plain.deinit();
+    try std.testing.expect(plain.count() > 0);
+    try std.testing.expect(std.mem.indexOf(u8, plain.rows[0][0].text, "contacts_lower_email") == null);
+    var orQuery = try db.exec("EXPLAIN QUERY PLAN SELECT email FROM contacts WHERE lower(email) = 'a@test' OR id = 1;");
+    defer orQuery.deinit();
+    try std.testing.expect(orQuery.count() > 0);
+    try std.testing.expect(std.mem.indexOf(u8, orQuery.rows[0][0].text, "contacts_lower_email") == null);
+    var found = try db.exec("SELECT id FROM contacts WHERE lower(email) = 'b@test';");
+    defer found.deinit();
+    try std.testing.expectEqual(@as(usize, 1), found.count());
+    try std.testing.expectEqual(@as(i64, 2), found.rows[0][0].integer);
+}
+
+test "expression and partial index combine correctly" {
+    const path = "sqlite_zig_expr_partial_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    var setup = try db.exec("CREATE TABLE staff (id INTEGER, email TEXT, active INTEGER); CREATE UNIQUE INDEX staff_active_lower ON staff (lower(email)) WHERE active = 1;");
+    setup.deinit();
+    var first = try db.exec("INSERT INTO staff VALUES (1, 'A@Test', 1);");
+    first.deinit();
+    try std.testing.expectError(error.ConstraintViolation, db.exec("INSERT INTO staff VALUES (2, 'a@test', 1);"));
+    var inactive = try db.exec("INSERT INTO staff VALUES (3, 'A@TEST', 0);");
+    inactive.deinit();
+    var rows = try db.exec("SELECT count(*) FROM staff;");
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(i64, 2), rows.rows[0][0].integer);
+    var planned = try db.exec("EXPLAIN QUERY PLAN SELECT email FROM staff WHERE lower(email) = 'a@test' AND active = 1;");
+    defer planned.deinit();
+    try std.testing.expect(planned.count() > 0);
+    try std.testing.expect(std.mem.indexOf(u8, planned.rows[0][0].text, "staff_active_lower") != null);
+}
+
+test "expression indexes persist across reopen" {
+    const path = "sqlite_zig_expr_persist_test.db";
+    var db = try freshDb(path);
+    var setup = try db.exec("CREATE TABLE persist (id INTEGER, email TEXT); CREATE UNIQUE INDEX persist_lower_email ON persist (lower(email)); INSERT INTO persist VALUES (1, 'A@Test');");
+    setup.deinit();
+    db.close();
+    db = try Connection.open(std.testing.allocator, path);
+    errdefer db.close();
+    defer dropDb(db, path);
+    try std.testing.expect(db.store.findIndexConst("persist_lower_email") != null);
+    try std.testing.expectError(error.ConstraintViolation, db.exec("INSERT INTO persist VALUES (2, 'a@test');"));
+    var allowed = try db.exec("INSERT INTO persist VALUES (3, 'other@test');");
+    allowed.deinit();
+    var check = try db.exec("EXPLAIN QUERY PLAN SELECT email FROM persist WHERE lower(email) = 'other@test';");
+    defer check.deinit();
+    try std.testing.expect(check.count() > 0);
+    try std.testing.expect(std.mem.indexOf(u8, check.rows[0][0].text, "persist_lower_email") != null);
+    var rows = try db.exec("SELECT count(*) FROM persist;");
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(i64, 2), rows.rows[0][0].integer);
+}
+
+test "dynamic and typed DSL support insert-select" {
+    const Src = @import("../dsl/table.zig").table("dsl_src_items", struct { id: i64, label: []const u8 });
+    const Dst = @import("../dsl/table.zig").table("dsl_dst_items", struct { id: i64, label: []const u8 });
+    const path = "sqlite_zig_dsl_insert_select_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    try db.createTable(Src, .{});
+    try db.createTable(Dst, .{});
+    var seed = try db.from(Src).insert(.{ .id = 1, .label = "one" });
+    seed.deinit();
+    var seed2 = try db.exec("INSERT INTO dsl_src_items VALUES (2, 'two'), (3, 'three');");
+    seed2.deinit();
+    var copied = try db.from(Dst).insertSelect(db.from(Src).select(.{ Src.columns.id, Src.columns.label }));
+    defer copied.deinit();
+    try std.testing.expectEqual(@as(usize, 3), copied.changes);
+    var rows = try db.from(Dst).select(.{Dst.columns.id}).fetch();
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(usize, 3), rows.count());
+    var filtered = try db.from("dsl_dst_items").insertSelect(
+        db.from("dsl_src_items").select(.{ db.col("id"), db.col("label") }).where(db.col("id").gt(10)),
+    );
+    defer filtered.deinit();
+    try std.testing.expectEqual(@as(usize, 0), filtered.changes);
+    var resized = try db.exec("SELECT count(*) FROM dsl_dst_items;");
+    defer resized.deinit();
+    try std.testing.expectEqual(@as(i64, 3), resized.rows[0][0].integer);
+    var returning = try db.from(Dst).returning(.{Dst.columns.id}).insertSelect(
+        db.from(Src).select(.{ Src.columns.id, Src.columns.label }).where(Src.columns.id.eq(1)),
+    );
+    defer returning.deinit();
+    try std.testing.expectEqual(@as(usize, 1), returning.count());
+    try std.testing.expectEqual(@as(i64, 1), returning.rows[0][0].integer);
+}
+
+test "dynamic and typed DSL support update-from" {
+    const Bal = @import("../dsl/table.zig").table("dsl_balances", struct { id: i64, amount: i64, flag: i64 });
+    const Adj = @import("../dsl/table.zig").table("dsl_adjustments", struct { id: i64, bal_id: i64 });
+    const path = "sqlite_zig_dsl_update_from_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    try db.createTable(Bal, .{});
+    try db.createTable(Adj, .{});
+    var seed = try db.exec("INSERT INTO dsl_balances VALUES (1, 100, 0), (2, 200, 0); INSERT INTO dsl_adjustments VALUES (10, 1);");
+    seed.deinit();
+    var mutation = try db.from(Bal).update(.{ .flag = 1 });
+    var updated = try mutation.updateFrom(Adj, Bal.columns.id.eq(Adj.columns.bal_id)).execute();
+    defer updated.deinit();
+    try std.testing.expectEqual(@as(usize, 1), updated.changes);
+    var rows = try db.exec("SELECT id, flag FROM dsl_balances ORDER BY id;");
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(i64, 1), rows.rows[0][1].integer);
+    try std.testing.expectEqual(@as(i64, 0), rows.rows[1][1].integer);
+    var dynMutation = try db.from("dsl_balances").update(.{ .flag = 7 });
+    var dynUpdated = try dynMutation.updateFrom("dsl_adjustments", db.col("dsl_balances.id").eq(db.col("dsl_adjustments.bal_id"))).where(db.col("id").eq(2)).execute();
+    defer dynUpdated.deinit();
+    try std.testing.expectEqual(@as(usize, 0), dynUpdated.changes);
+    var again = try db.exec("SELECT flag FROM dsl_balances WHERE id = 2;");
+    defer again.deinit();
+    try std.testing.expectEqual(@as(usize, 1), again.count());
+    try std.testing.expectEqual(@as(i64, 0), again.rows[0][0].integer);
+    var doomed = db.from(Bal).delete();
+    try std.testing.expectError(error.InvalidSql, doomed.updateFrom(Adj, Bal.columns.id.eq(Adj.columns.bal_id)).execute());
+}
+
+test "DSL creates partial and expression indexes" {
+    const Item = @import("../dsl/table.zig").table("dsl_idx_items", struct { id: i64, email: []const u8, active: i64 });
+    const path = "sqlite_zig_dsl_index_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    try db.createTable(Item, .{});
+    try db.createIndexWhere(Item, "dsl_idx_active", .{Item.columns.id}, false, "active = 1");
+    try std.testing.expect(db.store.findIndexConst("dsl_idx_active") != null);
+    try db.createIndexExpr("dsl_idx_items", "dsl_idx_lower", &.{"lower(email)"}, false, null);
+    try std.testing.expect(db.store.findIndexConst("dsl_idx_lower") != null);
+    try db.createIndexExpr(Item, "dsl_idx_combined", &.{"lower(email)"}, true, "active = 1");
+    try std.testing.expect(db.store.findIndexConst("dsl_idx_combined") != null);
+    try std.testing.expectError(error.UnknownColumn, db.createIndexWhere(Item, "dsl_idx_bad", .{Item.columns.id}, false, "missing = 1"));
+    try std.testing.expect(db.store.findIndexConst("dsl_idx_bad") == null);
+    var first = try db.from(Item).insert(.{ .id = 1, .email = "A@Test", .active = 1 });
+    first.deinit();
+    try std.testing.expectError(error.ConstraintViolation, db.from(Item).insert(.{ .id = 2, .email = "a@test", .active = 1 }));
+    var inactive = try db.from(Item).insert(.{ .id = 3, .email = "a@test", .active = 0 });
+    inactive.deinit();
+    var planned = try db.exec("EXPLAIN QUERY PLAN SELECT email FROM dsl_idx_items WHERE lower(email) = 'a@test' AND active = 1;");
+    defer planned.deinit();
+    try std.testing.expect(planned.count() > 0);
+    try std.testing.expect(std.mem.indexOf(u8, planned.rows[0][0].text, "dsl_idx_combined") != null);
+    db.close();
+    db = try Connection.open(std.testing.allocator, path);
+    errdefer db.close();
+    try std.testing.expect(db.store.findIndexConst("dsl_idx_active") != null);
+    try std.testing.expect(db.store.findIndexConst("dsl_idx_lower") != null);
+    try std.testing.expect(db.store.findIndexConst("dsl_idx_combined") != null);
+    try std.testing.expectError(error.ConstraintViolation, db.from(Item).insert(.{ .id = 4, .email = "A@TEST", .active = 1 }));
 }

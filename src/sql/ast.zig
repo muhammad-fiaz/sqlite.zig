@@ -53,7 +53,7 @@ pub const ReferentialAction = enum { restrict, cascade, setNull, setDefault, noA
 pub const ColumnDef = struct { name: []const u8, typeName: []const u8, primaryKey: bool = false, notNull: bool = false, unique: bool = false, foreignKey: ?ForeignKeyDef = null, defaultValue: ?Value = null, checkExpr: ?Expr = null, generatedExpr: ?Expr = null, generatedStored: bool = false };
 pub const TableForeignKeyDef = struct { columns: []const []const u8, table: []const u8, referencedColumns: []const []const u8, onDelete: ReferentialAction = .restrict, onUpdate: ReferentialAction = .restrict };
 pub const TableConstraint = union(enum) { primaryKey: []const []const u8, unique: []const []const u8, foreignKey: TableForeignKeyDef, check: Expr };
-pub const IndexDef = struct { name: []const u8, table: []const u8, columns: []const []const u8, unique: bool = false, ifNotExists: bool = false, whereExpr: ?Expr = null };
+pub const IndexDef = struct { name: []const u8, table: []const u8, columns: []const []const u8, keyExprs: []const ?Expr = &.{}, unique: bool = false, ifNotExists: bool = false, whereExpr: ?Expr = null, whereSql: ?[]const u8 = null };
 pub const TriggerEvent = enum { insert, update, delete };
 pub const TriggerTiming = enum { before, after };
 pub const TriggerDef = struct { name: []const u8, table: []const u8, timing: TriggerTiming = .after, event: TriggerEvent, whenSql: ?[]const u8 = null, body: []const u8, ifNotExists: bool = false };
@@ -581,6 +581,8 @@ pub fn deinit(allocator: anytype, statement: *Statement) void {
         },
         .createIndex => |value| {
             if (value.whereExpr) |wh| freeExpr(allocator, wh);
+            for (value.keyExprs) |maybeKey| if (maybeKey) |key| freeExpr(allocator, key);
+            if (value.keyExprs.len != 0) allocator.free(value.keyExprs);
             allocator.free(value.columns);
         },
         .createView => {},

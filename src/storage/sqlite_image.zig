@@ -7,6 +7,7 @@ const Schema = @import("../catalog/schema.zig").Schema;
 const Value = @import("../vm/value.zig").Value;
 const ast = @import("../sql/ast.zig");
 const Parser = @import("../sql/parser.zig").Parser;
+const exprEvaluator = @import("../sql/expr.zig");
 
 const Cell = struct { rowid: u64, values: []Value };
 
@@ -324,15 +325,29 @@ fn buildIndexBtree(allocator: std.mem.Allocator, pageBuilder: *PageBuilder, sche
         indexCells.deinit(allocator);
     }
 
+    var colNames = try allocator.alloc([]const u8, table.columns.len);
+    defer allocator.free(colNames);
+    for (table.columns, 0..) |col, position| colNames[position] = col.name;
     for (table.rows.items, 0..) |row, rowPosition| {
+        if (index.whereExpr) |predicate| {
+            const holds = try exprEvaluator.evalPredicate(allocator, colNames, row.values, predicate);
+            if (!holds) continue;
+        }
         var values = try allocator.alloc(Value, index.columns.len + 1);
         defer allocator.free(values);
         for (index.columns, 0..) |column, position| {
+            if (index.keyExpr(position)) |key| {
+                values[position] = try exprEvaluator.evalTemp(allocator, colNames, row.values, key);
+                continue;
+            }
             values[position] = row.values[columnIndex(table, column) orelse return error.UnknownColumn];
         }
         values[index.columns.len] = .{ .integer = @intCast(rowPosition + 1) };
         const item = try buildIndexCell(pageBuilder, values, databasePageSize);
         try indexCells.append(allocator, item);
+        for (index.columns, 0..) |_, position| {
+            if (index.keyExpr(position) != null) exprEvaluator.freeValue(allocator, values[position]);
+        }
     }
 
     var totalBytes: usize = 0;
@@ -480,7 +495,12 @@ fn createIndexSql(allocator: std.mem.Allocator, index: anytype) ![]u8 {
         if (position != 0) try sql.appendSlice(allocator, ", ");
         try sql.appendSlice(allocator, column);
     }
-    try sql.appendSlice(allocator, ");");
+    try sql.appendSlice(allocator, ")");
+    if (index.whereSql) |predicate| {
+        try sql.appendSlice(allocator, " WHERE ");
+        try sql.appendSlice(allocator, predicate);
+    }
+    try sql.appendSlice(allocator, ";");
     return sql.toOwnedSlice(allocator);
 }
 
