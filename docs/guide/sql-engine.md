@@ -11,7 +11,7 @@ description: "The hand-written SQL lexer, parser, and bytecode compiler supporti
 
 | Statement | Syntax |
 |-----------|--------|
-| **CREATE TABLE** | `CREATE TABLE [IF NOT EXISTS] name (columns [DEFAULT literal], constraints)` |
+| **CREATE TABLE** | `CREATE [TEMP] TABLE [IF NOT EXISTS] name (columns [DEFAULT literal], constraints)`; `TEMP` tables live for the session, shadow main tables, and are never persisted |
 | **DROP TABLE** | `DROP TABLE [IF EXISTS] name` |
 | **INSERT** | `INSERT INTO name VALUES (...)` or `INSERT INTO name (cols) VALUES (...)` |
 | **SELECT** | `SELECT [DISTINCT] columns FROM table [JOIN ...] [WHERE ...] [GROUP BY ...] [HAVING ...] [ORDER BY ...] [LIMIT ... [OFFSET ...]]` |
@@ -22,21 +22,34 @@ description: "The hand-written SQL lexer, parser, and bytecode compiler supporti
 | **ROLLBACK** | `ROLLBACK [TO [SAVEPOINT] name]` |
 | **SAVEPOINT** | `SAVEPOINT name` |
 | **RELEASE** | `RELEASE [SAVEPOINT] name` |
-| **CREATE VIEW** | `CREATE VIEW [IF NOT EXISTS] name AS SELECT ...` |
-| **CREATE TRIGGER** | `CREATE TRIGGER [IF NOT EXISTS] name [BEFORE\|AFTER] INSERT\|UPDATE\|DELETE ON table [WHEN ...] ...` |
+| **CREATE VIEW** | `CREATE [TEMP] VIEW [IF NOT EXISTS] name AS SELECT ...` |
+| **CREATE TRIGGER** | `CREATE [TEMP] TRIGGER [IF NOT EXISTS] name [BEFORE\|AFTER] INSERT\|UPDATE\|DELETE ON table [WHEN ...] ...` |
 | **CREATE INDEX** | `CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (columns)` |
 | **ALTER TABLE** | `ADD COLUMN`, `RENAME TO`, `RENAME COLUMN ... TO`, and `DROP COLUMN`; renames follow indexes, triggers (including `UPDATE OF` and `NEW`/`OLD` body references), views, `CHECK`/generated/index expressions, foreign keys, and `sqlite_sequence`; drops are refused while a column backs a key, index, or foreign key |
 | **UPSERT** | `INSERT ... ON CONFLICT [(cols)] [WHERE ...] DO NOTHING` / `DO UPDATE SET ...` with `excluded` |
 | **RETURNING** | `INSERT/UPDATE/DELETE ... RETURNING ...` |
 | **Compound SELECT** | `UNION [ALL]`, `INTERSECT`, `EXCEPT` with `ORDER BY` / `LIMIT` / `OFFSET` |
 | **CTE** | `WITH ...` / `WITH RECURSIVE ...` |
-| **VACUUM** | `VACUUM [main]` rebuilds the database; `VACUUM INTO 'file'` writes a copy |
+| **VACUUM** | `VACUUM [schema]` rebuilds the main or an attached database; `VACUUM INTO 'file'` writes a copy |
 | **EXPLAIN QUERY PLAN** | `EXPLAIN QUERY PLAN SELECT ...` reports index use vs table scans |
 | **CREATE VIRTUAL TABLE** | `generate_series` module only; other modules return an explicit error |
 | **DROP** | `DROP TABLE/INDEX/VIEW/TRIGGER [IF EXISTS] name` |
 | **PRAGMA** | `foreign_keys`, `user_version`, `application_id`, `schema_version`, `journal_mode`, `wal_checkpoint`, `synchronous`, `cache_size`, `page_size`, `encoding`, `busy_timeout`, `locking_mode`, `auto_vacuum`, `recursive_triggers`, `integrity_check`, `foreign_key_check`, `table_info`, `table_xinfo`, `table_list`, `index_list`, `index_info`, `index_xinfo`, `foreign_key_list`, `database_list` |
 
-`ATTACH` and `DETACH` parse but return an explicit unsupported-feature error.
+## Schemas: main, temp, and attached databases
+
+`ATTACH 'file.db' AS aux;` opens another database file alongside the main
+one; `DETACH aux;` closes it again (never `main` or `temp`, never inside a
+transaction). Tables, views, triggers, and indexes can be schema-qualified
+(`SELECT * FROM aux.orders`, `INSERT INTO aux.orders ...`,
+`CREATE TABLE aux.t (...)`, `DROP TABLE aux.t`, `PRAGMA aux.table_info(t)`),
+and columns as `aux.orders.amount`. Bare names resolve `temp` first, then
+`main`, then attached databases in attach order; a `TEMP` table therefore
+shadows a same-named main table. Transactions, savepoints, and statement
+atomicity span all schemas, and every attached file is persisted on commit
+alongside the main file. `PRAGMA database_list;` reports `main`, `temp`,
+and each attachment with its file path. Foreign keys stay within one
+schema: a child in `aux` cannot reference a table in `main`.
 
 Partial (`WHERE`) and expression indexes are supported: `CREATE [UNIQUE]
 INDEX name ON table (columns) WHERE predicate` indexes only matching rows

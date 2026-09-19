@@ -6,6 +6,7 @@ const Schema = @import("../catalog/schema.zig").Schema;
 const Table = @import("../catalog/schema.zig").Table;
 const View = @import("../catalog/schema.zig").View;
 const Index = @import("../catalog/schema.zig").Index;
+const Trigger = @import("../catalog/schema.zig").Trigger;
 const Value = @import("../vm/value.zig").Value;
 const ast = @import("../sql/ast.zig");
 const Parser = @import("../sql/parser.zig").Parser;
@@ -22,7 +23,10 @@ const functions = @import("../sql/functions.zig");
 
 const maxTriggerDepth: usize = 64;
 
-const Savepoint = struct { name: []u8, schema: Schema };
+const Savepoint = struct { name: []u8, schema: Schema, tempSchema: Schema, attached: std.ArrayList(AttachedBackup) };
+const AttachedDb = struct { name: []u8, file: DatabaseFile, store: Schema };
+const AttachedBackup = struct { name: []u8, store: Schema };
+const SchemaRef = union(enum) { main, temp, attached: usize };
 const OuterRow = struct { table: *const Table, alias: ?[]const u8 = null, values: []const Value, prev: ?*const OuterRow = null };
 const JoinSegment = struct { table: *const Table, alias: ?[]const u8, values: []const Value };
 const JoinRow = struct { segments: []JoinSegment, frames: []OuterRow };
@@ -35,8 +39,14 @@ pub const Connection = struct {
     allocator: std.mem.Allocator,
     file: DatabaseFile,
     store: Schema,
+    tempStore: Schema,
+    attached: std.ArrayList(AttachedDb) = .empty,
     backup: ?Schema = null,
+    tempBackup: ?Schema = null,
+    attachedBackup: std.ArrayList(AttachedBackup) = .empty,
     statementBackup: ?Schema = null,
+    tempStatementBackup: ?Schema = null,
+    attachedStatementBackup: std.ArrayList(AttachedBackup) = .empty,
     inAtomicStatement: bool = false,
     activeCtes: std.ArrayList([]const u8) = .empty,
     recursiveTriggers: bool = false,
@@ -56,7 +66,7 @@ pub const Connection = struct {
             allocator.destroy(connection);
             return err;
         };
-        connection.* = .{ .allocator = allocator, .file = file, .store = Schema.init(allocator), .savepoints = .empty };
+        connection.* = .{ .allocator = allocator, .file = file, .store = Schema.init(allocator), .tempStore = Schema.init(allocator), .savepoints = .empty };
         errdefer connection.close();
         if (try connection.file.readPayload()) |payload| {
             defer allocator.free(payload);
@@ -83,21 +93,263 @@ pub const Connection = struct {
         }
         self.persist() catch {};
         if (self.backup) |*backup| backup.deinit();
-        if (self.statementBackup) |*statement| statement.deinit();
+        if (self.tempBackup) |*backup| backup.deinit();
+        self.deinitAttachedBackup(&self.attachedBackup);
+        if (self.statementBackup) |*backup| backup.deinit();
+        if (self.tempStatementBackup) |*backup| backup.deinit();
+        self.deinitAttachedBackup(&self.attachedStatementBackup);
         self.activeCtes.deinit(self.allocator);
         self.triggerStack.deinit(self.allocator);
         self.clearSavepoints();
         self.savepoints.deinit(self.allocator);
         self.store.deinit();
+        self.tempStore.deinit();
+        for (self.attached.items) |*db| {
+            db.store.deinit();
+            db.file.close();
+            self.allocator.free(db.name);
+        }
+        self.attached.deinit(self.allocator);
         self.file.close();
         self.allocator.destroy(self);
     }
 
     fn persist(self: *Connection) !void {
-        const bytes = try sqliteImage.encodeWithPageSize(self.allocator, &self.store, self.file.pageSize);
+        try self.persistSchema(&self.file, &self.store);
+        for (self.attached.items) |*db| try self.persistSchema(&db.file, &db.store);
+    }
+
+    fn persistSchema(self: *Connection, file: *DatabaseFile, store: *Schema) !void {
+        const bytes = try sqliteImage.encodeWithPageSize(self.allocator, store, file.pageSize);
         defer self.allocator.free(bytes);
-        try self.file.writeImage(bytes);
-        if (self.synchronousLevel >= 2) try self.file.file.sync(self.file.threaded.io());
+        try file.writeImage(bytes);
+        if (self.synchronousLevel >= 2) try file.file.sync(file.threaded.io());
+    }
+
+    fn clearAttachedBackup(self: *Connection, backups: *std.ArrayList(AttachedBackup)) void {
+        for (backups.items) |*item| {
+            self.allocator.free(item.name);
+            item.store.deinit();
+        }
+        backups.clearRetainingCapacity();
+    }
+
+    fn deinitAttachedBackup(self: *Connection, backups: *std.ArrayList(AttachedBackup)) void {
+        self.clearAttachedBackup(backups);
+        backups.deinit(self.allocator);
+    }
+
+    fn snapshotAttached(self: *Connection, backups: *std.ArrayList(AttachedBackup)) !void {
+        for (self.attached.items) |db| {
+            const ownedName = try self.allocator.dupe(u8, db.name);
+            errdefer self.allocator.free(ownedName);
+            var cloned = try db.store.clone();
+            errdefer cloned.deinit();
+            try backups.append(self.allocator, .{ .name = ownedName, .store = cloned });
+        }
+    }
+
+    fn restoreAttached(self: *Connection, backups: *std.ArrayList(AttachedBackup)) void {
+        for (self.attached.items) |*db| {
+            for (backups.items) |*item| {
+                if (!std.ascii.eqlIgnoreCase(item.name, db.name)) continue;
+                db.store.deinit();
+                db.store = item.store;
+                item.store = Schema.init(self.allocator);
+            }
+        }
+        self.clearAttachedBackup(backups);
+    }
+
+    fn snapshotSchemas(self: *Connection) !void {
+        self.backup = try self.store.clone();
+        errdefer {
+            if (self.backup) |*backup| backup.deinit();
+            self.backup = null;
+        }
+        self.tempBackup = try self.tempStore.clone();
+        errdefer {
+            if (self.tempBackup) |*backup| backup.deinit();
+            self.tempBackup = null;
+        }
+        try self.snapshotAttached(&self.attachedBackup);
+    }
+
+    fn restoreSchemas(self: *Connection) void {
+        self.store.deinit();
+        self.store = self.backup.?;
+        self.backup = null;
+        self.tempStore.deinit();
+        self.tempStore = self.tempBackup.?;
+        self.tempBackup = null;
+        self.restoreAttached(&self.attachedBackup);
+    }
+
+    fn clearSchemaBackups(self: *Connection) void {
+        if (self.backup) |*backup| backup.deinit();
+        self.backup = null;
+        if (self.tempBackup) |*backup| backup.deinit();
+        self.tempBackup = null;
+        self.clearAttachedBackup(&self.attachedBackup);
+    }
+
+    fn snapshotStatementSchemas(self: *Connection) !void {
+        self.statementBackup = try self.store.clone();
+        errdefer {
+            if (self.statementBackup) |*backup| backup.deinit();
+            self.statementBackup = null;
+        }
+        self.tempStatementBackup = try self.tempStore.clone();
+        errdefer {
+            if (self.tempStatementBackup) |*backup| backup.deinit();
+            self.tempStatementBackup = null;
+        }
+        try self.snapshotAttached(&self.attachedStatementBackup);
+    }
+
+    fn restoreStatementSchemas(self: *Connection) void {
+        if (self.statementBackup != null) {
+            self.store.deinit();
+            self.store = self.statementBackup.?;
+            self.statementBackup = null;
+        }
+        if (self.tempStatementBackup != null) {
+            self.tempStore.deinit();
+            self.tempStore = self.tempStatementBackup.?;
+            self.tempStatementBackup = null;
+        }
+        self.restoreAttached(&self.attachedStatementBackup);
+    }
+
+    fn clearStatementBackups(self: *Connection) void {
+        if (self.statementBackup) |*backup| backup.deinit();
+        self.statementBackup = null;
+        if (self.tempStatementBackup) |*backup| backup.deinit();
+        self.tempStatementBackup = null;
+        self.clearAttachedBackup(&self.attachedStatementBackup);
+    }
+
+    fn splitSchemaName(name: []const u8) struct { qualifier: ?[]const u8, object: []const u8 } {
+        if (std.mem.indexOfScalar(u8, name, '.')) |dot| {
+            return .{ .qualifier = name[0..dot], .object = name[dot + 1 ..] };
+        }
+        return .{ .qualifier = null, .object = name };
+    }
+
+    fn resolveSchema(self: *Connection, qualifier: ?[]const u8) ?SchemaRef {
+        const name = qualifier orelse return null;
+        if (std.ascii.eqlIgnoreCase(name, "main")) return .main;
+        if (std.ascii.eqlIgnoreCase(name, "temp")) return .temp;
+        for (self.attached.items, 0..) |db, index| {
+            if (std.ascii.eqlIgnoreCase(db.name, name)) return .{ .attached = index };
+        }
+        return null;
+    }
+
+    fn storeFor(self: *Connection, ref: SchemaRef) *Schema {
+        return switch (ref) {
+            .main => &self.store,
+            .temp => &self.tempStore,
+            .attached => |index| &self.attached.items[index].store,
+        };
+    }
+
+    const ResolvedTable = struct { ref: SchemaRef, table: *Table };
+    const ResolvedView = struct { ref: SchemaRef, view: *View };
+    const ResolvedIndex = struct { ref: SchemaRef, index: *Index };
+    const ResolvedTrigger = struct { ref: SchemaRef, trigger: *Trigger };
+
+    fn findTableQualified(self: *Connection, qualifier: ?[]const u8, name: []const u8) ?ResolvedTable {
+        const ref = self.resolveSchema(qualifier) orelse return null;
+        const table = self.storeFor(ref).find(name) orelse return null;
+        return .{ .ref = ref, .table = table };
+    }
+
+    fn findTableOrdered(self: *Connection, name: []const u8) ?ResolvedTable {
+        if (self.cteActive(name)) {
+            if (self.store.find(name)) |table| return .{ .ref = .main, .table = table };
+            return null;
+        }
+        if (self.tempStore.find(name)) |table| return .{ .ref = .temp, .table = table };
+        if (self.store.find(name)) |table| return .{ .ref = .main, .table = table };
+        for (self.attached.items, 0..) |*db, index| {
+            if (db.store.find(name)) |table| return .{ .ref = .{ .attached = index }, .table = table };
+        }
+        return null;
+    }
+
+    fn resolveTableName(self: *Connection, name: []const u8) ?ResolvedTable {
+        const parts = splitSchemaName(name);
+        if (parts.qualifier) |qualifier| return self.findTableQualified(qualifier, parts.object);
+        return self.findTableOrdered(parts.object);
+    }
+
+    fn resolveViewName(self: *Connection, name: []const u8) ?ResolvedView {
+        const parts = splitSchemaName(name);
+        if (parts.qualifier) |qualifier| {
+            const ref = self.resolveSchema(qualifier) orelse return null;
+            const view = self.storeFor(ref).findView(parts.object) orelse return null;
+            return .{ .ref = ref, .view = view };
+        }
+        if (self.tempStore.findView(parts.object)) |view| return .{ .ref = .temp, .view = view };
+        if (self.store.findView(parts.object)) |view| return .{ .ref = .main, .view = view };
+        for (self.attached.items, 0..) |*db, index| {
+            if (db.store.findView(parts.object)) |view| return .{ .ref = .{ .attached = index }, .view = view };
+        }
+        return null;
+    }
+
+    fn resolveIndexName(self: *Connection, name: []const u8) ?ResolvedIndex {
+        const parts = splitSchemaName(name);
+        if (parts.qualifier) |qualifier| {
+            const ref = self.resolveSchema(qualifier) orelse return null;
+            const index = self.storeFor(ref).findIndex(parts.object) orelse return null;
+            return .{ .ref = ref, .index = index };
+        }
+        if (self.tempStore.findIndex(parts.object)) |index| return .{ .ref = .temp, .index = index };
+        if (self.store.findIndex(parts.object)) |index| return .{ .ref = .main, .index = index };
+        for (self.attached.items, 0..) |*db, index| {
+            if (db.store.findIndex(parts.object)) |found| return .{ .ref = .{ .attached = index }, .index = found };
+        }
+        return null;
+    }
+
+    fn schemaRefName(self: *Connection, ref: SchemaRef) []const u8 {
+        return switch (ref) {
+            .main => "main",
+            .temp => "temp",
+            .attached => |index| self.attached.items[index].name,
+        };
+    }
+
+    const DdlTarget = struct { store: *Schema, ref: SchemaRef, name: []const u8 };
+
+    fn createTarget(self: *Connection, name: []const u8, temporary: bool) !DdlTarget {
+        const parts = splitSchemaName(name);
+        if (temporary) {
+            if (parts.qualifier != null) return error.InvalidSql;
+            return .{ .store = &self.tempStore, .ref = .temp, .name = parts.object };
+        }
+        if (parts.qualifier) |qualifier| {
+            const ref = self.resolveSchema(qualifier) orelse return error.UnknownDatabase;
+            return .{ .store = self.storeFor(ref), .ref = ref, .name = parts.object };
+        }
+        return .{ .store = &self.store, .ref = .main, .name = parts.object };
+    }
+
+    fn resolveTriggerName(self: *Connection, name: []const u8) ?ResolvedTrigger {
+        const parts = splitSchemaName(name);
+        if (parts.qualifier) |qualifier| {
+            const ref = self.resolveSchema(qualifier) orelse return null;
+            const trigger = self.storeFor(ref).findTrigger(parts.object) orelse return null;
+            return .{ .ref = ref, .trigger = trigger };
+        }
+        if (self.tempStore.findTrigger(parts.object)) |trigger| return .{ .ref = .temp, .trigger = trigger };
+        if (self.store.findTrigger(parts.object)) |trigger| return .{ .ref = .main, .trigger = trigger };
+        for (self.attached.items, 0..) |*db, index| {
+            if (db.store.findTrigger(parts.object)) |found| return .{ .ref = .{ .attached = index }, .trigger = found };
+        }
+        return null;
     }
 
     pub fn exec(self: *Connection, sql: []const u8) !Result {
@@ -188,6 +440,33 @@ pub const Connection = struct {
 
     pub fn tableExists(self: *Connection, comptime TableType: type) bool {
         return self.store.find(TableType.tableName) != null;
+    }
+
+    pub fn userVersion(self: *Connection) u32 {
+        return self.file.getUserVersion();
+    }
+
+    pub fn setUserVersion(self: *Connection, version: u32) !void {
+        self.file.setUserVersion(version);
+        try self.persistSchema(&self.file, &self.store);
+    }
+
+    pub fn schemaVersion(self: *Connection) u32 {
+        return self.file.getSchemaVersion();
+    }
+
+    pub fn setSchemaVersion(self: *Connection, version: u32) !void {
+        self.file.setSchemaVersion(version);
+        try self.persistSchema(&self.file, &self.store);
+    }
+
+    pub fn applicationId(self: *Connection) u32 {
+        return self.file.getApplicationId();
+    }
+
+    pub fn setApplicationId(self: *Connection, id: u32) !void {
+        self.file.setApplicationId(id);
+        try self.persistSchema(&self.file, &self.store);
     }
 
     pub fn createTable(self: *Connection, target: anytype, options: anytype) !void {
@@ -580,7 +859,7 @@ pub const Connection = struct {
 
     pub fn begin(self: *Connection) !void {
         if (self.transactionActive) return error.TransactionActive;
-        self.backup = try self.store.clone();
+        try self.snapshotSchemas();
         self.transactionActive = true;
     }
 
@@ -593,40 +872,32 @@ pub const Connection = struct {
     pub fn commit(self: *Connection) !void {
         if (!self.transactionActive) return error.NotInTransaction;
         try self.persist();
-        if (self.backup) |*backup| backup.deinit();
-        self.backup = null;
+        self.clearSchemaBackups();
         self.clearSavepoints();
         self.transactionActive = false;
     }
     pub fn rollback(self: *Connection) !void {
         if (!self.transactionActive) return error.NotInTransaction;
-        self.store.deinit();
-        self.store = self.backup.?;
-        self.backup = null;
+        self.restoreSchemas();
         self.clearSavepoints();
         self.transactionActive = false;
     }
 
     fn beginStatementAtomic(self: *Connection) !void {
         if (self.inAtomicStatement) return;
-        self.statementBackup = try self.store.clone();
+        try self.snapshotStatementSchemas();
         self.inAtomicStatement = true;
     }
 
     fn endStatementAtomic(self: *Connection) void {
         if (!self.inAtomicStatement) return;
-        if (self.statementBackup) |*backup| backup.deinit();
-        self.statementBackup = null;
+        self.clearStatementBackups();
         self.inAtomicStatement = false;
     }
 
     fn abortStatementAtomic(self: *Connection) void {
         if (!self.inAtomicStatement) return;
-        if (self.statementBackup != null) {
-            self.store.deinit();
-            self.store = self.statementBackup.?;
-            self.statementBackup = null;
-        }
+        self.restoreStatementSchemas();
         self.inAtomicStatement = false;
     }
 
@@ -700,10 +971,7 @@ pub const Connection = struct {
     }
 
     fn clearSavepoints(self: *Connection) void {
-        for (self.savepoints.items) |*item| {
-            self.allocator.free(item.name);
-            item.schema.deinit();
-        }
+        for (self.savepoints.items) |*item| self.releaseSavepointEntry(item);
         self.savepoints.clearRetainingCapacity();
     }
 
@@ -711,10 +979,28 @@ pub const Connection = struct {
         if (!self.transactionActive) try self.begin();
         var snapshot = try self.store.clone();
         errdefer snapshot.deinit();
+        var tempSnapshot = try self.tempStore.clone();
+        errdefer tempSnapshot.deinit();
+        var attachedSnapshot = std.ArrayList(AttachedBackup).empty;
+        errdefer {
+            for (attachedSnapshot.items) |*item| {
+                self.allocator.free(item.name);
+                item.store.deinit();
+            }
+            attachedSnapshot.deinit(self.allocator);
+        }
+        try self.snapshotAttached(&attachedSnapshot);
         const ownedName = try self.allocator.dupe(u8, name);
         errdefer self.allocator.free(ownedName);
-        try self.savepoints.append(self.allocator, .{ .name = ownedName, .schema = snapshot });
+        try self.savepoints.append(self.allocator, .{ .name = ownedName, .schema = snapshot, .tempSchema = tempSnapshot, .attached = attachedSnapshot });
         return try emptyResult(self.allocator);
+    }
+
+    fn releaseSavepointEntry(self: *Connection, item: *Savepoint) void {
+        self.allocator.free(item.name);
+        item.schema.deinit();
+        item.tempSchema.deinit();
+        self.deinitAttachedBackup(&item.attached);
     }
 
     fn releaseCommand(self: *Connection, name: []const u8) !Result {
@@ -724,8 +1010,7 @@ pub const Connection = struct {
             if (std.ascii.eqlIgnoreCase(self.savepoints.items[index].name, name)) {
                 while (self.savepoints.items.len > index) {
                     var item = self.savepoints.pop().?;
-                    self.allocator.free(item.name);
-                    item.schema.deinit();
+                    self.releaseSavepointEntry(&item);
                 }
                 return try emptyResult(self.allocator);
             }
@@ -738,12 +1023,41 @@ pub const Connection = struct {
         while (index > 0) {
             index -= 1;
             if (std.ascii.eqlIgnoreCase(self.savepoints.items[index].name, name)) {
+                var restoredMain = try self.savepoints.items[index].schema.clone();
+                errdefer restoredMain.deinit();
+                var restoredTemp = try self.savepoints.items[index].tempSchema.clone();
+                errdefer restoredTemp.deinit();
+                var restoredAttached = std.ArrayList(AttachedBackup).empty;
+                errdefer {
+                    for (restoredAttached.items) |*item| {
+                        self.allocator.free(item.name);
+                        item.store.deinit();
+                    }
+                    restoredAttached.deinit(self.allocator);
+                }
+                for (self.savepoints.items[index].attached.items) |*item| {
+                    const ownedName = try self.allocator.dupe(u8, item.name);
+                    errdefer self.allocator.free(ownedName);
+                    var cloned = try item.store.clone();
+                    errdefer cloned.deinit();
+                    try restoredAttached.append(self.allocator, .{ .name = ownedName, .store = cloned });
+                }
                 self.store.deinit();
-                self.store = try self.savepoints.items[index].schema.clone();
+                self.store = restoredMain;
+                self.tempStore.deinit();
+                self.tempStore = restoredTemp;
+                for (self.attached.items) |*db| {
+                    for (restoredAttached.items) |*item| {
+                        if (!std.ascii.eqlIgnoreCase(item.name, db.name)) continue;
+                        db.store.deinit();
+                        db.store = item.store;
+                        item.store = Schema.init(self.allocator);
+                    }
+                }
+                self.deinitAttachedBackup(&restoredAttached);
                 while (self.savepoints.items.len > index + 1) {
                     var item = self.savepoints.pop().?;
-                    self.allocator.free(item.name);
-                    item.schema.deinit();
+                    self.releaseSavepointEntry(&item);
                 }
                 return try emptyResult(self.allocator);
             }
@@ -799,8 +1113,8 @@ pub const Connection = struct {
             .savepoint => |name| try self.savepointCommand(name),
             .release => |name| try self.releaseCommand(name),
             .rollbackTo => |name| try self.rollbackToCommand(name),
-            .attach => error.Unsupported,
-            .detach => error.Unsupported,
+            .attach => |value| try self.attachCommand(value),
+            .detach => |value| try self.detachCommand(value.schemaName),
             .vacuum => |value| try self.vacuumCommand(value.schemaName, value.into),
             .analyze => |value| blk: {
                 const nested = self.inAtomicStatement;
@@ -813,7 +1127,7 @@ pub const Connection = struct {
                 break :blk try emptyResult(self.allocator);
             },
         };
-        if (isSchemaChange(statement)) self.bumpSchemaVersion();
+        if (isSchemaChange(statement)) self.bumpSchemaVersionFor(statement);
         if (!self.transactionActive and !statement.isQuery()) try self.persist();
         return result;
     }
@@ -829,13 +1143,46 @@ pub const Connection = struct {
         self.file.setSchemaVersion(self.file.getSchemaVersion() +% 1);
     }
 
+    fn bumpSchemaVersionFor(self: *Connection, statement: ast.Statement) void {
+        const target: ?[]const u8 = switch (statement) {
+            .createTable => |value| if (value.temporary) null else value.name,
+            .createIndex => |value| value.table,
+            .createView => |value| if (value.temporary) null else value.name,
+            .createTrigger => |value| if (value.temporary) null else value.table,
+            .createVirtualTable => |value| value.name,
+            .dropTable => |value| value.name,
+            .dropIndex => |value| value.name,
+            .dropView => |value| value.name,
+            .dropTrigger => |value| value.name,
+            .alterTable => |value| switch (value) {
+                .addColumn => |change| change.table,
+                .renameTable => |change| change.table,
+                .renameColumn => |change| change.table,
+                .dropColumn => |change| change.table,
+            },
+            else => return,
+        };
+        const name = target orelse return;
+        const parts = splitSchemaName(name);
+        if (parts.qualifier) |qualifier| {
+            if (self.resolveSchema(qualifier)) |ref| {
+                if (ref == .attached) {
+                    const file = &self.attached.items[ref.attached].file;
+                    file.setSchemaVersion(file.getSchemaVersion() +% 1);
+                    return;
+                }
+            }
+        }
+        self.bumpSchemaVersion();
+    }
+
     fn emptyResult(allocator: std.mem.Allocator) !Result {
         return .{ .allocator = allocator, .columns = try allocator.alloc([]const u8, 0), .rows = try allocator.alloc([]Value, 0) };
     }
 
     fn executePragma(self: *Connection, value: anytype) !Result {
         if (value.schema) |schemaName| {
-            if (!std.ascii.eqlIgnoreCase(schemaName, "main") and !std.ascii.eqlIgnoreCase(schemaName, "temp")) return error.Unsupported;
+            if (!std.ascii.eqlIgnoreCase(schemaName, "main") and !std.ascii.eqlIgnoreCase(schemaName, "temp") and self.resolveSchema(schemaName) == null) return error.Unsupported;
         }
         if (std.ascii.eqlIgnoreCase(value.name, "foreign_keys")) {
             if (value.value) |setting| {
@@ -853,47 +1200,50 @@ pub const Connection = struct {
             return .{ .allocator = self.allocator, .columns = columns, .rows = rows };
         }
         if (std.ascii.eqlIgnoreCase(value.name, "user_version")) {
+            const target = self.pragmaFileStore(value.schema);
             if (value.value) |versionText| {
                 const version = std.fmt.parseInt(u32, versionText, 10) catch return error.InvalidSql;
-                self.file.setUserVersion(version);
-                try self.persist();
+                target.file.setUserVersion(version);
+                try self.persistSchema(target.file, target.store);
             }
             const names = [_][]const u8{"user_version"};
             const columns = try self.ownedColumns(&names);
             const rows = try self.allocator.alloc([]Value, 1);
             rows[0] = try self.allocator.alloc(Value, 1);
-            rows[0][0] = .{ .integer = self.file.getUserVersion() };
+            rows[0][0] = .{ .integer = target.file.getUserVersion() };
             return .{ .allocator = self.allocator, .columns = columns, .rows = rows };
         }
         if (std.ascii.eqlIgnoreCase(value.name, "application_id")) {
+            const target = self.pragmaFileStore(value.schema);
             if (value.value) |applicationText| {
-                const applicationId = std.fmt.parseInt(u32, applicationText, 10) catch return error.InvalidSql;
-                self.file.setApplicationId(applicationId);
-                try self.persist();
+                const parsedId = std.fmt.parseInt(u32, applicationText, 10) catch return error.InvalidSql;
+                target.file.setApplicationId(parsedId);
+                try self.persistSchema(target.file, target.store);
             }
             const names = [_][]const u8{"application_id"};
             const columns = try self.ownedColumns(&names);
             const rows = try self.allocator.alloc([]Value, 1);
             rows[0] = try self.allocator.alloc(Value, 1);
-            rows[0][0] = .{ .integer = self.file.getApplicationId() };
+            rows[0][0] = .{ .integer = target.file.getApplicationId() };
             return .{ .allocator = self.allocator, .columns = columns, .rows = rows };
         }
         if (std.ascii.eqlIgnoreCase(value.name, "journal_mode")) {
+            const target = self.pragmaFileStore(value.schema);
             if (value.value) |mode| {
                 if (std.ascii.eqlIgnoreCase(mode, "wal")) {
-                    self.file.enableWal();
-                    try self.persist();
+                    target.file.enableWal();
+                    try self.persistSchema(target.file, target.store);
                 } else if (std.ascii.eqlIgnoreCase(mode, "delete") or std.ascii.eqlIgnoreCase(mode, "rollback")) {
-                    try self.file.disableWal();
-                    if (self.synchronousLevel >= 1) try self.file.file.sync(self.file.threaded.io());
-                    try self.persist();
+                    try target.file.disableWal();
+                    if (self.synchronousLevel >= 1) try target.file.file.sync(target.file.threaded.io());
+                    try self.persistSchema(target.file, target.store);
                 } else return error.Unsupported;
             }
             const names = [_][]const u8{"journal_mode"};
             const columns = try self.ownedColumns(&names);
             const rows = try self.allocator.alloc([]Value, 1);
             rows[0] = try self.allocator.alloc(Value, 1);
-            rows[0][0] = .{ .text = try self.allocator.dupe(u8, self.file.journalMode()) };
+            rows[0][0] = .{ .text = try self.allocator.dupe(u8, target.file.journalMode()) };
             return .{ .allocator = self.allocator, .columns = columns, .rows = rows };
         }
         if (std.ascii.eqlIgnoreCase(value.name, "integrity_check")) return try self.pragmaIntegrityCheck(value);
@@ -936,18 +1286,19 @@ pub const Connection = struct {
             return .{ .allocator = self.allocator, .columns = columns, .rows = rows };
         }
         if (std.ascii.eqlIgnoreCase(value.name, "page_size")) {
+            const target = self.pragmaFileStore(value.schema);
             if (value.argument != null) return error.InvalidSql;
             if (value.value) |text| {
                 const size = std.fmt.parseInt(usize, text, 10) catch return error.InvalidSql;
                 if (size < 512 or size > 32768 or (size & (size - 1)) != 0) return error.InvalidSql;
-                self.file.pageSize = size;
-                try self.persist();
+                target.file.pageSize = size;
+                try self.persistSchema(target.file, target.store);
             }
             const names = [_][]const u8{"page_size"};
             const columns = try self.ownedColumns(&names);
             const rows = try self.allocator.alloc([]Value, 1);
             rows[0] = try self.allocator.alloc(Value, 1);
-            rows[0][0] = .{ .integer = @intCast(self.file.pageSize) };
+            rows[0][0] = .{ .integer = @intCast(target.file.pageSize) };
             return .{ .allocator = self.allocator, .columns = columns, .rows = rows };
         }
         if (std.ascii.eqlIgnoreCase(value.name, "encoding")) {
@@ -1012,17 +1363,18 @@ pub const Connection = struct {
             return .{ .allocator = self.allocator, .columns = columns, .rows = rows };
         }
         if (std.ascii.eqlIgnoreCase(value.name, "schema_version")) {
+            const target = self.pragmaFileStore(value.schema);
             if (value.argument != null) return error.InvalidSql;
             if (value.value) |text| {
                 const version = std.fmt.parseInt(u32, text, 10) catch return error.InvalidSql;
-                self.file.setSchemaVersion(version);
-                try self.persist();
+                target.file.setSchemaVersion(version);
+                try self.persistSchema(target.file, target.store);
             }
             const names = [_][]const u8{"schema_version"};
             const columns = try self.ownedColumns(&names);
             const rows = try self.allocator.alloc([]Value, 1);
             rows[0] = try self.allocator.alloc(Value, 1);
-            rows[0][0] = .{ .integer = self.file.getSchemaVersion() };
+            rows[0][0] = .{ .integer = target.file.getSchemaVersion() };
             return .{ .allocator = self.allocator, .columns = columns, .rows = rows };
         }
         if (std.ascii.eqlIgnoreCase(value.name, "recursive_triggers")) {
@@ -1042,12 +1394,13 @@ pub const Connection = struct {
             return .{ .allocator = self.allocator, .columns = columns, .rows = rows };
         }
         if (std.ascii.eqlIgnoreCase(value.name, "wal_checkpoint")) {
+            const target = self.pragmaFileStore(value.schema);
             if (value.value != null) return error.InvalidSql;
             if (value.argument) |mode| {
                 if (!std.ascii.eqlIgnoreCase(mode, "passive") and !std.ascii.eqlIgnoreCase(mode, "full") and !std.ascii.eqlIgnoreCase(mode, "restart") and !std.ascii.eqlIgnoreCase(mode, "truncate")) return error.InvalidSql;
             }
-            const checkpoint = try self.file.checkpointWal();
-            if (self.synchronousLevel >= 1) try self.file.file.sync(self.file.threaded.io());
+            const checkpoint = try target.file.checkpointWal();
+            if (self.synchronousLevel >= 1) try target.file.file.sync(target.file.threaded.io());
             const names = [_][]const u8{ "busy", "log", "checkpointed" };
             const columns = try self.ownedColumns(&names);
             const rows = try self.allocator.alloc([]Value, 1);
@@ -1077,9 +1430,6 @@ pub const Connection = struct {
             const last = name[name.len - 1];
             if ((first == '\'' and last == '\'') or (first == '"' and last == '"') or (first == '`' and last == '`') or (first == '[' and last == ']')) name = name[1 .. name.len - 1];
         }
-        if (std.mem.indexOfScalar(u8, name, '.')) |dot| {
-            if (std.ascii.eqlIgnoreCase(name[0..dot], "main") or std.ascii.eqlIgnoreCase(name[0..dot], "temp")) name = name[dot + 1 ..];
-        }
         if (name.len == 0) return null;
         return name;
     }
@@ -1089,9 +1439,35 @@ pub const Connection = struct {
         return pragmaTargetName(value.value);
     }
 
+    fn pragmaScopedTarget(self: *Connection, value: anytype, owned: *?[]u8) ?[]const u8 {
+        const target = pragmaArgumentName(value) orelse return null;
+        if (value.schema) |schemaName| {
+            if (splitSchemaName(target).qualifier == null) {
+                const combined = std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ schemaName, target }) catch return null;
+                owned.* = combined;
+                return combined;
+            }
+        }
+        return target;
+    }
+
     fn pragmaSchemaIsTemp(value: anytype) bool {
         if (value.schema) |schemaName| return std.ascii.eqlIgnoreCase(schemaName, "temp");
         return false;
+    }
+
+    const PragmaFile = struct { file: *DatabaseFile, store: *Schema };
+
+    fn pragmaFileStore(self: *Connection, schemaName: ?[]const u8) PragmaFile {
+        if (schemaName) |name| {
+            if (self.resolveSchema(name)) |ref| {
+                if (ref == .attached) {
+                    const index = ref.attached;
+                    return .{ .file = &self.attached.items[index].file, .store = &self.attached.items[index].store };
+                }
+            }
+        }
+        return .{ .file = &self.file, .store = &self.store };
     }
 
     fn fkActionName(action: ast.ReferentialAction) []const u8 {
@@ -1145,10 +1521,14 @@ pub const Connection = struct {
             }
             rows.deinit(self.allocator);
         }
-        const target = pragmaArgumentName(value);
+        var ownedTarget: ?[]u8 = null;
+        defer if (ownedTarget) |target| self.allocator.free(target);
+        const target = self.pragmaScopedTarget(value, &ownedTarget);
         if (target) |name| {
             if (!pragmaSchemaIsTemp(value)) {
-                if (self.store.find(name)) |table| {
+                const resolvedTable = self.resolveTableName(name);
+                if (resolvedTable) |resolved| {
+                    const table = resolved.table;
                     var pkOrder: [64][]const u8 = undefined;
                     var pkCount: usize = 0;
                     for (table.columns) |column| {
@@ -1192,7 +1572,8 @@ pub const Connection = struct {
                         try rows.append(self.allocator, row);
                         cid += 1;
                     }
-                } else if (self.store.findView(name)) |view| {
+                } else if (self.resolveViewName(name)) |resolvedView| {
+                    const view = resolvedView.view;
                     const viewColumns = try self.viewColumnNames(view);
                     defer {
                         for (viewColumns) |columnName| self.allocator.free(columnName);
@@ -1245,11 +1626,16 @@ pub const Connection = struct {
             }
             rows.deinit(self.allocator);
         }
-        if (pragmaArgumentName(value)) |name| {
+        var scopedOwned: ?[]u8 = null;
+        defer if (scopedOwned) |owned| self.allocator.free(owned);
+        if (self.pragmaScopedTarget(value, &scopedOwned)) |name| {
             if (!pragmaSchemaIsTemp(value)) {
-                if (self.store.find(name)) |table| {
+                const resolvedTable = self.resolveTableName(name);
+                if (resolvedTable) |resolved| {
+                    const table = resolved.table;
+                    const store = self.storeFor(resolved.ref);
                     var seq: i64 = 0;
-                    for (self.store.indexes.items) |index| {
+                    for (store.indexes.items) |index| {
                         if (!std.ascii.eqlIgnoreCase(index.table, table.name)) continue;
                         const row = try self.allocator.alloc(Value, names.len);
                         errdefer self.allocator.free(row);
@@ -1301,10 +1687,15 @@ pub const Connection = struct {
             }
             rows.deinit(self.allocator);
         }
-        if (pragmaArgumentName(value)) |name| {
+        var scopedOwned: ?[]u8 = null;
+        defer if (scopedOwned) |owned| self.allocator.free(owned);
+        if (self.pragmaScopedTarget(value, &scopedOwned)) |name| {
             if (!pragmaSchemaIsTemp(value)) {
-                if (self.store.findIndexConst(name)) |index| {
-                    if (self.store.findConst(index.table)) |table| {
+                const resolvedIndex = self.resolveIndexName(name);
+                if (resolvedIndex) |resolved| {
+                    const index = resolved.index;
+                    const store = self.storeFor(resolved.ref);
+                    if (store.findConst(index.table)) |table| {
                         for (index.columns, 0..) |keyColumn, position| {
                             const row = try self.allocator.alloc(Value, headers.len);
                             errdefer self.allocator.free(row);
@@ -1344,9 +1735,13 @@ pub const Connection = struct {
             }
             rows.deinit(self.allocator);
         }
-        if (pragmaArgumentName(value)) |name| {
+        var scopedOwned: ?[]u8 = null;
+        defer if (scopedOwned) |owned| self.allocator.free(owned);
+        if (self.pragmaScopedTarget(value, &scopedOwned)) |name| {
             if (!pragmaSchemaIsTemp(value)) {
-                if (self.store.find(name)) |table| {
+                const resolvedTable = self.resolveTableName(name);
+                if (resolvedTable) |resolved| {
+                    const table = resolved.table;
                     var id: i64 = 0;
                     for (table.columns) |column| {
                         const foreignTable = column.foreignTable orelse continue;
@@ -1392,17 +1787,35 @@ pub const Connection = struct {
     fn pragmaDatabaseList(self: *Connection) !Result {
         const names = [_][]const u8{ "seq", "name", "file" };
         const columns = try self.ownedColumns(&names);
-        const rows = try self.allocator.alloc([]Value, 2);
-        errdefer self.allocator.free(rows);
-        rows[0] = try self.allocator.alloc(Value, names.len);
-        rows[0][0] = .{ .integer = 0 };
-        rows[0][1] = .{ .text = try self.allocator.dupe(u8, "main") };
-        rows[0][2] = .{ .text = try self.allocator.dupe(u8, self.file.path) };
-        rows[1] = try self.allocator.alloc(Value, names.len);
-        rows[1][0] = .{ .integer = 1 };
-        rows[1][1] = .{ .text = try self.allocator.dupe(u8, "temp") };
-        rows[1][2] = .{ .text = try self.allocator.dupe(u8, "") };
-        return .{ .allocator = self.allocator, .columns = columns, .rows = rows };
+        var rows = std.ArrayList([]Value).empty;
+        errdefer {
+            for (rows.items) |row| {
+                for (row) |item| self.freeConcatText(item);
+                self.allocator.free(row);
+            }
+            rows.deinit(self.allocator);
+        }
+        const mainRow = try self.allocator.alloc(Value, names.len);
+        errdefer self.allocator.free(mainRow);
+        mainRow[0] = .{ .integer = 0 };
+        mainRow[1] = .{ .text = try self.allocator.dupe(u8, "main") };
+        mainRow[2] = .{ .text = try self.allocator.dupe(u8, self.file.path) };
+        try rows.append(self.allocator, mainRow);
+        const tempRow = try self.allocator.alloc(Value, names.len);
+        errdefer self.allocator.free(tempRow);
+        tempRow[0] = .{ .integer = 1 };
+        tempRow[1] = .{ .text = try self.allocator.dupe(u8, "temp") };
+        tempRow[2] = .{ .text = try self.allocator.dupe(u8, "") };
+        try rows.append(self.allocator, tempRow);
+        for (self.attached.items, 0..) |db, index| {
+            const attachedRow = try self.allocator.alloc(Value, names.len);
+            errdefer self.allocator.free(attachedRow);
+            attachedRow[0] = .{ .integer = @intCast(index + 2) };
+            attachedRow[1] = .{ .text = try self.allocator.dupe(u8, db.name) };
+            attachedRow[2] = .{ .text = try self.allocator.dupe(u8, db.file.path) };
+            try rows.append(self.allocator, attachedRow);
+        }
+        return .{ .allocator = self.allocator, .columns = columns, .rows = try rows.toOwnedSlice(self.allocator) };
     }
 
     fn pragmaTableList(self: *Connection, value: anytype) !Result {
@@ -1417,49 +1830,121 @@ pub const Connection = struct {
             rows.deinit(self.allocator);
         }
         const filter = pragmaArgumentName(value);
-        if (!pragmaSchemaIsTemp(value)) {
-            for (self.store.tables.items) |table| {
-                if (filter) |wanted| if (!std.ascii.eqlIgnoreCase(wanted, table.name)) continue;
-                const row = try self.allocator.alloc(Value, names.len);
-                errdefer self.allocator.free(row);
-                row[0] = .{ .text = try self.allocator.dupe(u8, "main") };
-                row[1] = .{ .text = try self.allocator.dupe(u8, table.name) };
-                row[2] = .{ .text = try self.allocator.dupe(u8, if (table.virtualModule != null) "virtual" else "table") };
-                row[3] = .{ .integer = @intCast(table.columns.len) };
-                row[4] = .{ .integer = if (table.withoutRowid) 1 else 0 };
-                row[5] = .{ .integer = if (table.strict) 1 else 0 };
-                try rows.append(self.allocator, row);
-            }
-            for (self.store.views.items) |view| {
-                if (filter) |wanted| if (!std.ascii.eqlIgnoreCase(wanted, view.name)) continue;
-                const viewColumns = try self.viewColumnNames(&view);
-                defer {
-                    for (viewColumns) |columnName| self.allocator.free(columnName);
-                    self.allocator.free(viewColumns);
-                }
-                const row = try self.allocator.alloc(Value, names.len);
-                errdefer self.allocator.free(row);
-                row[0] = .{ .text = try self.allocator.dupe(u8, "main") };
-                row[1] = .{ .text = try self.allocator.dupe(u8, view.name) };
-                row[2] = .{ .text = try self.allocator.dupe(u8, "view") };
-                row[3] = .{ .integer = @intCast(viewColumns.len) };
-                row[4] = .{ .integer = 0 };
-                row[5] = .{ .integer = 0 };
-                try rows.append(self.allocator, row);
-            }
+        const filterObject = if (filter) |wanted| splitSchemaName(wanted).object else null;
+        if (value.schema) |schemaName| {
+            const ref = self.resolveSchema(schemaName) orelse return .{ .allocator = self.allocator, .columns = columns, .rows = try rows.toOwnedSlice(self.allocator) };
+            try self.appendTableListRows(self.storeFor(ref), self.schemaRefName(ref), filterObject, &rows);
+        } else {
+            try self.appendTableListRows(&self.store, "main", filterObject, &rows);
+            try self.appendTableListRows(&self.tempStore, "temp", filterObject, &rows);
+            for (self.attached.items) |db| try self.appendTableListRows(&db.store, db.name, filterObject, &rows);
         }
         return .{ .allocator = self.allocator, .columns = columns, .rows = try rows.toOwnedSlice(self.allocator) };
     }
 
+    fn appendTableListRows(self: *Connection, store: *const Schema, schemaName: []const u8, filter: ?[]const u8, rows: *std.ArrayList([]Value)) !void {
+        for (store.tables.items) |table| {
+            if (filter) |wanted| if (!std.ascii.eqlIgnoreCase(wanted, table.name)) continue;
+            const row = try self.allocator.alloc(Value, 6);
+            errdefer self.allocator.free(row);
+            row[0] = .{ .text = try self.allocator.dupe(u8, schemaName) };
+            row[1] = .{ .text = try self.allocator.dupe(u8, table.name) };
+            row[2] = .{ .text = try self.allocator.dupe(u8, if (table.virtualModule != null) "virtual" else "table") };
+            row[3] = .{ .integer = @intCast(table.columns.len) };
+            row[4] = .{ .integer = if (table.withoutRowid) 1 else 0 };
+            row[5] = .{ .integer = if (table.strict) 1 else 0 };
+            try rows.append(self.allocator, row);
+        }
+        for (store.views.items) |view| {
+            if (filter) |wanted| if (!std.ascii.eqlIgnoreCase(wanted, view.name)) continue;
+            const viewColumns = try self.viewColumnNames(&view);
+            defer {
+                for (viewColumns) |columnName| self.allocator.free(columnName);
+                self.allocator.free(viewColumns);
+            }
+            const row = try self.allocator.alloc(Value, 6);
+            errdefer self.allocator.free(row);
+            row[0] = .{ .text = try self.allocator.dupe(u8, schemaName) };
+            row[1] = .{ .text = try self.allocator.dupe(u8, view.name) };
+            row[2] = .{ .text = try self.allocator.dupe(u8, "view") };
+            row[3] = .{ .integer = @intCast(viewColumns.len) };
+            row[4] = .{ .integer = 0 };
+            row[5] = .{ .integer = 0 };
+            try rows.append(self.allocator, row);
+        }
+    }
+
+    fn attachCommand(self: *Connection, value: anytype) !Result {
+        if (self.transactionActive or self.inAtomicStatement or self.savepoints.items.len != 0) return error.TransactionActive;
+        if (std.ascii.eqlIgnoreCase(value.schemaName, "main") or std.ascii.eqlIgnoreCase(value.schemaName, "temp")) return error.InvalidSql;
+        if (value.schemaName.len == 0 or self.resolveSchema(value.schemaName) != null) return error.InvalidSql;
+        const pathValue = try self.resolve(value.expr, &.{});
+        const ownedPath = value.expr == .binary or value.expr == .unary or value.expr == .function or value.expr == .caseExpr;
+        defer if (ownedPath) self.freeConcatText(pathValue);
+        const path = switch (pathValue) {
+            .text => |text| text,
+            .blob => |blob| blob,
+            else => return error.InvalidSql,
+        };
+        if (path.len == 0 or std.mem.eql(u8, path, ":memory:")) return error.InvalidSql;
+        var file = try DatabaseFile.open(self.allocator, path);
+        errdefer file.close();
+        var store = Schema.init(self.allocator);
+        errdefer store.deinit();
+        if (try file.readPayload()) |payload| {
+            defer self.allocator.free(payload);
+            const decoded = try image.decode(self.allocator, payload);
+            store.deinit();
+            store = decoded;
+            try self.persistSchema(&file, &store);
+        } else {
+            const bytes = try file.readImage();
+            defer self.allocator.free(bytes);
+            if (bytes.len <= 100) return error.InvalidHeader;
+            if (bytes[100] == 0x0d) {
+                const decoded = try sqliteImage.decode(self.allocator, bytes);
+                store.deinit();
+                store = decoded;
+            }
+        }
+        const ownedName = try self.allocator.dupe(u8, value.schemaName);
+        errdefer self.allocator.free(ownedName);
+        try self.attached.append(self.allocator, .{ .name = ownedName, .file = file, .store = store });
+        return try emptyResult(self.allocator);
+    }
+
+    fn detachCommand(self: *Connection, name: []const u8) !Result {
+        if (std.ascii.eqlIgnoreCase(name, "main") or std.ascii.eqlIgnoreCase(name, "temp")) return error.InvalidSql;
+        if (self.transactionActive or self.inAtomicStatement or self.savepoints.items.len != 0) return error.TransactionActive;
+        for (self.attached.items, 0..) |db, index| {
+            if (!std.ascii.eqlIgnoreCase(db.name, name)) continue;
+            var removed = self.attached.orderedRemove(index);
+            removed.store.deinit();
+            removed.file.close();
+            self.allocator.free(removed.name);
+            return try emptyResult(self.allocator);
+        }
+        return error.UnknownDatabase;
+    }
+
     fn vacuumCommand(self: *Connection, schemaName: ?[]const u8, into: ?ast.Expr) !Result {
         if (self.transactionActive or self.savepoints.items.len != 0) return error.TransactionActive;
+        var vacuumRef: SchemaRef = .main;
         if (schemaName) |name| {
-            if (!std.ascii.eqlIgnoreCase(name, "main") and !std.ascii.eqlIgnoreCase(name, "temp")) return error.Unsupported;
-        }
-        if (into) |intoExpr| {
-            if (schemaName) |name| {
-                if (!std.ascii.eqlIgnoreCase(name, "main")) return error.Unsupported;
+            if (std.ascii.eqlIgnoreCase(name, "temp")) return error.Unsupported;
+            if (!std.ascii.eqlIgnoreCase(name, "main")) {
+                const resolved = self.resolveSchema(name) orelse return error.UnknownDatabase;
+                if (resolved != .attached) return error.Unsupported;
+                vacuumRef = resolved;
             }
+        }
+        const vacuumFile = switch (vacuumRef) {
+            .main => &self.file,
+            .temp => return error.Unsupported,
+            .attached => |index| &self.attached.items[index].file,
+        };
+        const vacuumStore = self.storeFor(vacuumRef);
+        if (into) |intoExpr| {
             const target = switch (intoExpr) {
                 .literal => |lit| switch (lit) {
                     .text => |t| t,
@@ -1468,10 +1953,10 @@ pub const Connection = struct {
                 else => return error.InvalidSql,
             };
             if (target.len == 0) return error.InvalidSql;
-            if (std.ascii.eqlIgnoreCase(target, self.file.path)) return error.InvalidSql;
-            const bytes = try sqliteImage.encodeWithPageSize(self.allocator, &self.store, self.file.pageSize);
+            if (std.ascii.eqlIgnoreCase(target, vacuumFile.path)) return error.InvalidSql;
+            const bytes = try sqliteImage.encodeWithPageSize(self.allocator, vacuumStore, vacuumFile.pageSize);
             defer self.allocator.free(bytes);
-            const io = self.file.threaded.io();
+            const io = vacuumFile.threaded.io();
             var outFile = std.Io.Dir.cwd().openFile(io, target, .{ .mode = .read_write }) catch |err| switch (err) {
                 error.FileNotFound => try std.Io.Dir.cwd().createFile(io, target, .{ .read = true, .truncate = true }),
                 else => return err,
@@ -1482,42 +1967,74 @@ pub const Connection = struct {
             if (self.synchronousLevel >= 1) try outFile.sync(io);
             return try emptyResult(self.allocator);
         }
-        try self.persist();
+        try self.persistSchema(vacuumFile, vacuumStore);
         return try emptyResult(self.allocator);
     }
 
     fn analyzeDatabase(self: *Connection, target: ?[]const u8) !void {
         if (target) |name| {
-            if (std.ascii.eqlIgnoreCase(name, "main") or std.ascii.eqlIgnoreCase(name, "temp")) {
-                return self.analyzeScope(null);
+            const parts = splitSchemaName(name);
+            if (parts.qualifier) |qualifier| {
+                const ref = self.resolveSchema(qualifier) orelse return error.UnknownDatabase;
+                return self.analyzeDatabaseOn(self.storeFor(ref), ref, parts.object);
             }
-            if (self.store.find(name) != null) {
-                return self.analyzeScope(name);
+            if (std.ascii.eqlIgnoreCase(name, "main")) return self.analyzeDatabaseOn(&self.store, .main, null);
+            if (std.ascii.eqlIgnoreCase(name, "temp")) return self.analyzeDatabaseOn(&self.tempStore, .temp, null);
+            if (self.tempStore.find(name) != null) return self.analyzeDatabaseOn(&self.tempStore, .temp, name);
+            if (self.store.find(name) != null) return self.analyzeDatabaseOn(&self.store, .main, name);
+            for (self.attached.items, 0..) |*db, index| {
+                if (db.store.find(name) != null) return self.analyzeDatabaseOn(&db.store, .{ .attached = index }, name);
             }
-            for (self.store.indexes.items) |index| {
+            if (self.tempStore.findIndexConst(name) != null) return self.analyzeDatabaseOn(&self.tempStore, .temp, name);
+            if (self.store.findIndexConst(name) != null) return self.analyzeDatabaseOn(&self.store, .main, name);
+            for (self.attached.items, 0..) |*db, index| {
+                if (db.store.findIndexConst(name) != null) return self.analyzeDatabaseOn(&db.store, .{ .attached = index }, name);
+            }
+            return error.UnknownTable;
+        }
+        return self.analyzeDatabaseOn(&self.store, .main, null);
+    }
+
+    fn analyzeDatabaseOn(self: *Connection, store: *Schema, ref: SchemaRef, target: ?[]const u8) !void {
+        if (target) |name| {
+            if (store.find(name) != null) {
+                return self.analyzeScopeOn(store, ref, name);
+            }
+            for (store.indexes.items) |index| {
                 if (std.ascii.eqlIgnoreCase(index.name, name)) {
-                    const table = self.store.find(index.table) orelse return error.UnknownTable;
-                    self.store.clearStatScope(table.name, index.name);
-                    return self.store.collectIndexStats(table, &index);
+                    const table = store.find(index.table) orelse return error.UnknownTable;
+                    store.clearStatScope(table.name, index.name);
+                    return store.collectIndexStats(table, &index);
                 }
             }
             return error.UnknownTable;
         }
-        return self.analyzeScope(null);
+        return self.analyzeScopeOn(store, ref, null);
     }
 
     fn analyzeScope(self: *Connection, tableName: ?[]const u8) !void {
-        const hadStat = self.store.find("sqlite_stat1") != null;
-        _ = try self.store.ensureStatTable();
-        if (!hadStat) self.bumpSchemaVersion();
-        for (self.store.tables.items) |table| {
+        return self.analyzeScopeOn(&self.store, .main, tableName);
+    }
+
+    fn analyzeScopeOn(self: *Connection, store: *Schema, ref: SchemaRef, tableName: ?[]const u8) !void {
+        const hadStat = store.find("sqlite_stat1") != null;
+        _ = try store.ensureStatTable();
+        if (!hadStat) {
+            if (ref == .attached) {
+                const file = &self.attached.items[ref.attached].file;
+                file.setSchemaVersion(file.getSchemaVersion() +% 1);
+            } else if (ref == .main) {
+                self.bumpSchemaVersion();
+            }
+        }
+        for (store.tables.items) |table| {
             if (std.ascii.eqlIgnoreCase(table.name, "sqlite_stat1")) continue;
             if (tableName) |wanted| if (!std.ascii.eqlIgnoreCase(table.name, wanted)) continue;
-            self.store.clearStatScope(table.name, null);
-            try self.store.collectTableStats(&table);
-            for (self.store.indexes.items) |index| {
+            store.clearStatScope(table.name, null);
+            try store.collectTableStats(&table);
+            for (store.indexes.items) |index| {
                 if (!std.ascii.eqlIgnoreCase(index.table, table.name)) continue;
-                try self.store.collectIndexStats(&table, &index);
+                try store.collectIndexStats(&table, &index);
             }
         }
     }
@@ -1763,7 +2280,7 @@ pub const Connection = struct {
         defer ast.deinit(self.allocator, &statement);
         if (statement != .select) return error.InvalidSql;
         const query = statement.select;
-        var plan = try planner.planSelect(self.allocator, &self.store, query);
+        var plan = try self.planSelectQuery(query);
         defer plan.deinit();
         const detail = try plan.explain(self.allocator);
         defer self.allocator.free(detail);
@@ -1788,6 +2305,19 @@ pub const Connection = struct {
         return .{ .allocator = self.allocator, .columns = resultColumns, .rows = rows };
     }
 
+    fn planSelectQuery(self: *Connection, query: anytype) !planner.QueryPlan {
+        if (query.table) |tableName| {
+            const parts = splitSchemaName(tableName);
+            if (parts.qualifier) |qualifier| {
+                const ref = self.resolveSchema(qualifier) orelse return error.UnknownDatabase;
+                var stripped = query;
+                stripped.table = parts.object;
+                return planner.planSelect(self.allocator, self.storeFor(ref), stripped);
+            }
+        }
+        return planner.planSelect(self.allocator, &self.store, query);
+    }
+
     fn ownedColumns(self: *Connection, columns: []const []const u8) ![]const []const u8 {
         const result = try self.allocator.alloc([]const u8, columns.len);
         var count: usize = 0;
@@ -1802,56 +2332,118 @@ pub const Connection = struct {
         return result;
     }
     fn createTableCommand(self: *Connection, value: anytype) !Result {
-        if (self.store.find(value.name) != null and value.ifNotExists) return try emptyResult(self.allocator);
-        try self.store.createTableWithOptions(value.name, value.columns, value.constraints, .{ .strict = value.strict, .withoutRowid = value.withoutRowid });
+        const target = try self.createTarget(value.name, value.temporary);
+        if (target.store.find(target.name) != null and value.ifNotExists) return try emptyResult(self.allocator);
+        try target.store.createTableWithOptions(target.name, value.columns, value.constraints, .{ .strict = value.strict, .withoutRowid = value.withoutRowid });
         return try emptyResult(self.allocator);
     }
     fn alterTableCommand(self: *Connection, value: ast.AlterTable) !Result {
         switch (value) {
-            .addColumn => |change| try self.store.addColumn(change.table, change.definition),
-            .renameTable => |change| try self.store.renameTable(change.table, change.newName),
-            .renameColumn => |change| try self.store.renameColumn(change.table, change.oldName, change.newName),
-            .dropColumn => |change| try self.store.dropColumn(change.table, change.column),
+            .addColumn => |change| {
+                const resolved = self.resolveTableName(change.table) orelse return error.UnknownTable;
+                try self.storeFor(resolved.ref).addColumn(splitSchemaName(change.table).object, change.definition);
+            },
+            .renameTable => |change| {
+                if (splitSchemaName(change.newName).qualifier != null) return error.InvalidSql;
+                const resolved = self.resolveTableName(change.table) orelse return error.UnknownTable;
+                try self.storeFor(resolved.ref).renameTable(splitSchemaName(change.table).object, change.newName);
+            },
+            .renameColumn => |change| {
+                const resolved = self.resolveTableName(change.table) orelse return error.UnknownTable;
+                try self.storeFor(resolved.ref).renameColumn(splitSchemaName(change.table).object, change.oldName, change.newName);
+            },
+            .dropColumn => |change| {
+                const resolved = self.resolveTableName(change.table) orelse return error.UnknownTable;
+                try self.storeFor(resolved.ref).dropColumn(splitSchemaName(change.table).object, change.column);
+            },
         }
         return try emptyResult(self.allocator);
     }
     fn dropTableCommand(self: *Connection, name: []const u8, ifExists: bool) !Result {
-        self.store.dropTable(name) catch |err| if (ifExists and err == error.UnknownTable) return try emptyResult(self.allocator) else return err;
+        const resolved = self.resolveTableName(name) orelse {
+            if (ifExists) return try emptyResult(self.allocator);
+            const parts = splitSchemaName(name);
+            if (parts.qualifier != null and self.resolveSchema(parts.qualifier.?) == null) return error.UnknownDatabase;
+            return error.UnknownTable;
+        };
+        self.storeFor(resolved.ref).dropTable(splitSchemaName(name).object) catch |err| if (ifExists and err == error.UnknownTable) return try emptyResult(self.allocator) else return err;
         return try emptyResult(self.allocator);
     }
     fn createIndexCommand(self: *Connection, value: ast.IndexDef) !Result {
-        if (self.store.findIndexConst(value.name) != null and value.ifNotExists) return try emptyResult(self.allocator);
-        try self.store.createIndex(value);
+        const resolvedTable = self.resolveTableName(value.table) orelse return error.UnknownTable;
+        const tableStore = self.storeFor(resolvedTable.ref);
+        const nameParts = splitSchemaName(value.name);
+        if (nameParts.qualifier) |qualifier| {
+            const indexRef = self.resolveSchema(qualifier) orelse return error.UnknownDatabase;
+            if (!std.meta.eql(indexRef, resolvedTable.ref)) return error.InvalidSql;
+        }
+        if (tableStore.findIndexConst(nameParts.object) != null and value.ifNotExists) return try emptyResult(self.allocator);
+        var scoped = value;
+        scoped.name = nameParts.object;
+        scoped.table = resolvedTable.table.name;
+        try tableStore.createIndex(scoped);
         return try emptyResult(self.allocator);
     }
     fn dropIndexCommand(self: *Connection, name: []const u8, ifExists: bool) !Result {
-        self.store.dropIndex(name) catch |err| if (ifExists and err == error.UnknownIndex) return try emptyResult(self.allocator) else return err;
+        const resolved = self.resolveIndexName(name) orelse {
+            if (ifExists) return try emptyResult(self.allocator);
+            const parts = splitSchemaName(name);
+            if (parts.qualifier != null and self.resolveSchema(parts.qualifier.?) == null) return error.UnknownDatabase;
+            return error.UnknownIndex;
+        };
+        self.storeFor(resolved.ref).dropIndex(splitSchemaName(name).object) catch |err| if (ifExists and err == error.UnknownIndex) return try emptyResult(self.allocator) else return err;
         return try emptyResult(self.allocator);
     }
     fn createViewCommand(self: *Connection, value: anytype) !Result {
-        if (self.store.findViewConst(value.name) != null and value.ifNotExists) return try emptyResult(self.allocator);
-        try self.store.createView(value.name, value.sql);
+        const target = try self.createTarget(value.name, value.temporary);
+        if (target.store.findViewConst(target.name) != null and value.ifNotExists) return try emptyResult(self.allocator);
+        try target.store.createView(target.name, value.sql);
         return try emptyResult(self.allocator);
     }
     fn dropViewCommand(self: *Connection, name: []const u8, ifExists: bool) !Result {
-        self.store.dropView(name) catch |err| if (ifExists and err == error.UnknownView) return try emptyResult(self.allocator) else return err;
+        const resolved = self.resolveViewName(name) orelse {
+            if (ifExists) return try emptyResult(self.allocator);
+            const parts = splitSchemaName(name);
+            if (parts.qualifier != null and self.resolveSchema(parts.qualifier.?) == null) return error.UnknownDatabase;
+            return error.UnknownView;
+        };
+        self.storeFor(resolved.ref).dropView(splitSchemaName(name).object) catch |err| if (ifExists and err == error.UnknownView) return try emptyResult(self.allocator) else return err;
         return try emptyResult(self.allocator);
     }
     fn createTriggerCommand(self: *Connection, value: ast.TriggerDef) !Result {
-        if (self.store.findTriggerConst(value.name) != null and value.ifNotExists) return try emptyResult(self.allocator);
-        try self.store.createTrigger(value);
+        const resolvedTable = self.resolveTableName(value.table) orelse return error.UnknownTable;
+        const tableStore = self.storeFor(resolvedTable.ref);
+        const nameParts = splitSchemaName(value.name);
+        if (nameParts.qualifier) |qualifier| {
+            const triggerRef = self.resolveSchema(qualifier) orelse return error.UnknownDatabase;
+            if (!std.meta.eql(triggerRef, resolvedTable.ref)) return error.InvalidSql;
+        }
+        if (value.temporary and resolvedTable.ref != .temp) return error.InvalidSql;
+        if (!value.temporary and resolvedTable.ref == .temp) return error.InvalidSql;
+        if (tableStore.findTriggerConst(nameParts.object) != null and value.ifNotExists) return try emptyResult(self.allocator);
+        var scoped = value;
+        scoped.name = nameParts.object;
+        scoped.table = resolvedTable.table.name;
+        try tableStore.createTrigger(scoped);
         return try emptyResult(self.allocator);
     }
     fn createVirtualTableCommand(self: *Connection, value: ast.VirtualTableDef) !Result {
-        if (self.store.find(value.name) != null) {
+        const target = try self.createTarget(value.name, false);
+        if (target.store.find(target.name) != null) {
             if (value.ifNotExists) return try emptyResult(self.allocator);
             return error.TableExists;
         }
-        try self.store.createVirtualTable(value.name, value.module, value.arguments);
+        try target.store.createVirtualTable(target.name, value.module, value.arguments);
         return try emptyResult(self.allocator);
     }
     fn dropTriggerCommand(self: *Connection, name: []const u8, ifExists: bool) !Result {
-        self.store.dropTrigger(name) catch |err| if (ifExists and err == error.UnknownTrigger) return try emptyResult(self.allocator) else return err;
+        const resolved = self.resolveTriggerName(name) orelse {
+            if (ifExists) return try emptyResult(self.allocator);
+            const parts = splitSchemaName(name);
+            if (parts.qualifier != null and self.resolveSchema(parts.qualifier.?) == null) return error.UnknownDatabase;
+            return error.UnknownTrigger;
+        };
+        self.storeFor(resolved.ref).dropTrigger(splitSchemaName(name).object) catch |err| if (ifExists and err == error.UnknownTrigger) return try emptyResult(self.allocator) else return err;
         return try emptyResult(self.allocator);
     }
 
@@ -2173,8 +2765,8 @@ pub const Connection = struct {
         return isTruthy(result.rows[0][0]);
     }
 
-    fn fireTriggers(self: *Connection, tableName: []const u8, timing: ast.TriggerTiming, event: ast.TriggerEvent, newRow: ?[]const Value, oldRow: ?[]const Value, updatedColumns: []const []const u8) anyerror!void {
-        const table = self.store.findConst(tableName) orelse return error.UnknownTable;
+    fn fireTriggers(self: *Connection, store: *Schema, table: *const Table, timing: ast.TriggerTiming, event: ast.TriggerEvent, newRow: ?[]const Value, oldRow: ?[]const Value, updatedColumns: []const []const u8) anyerror!void {
+        const tableName = table.name;
         const PendingBody = struct { name: []u8, sql: []u8 };
         var pending = std.ArrayList(PendingBody).empty;
         defer {
@@ -2184,7 +2776,7 @@ pub const Connection = struct {
             }
             pending.deinit(self.allocator);
         }
-        for (self.store.triggers.items) |trigger| {
+        for (store.triggers.items) |trigger| {
             if (trigger.timing != timing) continue;
             if (trigger.event == event and std.ascii.eqlIgnoreCase(trigger.table, tableName)) {
                 if (!trigger.firesOnUpdate(updatedColumns)) continue;
@@ -2367,7 +2959,8 @@ pub const Connection = struct {
             for (items) |item| {
                 const itemResult = if ((item.op == .exists or item.op == .notExists) and item.tableScan != null) tableScanExists: {
                     const ts = item.tableScan.?;
-                    const inner = self.store.findConst(ts.table) orelse return error.UnknownTable;
+                    const resolvedInner = self.resolveTableName(ts.table) orelse return error.UnknownTable;
+                    const inner = resolvedInner.table;
                     const currentOuter = OuterRow{ .table = table, .alias = if (outer) |o| (if (o.table == table) o.alias else null) else null, .values = row, .prev = if (outer != null and outer.?.table == table) outer.?.prev else outer };
                     var found = false;
                     for (inner.rows.items) |innerRow| {
@@ -2432,7 +3025,8 @@ pub const Connection = struct {
                     } else if ((item.op == .in or item.op == .notIn) and item.tableScan != null) tableScanIn: {
                         if (current == .null) break :tableScanIn false;
                         const scan = item.tableScan.?;
-                        const inner = self.store.findConst(scan.table) orelse return error.UnknownTable;
+                        const resolvedScan = self.resolveTableName(scan.table) orelse return error.UnknownTable;
+                        const inner = resolvedScan.table;
                         const scanIdx = try columnIndex(inner, scan.column);
                         var scanFound = false;
                         for (inner.rows.items) |innerRow| if (compareCollated(current, .equal, innerRow.values[scanIdx], item.collate)) {
@@ -3020,7 +3614,8 @@ pub const Connection = struct {
         return switch (expr) {
             .literal => |value| value,
             .parameter => |index| if (index == 0) error.InvalidParameter else if (index > parameters.len) .null else parameters[index - 1],
-            .identifier => |name| {
+            .identifier => |rawName| {
+                const name = self.stripSchemaQualifier(rawName);
                 if (table) |concrete| {
                     if (std.mem.indexOfScalar(u8, name, '.')) |dot| {
                         const prefix = name[0..dot];
@@ -3271,7 +3866,7 @@ pub const Connection = struct {
         switch (expr) {
             .wildcard, .literal, .parameter, .scalarSubquery, .existsSubquery => {},
             .identifier => |name| {
-                const colName = if (std.mem.indexOfScalar(u8, name, '.')) |dot| name[dot + 1 ..] else name;
+                const colName = if (std.mem.lastIndexOfScalar(u8, name, '.')) |dot| name[dot + 1 ..] else name;
                 _ = try columnIndex(table, colName);
             },
             .function => |call| {
@@ -3369,7 +3964,9 @@ pub const Connection = struct {
 
     fn insertInto(self: *Connection, value: anytype, parameters: []const Value) anyerror!Result {
         if (self.cteActive(value.table)) return error.InvalidSql;
-        const table = self.store.find(value.table) orelse return error.UnknownTable;
+        const resolved = self.resolveTableName(value.table) orelse return error.UnknownTable;
+        const store = self.storeFor(resolved.ref);
+        const table = resolved.table;
         try validateReturningColumns(table, value.returning);
         var nonGenCount: usize = 0;
         for (table.columns) |c| if (c.generatedExpr == null) {
@@ -3404,11 +4001,11 @@ pub const Connection = struct {
                     if (value.columns.len != sourceRow.len) return error.ColumnCountMismatch;
                     for (value.columns, sourceRow) |name, item| row[try columnIndex(table, name)] = item;
                 }
-                try self.fireTriggers(table.name, .before, .insert, row, null, &.{});
-                self.store.appendRow(table, row) catch |err| {
+                try self.fireTriggers(store, table, .before, .insert, row, null, &.{});
+                store.appendRow(table, row) catch |err| {
                     if (value.conflict == .ignore and err == error.ConstraintViolation) {
                         if (value.conflictTargetColumns.len > 0 or value.conflictTargetWhere != null) {
-                            if (try self.conflictRowTarget(table, row, value.conflictTargetColumns, value.conflictTargetWhere, parameters) != null) {
+                            if (try self.conflictRowTarget(store, table, row, value.conflictTargetColumns, value.conflictTargetWhere, parameters) != null) {
                                 continue;
                             } else {
                                 return err;
@@ -3417,16 +4014,16 @@ pub const Connection = struct {
                         continue;
                     }
                     if (value.conflict == .replace and err == error.ConstraintViolation) {
-                        if (try self.replaceConflict(table, row)) {
-                            try self.store.appendRow(table, row);
-                            try self.fireTriggers(table.name, .after, .insert, row, null, &.{});
+                        if (try self.replaceConflict(store, table, row)) {
+                            try store.appendRow(table, row);
+                            try self.fireTriggers(store, table, .after, .insert, row, null, &.{});
                             changes += 1;
                             try affectedRows.append(self.allocator, table.rows.items[table.rows.items.len - 1].values);
                             continue;
                         }
                     }
                     if (value.conflict == .update and err == error.ConstraintViolation) {
-                        switch (try self.applyUpsert(table, row, value.conflictTargetColumns, value.conflictTargetWhere, value.upsertColumns, value.upsertValues, value.upsertWhere, parameters)) {
+                        switch (try self.applyUpsert(store, table, row, value.conflictTargetColumns, value.conflictTargetWhere, value.upsertColumns, value.upsertValues, value.upsertWhere, parameters)) {
                             .updated => |upIdx| {
                                 changes += 1;
                                 try affectedRows.append(self.allocator, table.rows.items[upIdx].values);
@@ -3438,7 +4035,7 @@ pub const Connection = struct {
                     }
                     return err;
                 };
-                try self.fireTriggers(table.name, .after, .insert, row, null, &.{});
+                try self.fireTriggers(store, table, .after, .insert, row, null, &.{});
                 changes += 1;
                 try affectedRows.append(self.allocator, table.rows.items[table.rows.items.len - 1].values);
             }
@@ -3467,11 +4064,11 @@ pub const Connection = struct {
             }
             {
                 defer self.freeResolvedTemps(table, row, value.columns, rowExprs);
-                try self.fireTriggers(table.name, .before, .insert, row, null, &.{});
-                self.store.appendRow(table, row) catch |err| {
+                try self.fireTriggers(store, table, .before, .insert, row, null, &.{});
+                store.appendRow(table, row) catch |err| {
                     if (value.conflict == .ignore and err == error.ConstraintViolation) {
                         if (value.conflictTargetColumns.len > 0 or value.conflictTargetWhere != null) {
-                            if (try self.conflictRowTarget(table, row, value.conflictTargetColumns, value.conflictTargetWhere, parameters) != null) {
+                            if (try self.conflictRowTarget(store, table, row, value.conflictTargetColumns, value.conflictTargetWhere, parameters) != null) {
                                 continue;
                             } else {
                                 return err;
@@ -3480,16 +4077,16 @@ pub const Connection = struct {
                         continue;
                     }
                     if (value.conflict == .replace and err == error.ConstraintViolation) {
-                        if (try self.replaceConflict(table, row)) {
-                            try self.store.appendRow(table, row);
-                            try self.fireTriggers(table.name, .after, .insert, row, null, &.{});
+                        if (try self.replaceConflict(store, table, row)) {
+                            try store.appendRow(table, row);
+                            try self.fireTriggers(store, table, .after, .insert, row, null, &.{});
                             changes += 1;
                             try affectedRows.append(self.allocator, table.rows.items[table.rows.items.len - 1].values);
                             continue;
                         }
                     }
                     if (value.conflict == .update and err == error.ConstraintViolation) {
-                        switch (try self.applyUpsert(table, row, value.conflictTargetColumns, value.conflictTargetWhere, value.upsertColumns, value.upsertValues, value.upsertWhere, parameters)) {
+                        switch (try self.applyUpsert(store, table, row, value.conflictTargetColumns, value.conflictTargetWhere, value.upsertColumns, value.upsertValues, value.upsertWhere, parameters)) {
                             .updated => |upIdx| {
                                 changes += 1;
                                 try affectedRows.append(self.allocator, table.rows.items[upIdx].values);
@@ -3501,7 +4098,7 @@ pub const Connection = struct {
                     }
                     return err;
                 };
-                try self.fireTriggers(table.name, .after, .insert, row, null, &.{});
+                try self.fireTriggers(store, table, .after, .insert, row, null, &.{});
                 changes += 1;
                 try affectedRows.append(self.allocator, table.rows.items[table.rows.items.len - 1].values);
             }
@@ -3647,7 +4244,7 @@ pub const Connection = struct {
         return .{ .allocator = self.allocator, .columns = try self.ownedColumns(columns.items), .rows = try rows.toOwnedSlice(self.allocator) };
     }
 
-    fn conflictRow(self: *Connection, table: *const Table, values: []const Value, ignoreIndex: ?usize) anyerror!?usize {
+    fn conflictRow(self: *Connection, store: *Schema, table: *const Table, values: []const Value, ignoreIndex: ?usize) anyerror!?usize {
         for (table.rows.items, 0..) |existing, rowIndex| {
             if (ignoreIndex != null and ignoreIndex.? == rowIndex) continue;
             var matched = false;
@@ -3670,7 +4267,7 @@ pub const Connection = struct {
                 }
                 if (valid and (constraint.kind == .primaryKey or !hasNull)) return rowIndex;
             }
-            for (self.store.indexes.items) |index| if (index.unique and std.ascii.eqlIgnoreCase(index.table, table.name)) {
+            for (store.indexes.items) |index| if (index.unique and std.ascii.eqlIgnoreCase(index.table, table.name)) {
                 var colNames: ?[][]const u8 = null;
                 defer if (colNames) |names| self.allocator.free(names);
                 var valid = true;
@@ -3701,17 +4298,17 @@ pub const Connection = struct {
                     if (!sameValue(existing.values[columnIdx], values[columnIdx])) valid = false;
                 }
                 if (!valid or hasNull) continue;
-                if (!try self.store.indexPredicateHolds(table, &index, values)) continue;
-                if (!try self.store.indexPredicateHolds(table, &index, existing.values)) continue;
+                if (!try store.indexPredicateHolds(table, &index, values)) continue;
+                if (!try store.indexPredicateHolds(table, &index, existing.values)) continue;
                 return rowIndex;
             };
         }
         return null;
     }
 
-    fn conflictRowTarget(self: *Connection, table: *const Table, values: []const Value, targetColumns: []const []const u8, targetWhere: ?ast.Conditions, parameters: []const Value) anyerror!?usize {
+    fn conflictRowTarget(self: *Connection, store: *Schema, table: *const Table, values: []const Value, targetColumns: []const []const u8, targetWhere: ?ast.Conditions, parameters: []const Value) anyerror!?usize {
         if (targetColumns.len == 0) {
-            const rowIdx = (try self.conflictRow(table, values, null)) orelse return null;
+            const rowIdx = (try self.conflictRow(store, table, values, null)) orelse return null;
             if (targetWhere) |whereCond| {
                 if (!try self.matches(table, table.rows.items[rowIdx].values, whereCond, parameters)) return null;
             }
@@ -3773,6 +4370,7 @@ pub const Connection = struct {
 
     fn applyUpsert(
         self: *Connection,
+        store: *Schema,
         table: *Table,
         values: []const Value,
         targetColumns: []const []const u8,
@@ -3786,7 +4384,7 @@ pub const Connection = struct {
             const index = try columnIndex(table, name);
             if (table.columns[index].generatedExpr != null) return error.ConstraintViolation;
         }
-        const rowIndex = (try self.conflictRowTarget(table, values, targetColumns, targetWhere, parameters)) orelse return .noConflict;
+        const rowIndex = (try self.conflictRowTarget(store, table, values, targetColumns, targetWhere, parameters)) orelse return .noConflict;
         const row = &table.rows.items[rowIndex];
         const excludedOuter = OuterRow{
             .table = table,
@@ -3825,9 +4423,9 @@ pub const Connection = struct {
             candidate[index] = newValue;
         }
         try self.recomputeGeneratedColumns(table, candidate, false);
-        try self.fireTriggers(table.name, .before, .update, candidate, oldSnapshot, columns);
-        try self.store.validateUpdate(table, rowIndex, candidate);
-        try self.applyUpdateActions(table.name, row.values, candidate);
+        try self.fireTriggers(store, table, .before, .update, candidate, oldSnapshot, columns);
+        try store.validateUpdate(table, rowIndex, candidate);
+        try self.applyUpdateActions(store, table.name, row.values, candidate);
         for (columns, expressions) |name, expression| {
             const index = try columnIndex(table, name);
             var newValue = try self.evalContext(table, row.values, expression, parameters, &excludedOuter);
@@ -3843,27 +4441,27 @@ pub const Connection = struct {
             if (expression == .binary or expression == .unary or expression == .function or expression == .caseExpr) self.freeConcatText(newValue);
         }
         try self.recomputeGeneratedColumns(table, row.values, true);
-        try self.fireTriggers(table.name, .after, .update, row.values, oldSnapshot, columns);
+        try self.fireTriggers(store, table, .after, .update, row.values, oldSnapshot, columns);
         return .{ .updated = rowIndex };
     }
 
-    fn deleteRowAt(self: *Connection, table: *Table, rowIndex: usize) !void {
-        try self.applyDeleteActions(table.name, table.rows.items[rowIndex].values);
-        try self.fireTriggers(table.name, .before, .delete, null, table.rows.items[rowIndex].values, &.{});
+    fn deleteRowAt(self: *Connection, store: *Schema, table: *Table, rowIndex: usize) !void {
+        try self.applyDeleteActions(store, table.name, table.rows.items[rowIndex].values);
+        try self.fireTriggers(store, table, .before, .delete, null, table.rows.items[rowIndex].values, &.{});
         const removed = table.rows.orderedRemove(rowIndex);
-        try self.fireTriggers(table.name, .after, .delete, null, removed.values, &.{});
+        try self.fireTriggers(store, table, .after, .delete, null, removed.values, &.{});
         for (removed.values) |item| if (item == .text) self.allocator.free(item.text) else if (item == .blob) self.allocator.free(item.blob);
         self.allocator.free(removed.values);
     }
 
-    fn replaceConflict(self: *Connection, table: *Table, values: []const Value) anyerror!bool {
-        const rowIndex = (try self.conflictRow(table, values, null)) orelse return false;
-        try self.deleteRowAt(table, rowIndex);
+    fn replaceConflict(self: *Connection, store: *Schema, table: *Table, values: []const Value) anyerror!bool {
+        const rowIndex = (try self.conflictRow(store, table, values, null)) orelse return false;
+        try self.deleteRowAt(store, table, rowIndex);
         return true;
     }
 
     fn resolveOrderColumnIndex(table: *const Table, projections: []const ast.Projection, orderCol: []const u8) ?usize {
-        const targetCol = if (std.mem.indexOfScalar(u8, orderCol, '.')) |dot| orderCol[dot + 1 ..] else orderCol;
+        const targetCol = if (std.mem.lastIndexOfScalar(u8, orderCol, '.')) |dot| orderCol[dot + 1 ..] else orderCol;
         if (std.fmt.parseInt(usize, targetCol, 10)) |num| {
             if (num >= 1 and num <= table.columns.len) return num - 1;
         } else |_| {}
@@ -3872,7 +4470,7 @@ pub const Connection = struct {
             if (p.alias) |a| {
                 if (std.ascii.eqlIgnoreCase(a, targetCol)) {
                     if (p.expr == .identifier) {
-                        const pCol = if (std.mem.indexOfScalar(u8, p.expr.identifier, '.')) |dot| p.expr.identifier[dot + 1 ..] else p.expr.identifier;
+                        const pCol = if (std.mem.lastIndexOfScalar(u8, p.expr.identifier, '.')) |dot| p.expr.identifier[dot + 1 ..] else p.expr.identifier;
                         if (columnIndex(table, pCol)) |idx| return idx else |_| {}
                     }
                     if (pIdx < table.columns.len) return pIdx;
@@ -3956,8 +4554,9 @@ pub const Connection = struct {
         var projections = std.ArrayList(ast.Projection).empty;
         defer projections.deinit(self.allocator);
         if (value.table) |tableName| {
-            const table = self.store.findConst(tableName) orelse {
-                const view = self.store.findViewConst(tableName) orelse return error.UnknownTable;
+            const resolved = self.resolveTableName(tableName) orelse {
+                const resolvedView = self.resolveViewName(tableName) orelse return error.UnknownTable;
+                const view = resolvedView.view;
                 var source = try self.execute(view.sql, parameters);
                 defer source.deinit();
                 const ephemeralName = try std.fmt.allocPrint(self.allocator, "__view__{s}", .{tableName});
@@ -3968,6 +4567,7 @@ pub const Connection = struct {
                 subValue.table = ephemeralName;
                 return self.selectWithOuter(subValue, parameters, outer);
             };
+            const table = resolved.table;
             if (value.joins.len != 0) return try self.selectJoin(value, table, parameters, outer);
             if (value.groupBy) |groupName| return try self.selectGrouped(table, value, groupName, parameters);
             var anyAgg = false;
@@ -4390,15 +4990,30 @@ pub const Connection = struct {
     const QualifierParts = struct { qualifier: []const u8, column: []const u8 };
 
     fn splitQualifier(name: []const u8) QualifierParts {
-        if (std.mem.indexOfScalar(u8, name, '.')) |dot| return .{ .qualifier = name[0..dot], .column = name[dot + 1 ..] };
+        if (std.mem.lastIndexOfScalar(u8, name, '.')) |dot| return .{ .qualifier = name[0..dot], .column = name[dot + 1 ..] };
         return .{ .qualifier = "", .column = name };
+    }
+
+    fn qualifierTablePart(qualifier: []const u8) []const u8 {
+        if (std.mem.lastIndexOfScalar(u8, qualifier, '.')) |dot| return qualifier[dot + 1 ..];
+        return qualifier;
     }
 
     fn groupQualifierMatches(qualifier: []const u8, table: *const Table, alias: ?[]const u8) bool {
         if (qualifier.len == 0) return true;
-        if (std.ascii.eqlIgnoreCase(qualifier, table.name)) return true;
-        if (alias) |name| if (std.ascii.eqlIgnoreCase(qualifier, name)) return true;
+        const tablePart = qualifierTablePart(qualifier);
+        if (std.ascii.eqlIgnoreCase(tablePart, table.name)) return true;
+        if (alias) |name| if (std.ascii.eqlIgnoreCase(tablePart, name)) return true;
         return false;
+    }
+
+    fn stripSchemaQualifier(self: *Connection, name: []const u8) []const u8 {
+        const firstDot = std.mem.indexOfScalar(u8, name, '.') orelse return name;
+        if (std.mem.indexOfScalar(u8, name[firstDot + 1 ..], '.') == null) return name;
+        const schemaName = name[0..firstDot];
+        if (std.ascii.eqlIgnoreCase(schemaName, "main") or std.ascii.eqlIgnoreCase(schemaName, "temp")) return name[firstDot + 1 ..];
+        for (self.attached.items) |*db| if (std.ascii.eqlIgnoreCase(db.name, schemaName)) return name[firstDot + 1 ..];
+        return name;
     }
 
     const KeyLoc = struct { provider: usize, group: ?usize };
@@ -4455,7 +5070,10 @@ pub const Connection = struct {
         var tables = std.ArrayList(*const Table).empty;
         defer tables.deinit(self.allocator);
         try tables.append(self.allocator, left);
-        for (joins) |join| try tables.append(self.allocator, self.store.findConst(join.table) orelse return error.UnknownTable);
+        for (joins) |join| {
+            const resolved = self.resolveTableName(join.table) orelse return error.UnknownTable;
+            try tables.append(self.allocator, resolved.table);
+        }
         var aliases = std.ArrayList(?[]const u8).empty;
         defer aliases.deinit(self.allocator);
         try aliases.append(self.allocator, value.tableAlias);
@@ -4613,7 +5231,7 @@ pub const Connection = struct {
                 }
             } else if (projection.expr == .identifier) {
                 const name = projection.expr.identifier;
-                const dot = std.mem.indexOfScalar(u8, name, '.');
+                const dot = std.mem.lastIndexOfScalar(u8, name, '.');
                 const columnName = if (dot) |position| name[position + 1 ..] else name;
                 try columns.append(self.allocator, projection.alias orelse columnName);
             } else if (projection.expr == .function) {
@@ -4931,12 +5549,15 @@ pub const Connection = struct {
 
     fn updateFrom(self: *Connection, value: anytype, parameters: []const Value) anyerror!Result {
         if (self.cteActive(value.table)) return error.InvalidSql;
-        const table = self.store.find(value.table) orelse return error.UnknownTable;
+        const resolved = self.resolveTableName(value.table) orelse return error.UnknownTable;
+        const store = self.storeFor(resolved.ref);
+        const table = resolved.table;
         for (value.columns) |name| {
             const index = try columnIndex(table, name);
             if (table.columns[index].generatedExpr != null) return error.ConstraintViolation;
         }
-        const source = self.store.findConst(value.from.?.table) orelse return error.UnknownTable;
+        const resolvedSource = self.resolveTableName(value.from.?.table) orelse return error.UnknownTable;
+        const source = resolvedSource.table;
         const sourceSpec = value.from.?;
         const hasPair = sourceSpec.leftColumn.len != 0 and sourceSpec.rightColumn.len != 0;
         const leftTable = if (sourceSpec.leftTable.len == 0) table else if (std.ascii.eqlIgnoreCase(sourceSpec.leftTable, table.name)) table else source;
@@ -4985,13 +5606,13 @@ pub const Connection = struct {
                     candidate[index] = newValue;
                 }
                 try self.recomputeGeneratedColumns(table, candidate, false);
-                try self.fireTriggers(table.name, .before, .update, candidate, row.values, value.columns);
-                self.store.validateUpdate(table, rowIndex, candidate) catch |err| {
+                try self.fireTriggers(store, table, .before, .update, candidate, row.values, value.columns);
+                store.validateUpdate(table, rowIndex, candidate) catch |err| {
                     if (err != error.ConstraintViolation) return err;
                     if (value.conflict == .ignore) continue;
                     return err;
                 };
-                self.applyUpdateActions(table.name, row.values, candidate) catch |err| {
+                self.applyUpdateActions(store, table.name, row.values, candidate) catch |err| {
                     if (err != error.ConstraintViolation) return err;
                     if (value.conflict == .ignore) continue;
                     return err;
@@ -5015,7 +5636,7 @@ pub const Connection = struct {
                     _ = updateIndex;
                 }
                 try self.recomputeGeneratedColumns(table, row.values, true);
-                try self.fireTriggers(table.name, .after, .update, candidate, oldSnapshot, value.columns);
+                try self.fireTriggers(store, table, .after, .update, candidate, oldSnapshot, value.columns);
                 changes += 1;
                 try affectedRows.append(self.allocator, row.values);
                 break;
@@ -5028,7 +5649,9 @@ pub const Connection = struct {
     fn update(self: *Connection, value: anytype, parameters: []const Value) !Result {
         if (value.from != null) return self.updateFrom(value, parameters);
         if (self.cteActive(value.table)) return error.InvalidSql;
-        const table = self.store.find(value.table) orelse return error.UnknownTable;
+        const resolved = self.resolveTableName(value.table) orelse return error.UnknownTable;
+        const store = self.storeFor(resolved.ref);
+        const table = resolved.table;
         try validateReturningColumns(table, value.returning);
         for (value.columns) |name| {
             const index = try columnIndex(table, name);
@@ -5072,25 +5695,25 @@ pub const Connection = struct {
                 candidate[index] = newValue;
             }
             try self.recomputeGeneratedColumns(table, candidate, false);
-            try self.fireTriggers(table.name, .before, .update, candidate, row.values, value.columns);
-            self.store.validateUpdate(table, rowIndex, candidate) catch |err| {
+            try self.fireTriggers(store, table, .before, .update, candidate, row.values, value.columns);
+            store.validateUpdate(table, rowIndex, candidate) catch |err| {
                 if (err != error.ConstraintViolation) return err;
                 switch (value.conflict) {
                     .ignore => continue :outer,
                     .replace => {
-                        while (try self.conflictRow(table, candidate, rowIndex)) |bad| {
-                            try self.deleteRowAt(table, bad);
+                        while (try self.conflictRow(store, table, candidate, rowIndex)) |bad| {
+                            try self.deleteRowAt(store, table, bad);
                             if (bad < rowIndex) rowIndex -= 1;
                             if (rowIndex >= table.rows.items.len) continue :outer;
                             row = &table.rows.items[rowIndex];
                             if (!(try self.matches(table, row.values, value.condition, parameters))) continue :outer;
                         }
-                        try self.store.validateUpdate(table, rowIndex, candidate);
+                        try store.validateUpdate(table, rowIndex, candidate);
                     },
                     else => return err,
                 }
             };
-            self.applyUpdateActions(table.name, row.values, candidate) catch |err| {
+            self.applyUpdateActions(store, table.name, row.values, candidate) catch |err| {
                 if (err != error.ConstraintViolation) return err;
                 switch (value.conflict) {
                     .ignore => continue :outer,
@@ -5119,7 +5742,7 @@ pub const Connection = struct {
             try self.recomputeGeneratedColumns(table, row.values, true);
             changes += 1;
             try affectedRows.append(self.allocator, row.values);
-            try self.fireTriggers(table.name, .after, .update, candidate, oldSnapshot, value.columns);
+            try self.fireTriggers(store, table, .after, .update, candidate, oldSnapshot, value.columns);
         }
         if (value.returning.len > 0) return self.evaluateReturning(table, value.returning, affectedRows.items, parameters);
         return .{ .allocator = self.allocator, .columns = try self.allocator.alloc([]const u8, 0), .rows = try self.allocator.alloc([]Value, 0), .changes = changes };
@@ -5157,9 +5780,9 @@ pub const Connection = struct {
         return true;
     }
 
-    fn applyCompositeUpdateActions(self: *Connection, parentName: []const u8, oldValues: []const Value, newValues: []const Value) anyerror!void {
-        const parent = self.store.findConst(parentName) orelse return error.ConstraintViolation;
-        for (self.store.tables.items) |*childTable| {
+    fn applyCompositeUpdateActions(self: *Connection, store: *Schema, parentName: []const u8, oldValues: []const Value, newValues: []const Value) anyerror!void {
+        const parent = store.findConst(parentName) orelse return error.ConstraintViolation;
+        for (store.tables.items) |*childTable| {
             var childRowIndex: usize = 0;
             while (childRowIndex < childTable.rows.items.len) : (childRowIndex += 1) {
                 var constraintIndex: usize = 0;
@@ -5211,7 +5834,7 @@ pub const Connection = struct {
                                 if (candidate[childIndex] == .text) self.allocator.free(candidate[childIndex].text) else if (candidate[childIndex] == .blob) self.allocator.free(candidate[childIndex].blob);
                                 candidate[childIndex] = try self.copyValue(newValues[parentIndex]);
                             }
-                            try self.applyUpdateActions(childTable.name, row.values, candidate);
+                            try self.applyUpdateActions(store, childTable.name, row.values, candidate);
                             for (row.values) |item| if (item == .text) self.allocator.free(item.text) else if (item == .blob) self.allocator.free(item.blob);
                             self.allocator.free(row.values);
                             row.values = candidate;
@@ -5222,9 +5845,9 @@ pub const Connection = struct {
         }
     }
 
-    fn applyCompositeDeleteActions(self: *Connection, parentName: []const u8, parentValues: []const Value) anyerror!void {
-        const parent = self.store.findConst(parentName) orelse return error.ConstraintViolation;
-        for (self.store.tables.items) |*childTable| {
+    fn applyCompositeDeleteActions(self: *Connection, store: *Schema, parentName: []const u8, parentValues: []const Value) anyerror!void {
+        const parent = store.findConst(parentName) orelse return error.ConstraintViolation;
+        for (store.tables.items) |*childTable| {
             var childRowIndex = childTable.rows.items.len;
             while (childRowIndex > 0) {
                 childRowIndex -= 1;
@@ -5261,7 +5884,7 @@ pub const Connection = struct {
                             }
                         },
                         .cascade => {
-                            try self.applyDeleteActions(childTable.name, childTable.rows.items[childRowIndex].values);
+                            try self.applyDeleteActions(store, childTable.name, childTable.rows.items[childRowIndex].values);
                             const removed = childTable.rows.orderedRemove(childRowIndex);
                             for (removed.values) |item| if (item == .text) self.allocator.free(item.text) else if (item == .blob) self.allocator.free(item.blob);
                             self.allocator.free(removed.values);
@@ -5272,13 +5895,13 @@ pub const Connection = struct {
         }
     }
 
-    fn applyUpdateActions(self: *Connection, parentName: []const u8, oldValues: []const Value, newValues: []const Value) anyerror!void {
-        if (!self.store.foreignKeysEnabled) return;
-        try self.applyCompositeUpdateActions(parentName, oldValues, newValues);
-        const parent = self.store.findConst(parentName) orelse return error.ConstraintViolation;
+    fn applyUpdateActions(self: *Connection, store: *Schema, parentName: []const u8, oldValues: []const Value, newValues: []const Value) anyerror!void {
+        if (!store.foreignKeysEnabled) return;
+        try self.applyCompositeUpdateActions(store, parentName, oldValues, newValues);
+        const parent = store.findConst(parentName) orelse return error.ConstraintViolation;
         var childTableIndex: usize = 0;
-        while (childTableIndex < self.store.tables.items.len) : (childTableIndex += 1) {
-            const childTable = &self.store.tables.items[childTableIndex];
+        while (childTableIndex < store.tables.items.len) : (childTableIndex += 1) {
+            const childTable = &store.tables.items[childTableIndex];
             var childColumnIndex: usize = 0;
             while (childColumnIndex < childTable.columns.len) : (childColumnIndex += 1) {
                 const childColumn = childTable.columns[childColumnIndex];
@@ -5315,7 +5938,7 @@ pub const Connection = struct {
                             const replacement = try self.copyValue(newValues[parentColumnIndex]);
                             if (candidate[childColumnIndex] == .text) self.allocator.free(candidate[childColumnIndex].text) else if (candidate[childColumnIndex] == .blob) self.allocator.free(candidate[childColumnIndex].blob);
                             candidate[childColumnIndex] = replacement;
-                            try self.applyUpdateActions(childTable.name, childRow.values, candidate);
+                            try self.applyUpdateActions(store, childTable.name, childRow.values, candidate);
                             for (childRow.values) |item| if (item == .text) self.allocator.free(item.text) else if (item == .blob) self.allocator.free(item.blob);
                             self.allocator.free(childRow.values);
                             childRow.values = candidate;
@@ -5326,21 +5949,21 @@ pub const Connection = struct {
         }
     }
 
-    fn applyDeleteActions(self: *Connection, parentName: []const u8, parentValues: []const Value) anyerror!void {
-        if (!self.store.foreignKeysEnabled) return;
-        try self.applyCompositeDeleteActions(parentName, parentValues);
+    fn applyDeleteActions(self: *Connection, store: *Schema, parentName: []const u8, parentValues: []const Value) anyerror!void {
+        if (!store.foreignKeysEnabled) return;
+        try self.applyCompositeDeleteActions(store, parentName, parentValues);
         var childTableIndex: usize = 0;
-        while (childTableIndex < self.store.tables.items.len) : (childTableIndex += 1) {
-            var childRowIndex = self.store.tables.items[childTableIndex].rows.items.len;
+        while (childTableIndex < store.tables.items.len) : (childTableIndex += 1) {
+            var childRowIndex = store.tables.items[childTableIndex].rows.items.len;
             while (childRowIndex > 0) {
                 childRowIndex -= 1;
                 var action: ?ast.ReferentialAction = null;
                 var childColumnIndex: usize = 0;
                 var parentColumnIndex: usize = 0;
-                const childTable = &self.store.tables.items[childTableIndex];
+                const childTable = &store.tables.items[childTableIndex];
                 for (childTable.columns, 0..) |column, columnIdx| if (column.foreignTable) |foreignTable| {
                     if (std.ascii.eqlIgnoreCase(foreignTable, parentName)) {
-                        const parentTable = self.store.findConst(parentName) orelse return error.ConstraintViolation;
+                        const parentTable = store.findConst(parentName) orelse return error.ConstraintViolation;
                         const referenced = column.foreignColumn orelse return error.ConstraintViolation;
                         for (parentTable.columns, 0..) |parentColumn, index| if (std.ascii.eqlIgnoreCase(parentColumn.name, referenced)) {
                             childColumnIndex = columnIdx;
@@ -5369,7 +5992,7 @@ pub const Connection = struct {
                         childTable.rows.items[childRowIndex].values[childColumnIndex] = try self.copyValue(def);
                     },
                     .cascade => {
-                        try self.applyDeleteActions(childTable.name, childTable.rows.items[childRowIndex].values);
+                        try self.applyDeleteActions(store, childTable.name, childTable.rows.items[childRowIndex].values);
                         const removed = childTable.rows.orderedRemove(childRowIndex);
                         for (removed.values) |item| if (item == .text) self.allocator.free(item.text) else if (item == .blob) self.allocator.free(item.blob);
                         self.allocator.free(removed.values);
@@ -5381,7 +6004,9 @@ pub const Connection = struct {
 
     fn delete(self: *Connection, value: anytype, parameters: []const Value) !Result {
         if (self.cteActive(value.table)) return error.InvalidSql;
-        const table = self.store.find(value.table) orelse return error.UnknownTable;
+        const resolved = self.resolveTableName(value.table) orelse return error.UnknownTable;
+        const store = self.storeFor(resolved.ref);
+        const table = resolved.table;
         try validateReturningColumns(table, value.returning);
         var affectedRows = std.ArrayList([]Value).empty;
         defer {
@@ -5395,10 +6020,10 @@ pub const Connection = struct {
         var index: usize = 0;
         while (index < table.rows.items.len) {
             if (try self.matches(table, table.rows.items[index].values, value.condition, parameters)) {
-                try self.fireTriggers(table.name, .before, .delete, null, table.rows.items[index].values, &.{});
-                try self.applyDeleteActions(table.name, table.rows.items[index].values);
+                try self.fireTriggers(store, table, .before, .delete, null, table.rows.items[index].values, &.{});
+                try self.applyDeleteActions(store, table.name, table.rows.items[index].values);
                 const row = table.rows.orderedRemove(index);
-                try self.fireTriggers(table.name, .after, .delete, null, row.values, &.{});
+                try self.fireTriggers(store, table, .after, .delete, null, row.values, &.{});
                 if (value.returning.len > 0) {
                     const cloned = try self.allocator.alloc(Value, row.values.len);
                     for (row.values, 0..) |item, i| cloned[i] = try self.copyValue(item);
@@ -10057,7 +10682,7 @@ test "vacuum rejects active transactions and unknown schemas" {
     var intact = try db.exec("SELECT count(*) FROM guard_items;");
     defer intact.deinit();
     try std.testing.expectEqual(@as(i64, 1), intact.rows[0][0].integer);
-    try std.testing.expectError(error.Unsupported, db.exec("VACUUM attached;"));
+    try std.testing.expectError(error.UnknownDatabase, db.exec("VACUUM attached;"));
     try std.testing.expectError(error.InvalidSql, db.exec("VACUUM INTO 42;"));
 }
 
@@ -11642,4 +12267,197 @@ test "table operations hold across raw and dsl" {
     try db.truncate(Widget);
     try db.dropTable("ops_widget");
     try std.testing.expectError(error.UnknownTable, db.dropTable("ops_widget"));
+}
+
+test "attached databases isolate join and persist" {
+    const path = "sqlite_zig_attach_main_test.db";
+    const auxPath = "sqlite_zig_attach_aux_test.db";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, auxPath) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, auxPath) catch {};
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    var setup = try db.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT); INSERT INTO users VALUES (1, 'ann'), (2, 'bob');");
+    setup.deinit();
+    var attach = try db.exec("ATTACH 'sqlite_zig_attach_aux_test.db' AS aux;");
+    attach.deinit();
+    var dblist = try db.exec("PRAGMA database_list;");
+    defer dblist.deinit();
+    try std.testing.expectEqual(@as(usize, 3), dblist.count());
+    try std.testing.expectEqualStrings("aux", dblist.rows[2][1].text);
+    try std.testing.expectEqualStrings(auxPath, dblist.rows[2][2].text);
+    var auxSetup = try db.exec("CREATE TABLE aux.orders (id INTEGER PRIMARY KEY, user_id INTEGER, amount INTEGER); INSERT INTO aux.orders VALUES (1, 1, 100), (2, 2, 200); CREATE TABLE aux.parents (id INTEGER PRIMARY KEY); INSERT INTO aux.parents VALUES (1); CREATE TABLE aux.children (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parents(id) ON DELETE CASCADE); INSERT INTO aux.children VALUES (1, 1);");
+    auxSetup.deinit();
+    try std.testing.expectError(error.ConstraintViolation, db.exec("INSERT INTO aux.children VALUES (2, 99);"));
+    var auxCascade = try db.exec("DELETE FROM aux.parents WHERE id = 1; SELECT count(*) FROM aux.children;");
+    defer auxCascade.deinit();
+    try std.testing.expectEqual(@as(i64, 0), auxCascade.rows[0][0].integer);
+    var joined = try db.exec("SELECT users.name, aux.orders.amount FROM users JOIN aux.orders ON users.id = aux.orders.user_id ORDER BY users.id;");
+    defer joined.deinit();
+    try std.testing.expectEqual(@as(usize, 2), joined.count());
+    try std.testing.expectEqualStrings("ann", joined.rows[0][0].text);
+    try std.testing.expectEqual(@as(i64, 100), joined.rows[0][1].integer);
+    try std.testing.expectEqualStrings("amount", joined.columns[1]);
+    var auxWrite = try db.exec("UPDATE aux.orders SET amount = 150 WHERE id = 1; DELETE FROM aux.orders WHERE id = 2;");
+    auxWrite.deinit();
+    var auxRead = try db.exec("SELECT count(*), sum(amount) FROM aux.orders;");
+    defer auxRead.deinit();
+    try std.testing.expectEqual(@as(i64, 1), auxRead.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 150), auxRead.rows[0][1].integer);
+    var auxInfo = try db.exec("PRAGMA aux.table_info(orders);");
+    defer auxInfo.deinit();
+    try std.testing.expectEqual(@as(usize, 3), auxInfo.count());
+    try std.testing.expectEqualStrings("user_id", auxInfo.rows[1][1].text);
+    var auxVersion = try db.exec("PRAGMA aux.user_version = 7; PRAGMA aux.user_version;");
+    defer auxVersion.deinit();
+    try std.testing.expectEqual(@as(i64, 7), auxVersion.rows[0][0].integer);
+    var mainVersion = try db.exec("PRAGMA user_version;");
+    defer mainVersion.deinit();
+    try std.testing.expectEqual(@as(i64, 0), mainVersion.rows[0][0].integer);
+    try std.testing.expectError(error.InvalidSql, db.exec("DETACH main;"));
+    try std.testing.expectError(error.InvalidSql, db.exec("DETACH temp;"));
+    try std.testing.expectError(error.UnknownDatabase, db.exec("DETACH missing;"));
+    var begun = try db.exec("BEGIN;");
+    begun.deinit();
+    try std.testing.expectError(error.TransactionActive, db.exec("DETACH aux;"));
+    var rolled = try db.exec("ROLLBACK;");
+    rolled.deinit();
+    var vacuumAux = try db.exec("VACUUM aux;");
+    vacuumAux.deinit();
+    var detached = try db.exec("DETACH aux;");
+    detached.deinit();
+    var dblistAfter = try db.exec("PRAGMA database_list;");
+    defer dblistAfter.deinit();
+    try std.testing.expectEqual(@as(usize, 2), dblistAfter.count());
+    try std.testing.expectError(error.UnknownTable, db.exec("SELECT count(*) FROM aux.orders;"));
+    db.close();
+    db = try Connection.open(std.testing.allocator, path);
+    errdefer db.close();
+    var direct = try Connection.open(std.testing.allocator, auxPath);
+    defer direct.close();
+    var auxRows = try direct.exec("SELECT count(*), sum(amount) FROM orders;");
+    defer auxRows.deinit();
+    try std.testing.expectEqual(@as(i64, 1), auxRows.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 150), auxRows.rows[0][1].integer);
+    var auxVersionKept = try direct.exec("PRAGMA user_version;");
+    defer auxVersionKept.deinit();
+    try std.testing.expectEqual(@as(i64, 7), auxVersionKept.rows[0][0].integer);
+}
+
+test "temp tables shadow main and vanish on reopen" {
+    const path = "sqlite_zig_temp_table_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    var setup = try db.exec("CREATE TABLE items (id INTEGER PRIMARY KEY, v TEXT); INSERT INTO items VALUES (1, 'main');");
+    setup.deinit();
+    var temp = try db.exec("CREATE TEMP TABLE items (id INTEGER PRIMARY KEY, v TEXT); INSERT INTO items VALUES (1, 'temp'), (2, 'temp2');");
+    temp.deinit();
+    var shadowed = try db.exec("SELECT v FROM items ORDER BY id;");
+    defer shadowed.deinit();
+    try std.testing.expectEqualStrings("temp", shadowed.rows[0][0].text);
+    var scoped = try db.exec("SELECT v FROM main.items; SELECT v FROM temp.items ORDER BY id;");
+    defer scoped.deinit();
+    try std.testing.expectEqualStrings("temp2", scoped.rows[1][0].text);
+    var tempOnly = try db.exec("CREATE TEMP TABLE scratch (x INTEGER); INSERT INTO scratch VALUES (5);");
+    tempOnly.deinit();
+    try std.testing.expectError(error.UnknownTable, db.exec("SELECT x FROM main.scratch;"));
+    var tempRead = try db.exec("SELECT x FROM scratch;");
+    defer tempRead.deinit();
+    try std.testing.expectEqual(@as(i64, 5), tempRead.rows[0][0].integer);
+    var tempWrite = try db.exec("UPDATE scratch SET x = 6; DELETE FROM items WHERE id = 2;");
+    tempWrite.deinit();
+    var tempCheck = try db.exec("SELECT x FROM temp.scratch; SELECT count(*) FROM main.items;");
+    defer tempCheck.deinit();
+    try std.testing.expectEqual(@as(i64, 1), tempCheck.rows[0][0].integer);
+    try std.testing.expectError(error.UnexpectedToken, db.exec("CREATE TEMP INDEX scratch_idx ON scratch (x);"));
+    try std.testing.expectError(error.InvalidSql, db.exec("CREATE TEMP TABLE aux.t (x INTEGER);"));
+    var tempView = try db.exec("CREATE TEMP VIEW scratch_view AS SELECT x FROM scratch;");
+    tempView.deinit();
+    var viaTempView = try db.exec("SELECT x FROM scratch_view;");
+    defer viaTempView.deinit();
+    try std.testing.expectEqual(@as(i64, 6), viaTempView.rows[0][0].integer);
+    var dropTemp = try db.exec("DROP TABLE items;");
+    dropTemp.deinit();
+    var unshadowed = try db.exec("SELECT v FROM main.items;");
+    defer unshadowed.deinit();
+    try std.testing.expectEqualStrings("main", unshadowed.rows[0][0].text);
+    var list = try db.exec("PRAGMA table_list;");
+    defer list.deinit();
+    var sawTemp = false;
+    for (list.rows) |row| {
+        if (std.mem.eql(u8, row[0].text, "temp") and std.mem.eql(u8, row[1].text, "scratch")) sawTemp = true;
+    }
+    try std.testing.expect(sawTemp);
+    db.close();
+    db = try Connection.open(std.testing.allocator, path);
+    errdefer db.close();
+    var gone = try db.exec("SELECT count(*) FROM items;");
+    defer gone.deinit();
+    try std.testing.expectEqual(@as(i64, 1), gone.rows[0][0].integer);
+    try std.testing.expectError(error.UnknownTable, db.exec("SELECT x FROM scratch;"));
+}
+
+test "transactions span main attached and temp schemas" {
+    const path = "sqlite_zig_xdb_txn_test.db";
+    const auxPath = "sqlite_zig_xdb_txn_aux_test.db";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, auxPath) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, auxPath) catch {};
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    var setup = try db.exec("CREATE TABLE m (id INTEGER PRIMARY KEY, v INTEGER); INSERT INTO m VALUES (1, 10); ATTACH 'sqlite_zig_xdb_txn_aux_test.db' AS aux; CREATE TABLE aux.a (id INTEGER PRIMARY KEY, v INTEGER); INSERT INTO aux.a VALUES (1, 100); CREATE TEMP TABLE t (id INTEGER PRIMARY KEY, v INTEGER); INSERT INTO t VALUES (1, 1000);");
+    setup.deinit();
+    var txn = try db.exec("BEGIN; INSERT INTO m VALUES (2, 20); INSERT INTO aux.a VALUES (2, 200); INSERT INTO t VALUES (2, 2000); ROLLBACK;");
+    txn.deinit();
+    var rolledM = try db.exec("SELECT count(*) FROM m;");
+    defer rolledM.deinit();
+    try std.testing.expectEqual(@as(i64, 1), rolledM.rows[0][0].integer);
+    var rolledA = try db.exec("SELECT count(*) FROM aux.a;");
+    defer rolledA.deinit();
+    try std.testing.expectEqual(@as(i64, 1), rolledA.rows[0][0].integer);
+    var rolledT = try db.exec("SELECT count(*) FROM t;");
+    defer rolledT.deinit();
+    try std.testing.expectEqual(@as(i64, 1), rolledT.rows[0][0].integer);
+    var txn2 = try db.exec("BEGIN; INSERT INTO m VALUES (2, 20); INSERT INTO aux.a VALUES (2, 200); INSERT INTO t VALUES (2, 2000); COMMIT;");
+    txn2.deinit();
+    var keptM = try db.exec("SELECT sum(v) FROM m;");
+    defer keptM.deinit();
+    try std.testing.expectEqual(@as(i64, 30), keptM.rows[0][0].integer);
+    var keptA = try db.exec("SELECT sum(v) FROM aux.a;");
+    defer keptA.deinit();
+    try std.testing.expectEqual(@as(i64, 300), keptA.rows[0][0].integer);
+    var keptT = try db.exec("SELECT sum(v) FROM t;");
+    defer keptT.deinit();
+    try std.testing.expectEqual(@as(i64, 3000), keptT.rows[0][0].integer);
+    var save = try db.exec("SAVEPOINT sp1; DELETE FROM m WHERE id = 2; DELETE FROM aux.a WHERE id = 2; ROLLBACK TO sp1;");
+    save.deinit();
+    try std.testing.expectError(error.TransactionActive, db.exec("ATTACH 'x.db' AS x2;"));
+    try std.testing.expectError(error.TransactionActive, db.exec("DETACH aux;"));
+    var restoredM = try db.exec("SELECT count(*) FROM m;");
+    defer restoredM.deinit();
+    try std.testing.expectEqual(@as(i64, 2), restoredM.rows[0][0].integer);
+    var restoredA = try db.exec("SELECT count(*) FROM aux.a;");
+    defer restoredA.deinit();
+    try std.testing.expectEqual(@as(i64, 2), restoredA.rows[0][0].integer);
+    var release = try db.exec("RELEASE sp1; COMMIT;");
+    release.deinit();
+    var cleanup = try db.exec("DETACH aux;");
+    cleanup.deinit();
+}
+
+test "version accessors roundtrip through the public api" {
+    const path = "sqlite_zig_version_api_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    try std.testing.expectEqual(@as(u32, 0), db.userVersion());
+    try db.setUserVersion(41);
+    try std.testing.expectEqual(@as(u32, 41), db.userVersion());
+    try db.setApplicationId(99);
+    try std.testing.expectEqual(@as(u32, 99), db.applicationId());
+    try db.setSchemaVersion(7);
+    try std.testing.expectEqual(@as(u32, 7), db.schemaVersion());
+    db.close();
+    db = try Connection.open(std.testing.allocator, path);
+    errdefer db.close();
+    try std.testing.expectEqual(@as(u32, 41), db.userVersion());
+    try std.testing.expectEqual(@as(u32, 99), db.applicationId());
+    try std.testing.expectEqual(@as(u32, 7), db.schemaVersion());
 }

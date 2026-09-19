@@ -63,11 +63,33 @@ var version = try db.exec("PRAGMA user_version = 3;");
 version.deinit();
 ```
 
+The same versions are available as direct methods, alongside the engine
+schema version used for cache invalidation:
+
+```zig
+try db.setUserVersion(3);
+const current = db.userVersion();
+const cookie = db.schemaVersion();
+try db.setApplicationId(305419896);
+const appId = db.applicationId();
+```
+
 Applications can also persist an identifier in SQLite's standard header field:
 
 ```zig
 var application = try db.exec("PRAGMA application_id = 305419896;");
 application.deinit();
+```
+
+Additional databases can be attached for the session and addressed by name:
+
+```zig
+var attached = try db.exec("ATTACH 'archive.db' AS aux;");
+attached.deinit();
+var rows = try db.exec("SELECT * FROM aux.orders;");
+defer rows.deinit();
+var detached = try db.exec("DETACH aux;");
+detached.deinit();
 ```
 
 Foreign-key checks and cascading actions can be controlled per connection:

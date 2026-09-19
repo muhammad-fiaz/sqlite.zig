@@ -56,7 +56,7 @@ pub const TableConstraint = union(enum) { primaryKey: []const []const u8, unique
 pub const IndexDef = struct { name: []const u8, table: []const u8, columns: []const []const u8, keyExprs: []const ?Expr = &.{}, unique: bool = false, ifNotExists: bool = false, whereExpr: ?Expr = null, whereSql: ?[]const u8 = null };
 pub const TriggerEvent = enum { insert, update, delete };
 pub const TriggerTiming = enum { before, after };
-pub const TriggerDef = struct { name: []const u8, table: []const u8, timing: TriggerTiming = .after, event: TriggerEvent, updateOf: []const []const u8 = &.{}, whenSql: ?[]const u8 = null, body: []const u8, ifNotExists: bool = false };
+pub const TriggerDef = struct { name: []const u8, table: []const u8, timing: TriggerTiming = .after, event: TriggerEvent, updateOf: []const []const u8 = &.{}, whenSql: ?[]const u8 = null, body: []const u8, ifNotExists: bool = false, temporary: bool = false };
 pub const VirtualTableDef = struct { name: []const u8, module: []const u8, arguments: []const []const u8, ifNotExists: bool = false };
 pub const CteDef = struct { name: []const u8, columns: []const []const u8 = &.{}, querySql: []const u8, recursiveSql: ?[]const u8 = null, recursiveAll: bool = false };
 pub const WithSelect = struct { ctes: []CteDef, bodySql: []const u8, recursive: bool = false };
@@ -74,9 +74,9 @@ pub const CompoundOp = enum { unionOp, unionAllOp, intersectOp, exceptOp };
 pub const CompoundSelect = struct { leftSql: []const u8, op: CompoundOp, rightSql: []const u8, order: ?Order = null, limit: ?usize = null, offset: ?usize = null };
 
 pub const Statement = union(enum) {
-    createTable: struct { name: []const u8, columns: []ColumnDef, constraints: []TableConstraint = &.{}, ifNotExists: bool = false, strict: bool = false, withoutRowid: bool = false },
+    createTable: struct { name: []const u8, columns: []ColumnDef, constraints: []TableConstraint = &.{}, ifNotExists: bool = false, strict: bool = false, withoutRowid: bool = false, temporary: bool = false },
     createIndex: IndexDef,
-    createView: struct { name: []const u8, sql: []const u8, ifNotExists: bool = false },
+    createView: struct { name: []const u8, sql: []const u8, ifNotExists: bool = false, temporary: bool = false },
     createTrigger: TriggerDef,
     createVirtualTable: VirtualTableDef,
     withSelect: WithSelect,
