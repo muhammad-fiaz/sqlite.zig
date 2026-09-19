@@ -73,7 +73,7 @@ fn readInteger(bytes: []const u8, count: usize) i64 {
 
 pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) ![]Value {
     const first = try varint.decode(bytes);
-    const headerSize: usize = first.value;
+    const headerSize: usize = @intCast(first.value);
     if (headerSize > bytes.len or headerSize == 0) return Error.InvalidRecord;
     var types = std.ArrayList(u64).empty;
     defer types.deinit(allocator);

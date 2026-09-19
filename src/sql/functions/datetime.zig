@@ -100,15 +100,25 @@ fn parseTimeOnly(str: []const u8) ?DateTime {
     };
 }
 
-fn getCurrentTimestamp() i64 {
+const ClockError = error{ClockUnavailable};
+
+fn getCurrentTimestamp() ClockError!i64 {
     const builtin = @import("builtin");
-    if (builtin.os.tag == .windows) {
-        const win100ns = @as(i64, @bitCast(std.os.windows.ntdll.RtlGetSystemTimePrecise()));
-        return @divTrunc(win100ns, 10_000_000) + std.time.epoch.windows;
-    } else {
-        var ts: std.posix.timespec = undefined;
-        _ = std.posix.clock_gettime(std.posix.CLOCK.REALTIME, &ts) catch return 1726693200;
-        return ts.sec;
+    switch (builtin.os.tag) {
+        .windows => {
+            const win100ns = @as(i64, @bitCast(std.os.windows.ntdll.RtlGetSystemTimePrecise()));
+            return @divTrunc(win100ns, 10_000_000) + std.time.epoch.windows;
+        },
+        .linux => {
+            var ts: std.os.linux.timespec = undefined;
+            if (std.os.linux.clock_gettime(.REALTIME, &ts) != 0) return error.ClockUnavailable;
+            return ts.sec;
+        },
+        // This toolchain exposes no pure-Zig wall clock for other targets
+        // (on macOS, time lives behind the Io clock interface or libSystem,
+        // neither of which the expression evaluator carries). Report it so
+        // callers yield NULL instead of fabricating a time.
+        else => return error.ClockUnavailable,
     }
 }
 
@@ -116,7 +126,7 @@ fn parseDateTimeString(str: []const u8) ?DateTime {
     const trimmed = std.mem.trim(u8, str, " \t\r\n");
     if (trimmed.len == 0) return null;
     if (std.ascii.eqlIgnoreCase(trimmed, "now")) {
-        const nowSec = getCurrentTimestamp();
+        const nowSec = getCurrentTimestamp() catch return null;
         return DateTime.fromUnixEpoch(nowSec);
     }
     if (trimmed.len >= 10 and trimmed[4] == '-' and trimmed[7] == '-') {
