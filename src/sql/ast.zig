@@ -56,7 +56,7 @@ pub const TableConstraint = union(enum) { primaryKey: []const []const u8, unique
 pub const IndexDef = struct { name: []const u8, table: []const u8, columns: []const []const u8, keyExprs: []const ?Expr = &.{}, unique: bool = false, ifNotExists: bool = false, whereExpr: ?Expr = null, whereSql: ?[]const u8 = null };
 pub const TriggerEvent = enum { insert, update, delete };
 pub const TriggerTiming = enum { before, after };
-pub const TriggerDef = struct { name: []const u8, table: []const u8, timing: TriggerTiming = .after, event: TriggerEvent, whenSql: ?[]const u8 = null, body: []const u8, ifNotExists: bool = false };
+pub const TriggerDef = struct { name: []const u8, table: []const u8, timing: TriggerTiming = .after, event: TriggerEvent, updateOf: []const []const u8 = &.{}, whenSql: ?[]const u8 = null, body: []const u8, ifNotExists: bool = false };
 pub const VirtualTableDef = struct { name: []const u8, module: []const u8, arguments: []const []const u8, ifNotExists: bool = false };
 pub const CteDef = struct { name: []const u8, querySql: []const u8, recursiveSql: ?[]const u8 = null };
 pub const WithSelect = struct { ctes: []CteDef, bodySql: []const u8, recursive: bool = false };
@@ -101,6 +101,7 @@ pub const Statement = union(enum) {
     attach: struct { expr: Expr, schemaName: []const u8 },
     detach: struct { schemaName: []const u8 },
     vacuum: struct { schemaName: ?[]const u8 = null, into: ?Expr = null },
+    analyze: struct { target: ?[]const u8 = null },
 
     pub fn isQuery(self: Statement) bool {
         return self == .select or self == .withSelect or self == .compoundSelect or self == .explainQueryPlan;
@@ -586,7 +587,9 @@ pub fn deinit(allocator: anytype, statement: *Statement) void {
             allocator.free(value.columns);
         },
         .createView => {},
-        .createTrigger => {},
+        .createTrigger => |value| {
+            if (value.updateOf.len != 0) allocator.free(value.updateOf);
+        },
         .createVirtualTable => |value| allocator.free(value.arguments),
         .withSelect => |value| allocator.free(value.ctes),
         .compoundSelect => {},

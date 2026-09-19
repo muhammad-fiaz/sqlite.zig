@@ -750,6 +750,16 @@ pub const Connection = struct {
             .attach => error.Unsupported,
             .detach => error.Unsupported,
             .vacuum => |value| try self.vacuumCommand(value.schemaName, value.into),
+            .analyze => |value| blk: {
+                const nested = self.inAtomicStatement;
+                if (!nested) try self.beginStatementAtomic();
+                self.analyzeDatabase(value.target) catch |err| {
+                    if (!nested) self.abortStatementAtomic();
+                    return err;
+                };
+                if (!nested) self.endStatementAtomic();
+                break :blk try emptyResult(self.allocator);
+            },
         };
         if (!self.transactionActive and !statement.isQuery()) try self.persist();
         return result;
@@ -970,6 +980,40 @@ pub const Connection = struct {
         }
         try self.persist();
         return try emptyResult(self.allocator);
+    }
+
+    fn analyzeDatabase(self: *Connection, target: ?[]const u8) !void {
+        if (target) |name| {
+            if (std.ascii.eqlIgnoreCase(name, "main") or std.ascii.eqlIgnoreCase(name, "temp")) {
+                return self.analyzeScope(null);
+            }
+            if (self.store.find(name) != null) {
+                return self.analyzeScope(name);
+            }
+            for (self.store.indexes.items) |index| {
+                if (std.ascii.eqlIgnoreCase(index.name, name)) {
+                    const table = self.store.find(index.table) orelse return error.UnknownTable;
+                    self.store.clearStatScope(table.name, index.name);
+                    return self.store.collectIndexStats(table, &index);
+                }
+            }
+            return error.UnknownTable;
+        }
+        return self.analyzeScope(null);
+    }
+
+    fn analyzeScope(self: *Connection, tableName: ?[]const u8) !void {
+        _ = try self.store.ensureStatTable();
+        for (self.store.tables.items) |table| {
+            if (std.ascii.eqlIgnoreCase(table.name, "sqlite_stat1")) continue;
+            if (tableName) |wanted| if (!std.ascii.eqlIgnoreCase(table.name, wanted)) continue;
+            self.store.clearStatScope(table.name, null);
+            try self.store.collectTableStats(&table);
+            for (self.store.indexes.items) |index| {
+                if (!std.ascii.eqlIgnoreCase(index.table, table.name)) continue;
+                try self.store.collectIndexStats(&table, &index);
+            }
+        }
     }
 
     fn integrityProblem(self: *Connection, rows: *std.ArrayList([]Value), cap: usize, comptime fmt: []const u8, args: anytype) !void {
@@ -1594,7 +1638,7 @@ pub const Connection = struct {
         return isTruthy(result.rows[0][0]);
     }
 
-    fn fireTriggers(self: *Connection, tableName: []const u8, timing: ast.TriggerTiming, event: ast.TriggerEvent, newRow: ?[]const Value, oldRow: ?[]const Value) anyerror!void {
+    fn fireTriggers(self: *Connection, tableName: []const u8, timing: ast.TriggerTiming, event: ast.TriggerEvent, newRow: ?[]const Value, oldRow: ?[]const Value, updatedColumns: []const []const u8) anyerror!void {
         const table = self.store.findConst(tableName) orelse return error.UnknownTable;
         var bodies = std.ArrayList([]u8).empty;
         defer {
@@ -1604,6 +1648,7 @@ pub const Connection = struct {
         for (self.store.triggers.items) |trigger| {
             if (trigger.timing != timing) continue;
             if (trigger.event == event and std.ascii.eqlIgnoreCase(trigger.table, tableName)) {
+                if (!trigger.firesOnUpdate(updatedColumns)) continue;
                 if (!try self.triggerWhenMatched(table, trigger, event, newRow, oldRow)) continue;
                 try bodies.append(self.allocator, try self.renderTriggerBody(trigger.body, table, event, newRow, oldRow));
             }
@@ -2797,7 +2842,7 @@ pub const Connection = struct {
                     if (value.columns.len != sourceRow.len) return error.ColumnCountMismatch;
                     for (value.columns, sourceRow) |name, item| row[try columnIndex(table, name)] = item;
                 }
-                try self.fireTriggers(table.name, .before, .insert, row, null);
+                try self.fireTriggers(table.name, .before, .insert, row, null, &.{});
                 self.store.appendRow(table, row) catch |err| {
                     if (value.conflict == .ignore and err == error.ConstraintViolation) {
                         if (value.conflictTargetColumns.len > 0 or value.conflictTargetWhere != null) {
@@ -2812,7 +2857,7 @@ pub const Connection = struct {
                     if (value.conflict == .replace and err == error.ConstraintViolation) {
                         if (try self.replaceConflict(table, row)) {
                             try self.store.appendRow(table, row);
-                            try self.fireTriggers(table.name, .after, .insert, row, null);
+                            try self.fireTriggers(table.name, .after, .insert, row, null, &.{});
                             changes += 1;
                             try affectedRows.append(self.allocator, table.rows.items[table.rows.items.len - 1].values);
                             continue;
@@ -2831,7 +2876,7 @@ pub const Connection = struct {
                     }
                     return err;
                 };
-                try self.fireTriggers(table.name, .after, .insert, row, null);
+                try self.fireTriggers(table.name, .after, .insert, row, null, &.{});
                 changes += 1;
                 try affectedRows.append(self.allocator, table.rows.items[table.rows.items.len - 1].values);
             }
@@ -2860,7 +2905,7 @@ pub const Connection = struct {
             }
             {
                 defer self.freeResolvedTemps(table, row, value.columns, rowExprs);
-                try self.fireTriggers(table.name, .before, .insert, row, null);
+                try self.fireTriggers(table.name, .before, .insert, row, null, &.{});
                 self.store.appendRow(table, row) catch |err| {
                     if (value.conflict == .ignore and err == error.ConstraintViolation) {
                         if (value.conflictTargetColumns.len > 0 or value.conflictTargetWhere != null) {
@@ -2875,7 +2920,7 @@ pub const Connection = struct {
                     if (value.conflict == .replace and err == error.ConstraintViolation) {
                         if (try self.replaceConflict(table, row)) {
                             try self.store.appendRow(table, row);
-                            try self.fireTriggers(table.name, .after, .insert, row, null);
+                            try self.fireTriggers(table.name, .after, .insert, row, null, &.{});
                             changes += 1;
                             try affectedRows.append(self.allocator, table.rows.items[table.rows.items.len - 1].values);
                             continue;
@@ -2894,7 +2939,7 @@ pub const Connection = struct {
                     }
                     return err;
                 };
-                try self.fireTriggers(table.name, .after, .insert, row, null);
+                try self.fireTriggers(table.name, .after, .insert, row, null, &.{});
                 changes += 1;
                 try affectedRows.append(self.allocator, table.rows.items[table.rows.items.len - 1].values);
             }
@@ -3218,7 +3263,7 @@ pub const Connection = struct {
             candidate[index] = newValue;
         }
         try self.recomputeGeneratedColumns(table, candidate, false);
-        try self.fireTriggers(table.name, .before, .update, candidate, oldSnapshot);
+        try self.fireTriggers(table.name, .before, .update, candidate, oldSnapshot, columns);
         try self.store.validateUpdate(table, rowIndex, candidate);
         try self.applyUpdateActions(table.name, row.values, candidate);
         for (columns, expressions) |name, expression| {
@@ -3235,15 +3280,15 @@ pub const Connection = struct {
             if (expression == .binary or expression == .unary or expression == .function or expression == .caseExpr) self.freeConcatText(newValue);
         }
         try self.recomputeGeneratedColumns(table, row.values, true);
-        try self.fireTriggers(table.name, .after, .update, row.values, oldSnapshot);
+        try self.fireTriggers(table.name, .after, .update, row.values, oldSnapshot, columns);
         return .{ .updated = rowIndex };
     }
 
     fn deleteRowAt(self: *Connection, table: *Table, rowIndex: usize) !void {
         try self.applyDeleteActions(table.name, table.rows.items[rowIndex].values);
-        try self.fireTriggers(table.name, .before, .delete, null, table.rows.items[rowIndex].values);
+        try self.fireTriggers(table.name, .before, .delete, null, table.rows.items[rowIndex].values, &.{});
         const removed = table.rows.orderedRemove(rowIndex);
-        try self.fireTriggers(table.name, .after, .delete, null, removed.values);
+        try self.fireTriggers(table.name, .after, .delete, null, removed.values, &.{});
         for (removed.values) |item| if (item == .text) self.allocator.free(item.text) else if (item == .blob) self.allocator.free(item.blob);
         self.allocator.free(removed.values);
     }
@@ -4377,7 +4422,7 @@ pub const Connection = struct {
                     candidate[index] = newValue;
                 }
                 try self.recomputeGeneratedColumns(table, candidate, false);
-                try self.fireTriggers(table.name, .before, .update, candidate, row.values);
+                try self.fireTriggers(table.name, .before, .update, candidate, row.values, value.columns);
                 self.store.validateUpdate(table, rowIndex, candidate) catch |err| {
                     if (err != error.ConstraintViolation) return err;
                     if (value.conflict == .ignore) continue;
@@ -4407,7 +4452,7 @@ pub const Connection = struct {
                     _ = updateIndex;
                 }
                 try self.recomputeGeneratedColumns(table, row.values, true);
-                try self.fireTriggers(table.name, .after, .update, candidate, oldSnapshot);
+                try self.fireTriggers(table.name, .after, .update, candidate, oldSnapshot, value.columns);
                 changes += 1;
                 try affectedRows.append(self.allocator, row.values);
                 break;
@@ -4464,7 +4509,7 @@ pub const Connection = struct {
                 candidate[index] = newValue;
             }
             try self.recomputeGeneratedColumns(table, candidate, false);
-            try self.fireTriggers(table.name, .before, .update, candidate, row.values);
+            try self.fireTriggers(table.name, .before, .update, candidate, row.values, value.columns);
             self.store.validateUpdate(table, rowIndex, candidate) catch |err| {
                 if (err != error.ConstraintViolation) return err;
                 switch (value.conflict) {
@@ -4510,7 +4555,7 @@ pub const Connection = struct {
             try self.recomputeGeneratedColumns(table, row.values, true);
             changes += 1;
             try affectedRows.append(self.allocator, row.values);
-            try self.fireTriggers(table.name, .after, .update, candidate, oldSnapshot);
+            try self.fireTriggers(table.name, .after, .update, candidate, oldSnapshot, value.columns);
         }
         if (value.returning.len > 0) return self.evaluateReturning(table, value.returning, affectedRows.items, parameters);
         return .{ .allocator = self.allocator, .columns = try self.allocator.alloc([]const u8, 0), .rows = try self.allocator.alloc([]Value, 0), .changes = changes };
@@ -4786,10 +4831,10 @@ pub const Connection = struct {
         var index: usize = 0;
         while (index < table.rows.items.len) {
             if (try self.matches(table, table.rows.items[index].values, value.condition, parameters)) {
-                try self.fireTriggers(table.name, .before, .delete, null, table.rows.items[index].values);
+                try self.fireTriggers(table.name, .before, .delete, null, table.rows.items[index].values, &.{});
                 try self.applyDeleteActions(table.name, table.rows.items[index].values);
                 const row = table.rows.orderedRemove(index);
-                try self.fireTriggers(table.name, .after, .delete, null, row.values);
+                try self.fireTriggers(table.name, .after, .delete, null, row.values, &.{});
                 if (value.returning.len > 0) {
                     const cloned = try self.allocator.alloc(Value, row.values.len);
                     for (row.values, 0..) |item, i| cloned[i] = try self.copyValue(item);
@@ -10045,4 +10090,192 @@ test "with clause combines with upsert and constraints" {
     var intact = try db.exec("SELECT count(*) FROM upsert_items;");
     defer intact.deinit();
     try std.testing.expectEqual(@as(i64, 2), intact.rows[0][0].integer);
+}
+
+test "update of triggers fire only for listed columns" {
+    const path = "sqlite_zig_update_of_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    var setup = try db.exec("CREATE TABLE accounts (id INTEGER, balance INTEGER, note TEXT); CREATE TABLE audit (id INTEGER, balance INTEGER); INSERT INTO accounts VALUES (1, 100, 'a');");
+    setup.deinit();
+    var created = try db.exec("CREATE TRIGGER audit_balance AFTER UPDATE OF balance ON accounts BEGIN INSERT INTO audit VALUES (NEW.id, NEW.balance); END;");
+    created.deinit();
+    var untouched = try db.exec("UPDATE accounts SET note = 'b' WHERE id = 1;");
+    untouched.deinit();
+    var quiet = try db.exec("SELECT count(*) FROM audit;");
+    defer quiet.deinit();
+    try std.testing.expectEqual(@as(i64, 0), quiet.rows[0][0].integer);
+    var changed = try db.exec("UPDATE accounts SET balance = 200 WHERE id = 1;");
+    changed.deinit();
+    var logged = try db.exec("SELECT id, balance FROM audit;");
+    defer logged.deinit();
+    try std.testing.expectEqual(@as(usize, 1), logged.count());
+    try std.testing.expectEqual(@as(i64, 1), logged.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 200), logged.rows[0][1].integer);
+    var dropFirst = try db.exec("DROP TRIGGER audit_balance;");
+    dropFirst.deinit();
+    var combo = try db.exec("CREATE TRIGGER big_balance AFTER UPDATE OF balance ON accounts WHEN NEW.balance > 1000 BEGIN INSERT INTO audit VALUES (NEW.id, NEW.balance); END;");
+    combo.deinit();
+    var small = try db.exec("UPDATE accounts SET balance = 300 WHERE id = 1;");
+    small.deinit();
+    var stillOne = try db.exec("SELECT count(*) FROM audit;");
+    defer stillOne.deinit();
+    try std.testing.expectEqual(@as(i64, 1), stillOne.rows[0][0].integer);
+    var big = try db.exec("UPDATE accounts SET balance = 2000 WHERE id = 1;");
+    big.deinit();
+    var two = try db.exec("SELECT balance FROM audit ORDER BY balance;");
+    defer two.deinit();
+    try std.testing.expectEqual(@as(usize, 2), two.count());
+    try std.testing.expectEqual(@as(i64, 2000), two.rows[1][0].integer);
+    var noteOnly = try db.exec("UPDATE accounts SET note = 'c' WHERE id = 1;");
+    noteOnly.deinit();
+    var auditRows = try db.exec("SELECT count(*) FROM audit;");
+    defer auditRows.deinit();
+    try std.testing.expectEqual(@as(i64, 2), auditRows.rows[0][0].integer);
+}
+
+test "update of rejects unknown columns and non-update events" {
+    const path = "sqlite_zig_update_of_errors_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    var setup = try db.exec("CREATE TABLE t (id INTEGER, v INTEGER);");
+    setup.deinit();
+    try std.testing.expectError(error.UnknownColumn, db.exec("CREATE TRIGGER bad_of AFTER UPDATE OF missing ON t BEGIN SELECT 1; END;"));
+    try std.testing.expect(db.store.findTriggerConst("bad_of") == null);
+    try std.testing.expectError(error.UnexpectedToken, db.exec("CREATE TRIGGER bad_event BEFORE INSERT OF v ON t BEGIN SELECT 1; END;"));
+    try std.testing.expect(db.store.findTriggerConst("bad_event") == null);
+    var rows = try db.exec("SELECT count(*) FROM t;");
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(i64, 0), rows.rows[0][0].integer);
+}
+
+test "update of triggers persist and interact with upsert" {
+    const path = "sqlite_zig_update_of_persist_test.db";
+    var db = try freshDb(path);
+    var setup = try db.exec("CREATE TABLE stock (id INTEGER PRIMARY KEY, qty INTEGER); CREATE TABLE stock_log (id INTEGER); INSERT INTO stock VALUES (1, 10); CREATE TRIGGER log_qty AFTER UPDATE OF qty ON stock BEGIN INSERT INTO stock_log VALUES (NEW.id); END;");
+    setup.deinit();
+    var sameValue = try db.exec("UPDATE stock SET qty = 10 WHERE id = 1;");
+    sameValue.deinit();
+    var upserted = try db.exec("INSERT INTO stock VALUES (1, 20) ON CONFLICT(id) DO UPDATE SET qty = excluded.qty;");
+    upserted.deinit();
+    db.close();
+    db = try Connection.open(std.testing.allocator, path);
+    errdefer db.close();
+    defer dropDb(db, path);
+    try std.testing.expect(db.store.findTriggerConst("log_qty") != null);
+    var logged = try db.exec("SELECT count(*) FROM stock_log;");
+    defer logged.deinit();
+    try std.testing.expectEqual(@as(i64, 2), logged.rows[0][0].integer);
+    var untouched = try db.exec("UPDATE stock SET id = 1 WHERE id = 1;");
+    untouched.deinit();
+    var still = try db.exec("SELECT count(*) FROM stock_log;");
+    defer still.deinit();
+    try std.testing.expectEqual(@as(i64, 2), still.rows[0][0].integer);
+}
+
+test "analyze collects table and index statistics" {
+    const path = "sqlite_zig_analyze_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    var setup = try db.exec("CREATE TABLE stat_items (id INTEGER, code TEXT, active INTEGER); CREATE UNIQUE INDEX stat_id_idx ON stat_items (id); CREATE INDEX stat_code_idx ON stat_items (code); CREATE INDEX stat_active_code_idx ON stat_items (active, code); CREATE UNIQUE INDEX stat_partial_idx ON stat_items (code) WHERE active = 1; CREATE INDEX stat_expr_idx ON stat_items (lower(code)); INSERT INTO stat_items VALUES (1, 'a', 1), (2, 'a', 0), (3, 'b', 1), (4, 'b', 0);");
+    setup.deinit();
+    var analyzed = try db.exec("ANALYZE;");
+    analyzed.deinit();
+    var tableStat = try db.exec("SELECT stat FROM sqlite_stat1 WHERE tbl = 'stat_items' AND idx IS NULL;");
+    defer tableStat.deinit();
+    try std.testing.expectEqual(@as(usize, 1), tableStat.count());
+    try std.testing.expectEqualStrings("4", tableStat.rows[0][0].text);
+    var uniqueStat = try db.exec("SELECT stat FROM sqlite_stat1 WHERE idx = 'stat_id_idx';");
+    defer uniqueStat.deinit();
+    try std.testing.expectEqualStrings("4 1", uniqueStat.rows[0][0].text);
+    var plainStat = try db.exec("SELECT stat FROM sqlite_stat1 WHERE idx = 'stat_code_idx';");
+    defer plainStat.deinit();
+    try std.testing.expectEqualStrings("4 2", plainStat.rows[0][0].text);
+    var compositeStat = try db.exec("SELECT stat FROM sqlite_stat1 WHERE idx = 'stat_active_code_idx';");
+    defer compositeStat.deinit();
+    try std.testing.expectEqualStrings("4 2 1", compositeStat.rows[0][0].text);
+    var partialStat = try db.exec("SELECT stat FROM sqlite_stat1 WHERE idx = 'stat_partial_idx';");
+    defer partialStat.deinit();
+    try std.testing.expectEqualStrings("2 1", partialStat.rows[0][0].text);
+    var exprStat = try db.exec("SELECT stat FROM sqlite_stat1 WHERE idx = 'stat_expr_idx';");
+    defer exprStat.deinit();
+    try std.testing.expectEqualStrings("4 2", exprStat.rows[0][0].text);
+}
+
+test "analyze supports table, index, and schema targets" {
+    const path = "sqlite_zig_analyze_target_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    var setup = try db.exec("CREATE TABLE scope_a (id INTEGER); CREATE TABLE scope_b (id INTEGER); CREATE INDEX scope_a_idx ON scope_a (id); INSERT INTO scope_a VALUES (1), (2); INSERT INTO scope_b VALUES (1), (2), (3);");
+    setup.deinit();
+    var scoped = try db.exec("ANALYZE scope_a;");
+    scoped.deinit();
+    var aStat = try db.exec("SELECT stat FROM sqlite_stat1 WHERE tbl = 'scope_a' AND idx IS NULL;");
+    defer aStat.deinit();
+    try std.testing.expectEqualStrings("2", aStat.rows[0][0].text);
+    var bMissing = try db.exec("SELECT count(*) FROM sqlite_stat1 WHERE tbl = 'scope_b';");
+    defer bMissing.deinit();
+    try std.testing.expectEqual(@as(i64, 0), bMissing.rows[0][0].integer);
+    var indexed = try db.exec("ANALYZE scope_a_idx;");
+    indexed.deinit();
+    var idxStat = try db.exec("SELECT stat FROM sqlite_stat1 WHERE idx = 'scope_a_idx';");
+    defer idxStat.deinit();
+    try std.testing.expectEqualStrings("2 1", idxStat.rows[0][0].text);
+    var mainScoped = try db.exec("ANALYZE main;");
+    mainScoped.deinit();
+    var bNow = try db.exec("SELECT stat FROM sqlite_stat1 WHERE tbl = 'scope_b' AND idx IS NULL;");
+    defer bNow.deinit();
+    try std.testing.expectEqualStrings("3", bNow.rows[0][0].text);
+    try std.testing.expectError(error.UnknownTable, db.exec("ANALYZE nope;"));
+    var intact = try db.exec("SELECT count(*) FROM sqlite_stat1;");
+    defer intact.deinit();
+    try std.testing.expectEqual(@as(i64, 3), intact.rows[0][0].integer);
+}
+
+test "analyze refreshes stale statistics" {
+    const path = "sqlite_zig_analyze_stale_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    var setup = try db.exec("CREATE TABLE stale (id INTEGER); CREATE INDEX stale_idx ON stale (id); INSERT INTO stale VALUES (1), (2);");
+    setup.deinit();
+    var first = try db.exec("ANALYZE;");
+    first.deinit();
+    var grown = try db.exec("INSERT INTO stale VALUES (3), (4), (5);");
+    grown.deinit();
+    var before = try db.exec("SELECT stat FROM sqlite_stat1 WHERE tbl = 'stale' AND idx IS NULL;");
+    defer before.deinit();
+    try std.testing.expectEqualStrings("2", before.rows[0][0].text);
+    var second = try db.exec("ANALYZE stale;");
+    second.deinit();
+    var after = try db.exec("SELECT stat FROM sqlite_stat1 WHERE tbl = 'stale' AND idx IS NULL;");
+    defer after.deinit();
+    try std.testing.expectEqualStrings("5", after.rows[0][0].text);
+    var dropped = try db.exec("DROP INDEX stale_idx;");
+    dropped.deinit();
+    var gone = try db.exec("SELECT count(*) FROM sqlite_stat1 WHERE idx = 'stale_idx';");
+    defer gone.deinit();
+    try std.testing.expectEqual(@as(i64, 0), gone.rows[0][0].integer);
+}
+
+test "analyze persists and rolls back with transactions" {
+    const path = "sqlite_zig_analyze_txn_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    var setup = try db.exec("CREATE TABLE txn_items (id INTEGER); INSERT INTO txn_items VALUES (1);");
+    setup.deinit();
+    var begun = try db.exec("BEGIN;");
+    begun.deinit();
+    var analyzed = try db.exec("ANALYZE;");
+    analyzed.deinit();
+    var rolled = try db.exec("ROLLBACK;");
+    rolled.deinit();
+    try std.testing.expectError(error.UnknownTable, db.exec("SELECT count(*) FROM sqlite_stat1;"));
+    var committed = try db.exec("ANALYZE;");
+    committed.deinit();
+    db.close();
+    db = try Connection.open(std.testing.allocator, path);
+    errdefer db.close();
+    var rows = try db.exec("SELECT stat FROM sqlite_stat1 WHERE tbl = 'txn_items' AND idx IS NULL;");
+    defer rows.deinit();
+    try std.testing.expectEqualStrings("1", rows.rows[0][0].text);
 }

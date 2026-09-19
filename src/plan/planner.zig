@@ -3,6 +3,7 @@ const Cost = @import("cost.zig").Cost;
 const cost = @import("cost.zig");
 const ast = @import("../sql/ast.zig");
 const exprEvaluator = @import("../sql/expr.zig");
+const Value = @import("../vm/value.zig").Value;
 const Schema = @import("../catalog/schema.zig").Schema;
 const Table = @import("../catalog/schema.zig").Table;
 const Index = @import("../catalog/schema.zig").Index;
@@ -169,7 +170,7 @@ pub fn planSelect(allocator: std.mem.Allocator, schema: *const Schema, selectStm
     const joinList: []const ast.Join = selectStmt.joins;
 
     const table = schema.findConst(tableName) orelse return error.UnknownTable;
-    const rowCount = if (table.rows.items.len > 1000) table.rows.items.len else 1000;
+    const rowCount = schema.statRowCount(table.name) orelse if (table.rows.items.len > 1000) table.rows.items.len else 1000;
 
     var bestPlan = QueryPlan{
         .tableName = table.name,
@@ -666,4 +667,60 @@ test "planner plans nested loop join with indexed inner table" {
     const explained = try plan.explain(std.testing.allocator);
     defer std.testing.allocator.free(explained);
     try std.testing.expectEqualStrings("SCAN authors\nSEARCH books USING INDEX books_author_idx (author_id=?)", explained);
+}
+
+test "planner row counts follow analyzed statistics" {
+    var schema = Schema.init(std.testing.allocator);
+    defer schema.deinit();
+
+    const cols = [_]ast.ColumnDef{
+        .{ .name = "id", .typeName = "INTEGER" },
+    };
+    try schema.createTable("widgets", &cols, &.{});
+    const table = schema.find("widgets").?;
+    var values = [_]Value{.{ .integer = 1 }};
+    var second = [_]Value{.{ .integer = 2 }};
+    var third = [_]Value{.{ .integer = 3 }};
+    var fourth = [_]Value{.{ .integer = 4 }};
+    var fifth = [_]Value{.{ .integer = 5 }};
+    try schema.appendRow(table, &values);
+    try schema.appendRow(table, &second);
+    try schema.appendRow(table, &third);
+    try schema.appendRow(table, &fourth);
+    try schema.appendRow(table, &fifth);
+
+    var fresh = try planSelect(std.testing.allocator, &schema, .{
+        .table = @as(?[]const u8, "widgets"),
+        .condition = @as(?ast.Conditions, null),
+        .order = @as(?ast.Order, null),
+        .projections = @as([]const ast.Projection, &.{}),
+        .joins = @as([]const ast.Join, &.{}),
+    });
+    defer fresh.deinit();
+    try std.testing.expectEqual(@as(f64, 1000.0), fresh.cost.total);
+
+    try schema.collectTableStats(table);
+    var analyzed = try planSelect(std.testing.allocator, &schema, .{
+        .table = @as(?[]const u8, "widgets"),
+        .condition = @as(?ast.Conditions, null),
+        .order = @as(?ast.Order, null),
+        .projections = @as([]const ast.Projection, &.{}),
+        .joins = @as([]const ast.Join, &.{}),
+    });
+    defer analyzed.deinit();
+    try std.testing.expectEqual(@as(f64, 5.0), analyzed.cost.total);
+
+    while (table.rows.items.len > 1) {
+        const removed = table.rows.orderedRemove(1);
+        std.testing.allocator.free(removed.values);
+    }
+    var stale = try planSelect(std.testing.allocator, &schema, .{
+        .table = @as(?[]const u8, "widgets"),
+        .condition = @as(?ast.Conditions, null),
+        .order = @as(?ast.Order, null),
+        .projections = @as([]const ast.Projection, &.{}),
+        .joins = @as([]const ast.Join, &.{}),
+    });
+    defer stale.deinit();
+    try std.testing.expectEqual(@as(f64, 5.0), stale.cost.total);
 }

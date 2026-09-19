@@ -528,6 +528,13 @@ fn createTriggerSql(allocator: std.mem.Allocator, trigger: anytype) ![]u8 {
         .update => "UPDATE",
         .delete => "DELETE",
     });
+    if (trigger.updateOf.len != 0) {
+        try sql.appendSlice(allocator, " OF ");
+        for (trigger.updateOf, 0..) |column, position| {
+            if (position != 0) try sql.appendSlice(allocator, ", ");
+            try sql.appendSlice(allocator, column);
+        }
+    }
     try sql.appendSlice(allocator, " ON ");
     try sql.appendSlice(allocator, trigger.table);
     if (trigger.whenSql) |whenSql| {

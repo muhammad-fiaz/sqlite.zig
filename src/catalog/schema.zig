@@ -23,7 +23,24 @@ pub const Index = struct {
     }
 };
 pub const View = struct { name: []u8, sql: []u8 };
-pub const Trigger = struct { name: []u8, table: []u8, timing: ast.TriggerTiming = .after, event: ast.TriggerEvent, whenSql: ?[]u8 = null, body: []u8 };
+pub const Trigger = struct {
+    name: []u8,
+    table: []u8,
+    timing: ast.TriggerTiming = .after,
+    event: ast.TriggerEvent,
+    updateOf: [][]u8 = &.{},
+    whenSql: ?[]u8 = null,
+    body: []u8,
+
+    pub fn firesOnUpdate(self: *const Trigger, updatedColumns: []const []const u8) bool {
+        if (self.event != .update) return true;
+        if (self.updateOf.len == 0) return true;
+        for (updatedColumns) |updated| {
+            for (self.updateOf) |listed| if (std.ascii.eqlIgnoreCase(updated, listed)) return true;
+        }
+        return false;
+    }
+};
 
 pub const Schema = struct {
     allocator: std.mem.Allocator,
@@ -88,6 +105,8 @@ pub const Schema = struct {
         for (self.triggers.items) |trigger| {
             self.allocator.free(trigger.name);
             self.allocator.free(trigger.table);
+            for (trigger.updateOf) |column| self.allocator.free(column);
+            self.allocator.free(trigger.updateOf);
             if (trigger.whenSql) |when| self.allocator.free(when);
             self.allocator.free(trigger.body);
         }
@@ -165,10 +184,20 @@ pub const Schema = struct {
 
     pub fn createTrigger(self: *Schema, definition: ast.TriggerDef) !void {
         if (self.findTrigger(definition.name) != null) return error.TriggerExists;
-        if (self.find(definition.table) == null) return error.UnknownTable;
+        const table = self.find(definition.table) orelse return error.UnknownTable;
+        if (definition.event != .update and definition.updateOf.len != 0) return error.InvalidSql;
+        for (definition.updateOf) |name| if (self.columnIndex(table, name) == null) return error.UnknownColumn;
         const whenSql = if (definition.whenSql) |when| try self.allocator.dupe(u8, when) else null;
         errdefer if (whenSql) |when| self.allocator.free(when);
-        try self.triggers.append(self.allocator, .{ .name = try self.allocator.dupe(u8, definition.name), .table = try self.allocator.dupe(u8, definition.table), .timing = definition.timing, .event = definition.event, .whenSql = whenSql, .body = try self.allocator.dupe(u8, definition.body) });
+        const updateOf = try self.allocator.alloc([]u8, definition.updateOf.len);
+        errdefer self.allocator.free(updateOf);
+        var copied: usize = 0;
+        errdefer for (updateOf[0..copied]) |column| self.allocator.free(column);
+        for (definition.updateOf, 0..) |column, index| {
+            updateOf[index] = try self.allocator.dupe(u8, column);
+            copied += 1;
+        }
+        try self.triggers.append(self.allocator, .{ .name = try self.allocator.dupe(u8, definition.name), .table = try self.allocator.dupe(u8, definition.table), .timing = definition.timing, .event = definition.event, .updateOf = updateOf, .whenSql = whenSql, .body = try self.allocator.dupe(u8, definition.body) });
     }
 
     pub fn dropTrigger(self: *Schema, name: []const u8) !void {
@@ -176,6 +205,8 @@ pub const Schema = struct {
             const removed = self.triggers.orderedRemove(position);
             self.allocator.free(removed.name);
             self.allocator.free(removed.table);
+            for (removed.updateOf) |column| self.allocator.free(column);
+            self.allocator.free(removed.updateOf);
             if (removed.whenSql) |when| self.allocator.free(when);
             self.allocator.free(removed.body);
             return;
@@ -317,6 +348,7 @@ pub const Schema = struct {
 
     pub fn dropIndex(self: *Schema, name: []const u8) !void {
         for (self.indexes.items, 0..) |index, position| if (std.ascii.eqlIgnoreCase(index.name, name)) {
+            self.clearStatScope(index.table, index.name);
             const removed = self.indexes.orderedRemove(position);
             self.allocator.free(removed.name);
             self.allocator.free(removed.table);
@@ -593,9 +625,13 @@ pub const Schema = struct {
                         const removed = self.triggers.orderedRemove(triggerPosition);
                         self.allocator.free(removed.name);
                         self.allocator.free(removed.table);
+                        for (removed.updateOf) |column| self.allocator.free(column);
+                        self.allocator.free(removed.updateOf);
+                        if (removed.whenSql) |when| self.allocator.free(when);
                         self.allocator.free(removed.body);
                     } else triggerPosition += 1;
                 }
+                self.clearStatScope(name, null);
                 self.removeTable(index);
                 return;
             }
@@ -974,6 +1010,153 @@ pub const Schema = struct {
         };
     }
 
+    fn statTable(self: *Schema) ?*Table {
+        return self.find("sqlite_stat1");
+    }
+
+    pub fn ensureStatTable(self: *Schema) !*Table {
+        if (self.find("sqlite_stat1")) |existing| {
+            if (existing.columns.len != 3) return error.SchemaMismatch;
+            for (existing.columns, 0..) |column, index| {
+                const expected: []const u8 = if (index == 0) "tbl" else if (index == 1) "idx" else "stat";
+                if (!std.ascii.eqlIgnoreCase(column.name, expected)) return error.SchemaMismatch;
+            }
+            return existing;
+        }
+        const definitions = [_]ast.ColumnDef{
+            .{ .name = "tbl", .typeName = "TEXT" },
+            .{ .name = "idx", .typeName = "TEXT" },
+            .{ .name = "stat", .typeName = "TEXT" },
+        };
+        try self.createTable("sqlite_stat1", &definitions, &.{});
+        return self.find("sqlite_stat1").?;
+    }
+
+    pub fn clearStatScope(self: *Schema, tableName: ?[]const u8, indexName: ?[]const u8) void {
+        const stat = self.find("sqlite_stat1") orelse return;
+        var position = stat.rows.items.len;
+        while (position > 0) {
+            position -= 1;
+            const row = stat.rows.items[position];
+            if (row.values.len != 3) continue;
+            if (tableName) |wanted| {
+                if (row.values[0] != .text or !std.ascii.eqlIgnoreCase(row.values[0].text, wanted)) continue;
+                if (indexName) |wantedIndex| {
+                    if (row.values[1] != .text or !std.ascii.eqlIgnoreCase(row.values[1].text, wantedIndex)) continue;
+                }
+            } else if (indexName != null) {
+                continue;
+            }
+            const removed = stat.rows.orderedRemove(position);
+            for (removed.values) |value| freeValue(self.allocator, value);
+            self.allocator.free(removed.values);
+        }
+    }
+
+    pub fn statRowCount(self: *const Schema, tableName: []const u8) ?usize {
+        const stat = self.findConst("sqlite_stat1") orelse return null;
+        var tableIdx: ?usize = null;
+        var idxIdx: ?usize = null;
+        var statIdx: ?usize = null;
+        for (stat.columns, 0..) |column, index| {
+            if (std.ascii.eqlIgnoreCase(column.name, "tbl")) tableIdx = index;
+            if (std.ascii.eqlIgnoreCase(column.name, "idx")) idxIdx = index;
+            if (std.ascii.eqlIgnoreCase(column.name, "stat")) statIdx = index;
+        }
+        const tIdx = tableIdx orelse return null;
+        const iIdx = idxIdx orelse return null;
+        const sIdx = statIdx orelse return null;
+        for (stat.rows.items) |row| {
+            if (row.values.len != stat.columns.len) continue;
+            if (row.values[tIdx] != .text) continue;
+            if (!std.ascii.eqlIgnoreCase(row.values[tIdx].text, tableName)) continue;
+            if (row.values[iIdx] != .null) continue;
+            if (row.values[sIdx] != .text) continue;
+            const count = std.fmt.parseInt(usize, std.mem.trim(u8, row.values[sIdx].text, " \t"), 10) catch continue;
+            return count;
+        }
+        return null;
+    }
+
+    fn statKeyValue(self: *const Schema, table: *const Table, index: *const Index, colNames: []const []const u8, position: usize, values: []const Value) !Value {
+        if (index.keyExpr(position)) |key| return exprEvaluator.evalTemp(self.allocator, colNames, values, key);
+        const columnIdx = self.columnIndex(table, index.columns[position]) orelse return error.UnknownColumn;
+        return switch (values[columnIdx]) {
+            .text => |text| .{ .text = try self.allocator.dupe(u8, text) },
+            .blob => |blob| .{ .blob = try self.allocator.dupe(u8, blob) },
+            else => |value| value,
+        };
+    }
+
+    fn statPrefixDistinct(self: *const Schema, table: *const Table, index: *const Index, colNames: []const []const u8, rows: []const Row, prefixLen: usize) !usize {
+        var distinct: usize = 0;
+        for (rows, 0..) |row, rowIndex| {
+            var seen = false;
+            for (rows[0..rowIndex]) |other| {
+                var same = true;
+                for (0..prefixLen) |position| {
+                    const left = try self.statKeyValue(table, index, colNames, position, row.values);
+                    defer exprEvaluator.freeValue(self.allocator, left);
+                    const right = try self.statKeyValue(table, index, colNames, position, other.values);
+                    defer exprEvaluator.freeValue(self.allocator, right);
+                    if (left == .null or right == .null) {
+                        if (left != .null or right != .null) same = false;
+                        continue;
+                    }
+                    if (!valuesEqual(left, right)) same = false;
+                }
+                if (same) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) distinct += 1;
+        }
+        return distinct;
+    }
+
+    pub fn collectTableStats(self: *Schema, table: *const Table) !void {
+        const stat = try self.ensureStatTable();
+        const countText = try std.fmt.allocPrint(self.allocator, "{d}", .{table.rows.items.len});
+        defer self.allocator.free(countText);
+        const row = [_]Value{ .{ .text = table.name }, .null, .{ .text = countText } };
+        try self.appendRow(stat, &row);
+    }
+
+    pub fn collectIndexStats(self: *Schema, table: *const Table, index: *const Index) !void {
+        const stat = try self.ensureStatTable();
+        var colNames = try self.allocator.alloc([]const u8, table.columns.len);
+        defer self.allocator.free(colNames);
+        for (table.columns, 0..) |col, idx| colNames[idx] = col.name;
+        var matched = std.ArrayList(Row).empty;
+        defer matched.deinit(self.allocator);
+        for (table.rows.items) |row| {
+            if (try self.indexPredicateHolds(table, index, row.values)) try matched.append(self.allocator, row);
+        }
+        var text = std.ArrayList(u8).empty;
+        defer text.deinit(self.allocator);
+        const countText = try std.fmt.allocPrint(self.allocator, "{d}", .{matched.items.len});
+        defer self.allocator.free(countText);
+        try text.appendSlice(self.allocator, countText);
+        for (0..index.columns.len) |prefixLen| {
+            const distinct = try self.statPrefixDistinct(table, index, colNames, matched.items, prefixLen + 1);
+            var average: usize = 0;
+            if (distinct != 0) average = (matched.items.len + distinct / 2) / distinct;
+            if (positionIsUnique(index, prefixLen)) average = 1;
+            const averageText = try std.fmt.allocPrint(self.allocator, " {d}", .{average});
+            defer self.allocator.free(averageText);
+            try text.appendSlice(self.allocator, averageText);
+        }
+        const statText = try text.toOwnedSlice(self.allocator);
+        defer self.allocator.free(statText);
+        const row = [_]Value{ .{ .text = table.name }, .{ .text = index.name }, .{ .text = statText } };
+        try self.appendRow(stat, &row);
+    }
+
+    fn positionIsUnique(index: *const Index, position: usize) bool {
+        return index.unique and position + 1 == index.columns.len;
+    }
+
     pub fn clone(self: *const Schema) !Schema {
         var result = Schema.init(self.allocator);
         result.foreignKeysEnabled = false;
@@ -1017,7 +1200,7 @@ pub const Schema = struct {
             try result.createIndex(.{ .name = index.name, .table = index.table, .columns = columns, .keyExprs = index.keyExprs, .unique = index.unique, .whereExpr = index.whereExpr, .whereSql = index.whereSql });
         }
         for (self.views.items) |view| try result.createView(view.name, view.sql);
-        for (self.triggers.items) |trigger| try result.createTrigger(.{ .name = trigger.name, .table = trigger.table, .timing = trigger.timing, .event = trigger.event, .whenSql = trigger.whenSql, .body = trigger.body });
+        for (self.triggers.items) |trigger| try result.createTrigger(.{ .name = trigger.name, .table = trigger.table, .timing = trigger.timing, .event = trigger.event, .updateOf = trigger.updateOf, .whenSql = trigger.whenSql, .body = trigger.body });
         result.foreignKeysEnabled = self.foreignKeysEnabled;
         return result;
     }

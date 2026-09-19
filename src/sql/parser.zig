@@ -236,6 +236,10 @@ pub const Parser = struct {
                 intoExpr = try self.parseExpr();
             }
             statement = .{ .vacuum = .{ .schemaName = schemaName, .into = intoExpr } };
+        } else if (self.acceptWord("analyze")) {
+            var target: ?[]const u8 = null;
+            if (self.current().tag == .word) target = try self.word();
+            statement = .{ .analyze = .{ .target = target } };
         } else if (self.acceptWord("create")) statement = try self.parseCreate() else if (self.acceptWord("drop")) statement = try self.parseDrop() else if (self.acceptWord("alter")) statement = try self.parseAlter() else if (self.acceptWord("insert")) statement = try self.parseInsert() else if (self.acceptWord("select")) statement = try self.parseSelectOrCompound() else if (self.acceptWord("update")) statement = try self.parseUpdate() else if (self.acceptWord("delete")) statement = try self.parseDelete() else if (self.acceptWord("begin")) {
             _ = self.acceptWord("deferred");
             _ = self.acceptWord("immediate");
@@ -655,6 +659,14 @@ pub const Parser = struct {
             break :blk .after;
         };
         const event: ast.TriggerEvent = if (self.acceptWord("insert")) .insert else if (self.acceptWord("update")) .update else if (self.acceptWord("delete")) .delete else return Error.UnexpectedToken;
+        var updateOf = std.ArrayList([]const u8).empty;
+        errdefer updateOf.deinit(self.allocator);
+        if (event == .update and self.acceptWord("of")) {
+            while (true) {
+                try updateOf.append(self.allocator, try self.word());
+                if (!self.acceptTag(.comma)) break;
+            }
+        }
         try self.requireWord("on");
         const table = try self.word();
         var whenSql: ?[]const u8 = null;
@@ -673,7 +685,7 @@ pub const Parser = struct {
         if (self.current().tag == .eof or self.current().position == bodyStart) return Error.UnexpectedToken;
         const bodyEnd = self.current().position;
         _ = self.advance();
-        return .{ .createTrigger = .{ .name = name, .table = table, .timing = timing, .event = event, .whenSql = whenSql, .body = try self.copy(self.source[bodyStart..bodyEnd]), .ifNotExists = ifNotExists } };
+        return .{ .createTrigger = .{ .name = name, .table = table, .timing = timing, .event = event, .updateOf = try updateOf.toOwnedSlice(self.allocator), .whenSql = whenSql, .body = try self.copy(self.source[bodyStart..bodyEnd]), .ifNotExists = ifNotExists } };
     }
 
     fn parseDrop(self: *Parser) !ast.Statement {
@@ -2065,6 +2077,37 @@ test "parser parses with clause backing mutations" {
     var s3 = try p3.parse();
     defer ast.deinit(std.testing.allocator, &s3);
     try std.testing.expect(s3 == .insert);
+    var p4 = try Parser.init(std.testing.allocator, "CREATE TRIGGER t AFTER UPDATE OF a, b ON t BEGIN SELECT 1; END;");
+    defer p4.deinit();
+    var s4 = try p4.parse();
+    defer ast.deinit(std.testing.allocator, &s4);
+    try std.testing.expect(s4 == .createTrigger);
+    try std.testing.expectEqual(@as(usize, 2), s4.createTrigger.updateOf.len);
+    try std.testing.expectEqualStrings("a", s4.createTrigger.updateOf[0]);
+    var p5 = try Parser.init(std.testing.allocator, "CREATE TRIGGER u BEFORE UPDATE ON t BEGIN SELECT 1; END;");
+    defer p5.deinit();
+    var s5 = try p5.parse();
+    defer ast.deinit(std.testing.allocator, &s5);
+    try std.testing.expectEqual(@as(usize, 0), s5.createTrigger.updateOf.len);
+}
+
+test "parser parses analyze with optional target" {
+    var p1 = try Parser.init(std.testing.allocator, "ANALYZE;");
+    defer p1.deinit();
+    var s1 = try p1.parse();
+    defer ast.deinit(std.testing.allocator, &s1);
+    try std.testing.expect(s1 == .analyze);
+    try std.testing.expect(s1.analyze.target == null);
+    var p2 = try Parser.init(std.testing.allocator, "ANALYZE mytable;");
+    defer p2.deinit();
+    var s2 = try p2.parse();
+    defer ast.deinit(std.testing.allocator, &s2);
+    try std.testing.expectEqualStrings("mytable", s2.analyze.target.?);
+    var p3 = try Parser.init(std.testing.allocator, "ANALYZE myindex;");
+    defer p3.deinit();
+    var s3 = try p3.parse();
+    defer ast.deinit(std.testing.allocator, &s3);
+    try std.testing.expectEqualStrings("myindex", s3.analyze.target.?);
 }
 
 test "parser parses conflict policies on insert and update" {
