@@ -52,9 +52,43 @@ pub fn tokenize(allocator: std.mem.Allocator, sql: []const u8) ![]Token {
                 } else return Error.UnterminatedString;
             },
             '0'...'9' => {
-                i += 1;
-                while (i < sql.len and (std.ascii.isDigit(sql[i]) or sql[i] == '.')) i += 1;
-                try tokens.append(allocator, .{ .tag = .number, .text = sql[start..i], .position = start });
+                if (sql[i] == '0' and i + 1 < sql.len and (sql[i + 1] == 'x' or sql[i + 1] == 'X')) {
+                    i += 2;
+                    const hexStart = i;
+                    while (i < sql.len and std.ascii.isHex(sql[i])) i += 1;
+                    if (i == hexStart) i = start + 1;
+                    try tokens.append(allocator, .{ .tag = .number, .text = sql[start..i], .position = start });
+                } else {
+                    i += 1;
+                    while (i < sql.len and std.ascii.isDigit(sql[i])) i += 1;
+                    if (i < sql.len and sql[i] == '.') i += 1;
+                    while (i < sql.len and std.ascii.isDigit(sql[i])) i += 1;
+                    if (i < sql.len and (sql[i] == 'e' or sql[i] == 'E')) {
+                        var cursor = i + 1;
+                        if (cursor < sql.len and (sql[cursor] == '+' or sql[cursor] == '-')) cursor += 1;
+                        var expDigits: usize = 0;
+                        while (cursor < sql.len and std.ascii.isDigit(sql[cursor])) : (cursor += 1) expDigits += 1;
+                        if (expDigits != 0) i = cursor;
+                    }
+                    try tokens.append(allocator, .{ .tag = .number, .text = sql[start..i], .position = start });
+                }
+            },
+            '.' => {
+                if (i + 1 < sql.len and std.ascii.isDigit(sql[i + 1])) {
+                    i += 1;
+                    while (i < sql.len and std.ascii.isDigit(sql[i])) i += 1;
+                    if (i < sql.len and (sql[i] == 'e' or sql[i] == 'E')) {
+                        var cursor = i + 1;
+                        if (cursor < sql.len and (sql[cursor] == '+' or sql[cursor] == '-')) cursor += 1;
+                        var expDigits: usize = 0;
+                        while (cursor < sql.len and std.ascii.isDigit(sql[cursor])) : (cursor += 1) expDigits += 1;
+                        if (expDigits != 0) i = cursor;
+                    }
+                    try tokens.append(allocator, .{ .tag = .number, .text = sql[start..i], .position = start });
+                } else {
+                    try tokens.append(allocator, .{ .tag = .dot, .text = sql[i .. i + 1], .position = i });
+                    i += 1;
+                }
             },
             '?' => {
                 i += 1;
@@ -76,10 +110,6 @@ pub fn tokenize(allocator: std.mem.Allocator, sql: []const u8) ![]Token {
             },
             ',' => {
                 try tokens.append(allocator, .{ .tag = .comma, .text = sql[i .. i + 1], .position = i });
-                i += 1;
-            },
-            '.' => {
-                try tokens.append(allocator, .{ .tag = .dot, .text = sql[i .. i + 1], .position = i });
                 i += 1;
             },
             '*' => {

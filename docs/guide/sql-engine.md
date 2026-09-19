@@ -11,10 +11,10 @@ description: "The hand-written SQL lexer, parser, and bytecode compiler supporti
 
 | Statement | Syntax |
 |-----------|--------|
-| **CREATE TABLE** | `CREATE [TEMP] TABLE [IF NOT EXISTS] name (columns [DEFAULT literal], constraints)`; `TEMP` tables live for the session, shadow main tables, and are never persisted |
+| **CREATE TABLE** | `CREATE [TEMP\|TEMPORARY] TABLE [IF NOT EXISTS] name (columns [DEFAULT literal], constraints)`; `TEMP` tables live for the session, shadow main tables, and are never persisted |
 | **DROP TABLE** | `DROP TABLE [IF EXISTS] name` |
 | **INSERT** | `INSERT INTO name VALUES (...)` or `INSERT INTO name (cols) VALUES (...)` |
-| **SELECT** | `SELECT [DISTINCT] columns FROM table [JOIN ...] [WHERE ...] [GROUP BY ...] [HAVING ...] [ORDER BY ...] [LIMIT ... [OFFSET ...]]` |
+| **SELECT** | `SELECT [DISTINCT\|ALL] columns FROM table [JOIN ...] [WHERE ...] [GROUP BY ...] [HAVING ...] [ORDER BY ...] [LIMIT ... [OFFSET ...]]` |
 | **UPDATE** | `UPDATE name SET col = expr [WHERE ...]` and `UPDATE name SET ... FROM source WHERE join [AND ...]` |
 | **DELETE** | `DELETE FROM name [WHERE ...]` |
 | **BEGIN** | `BEGIN [DEFERRED\|IMMEDIATE\|EXCLUSIVE]` or `START TRANSACTION` |
@@ -100,8 +100,20 @@ wrappers `.replace(search, replacement)` and `.substr(start, length)`.
 
 `NULLIF(value, other)` is supported in raw SQL.
 
+String and numeric helpers follow SQLite conversions: `CONCAT(...)` skips
+nulls, `CONCAT_WS(sep, ...)` returns null on a null separator,
+`OCTET_LENGTH` counts bytes, `ZEROBLOB(n)` builds zero bytes, `SIGN`
+accepts only well-formed numbers, `IIF(cond, a, b)`/`IF` use numeric
+truthiness, `UNLIKELY`/`LIKELY`/`LIKELIHOOD` pass values through,
+`RANDOM()`/`RANDOMBLOB(n)` generate values, `SQLITE_VERSION()`/
+`SQLITE_SOURCE_ID()` report the engine version, `JSON_QUOTE` renders JSON
+literals (rejecting blobs), and `UNISTR` decodes `\uXXXX` escapes.
+`LENGTH` counts characters, `CHAR` maps null to `NUL`, and scalar `MIN`/`MAX`
+return null when any argument is null.
+
 The numeric `ROUND(value, digits)` function is available in raw SQL and as
-`.round(digits)` in the DSL.
+`.round(digits)` in the DSL. `EXP`, `MOD`, `COSH`, `SINH`, `TANH`,
+`ACOSH`, `ASINH`, and `ATANH` round out the math family.
 
 Common casts are supported with `CAST(value AS <type>)` for every SQLite
 type name (affinity-routed, so `BIGINT`, `VARCHAR(10)`, `DOUBLE PRECISION`,
@@ -129,7 +141,13 @@ SQLite identity predicates are also supported: `IS`, `IS NOT`, `IS NULL`, and
 
 ## WHERE Clauses
 
-Standard comparison operators: `=`, `!=`, `<>`, `<`, `>`, `<=`, `>=`, `LIKE`, `NOT LIKE`, `IS NULL`, `IS NOT NULL`, `BETWEEN ... AND ...`, `IN (...)`, `NOT IN (...)`, `EXISTS (...)`.
+Standard comparison operators: `=`, `!=`, `<>`, `<`, `>`, `<=`, `>=`, `LIKE`, `NOT LIKE`, `IS NULL`, `IS NOT NULL`, `BETWEEN ... AND ...`, `IN (...)`, `NOT IN (...)`, `EXISTS (...)`. A bare column or expression
+(`WHERE active`, `WHERE NOT ready`) filters by numeric truthiness, so
+`'1'` and `'2x'` match while `'0'`, `'0.0'`, `''`, and `'abc'` do not; the
+same rule applies to bare `HAVING` expressions.
+
+Connection write counters are readable with `LAST_INSERT_ROWID()`,
+`CHANGES()`, and `TOTAL_CHANGES()`.
 
 ## Aggregate Functions
 

@@ -1,5 +1,6 @@
 const std = @import("std");
 const Value = @import("../../vm/value.zig").Value;
+const scalar = @import("scalar.zig");
 
 pub const AggKind = enum {
     count,
@@ -168,7 +169,7 @@ pub const AggState = struct {
                     .text => |t| strPiece = try self.allocator.dupe(u8, t),
                     .blob => |b| strPiece = try self.allocator.dupe(u8, b),
                     .integer => |i| strPiece = try std.fmt.allocPrint(self.allocator, "{d}", .{i}),
-                    .real => |r| strPiece = try std.fmt.allocPrint(self.allocator, "{d}", .{r}),
+                    .real => |r| strPiece = try scalar.formatReal(self.allocator, r),
                     .null => return,
                 }
                 try self.concatPieces.append(self.allocator, strPiece);

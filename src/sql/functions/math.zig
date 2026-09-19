@@ -132,3 +132,44 @@ pub fn evalRadians(arg: Value) Value {
 pub fn evalPi() Value {
     return .{ .real = std.math.pi };
 }
+
+pub fn evalExp(arg: Value) Value {
+    const f = toFloat(arg) orelse return .null;
+    return .{ .real = std.math.exp(f) };
+}
+
+pub fn evalMod(xVal: Value, yVal: Value) Value {
+    const x = toFloat(xVal) orelse return .null;
+    const y = toFloat(yVal) orelse return .null;
+    return .{ .real = @rem(x, y) };
+}
+
+pub fn evalCosh(arg: Value) Value {
+    const f = toFloat(arg) orelse return .null;
+    return .{ .real = std.math.cosh(f) };
+}
+
+pub fn evalSinh(arg: Value) Value {
+    const f = toFloat(arg) orelse return .null;
+    return .{ .real = std.math.sinh(f) };
+}
+
+pub fn evalTanh(arg: Value) Value {
+    const f = toFloat(arg) orelse return .null;
+    return .{ .real = std.math.tanh(f) };
+}
+
+pub fn evalAcosh(arg: Value) Value {
+    const f = toFloat(arg) orelse return .null;
+    return .{ .real = std.math.acosh(f) };
+}
+
+pub fn evalAsinh(arg: Value) Value {
+    const f = toFloat(arg) orelse return .null;
+    return .{ .real = std.math.asinh(f) };
+}
+
+pub fn evalAtanh(arg: Value) Value {
+    const f = toFloat(arg) orelse return .null;
+    return .{ .real = std.math.atanh(f) };
+}

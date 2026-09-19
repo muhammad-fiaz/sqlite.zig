@@ -29,7 +29,7 @@ pub fn isWindowOnly(name: []const u8) bool {
 pub fn evalScalar(allocator: std.mem.Allocator, name: []const u8, args: []const Value) !Value {
     if (std.ascii.eqlIgnoreCase(name, "abs")) {
         if (args.len != 1) return error.InvalidArgumentCount;
-        return scalar.evalAbs(args[0]);
+        return try scalar.evalAbs(args[0]);
     }
     if (std.ascii.eqlIgnoreCase(name, "lower")) {
         if (args.len != 1) return error.InvalidArgumentCount;
@@ -41,7 +41,7 @@ pub fn evalScalar(allocator: std.mem.Allocator, name: []const u8, args: []const 
     }
     if (std.ascii.eqlIgnoreCase(name, "length")) {
         if (args.len != 1) return error.InvalidArgumentCount;
-        return scalar.evalLength(args[0]);
+        return try scalar.evalLength(allocator, args[0]);
     }
     if (std.ascii.eqlIgnoreCase(name, "round")) {
         if (args.len < 1 or args.len > 2) return error.InvalidArgumentCount;
@@ -64,7 +64,7 @@ pub fn evalScalar(allocator: std.mem.Allocator, name: []const u8, args: []const 
     }
     if (std.ascii.eqlIgnoreCase(name, "instr")) {
         if (args.len != 2) return error.InvalidArgumentCount;
-        return scalar.evalInstr(args[0], args[1]);
+        return try scalar.evalInstr(allocator, args[0], args[1]);
     }
     if (std.ascii.eqlIgnoreCase(name, "replace")) {
         if (args.len != 3) return error.InvalidArgumentCount;
@@ -111,32 +111,81 @@ pub fn evalScalar(allocator: std.mem.Allocator, name: []const u8, args: []const 
     }
     if (std.ascii.eqlIgnoreCase(name, "unicode")) {
         if (args.len != 1) return error.InvalidArgumentCount;
-        return scalar.evalUnicode(args[0]);
+        return try scalar.evalUnicode(allocator, args[0]);
     }
     if (std.ascii.eqlIgnoreCase(name, "printf") or std.ascii.eqlIgnoreCase(name, "format")) {
         return scalar.evalPrintf(allocator, args);
     }
+    if (std.ascii.eqlIgnoreCase(name, "concat")) {
+        return try scalar.evalConcat(allocator, args);
+    }
+    if (std.ascii.eqlIgnoreCase(name, "concat_ws")) {
+        if (args.len < 1) return error.InvalidArgumentCount;
+        return try scalar.evalConcatWs(allocator, args);
+    }
+    if (std.ascii.eqlIgnoreCase(name, "octet_length")) {
+        if (args.len != 1) return error.InvalidArgumentCount;
+        return try scalar.evalOctetLength(allocator, args[0]);
+    }
+    if (std.ascii.eqlIgnoreCase(name, "zeroblob")) {
+        if (args.len != 1) return error.InvalidArgumentCount;
+        return try scalar.evalZeroblob(allocator, args[0]);
+    }
+    if (std.ascii.eqlIgnoreCase(name, "sign")) {
+        if (args.len != 1) return error.InvalidArgumentCount;
+        return scalar.evalSign(args[0]);
+    }
+    if (std.ascii.eqlIgnoreCase(name, "iif") or std.ascii.eqlIgnoreCase(name, "if")) {
+        if (args.len != 3) return error.InvalidArgumentCount;
+        return try scalar.evalIif(allocator, args[0], args[1], args[2]);
+    }
+    if (std.ascii.eqlIgnoreCase(name, "unlikely") or std.ascii.eqlIgnoreCase(name, "likely")) {
+        if (args.len != 1) return error.InvalidArgumentCount;
+        return try scalar.evalUnlikely(allocator, args[0]);
+    }
+    if (std.ascii.eqlIgnoreCase(name, "likelihood")) {
+        if (args.len != 2) return error.InvalidArgumentCount;
+        return try scalar.evalUnlikely(allocator, args[0]);
+    }
+    if (std.ascii.eqlIgnoreCase(name, "random")) {
+        if (args.len != 0) return error.InvalidArgumentCount;
+        return try scalar.evalRandom(allocator);
+    }
+    if (std.ascii.eqlIgnoreCase(name, "randomblob")) {
+        if (args.len != 1) return error.InvalidArgumentCount;
+        return try scalar.evalRandomblob(allocator, args[0]);
+    }
+    if (std.ascii.eqlIgnoreCase(name, "sqlite_version")) {
+        if (args.len != 0) return error.InvalidArgumentCount;
+        return try scalar.evalSqliteVersion(allocator);
+    }
+    if (std.ascii.eqlIgnoreCase(name, "sqlite_source_id")) {
+        if (args.len != 0) return error.InvalidArgumentCount;
+        return try scalar.evalSqliteSourceId(allocator);
+    }
+    if (std.ascii.eqlIgnoreCase(name, "json_quote")) {
+        if (args.len != 1) return error.InvalidArgumentCount;
+        return try scalar.evalJsonQuote(allocator, args[0]);
+    }
+    if (std.ascii.eqlIgnoreCase(name, "unistr")) {
+        if (args.len != 1) return error.InvalidArgumentCount;
+        return try scalar.evalUnistr(allocator, args[0]);
+    }
     if (std.ascii.eqlIgnoreCase(name, "min") and args.len >= 2) {
+        for (args) |arg| if (arg == .null) return .null;
         var minVal = args[0];
         for (args[1..]) |arg| {
-            if (minVal == .null) {
-                minVal = arg;
-            } else if (arg != .null and arg.order(minVal, .binary) == .lt) {
-                minVal = arg;
-            }
+            if (arg.order(minVal, .binary) == .lt) minVal = arg;
         }
-        return minVal;
+        return try minVal.clone(allocator);
     }
     if (std.ascii.eqlIgnoreCase(name, "max") and args.len >= 2) {
+        for (args) |arg| if (arg == .null) return .null;
         var maxVal = args[0];
         for (args[1..]) |arg| {
-            if (maxVal == .null) {
-                maxVal = arg;
-            } else if (arg != .null and arg.order(maxVal, .binary) == .gt) {
-                maxVal = arg;
-            }
+            if (arg.order(maxVal, .binary) == .gt) maxVal = arg;
         }
-        return maxVal;
+        return try maxVal.clone(allocator);
     }
 
     if (std.ascii.eqlIgnoreCase(name, "ceil") or std.ascii.eqlIgnoreCase(name, "ceiling")) {
@@ -213,6 +262,38 @@ pub fn evalScalar(allocator: std.mem.Allocator, name: []const u8, args: []const 
     }
     if (std.ascii.eqlIgnoreCase(name, "pi")) {
         return math.evalPi();
+    }
+    if (std.ascii.eqlIgnoreCase(name, "exp")) {
+        if (args.len != 1) return error.InvalidArgumentCount;
+        return math.evalExp(args[0]);
+    }
+    if (std.ascii.eqlIgnoreCase(name, "mod")) {
+        if (args.len != 2) return error.InvalidArgumentCount;
+        return math.evalMod(args[0], args[1]);
+    }
+    if (std.ascii.eqlIgnoreCase(name, "cosh")) {
+        if (args.len != 1) return error.InvalidArgumentCount;
+        return math.evalCosh(args[0]);
+    }
+    if (std.ascii.eqlIgnoreCase(name, "sinh")) {
+        if (args.len != 1) return error.InvalidArgumentCount;
+        return math.evalSinh(args[0]);
+    }
+    if (std.ascii.eqlIgnoreCase(name, "tanh")) {
+        if (args.len != 1) return error.InvalidArgumentCount;
+        return math.evalTanh(args[0]);
+    }
+    if (std.ascii.eqlIgnoreCase(name, "acosh")) {
+        if (args.len != 1) return error.InvalidArgumentCount;
+        return math.evalAcosh(args[0]);
+    }
+    if (std.ascii.eqlIgnoreCase(name, "asinh")) {
+        if (args.len != 1) return error.InvalidArgumentCount;
+        return math.evalAsinh(args[0]);
+    }
+    if (std.ascii.eqlIgnoreCase(name, "atanh")) {
+        if (args.len != 1) return error.InvalidArgumentCount;
+        return math.evalAtanh(args[0]);
     }
 
     if (std.ascii.eqlIgnoreCase(name, "date")) {

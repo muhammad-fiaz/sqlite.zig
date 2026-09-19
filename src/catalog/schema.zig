@@ -1230,7 +1230,7 @@ pub const Schema = struct {
         self.allocator.free(table.name);
     }
 
-    fn rowidAliasColumn(table: *const Table) ?usize {
+    pub fn rowidAliasColumn(table: *const Table) ?usize {
         if (table.withoutRowid) return null;
         var found: ?usize = null;
         for (table.columns, 0..) |column, index| {
