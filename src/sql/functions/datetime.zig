@@ -1,16 +1,17 @@
 const std = @import("std");
 const Value = @import("../../vm/value.zig").Value;
 
-// System libc wall clock for Apple targets, where the toolchain exposes no
-// pure-Zig syscall layer. Zig links libSystem by default on these targets,
-// so no extra link flags are needed. The declaration is only referenced from
-// the Apple branch below; other targets never emit a reference to it.
-const DarwinTimeval = extern struct {
+// System libc wall clock for targets where the toolchain exposes no
+// pure-Zig syscall layer (Apple and BSD families). Linking the reference was
+// verified for these targets with no extra link flags. The declaration is
+// only referenced from the branches below; other targets never emit a
+// reference to it.
+const CTimeval = extern struct {
     tv_sec: c_long,
     tv_usec: c_int,
 };
 
-extern "c" fn gettimeofday(tp: *DarwinTimeval, tzp: ?*anyopaque) c_int;
+extern "c" fn gettimeofday(tp: *CTimeval, tzp: ?*anyopaque) c_int;
 
 pub const DateTime = struct {
     year: i32,
@@ -125,8 +126,10 @@ fn getCurrentTimestamp() ClockError!i64 {
             if (std.os.linux.clock_gettime(.REALTIME, &ts) != 0) return error.ClockUnavailable;
             return ts.sec;
         },
-        .macos, .ios, .tvos, .watchos, .visionos => {
-            var tv: DarwinTimeval = undefined;
+        .macos, .ios, .tvos, .watchos, .visionos,
+        .freebsd, .netbsd, .openbsd, .dragonfly, .haiku, .illumos,
+        => {
+            var tv: CTimeval = undefined;
             if (gettimeofday(&tv, null) != 0) return error.ClockUnavailable;
             return @intCast(tv.tv_sec);
         },
