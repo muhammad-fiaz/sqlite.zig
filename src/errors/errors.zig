@@ -22,6 +22,7 @@ pub const Error = error{
     TransactionActive,
     Unsupported,
     SchemaMismatch,
+    TriggerDepthExceeded,
 };
 
 pub fn message(err: Error) []const u8 {
@@ -47,6 +48,7 @@ pub fn message(err: Error) []const u8 {
         error.TransactionActive => "transaction already active",
         error.Unsupported => "unsupported feature",
         error.SchemaMismatch => "database schema does not match the declared table",
+        error.TriggerDepthExceeded => "triggers nested too deep",
     };
 }
 

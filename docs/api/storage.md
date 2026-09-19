@@ -31,9 +31,15 @@ checkpoints back to the main database when switched to `DELETE` mode.
 var mode = try db.exec("PRAGMA journal_mode=WAL;");
 mode.deinit();
 // ... writes are durable in the native WAL ...
-var checkpoint = try db.exec("PRAGMA journal_mode=DELETE;");
+var checkpoint = try db.exec("PRAGMA wal_checkpoint(TRUNCATE);");
 checkpoint.deinit();
+var back = try db.exec("PRAGMA journal_mode=DELETE;");
+back.deinit();
 ```
+
+`PRAGMA wal_checkpoint;` (or with `PASSIVE`, `FULL`, `RESTART`, `TRUNCATE`)
+merges WAL frames into the main database and reports `busy`, `log`, and
+`checkpointed` frame counts.
 
 This is single-process native WAL support; multi-process locking, VFS callbacks,
 and full SQLite concurrency semantics remain under development.

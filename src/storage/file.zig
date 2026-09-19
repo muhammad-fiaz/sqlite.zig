@@ -13,6 +13,7 @@ pub const DatabaseFile = struct {
     pageSize: usize,
     userVersion: u32 = 0,
     applicationId: u32 = 0,
+    schemaVersion: u32 = 1,
     walEnabled: bool = false,
 
     pub fn open(allocator: std.mem.Allocator, path: []const u8) !DatabaseFile {
@@ -46,6 +47,7 @@ pub const DatabaseFile = struct {
             result.pageSize = header.pageSize;
             result.userVersion = header.userVersion;
             result.applicationId = header.applicationId;
+            result.schemaVersion = header.schemaCookie;
         }
         return result;
     }
@@ -116,6 +118,7 @@ pub const DatabaseFile = struct {
     }
 
     pub fn writeImage(self: *DatabaseFile, bytes: []const u8) !void {
+        if (bytes.len >= 44) std.mem.writeInt(u32, @constCast(bytes[40..44]), self.schemaVersion, .big);
         if (bytes.len >= 64) std.mem.writeInt(u32, @constCast(bytes[60..64]), self.userVersion, .big);
         if (bytes.len >= 72) std.mem.writeInt(u32, @constCast(bytes[68..72]), self.applicationId, .big);
         if (self.walEnabled) return self.writeWal(bytes);
@@ -137,6 +140,35 @@ pub const DatabaseFile = struct {
 
     pub fn setApplicationId(self: *DatabaseFile, applicationId: u32) void {
         self.applicationId = applicationId;
+    }
+
+    pub fn getSchemaVersion(self: *const DatabaseFile) u32 {
+        return self.schemaVersion;
+    }
+
+    pub fn setSchemaVersion(self: *DatabaseFile, version: u32) void {
+        self.schemaVersion = version;
+    }
+
+    pub fn checkpointWal(self: *DatabaseFile) !struct { busy: u32, log: u32, checkpointed: u32 } {
+        if (!self.walEnabled) return .{ .busy = 0, .log = 0, .checkpointed = 0 };
+        const walBytes = try self.readWal() orelse return .{ .busy = 0, .log = 0, .checkpointed = 0 };
+        defer self.allocator.free(walBytes);
+        if (walBytes.len < wal.headerSize) return error.InvalidWal;
+        const framePageSize = std.mem.readInt(u32, walBytes[8..12], .big);
+        if (framePageSize < 512 or (walBytes.len - wal.headerSize) % (wal.frameHeaderSize + framePageSize) != 0) return error.InvalidWal;
+        const frames: u32 = @intCast((walBytes.len - wal.headerSize) / (wal.frameHeaderSize + framePageSize));
+        const merged = try self.readImage();
+        defer self.allocator.free(merged);
+        const io = self.threaded.io();
+        try self.file.writePositionalAll(io, merged, 0);
+        try self.file.setLength(io, merged.len);
+        const path = try self.walPath();
+        defer self.allocator.free(path);
+        var walFile = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+        defer walFile.close(io);
+        try walFile.setLength(io, 0);
+        return .{ .busy = 0, .log = frames, .checkpointed = frames };
     }
 
     pub fn enableWal(self: *DatabaseFile) void {

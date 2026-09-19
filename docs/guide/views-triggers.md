@@ -78,3 +78,10 @@ result.deinit();
 
 - `NEW.column` — Access the new row value (INSERT/UPDATE)
 - `OLD.column` — Access the old row value (UPDATE/DELETE)
+
+### Recursive Triggers
+
+A trigger whose body fires itself again is skipped by default (matching SQLite
+with `PRAGMA recursive_triggers=OFF`). Set `PRAGMA recursive_triggers=ON;` to
+allow recursion; runaway recursion aborts with an error after 64 nested levels
+and rolls back the whole statement.

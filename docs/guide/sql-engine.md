@@ -34,7 +34,7 @@ description: "The hand-written SQL lexer, parser, and bytecode compiler supporti
 | **EXPLAIN QUERY PLAN** | `EXPLAIN QUERY PLAN SELECT ...` reports index use vs table scans |
 | **CREATE VIRTUAL TABLE** | `generate_series` module only; other modules return an explicit error |
 | **DROP** | `DROP TABLE/INDEX/VIEW/TRIGGER [IF EXISTS] name` |
-| **PRAGMA** | `foreign_keys`, `user_version`, `application_id`, `journal_mode`, `synchronous`, `cache_size`, `page_size`, `encoding`, `busy_timeout`, `locking_mode`, `auto_vacuum`, `integrity_check`, `foreign_key_check` |
+| **PRAGMA** | `foreign_keys`, `user_version`, `application_id`, `schema_version`, `journal_mode`, `wal_checkpoint`, `synchronous`, `cache_size`, `page_size`, `encoding`, `busy_timeout`, `locking_mode`, `auto_vacuum`, `recursive_triggers`, `integrity_check`, `foreign_key_check` |
 
 `ATTACH` and `DETACH` parse but return an explicit unsupported-feature error.
 

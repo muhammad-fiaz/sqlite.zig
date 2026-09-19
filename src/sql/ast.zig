@@ -104,7 +104,7 @@ pub const Statement = union(enum) {
     analyze: struct { target: ?[]const u8 = null },
 
     pub fn isQuery(self: Statement) bool {
-        return self == .select or self == .withSelect or self == .compoundSelect or self == .explainQueryPlan;
+        return self == .select or self == .withSelect or self == .compoundSelect or self == .explainQueryPlan or self == .pragma;
     }
 };
 

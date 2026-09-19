@@ -248,7 +248,7 @@ pub const Parser = struct {
         } else if (self.acceptWord("start")) {
             try self.requireWord("transaction");
             statement = .begin;
-        } else if (self.acceptWord("commit")) statement = .commit else if (self.acceptWord("rollback")) {
+        } else if (self.acceptWord("commit")) statement = .commit else if (self.acceptWord("end")) statement = .commit else if (self.acceptWord("rollback")) {
             if (self.acceptWord("to")) statement = .{ .rollbackTo = try self.word() } else statement = .rollback;
         } else if (self.acceptWord("savepoint")) statement = .{ .savepoint = try self.word() } else if (self.acceptWord("release")) {
             _ = self.acceptWord("savepoint");

@@ -18,6 +18,8 @@ const planner = @import("../plan/planner.zig");
 const exprEvaluator = @import("../sql/expr.zig");
 const functions = @import("../sql/functions.zig");
 
+const maxTriggerDepth: usize = 64;
+
 const Savepoint = struct { name: []u8, schema: Schema };
 const OuterRow = struct { table: *const Table, alias: ?[]const u8 = null, values: []const Value, prev: ?*const OuterRow = null };
 const JoinSegment = struct { table: *const Table, alias: ?[]const u8, values: []const Value };
@@ -35,6 +37,8 @@ pub const Connection = struct {
     statementBackup: ?Schema = null,
     inAtomicStatement: bool = false,
     activeCtes: std.ArrayList([]const u8) = .empty,
+    recursiveTriggers: bool = false,
+    triggerStack: std.ArrayList([]const u8) = .empty,
     transactionActive: bool = false,
     savepoints: std.ArrayList(Savepoint),
     parseCount: usize = 0,
@@ -76,6 +80,7 @@ pub const Connection = struct {
         if (self.backup) |*backup| backup.deinit();
         if (self.statementBackup) |*statement| statement.deinit();
         self.activeCtes.deinit(self.allocator);
+        self.triggerStack.deinit(self.allocator);
         self.clearSavepoints();
         self.savepoints.deinit(self.allocator);
         self.store.deinit();
@@ -766,8 +771,20 @@ pub const Connection = struct {
                 break :blk try emptyResult(self.allocator);
             },
         };
+        if (isSchemaChange(statement)) self.bumpSchemaVersion();
         if (!self.transactionActive and !statement.isQuery()) try self.persist();
         return result;
+    }
+
+    fn isSchemaChange(statement: ast.Statement) bool {
+        return switch (statement) {
+            .createTable, .createIndex, .createView, .createTrigger, .createVirtualTable, .dropTable, .dropIndex, .dropView, .dropTrigger, .alterTable => true,
+            else => false,
+        };
+    }
+
+    fn bumpSchemaVersion(self: *Connection) void {
+        self.file.setSchemaVersion(self.file.getSchemaVersion() +% 1);
     }
 
     fn emptyResult(allocator: std.mem.Allocator) !Result {
@@ -949,6 +966,52 @@ pub const Connection = struct {
             rows[0][0] = .{ .integer = @intCast(self.autoVacuum) };
             return .{ .allocator = self.allocator, .columns = columns, .rows = rows };
         }
+        if (std.ascii.eqlIgnoreCase(value.name, "schema_version")) {
+            if (value.argument != null) return error.InvalidSql;
+            if (value.value) |text| {
+                const version = std.fmt.parseInt(u32, text, 10) catch return error.InvalidSql;
+                self.file.setSchemaVersion(version);
+                try self.persist();
+            }
+            const names = [_][]const u8{"schema_version"};
+            const columns = try self.ownedColumns(&names);
+            const rows = try self.allocator.alloc([]Value, 1);
+            rows[0] = try self.allocator.alloc(Value, 1);
+            rows[0][0] = .{ .integer = self.file.getSchemaVersion() };
+            return .{ .allocator = self.allocator, .columns = columns, .rows = rows };
+        }
+        if (std.ascii.eqlIgnoreCase(value.name, "recursive_triggers")) {
+            if (value.argument != null) return error.InvalidSql;
+            if (value.value) |text| {
+                if (std.ascii.eqlIgnoreCase(text, "on") or std.mem.eql(u8, text, "1")) {
+                    self.recursiveTriggers = true;
+                } else if (std.ascii.eqlIgnoreCase(text, "off") or std.mem.eql(u8, text, "0")) {
+                    self.recursiveTriggers = false;
+                } else return error.InvalidSql;
+            }
+            const names = [_][]const u8{"recursive_triggers"};
+            const columns = try self.ownedColumns(&names);
+            const rows = try self.allocator.alloc([]Value, 1);
+            rows[0] = try self.allocator.alloc(Value, 1);
+            rows[0][0] = .{ .integer = if (self.recursiveTriggers) 1 else 0 };
+            return .{ .allocator = self.allocator, .columns = columns, .rows = rows };
+        }
+        if (std.ascii.eqlIgnoreCase(value.name, "wal_checkpoint")) {
+            if (value.value != null) return error.InvalidSql;
+            if (value.argument) |mode| {
+                if (!std.ascii.eqlIgnoreCase(mode, "passive") and !std.ascii.eqlIgnoreCase(mode, "full") and !std.ascii.eqlIgnoreCase(mode, "restart") and !std.ascii.eqlIgnoreCase(mode, "truncate")) return error.InvalidSql;
+            }
+            const checkpoint = try self.file.checkpointWal();
+            if (self.synchronousLevel >= 1) try self.file.file.sync(self.file.threaded.io());
+            const names = [_][]const u8{ "busy", "log", "checkpointed" };
+            const columns = try self.ownedColumns(&names);
+            const rows = try self.allocator.alloc([]Value, 1);
+            rows[0] = try self.allocator.alloc(Value, 3);
+            rows[0][0] = .{ .integer = checkpoint.busy };
+            rows[0][1] = .{ .integer = checkpoint.log };
+            rows[0][2] = .{ .integer = checkpoint.checkpointed };
+            return .{ .allocator = self.allocator, .columns = columns, .rows = rows };
+        }
         return error.Unsupported;
     }
 
@@ -1008,7 +1071,9 @@ pub const Connection = struct {
     }
 
     fn analyzeScope(self: *Connection, tableName: ?[]const u8) !void {
+        const hadStat = self.store.find("sqlite_stat1") != null;
         _ = try self.store.ensureStatTable();
+        if (!hadStat) self.bumpSchemaVersion();
         for (self.store.tables.items) |table| {
             if (std.ascii.eqlIgnoreCase(table.name, "sqlite_stat1")) continue;
             if (tableName) |wanted| if (!std.ascii.eqlIgnoreCase(table.name, wanted)) continue;
@@ -1674,23 +1739,50 @@ pub const Connection = struct {
 
     fn fireTriggers(self: *Connection, tableName: []const u8, timing: ast.TriggerTiming, event: ast.TriggerEvent, newRow: ?[]const Value, oldRow: ?[]const Value, updatedColumns: []const []const u8) anyerror!void {
         const table = self.store.findConst(tableName) orelse return error.UnknownTable;
-        var bodies = std.ArrayList([]u8).empty;
+        const PendingBody = struct { name: []u8, sql: []u8 };
+        var pending = std.ArrayList(PendingBody).empty;
         defer {
-            for (bodies.items) |body| self.allocator.free(body);
-            bodies.deinit(self.allocator);
+            for (pending.items) |item| {
+                self.allocator.free(item.name);
+                self.allocator.free(item.sql);
+            }
+            pending.deinit(self.allocator);
         }
         for (self.store.triggers.items) |trigger| {
             if (trigger.timing != timing) continue;
             if (trigger.event == event and std.ascii.eqlIgnoreCase(trigger.table, tableName)) {
                 if (!trigger.firesOnUpdate(updatedColumns)) continue;
                 if (!try self.triggerWhenMatched(table, trigger, event, newRow, oldRow)) continue;
-                try bodies.append(self.allocator, try self.renderTriggerBody(trigger.body, table, event, newRow, oldRow));
+                const ownedName = try self.allocator.dupe(u8, trigger.name);
+                errdefer self.allocator.free(ownedName);
+                const sql = try self.renderTriggerBody(trigger.body, table, event, newRow, oldRow);
+                errdefer self.allocator.free(sql);
+                try pending.append(self.allocator, .{ .name = ownedName, .sql = sql });
             }
         }
-        for (bodies.items) |body| {
-            var result = try self.execute(body, &.{});
+        for (pending.items) |item| {
+            if (self.triggerOnStack(item.name)) {
+                if (!self.recursiveTriggers) continue;
+                if (self.triggerStack.items.len >= maxTriggerDepth) return error.TriggerDepthExceeded;
+            } else if (self.triggerStack.items.len >= maxTriggerDepth) {
+                return error.TriggerDepthExceeded;
+            }
+            const owned = try self.allocator.dupe(u8, item.name);
+            try self.triggerStack.append(self.allocator, owned);
+            var result = self.execute(item.sql, &.{}) catch |err| {
+                const dropped = self.triggerStack.pop() orelse unreachable;
+                self.allocator.free(dropped);
+                return err;
+            };
             result.deinit();
+            const dropped = self.triggerStack.pop() orelse unreachable;
+            self.allocator.free(dropped);
         }
+    }
+
+    fn triggerOnStack(self: *Connection, name: []const u8) bool {
+        for (self.triggerStack.items) |active| if (std.ascii.eqlIgnoreCase(active, name)) return true;
+        return false;
     }
 
     fn resolve(self: *Connection, expr: ast.Expr, parameters: []const Value) !Value {
@@ -10390,4 +10482,128 @@ test "recursive union all keeps duplicates while union dedups" {
     try std.testing.expectEqual(@as(usize, 2), distinct.count());
     try std.testing.expectEqual(@as(i64, 0), distinct.rows[0][0].integer);
     try std.testing.expectEqual(@as(i64, 1), distinct.rows[1][0].integer);
+}
+
+test "end commits like commit" {
+    const path = "sqlite_zig_end_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    var setup = try db.exec("CREATE TABLE ends (id INTEGER);");
+    setup.deinit();
+    var begun = try db.exec("BEGIN;");
+    begun.deinit();
+    var inserted = try db.exec("INSERT INTO ends VALUES (1);");
+    inserted.deinit();
+    var ended = try db.exec("END;");
+    ended.deinit();
+    var rows = try db.exec("SELECT id FROM ends;");
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(i64, 1), rows.rows[0][0].integer);
+    try std.testing.expectError(error.NotInTransaction, db.exec("END;"));
+    db.close();
+    db = try Connection.open(std.testing.allocator, path);
+    errdefer db.close();
+    var reopened = try db.exec("SELECT count(*) FROM ends;");
+    defer reopened.deinit();
+    try std.testing.expectEqual(@as(i64, 1), reopened.rows[0][0].integer);
+}
+
+test "recursive triggers skip by default and run when enabled" {
+    const path = "sqlite_zig_recursive_trigger_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    var setup = try db.exec("CREATE TABLE rec (id INTEGER);");
+    setup.deinit();
+    var flag = try db.exec("PRAGMA recursive_triggers;");
+    defer flag.deinit();
+    try std.testing.expectEqual(@as(i64, 0), flag.rows[0][0].integer);
+    try std.testing.expectError(error.InvalidSql, db.exec("PRAGMA recursive_triggers = sometimes;"));
+    var trigger = try db.exec("CREATE TRIGGER rec_self AFTER INSERT ON rec BEGIN INSERT INTO rec VALUES (NEW.id + 1); END;");
+    trigger.deinit();
+    var first = try db.exec("INSERT INTO rec VALUES (1);");
+    first.deinit();
+    var twice = try db.exec("SELECT id FROM rec ORDER BY id;");
+    defer twice.deinit();
+    try std.testing.expectEqual(@as(usize, 2), twice.count());
+    try std.testing.expectEqual(@as(i64, 2), twice.rows[1][0].integer);
+    var on = try db.exec("PRAGMA recursive_triggers = ON;");
+    on.deinit();
+    var check = try db.exec("PRAGMA recursive_triggers;");
+    defer check.deinit();
+    try std.testing.expectEqual(@as(i64, 1), check.rows[0][0].integer);
+    var wipe = try db.exec("DELETE FROM rec;");
+    wipe.deinit();
+    try std.testing.expectError(error.TriggerDepthExceeded, db.exec("INSERT INTO rec VALUES (1);"));
+    var empty = try db.exec("SELECT count(*) FROM rec;");
+    defer empty.deinit();
+    try std.testing.expectEqual(@as(i64, 0), empty.rows[0][0].integer);
+    var off = try db.exec("PRAGMA recursive_triggers = OFF;");
+    off.deinit();
+}
+
+test "schema version persists and bumps on schema changes" {
+    const path = "sqlite_zig_schema_version_test.db";
+    var db = try freshDb(path);
+    var initial = try db.exec("PRAGMA schema_version;");
+    defer initial.deinit();
+    try std.testing.expectEqual(@as(i64, 1), initial.rows[0][0].integer);
+    var setup = try db.exec("CREATE TABLE sv (id INTEGER);");
+    setup.deinit();
+    var bumped = try db.exec("PRAGMA schema_version;");
+    defer bumped.deinit();
+    try std.testing.expectEqual(@as(i64, 2), bumped.rows[0][0].integer);
+    var set = try db.exec("PRAGMA schema_version = 42;");
+    set.deinit();
+    var readBack = try db.exec("PRAGMA schema_version;");
+    defer readBack.deinit();
+    try std.testing.expectEqual(@as(i64, 42), readBack.rows[0][0].integer);
+    try std.testing.expectError(error.InvalidSql, db.exec("PRAGMA schema_version = 'many';"));
+    db.close();
+    db = try Connection.open(std.testing.allocator, path);
+    errdefer db.close();
+    defer dropDb(db, path);
+    var persisted = try db.exec("PRAGMA schema_version;");
+    defer persisted.deinit();
+    try std.testing.expectEqual(@as(i64, 42), persisted.rows[0][0].integer);
+}
+
+test "wal checkpoint merges frames and reports counts" {
+    const path = "sqlite_zig_wal_checkpoint_test.db";
+    const walPath = "sqlite_zig_wal_checkpoint_test.db-wal";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    std.Io.Dir.cwd().deleteFile(std.testing.io, walPath) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, walPath) catch {};
+    var db = try Connection.open(std.testing.allocator, path);
+    defer db.close();
+    var setup = try db.exec("CREATE TABLE chk (id INTEGER);");
+    setup.deinit();
+    var plain = try db.exec("PRAGMA wal_checkpoint;");
+    defer plain.deinit();
+    try std.testing.expectEqual(@as(i64, 0), plain.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 0), plain.rows[0][1].integer);
+    try std.testing.expectEqual(@as(i64, 0), plain.rows[0][2].integer);
+    var walMode = try db.exec("PRAGMA journal_mode=WAL;");
+    walMode.deinit();
+    var inserted = try db.exec("INSERT INTO chk VALUES (1), (2);");
+    inserted.deinit();
+    try std.testing.expectError(error.InvalidSql, db.exec("PRAGMA wal_checkpoint(BOGUS);"));
+    var checkpoint = try db.exec("PRAGMA wal_checkpoint(TRUNCATE);");
+    defer checkpoint.deinit();
+    try std.testing.expectEqual(@as(i64, 0), checkpoint.rows[0][0].integer);
+    try std.testing.expect(checkpoint.rows[0][1].integer > 0);
+    try std.testing.expectEqual(checkpoint.rows[0][1].integer, checkpoint.rows[0][2].integer);
+    var walFile = try std.Io.Dir.cwd().openFile(std.testing.io, walPath, .{ .mode = .read_only });
+    defer walFile.close(std.testing.io);
+    const stat = try walFile.stat(std.testing.io);
+    try std.testing.expectEqual(@as(u64, 0), stat.size);
+    var rows = try db.exec("SELECT count(*) FROM chk;");
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(i64, 2), rows.rows[0][0].integer);
+    db.close();
+    db = try Connection.open(std.testing.allocator, path);
+    errdefer db.close();
+    var reopened = try db.exec("SELECT count(*) FROM chk;");
+    defer reopened.deinit();
+    try std.testing.expectEqual(@as(i64, 2), reopened.rows[0][0].integer);
 }

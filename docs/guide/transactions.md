@@ -77,5 +77,7 @@ result = try db.exec("COMMIT;");
 result.deinit();
 ```
 
+`END;` is accepted as an alias for `COMMIT;`.
+
 > [!WARNING]
 > Always ensure transactions are either committed or rolled back. Uncommitted transactions will be rolled back when the connection is closed.
