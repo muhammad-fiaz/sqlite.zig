@@ -1355,9 +1355,13 @@ pub const Connection = struct {
         for (ctes) |cte| {
             var source = try self.execute(cte.querySql, parameters);
             defer source.deinit();
+            if (cte.columns.len != 0 and cte.columns.len != source.columns.len) return error.ColumnCountMismatch;
             const definitions = try self.allocator.alloc(ast.ColumnDef, source.columns.len);
             defer self.allocator.free(definitions);
-            for (source.columns, 0..) |column, index| definitions[index] = .{ .name = column, .typeName = if (source.rows.len == 0) "" else source.rows[0][index].typeName() };
+            for (source.columns, 0..) |column, index| {
+                const resolved = if (cte.columns.len != 0) cte.columns[index] else column;
+                definitions[index] = .{ .name = resolved, .typeName = if (source.rows.len == 0) "" else source.rows[0][index].typeName() };
+            }
             try self.store.createTable(cte.name, definitions, &.{});
             const table = self.store.find(cte.name).?;
             for (source.rows) |row| try self.store.appendRow(table, row);
@@ -10278,4 +10282,29 @@ test "analyze persists and rolls back with transactions" {
     var rows = try db.exec("SELECT stat FROM sqlite_stat1 WHERE tbl = 'txn_items' AND idx IS NULL;");
     defer rows.deinit();
     try std.testing.expectEqualStrings("1", rows.rows[0][0].text);
+}
+
+test "cte column lists rename projected columns" {
+    const path = "sqlite_zig_cte_columns_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    var setup = try db.exec("CREATE TABLE base_items (id INTEGER); INSERT INTO base_items VALUES (1), (2);");
+    setup.deinit();
+    var renamed = try db.exec("WITH vals(x) AS (SELECT id FROM base_items) SELECT x FROM vals ORDER BY x;");
+    defer renamed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), renamed.count());
+    try std.testing.expectEqualStrings("x", renamed.columns[0]);
+    try std.testing.expectEqual(@as(i64, 2), renamed.rows[1][0].integer);
+    var recursive = try db.exec("WITH RECURSIVE nums(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM nums WHERE n < 4) SELECT sum(n) FROM nums;");
+    defer recursive.deinit();
+    try std.testing.expectEqual(@as(i64, 10), recursive.rows[0][0].integer);
+    var copied = try db.exec("CREATE TABLE copied (v INTEGER); WITH vals(y) AS (SELECT id FROM base_items WHERE id = 2) INSERT INTO copied SELECT y FROM vals;");
+    defer copied.deinit();
+    var stored = try db.exec("SELECT v FROM copied;");
+    defer stored.deinit();
+    try std.testing.expectEqual(@as(i64, 2), stored.rows[0][0].integer);
+    try std.testing.expectError(error.ColumnCountMismatch, db.exec("WITH bad(a, b) AS (SELECT id FROM base_items) SELECT a FROM bad;"));
+    var intact = try db.exec("SELECT count(*) FROM base_items;");
+    defer intact.deinit();
+    try std.testing.expectEqual(@as(i64, 2), intact.rows[0][0].integer);
 }

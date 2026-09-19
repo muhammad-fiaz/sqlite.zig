@@ -265,12 +265,17 @@ pub const Parser = struct {
     fn parseWith(self: *Parser) !ast.Statement {
         const recursive = self.acceptWord("recursive");
         var ctes = std.ArrayList(ast.CteDef).empty;
-        errdefer ctes.deinit(self.allocator);
+        errdefer {
+            for (ctes.items) |cte| if (cte.columns.len != 0) self.allocator.free(cte.columns);
+            ctes.deinit(self.allocator);
+        }
         while (true) {
             const name = try self.word();
+            var columnList = std.ArrayList([]const u8).empty;
+            errdefer columnList.deinit(self.allocator);
             if (self.acceptTag(.lparen)) {
                 while (true) {
-                    _ = try self.word();
+                    try columnList.append(self.allocator, try self.word());
                     if (!self.acceptTag(.comma)) break;
                 }
                 try self.requireTag(.rparen);
@@ -305,7 +310,7 @@ pub const Parser = struct {
                 }
             }
             try self.requireTag(.rparen);
-            try ctes.append(self.allocator, .{ .name = name, .querySql = try self.copy(self.source[queryStart..compoundEnd]), .recursiveSql = recursiveSql });
+            try ctes.append(self.allocator, .{ .name = name, .columns = try columnList.toOwnedSlice(self.allocator), .querySql = try self.copy(self.source[queryStart..compoundEnd]), .recursiveSql = recursiveSql });
             if (!self.acceptTag(.comma)) break;
         }
         const bodyStart = self.current().position;
