@@ -32,6 +32,9 @@ pub const Connection = struct {
     file: DatabaseFile,
     store: Schema,
     backup: ?Schema = null,
+    statementBackup: ?Schema = null,
+    inAtomicStatement: bool = false,
+    activeCtes: std.ArrayList([]const u8) = .empty,
     transactionActive: bool = false,
     savepoints: std.ArrayList(Savepoint),
     parseCount: usize = 0,
@@ -71,6 +74,8 @@ pub const Connection = struct {
         }
         self.persist() catch {};
         if (self.backup) |*backup| backup.deinit();
+        if (self.statementBackup) |*statement| statement.deinit();
+        self.activeCtes.deinit(self.allocator);
         self.clearSavepoints();
         self.savepoints.deinit(self.allocator);
         self.store.deinit();
@@ -550,6 +555,76 @@ pub const Connection = struct {
         self.transactionActive = false;
     }
 
+    fn beginStatementAtomic(self: *Connection) !void {
+        if (self.inAtomicStatement) return;
+        self.statementBackup = try self.store.clone();
+        self.inAtomicStatement = true;
+    }
+
+    fn endStatementAtomic(self: *Connection) void {
+        if (!self.inAtomicStatement) return;
+        if (self.statementBackup) |*backup| backup.deinit();
+        self.statementBackup = null;
+        self.inAtomicStatement = false;
+    }
+
+    fn abortStatementAtomic(self: *Connection) void {
+        if (!self.inAtomicStatement) return;
+        if (self.statementBackup != null) {
+            self.store.deinit();
+            self.store = self.statementBackup.?;
+            self.statementBackup = null;
+        }
+        self.inAtomicStatement = false;
+    }
+
+    fn resolveStatementError(self: *Connection, policy: ast.ConflictPolicy) void {
+        switch (policy) {
+            .none, .abort, .update => self.abortStatementAtomic(),
+            .fail => self.endStatementAtomic(),
+            .rollback => {
+                if (self.transactionActive) {
+                    self.rollback() catch {};
+                    self.endStatementAtomic();
+                } else self.abortStatementAtomic();
+            },
+            .ignore, .replace => self.endStatementAtomic(),
+        }
+    }
+
+    fn executeInsertAtomic(self: *Connection, value: anytype, parameters: []const Value) !Result {
+        const nested = self.inAtomicStatement;
+        if (!nested) try self.beginStatementAtomic();
+        const result = self.insertInto(value, parameters) catch |err| {
+            if (!nested) self.resolveStatementError(value.conflict);
+            return err;
+        };
+        if (!nested) self.endStatementAtomic();
+        return result;
+    }
+
+    fn executeUpdateAtomic(self: *Connection, value: anytype, parameters: []const Value) !Result {
+        const nested = self.inAtomicStatement;
+        if (!nested) try self.beginStatementAtomic();
+        const result = self.update(value, parameters) catch |err| {
+            if (!nested) self.resolveStatementError(value.conflict);
+            return err;
+        };
+        if (!nested) self.endStatementAtomic();
+        return result;
+    }
+
+    fn executeDeleteAtomic(self: *Connection, value: anytype, parameters: []const Value) !Result {
+        const nested = self.inAtomicStatement;
+        if (!nested) try self.beginStatementAtomic();
+        const result = self.delete(value, parameters) catch |err| {
+            if (!nested) self.abortStatementAtomic();
+            return err;
+        };
+        if (!nested) self.endStatementAtomic();
+        return result;
+    }
+
     pub fn transaction(self: *Connection, callback: anytype) !void {
         try self.begin();
         errdefer self.rollback() catch {};
@@ -648,15 +723,15 @@ pub const Connection = struct {
             .dropIndex => |value| try self.dropIndexCommand(value.name, value.ifExists),
             .dropView => |value| try self.dropViewCommand(value.name, value.ifExists),
             .dropTrigger => |value| try self.dropTriggerCommand(value.name, value.ifExists),
-            .insert => |value| try self.insertInto(value, parameters),
+            .insert => |value| try self.executeInsertAtomic(value, parameters),
             .select => |value| try self.selectWithOuter(value, parameters, outer),
             .withSelect => |value| try self.executeWith(value, parameters),
             .compoundSelect => |compound| try self.executeCompoundWithOuter(compound, parameters, outer),
             .explainQueryPlan => |querySql| try self.explainQueryPlan(querySql),
             .pragma => |value| try self.executePragma(value),
             .alterTable => |value| try self.alterTableCommand(value),
-            .update => |value| try self.update(value, parameters),
-            .delete => |value| try self.delete(value, parameters),
+            .update => |value| try self.executeUpdateAtomic(value, parameters),
+            .delete => |value| try self.executeDeleteAtomic(value, parameters),
             .begin => blk: {
                 try self.begin();
                 break :blk try emptyResult(self.allocator);
@@ -1263,6 +1338,7 @@ pub const Connection = struct {
                     if (added == 0) break;
                 } else return error.RecursiveCteLimit;
             }
+            try self.activeCtes.append(self.allocator, cte.name);
             created += 1;
         }
         return created;
@@ -1272,8 +1348,14 @@ pub const Connection = struct {
         var remaining = ctes.len;
         while (remaining > 0) {
             remaining -= 1;
+            if (self.activeCtes.items.len != 0) _ = self.activeCtes.pop();
             self.store.dropTable(ctes[remaining].name) catch {};
         }
+    }
+
+    fn cteActive(self: *Connection, name: []const u8) bool {
+        for (self.activeCtes.items) |active| if (std.ascii.eqlIgnoreCase(active, name)) return true;
+        return false;
     }
 
     fn executeWith(self: *Connection, value: ast.WithSelect, parameters: []const Value) anyerror!Result {
@@ -2679,6 +2761,7 @@ pub const Connection = struct {
     }
 
     fn insertInto(self: *Connection, value: anytype, parameters: []const Value) anyerror!Result {
+        if (self.cteActive(value.table)) return error.InvalidSql;
         const table = self.store.find(value.table) orelse return error.UnknownTable;
         try validateReturningColumns(table, value.returning);
         var nonGenCount: usize = 0;
@@ -2957,8 +3040,9 @@ pub const Connection = struct {
         return .{ .allocator = self.allocator, .columns = try self.ownedColumns(columns.items), .rows = try rows.toOwnedSlice(self.allocator) };
     }
 
-    fn conflictRow(self: *Connection, table: *const Table, values: []const Value) anyerror!?usize {
+    fn conflictRow(self: *Connection, table: *const Table, values: []const Value, ignoreIndex: ?usize) anyerror!?usize {
         for (table.rows.items, 0..) |existing, rowIndex| {
+            if (ignoreIndex != null and ignoreIndex.? == rowIndex) continue;
             var matched = false;
             for (table.columns, 0..) |column, columnIdx| if ((column.primaryKey or column.unique) and values[columnIdx] != .null and sameValue(existing.values[columnIdx], values[columnIdx])) {
                 matched = true;
@@ -3020,7 +3104,7 @@ pub const Connection = struct {
 
     fn conflictRowTarget(self: *Connection, table: *const Table, values: []const Value, targetColumns: []const []const u8, targetWhere: ?ast.Conditions, parameters: []const Value) anyerror!?usize {
         if (targetColumns.len == 0) {
-            const rowIdx = (try self.conflictRow(table, values)) orelse return null;
+            const rowIdx = (try self.conflictRow(table, values, null)) orelse return null;
             if (targetWhere) |whereCond| {
                 if (!try self.matches(table, table.rows.items[rowIdx].values, whereCond, parameters)) return null;
             }
@@ -3155,14 +3239,18 @@ pub const Connection = struct {
         return .{ .updated = rowIndex };
     }
 
-    fn replaceConflict(self: *Connection, table: *Table, values: []const Value) anyerror!bool {
-        const rowIndex = (try self.conflictRow(table, values)) orelse return false;
+    fn deleteRowAt(self: *Connection, table: *Table, rowIndex: usize) !void {
         try self.applyDeleteActions(table.name, table.rows.items[rowIndex].values);
         try self.fireTriggers(table.name, .before, .delete, null, table.rows.items[rowIndex].values);
         const removed = table.rows.orderedRemove(rowIndex);
         try self.fireTriggers(table.name, .after, .delete, null, removed.values);
         for (removed.values) |item| if (item == .text) self.allocator.free(item.text) else if (item == .blob) self.allocator.free(item.blob);
         self.allocator.free(removed.values);
+    }
+
+    fn replaceConflict(self: *Connection, table: *Table, values: []const Value) anyerror!bool {
+        const rowIndex = (try self.conflictRow(table, values, null)) orelse return false;
+        try self.deleteRowAt(table, rowIndex);
         return true;
     }
 
@@ -4234,6 +4322,7 @@ pub const Connection = struct {
     }
 
     fn updateFrom(self: *Connection, value: anytype, parameters: []const Value) anyerror!Result {
+        if (self.cteActive(value.table)) return error.InvalidSql;
         const table = self.store.find(value.table) orelse return error.UnknownTable;
         for (value.columns) |name| {
             const index = try columnIndex(table, name);
@@ -4289,8 +4378,16 @@ pub const Connection = struct {
                 }
                 try self.recomputeGeneratedColumns(table, candidate, false);
                 try self.fireTriggers(table.name, .before, .update, candidate, row.values);
-                try self.store.validateUpdate(table, rowIndex, candidate);
-                try self.applyUpdateActions(table.name, row.values, candidate);
+                self.store.validateUpdate(table, rowIndex, candidate) catch |err| {
+                    if (err != error.ConstraintViolation) return err;
+                    if (value.conflict == .ignore) continue;
+                    return err;
+                };
+                self.applyUpdateActions(table.name, row.values, candidate) catch |err| {
+                    if (err != error.ConstraintViolation) return err;
+                    if (value.conflict == .ignore) continue;
+                    return err;
+                };
                 const oldSnapshot = try self.allocator.alloc(Value, row.values.len);
                 defer {
                     for (oldSnapshot) |item| if (item == .text) self.allocator.free(item.text) else if (item == .blob) self.allocator.free(item.blob);
@@ -4322,6 +4419,7 @@ pub const Connection = struct {
 
     fn update(self: *Connection, value: anytype, parameters: []const Value) !Result {
         if (value.from != null) return self.updateFrom(value, parameters);
+        if (self.cteActive(value.table)) return error.InvalidSql;
         const table = self.store.find(value.table) orelse return error.UnknownTable;
         try validateReturningColumns(table, value.returning);
         for (value.columns) |name| {
@@ -4331,7 +4429,12 @@ pub const Connection = struct {
         var affectedRows = std.ArrayList([]const Value).empty;
         defer affectedRows.deinit(self.allocator);
         var changes: usize = 0;
-        for (table.rows.items, 0..) |*row, rowIndex| if (try self.matches(table, row.values, value.condition, parameters)) {
+        var cursor: usize = 0;
+        outer: while (cursor < table.rows.items.len) {
+            var rowIndex = cursor;
+            cursor += 1;
+            var row = &table.rows.items[rowIndex];
+            if (!(try self.matches(table, row.values, value.condition, parameters))) continue :outer;
             const candidate = try self.allocator.alloc(Value, row.values.len);
             defer {
                 for (value.columns, value.values) |name, expr| {
@@ -4350,14 +4453,42 @@ pub const Connection = struct {
             for (value.columns, value.values) |name, expr| {
                 const index = try columnIndex(table, name);
                 var newValue = try self.eval(table, row.values, expr, parameters);
-                if (newValue == .null and table.columns[index].notNull) return error.ConstraintViolation;
-                if (table.strict) newValue = try Schema.coerceStrict(table.columns[index].typeName, newValue);
+                if (newValue == .null and table.columns[index].notNull) {
+                    if (value.conflict == .ignore) continue :outer;
+                    return error.ConstraintViolation;
+                }
+                if (table.strict) newValue = Schema.coerceStrict(table.columns[index].typeName, newValue) catch |err| {
+                    if (err == error.ConstraintViolation and value.conflict == .ignore) continue :outer;
+                    return err;
+                };
                 candidate[index] = newValue;
             }
             try self.recomputeGeneratedColumns(table, candidate, false);
             try self.fireTriggers(table.name, .before, .update, candidate, row.values);
-            try self.store.validateUpdate(table, rowIndex, candidate);
-            try self.applyUpdateActions(table.name, row.values, candidate);
+            self.store.validateUpdate(table, rowIndex, candidate) catch |err| {
+                if (err != error.ConstraintViolation) return err;
+                switch (value.conflict) {
+                    .ignore => continue :outer,
+                    .replace => {
+                        while (try self.conflictRow(table, candidate, rowIndex)) |bad| {
+                            try self.deleteRowAt(table, bad);
+                            if (bad < rowIndex) rowIndex -= 1;
+                            if (rowIndex >= table.rows.items.len) continue :outer;
+                            row = &table.rows.items[rowIndex];
+                            if (!(try self.matches(table, row.values, value.condition, parameters))) continue :outer;
+                        }
+                        try self.store.validateUpdate(table, rowIndex, candidate);
+                    },
+                    else => return err,
+                }
+            };
+            self.applyUpdateActions(table.name, row.values, candidate) catch |err| {
+                if (err != error.ConstraintViolation) return err;
+                switch (value.conflict) {
+                    .ignore => continue :outer,
+                    else => return err,
+                }
+            };
             const oldSnapshot = try self.allocator.alloc(Value, row.values.len);
             defer {
                 for (oldSnapshot) |item| if (item == .text) self.allocator.free(item.text) else if (item == .blob) self.allocator.free(item.blob);
@@ -4380,7 +4511,7 @@ pub const Connection = struct {
             changes += 1;
             try affectedRows.append(self.allocator, row.values);
             try self.fireTriggers(table.name, .after, .update, candidate, oldSnapshot);
-        };
+        }
         if (value.returning.len > 0) return self.evaluateReturning(table, value.returning, affectedRows.items, parameters);
         return .{ .allocator = self.allocator, .columns = try self.allocator.alloc([]const u8, 0), .rows = try self.allocator.alloc([]Value, 0), .changes = changes };
     }
@@ -4640,6 +4771,7 @@ pub const Connection = struct {
     }
 
     fn delete(self: *Connection, value: anytype, parameters: []const Value) !Result {
+        if (self.cteActive(value.table)) return error.InvalidSql;
         const table = self.store.find(value.table) orelse return error.UnknownTable;
         try validateReturningColumns(table, value.returning);
         var affectedRows = std.ArrayList([]Value).empty;
@@ -9688,4 +9820,229 @@ test "DSL creates partial and expression indexes" {
     try std.testing.expect(db.store.findIndexConst("dsl_idx_lower") != null);
     try std.testing.expect(db.store.findIndexConst("dsl_idx_combined") != null);
     try std.testing.expectError(error.ConstraintViolation, db.from(Item).insert(.{ .id = 4, .email = "A@TEST", .active = 1 }));
+}
+
+test "insert conflict policies control statement atomicity" {
+    const path = "sqlite_zig_conflict_atomicity_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    var setup = try db.exec("CREATE TABLE conflicts (id INTEGER, code TEXT UNIQUE);");
+    setup.deinit();
+    try std.testing.expectError(error.ConstraintViolation, db.exec("INSERT INTO conflicts VALUES (1, 'a'), (2, 'a');"));
+    var none = try db.exec("SELECT count(*) FROM conflicts;");
+    defer none.deinit();
+    try std.testing.expectEqual(@as(i64, 0), none.rows[0][0].integer);
+    try std.testing.expectError(error.ConstraintViolation, db.exec("INSERT OR ABORT INTO conflicts VALUES (3, 'b'), (4, 'b');"));
+    var aborted = try db.exec("SELECT count(*) FROM conflicts;");
+    defer aborted.deinit();
+    try std.testing.expectEqual(@as(i64, 0), aborted.rows[0][0].integer);
+    try std.testing.expectError(error.ConstraintViolation, db.exec("INSERT OR FAIL INTO conflicts VALUES (5, 'c'), (6, 'c');"));
+    var failed = try db.exec("SELECT id FROM conflicts ORDER BY id;");
+    defer failed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), failed.count());
+    try std.testing.expectEqual(@as(i64, 5), failed.rows[0][0].integer);
+    var cleanup = try db.exec("DELETE FROM conflicts;");
+    cleanup.deinit();
+    var begun = try db.exec("BEGIN;");
+    begun.deinit();
+    var first = try db.exec("INSERT INTO conflicts VALUES (7, 'd');");
+    first.deinit();
+    try std.testing.expectError(error.ConstraintViolation, db.exec("INSERT OR ROLLBACK INTO conflicts VALUES (8, 'd');"));
+    try std.testing.expectError(error.NotInTransaction, db.exec("COMMIT;"));
+    var rolled = try db.exec("SELECT count(*) FROM conflicts;");
+    defer rolled.deinit();
+    try std.testing.expectEqual(@as(i64, 0), rolled.rows[0][0].integer);
+    try std.testing.expectError(error.ConstraintViolation, db.exec("INSERT OR ROLLBACK INTO conflicts VALUES (9, 'e'), (10, 'e');"));
+    var outside = try db.exec("SELECT count(*) FROM conflicts;");
+    defer outside.deinit();
+    try std.testing.expectEqual(@as(i64, 0), outside.rows[0][0].integer);
+}
+
+test "insert DSL conflict policies match raw SQL" {
+    const Item = @import("../dsl/table.zig").table("dsl_conflict_items", struct { id: i64, code: []const u8 });
+    const path = "sqlite_zig_dsl_conflict_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    try db.createTable(Item, .{ .unique = &.{Item.columns.code} });
+    var first = try db.from(Item).insertOrFail(.{ .id = 1, .code = "a" });
+    first.deinit();
+    try std.testing.expectError(error.ConstraintViolation, db.from(Item).insertOrFail(.{ .id = 2, .code = "a" }));
+    var kept = try db.exec("SELECT id FROM dsl_conflict_items ORDER BY id;");
+    defer kept.deinit();
+    try std.testing.expectEqual(@as(usize, 1), kept.count());
+    try std.testing.expectError(error.ConstraintViolation, db.from(Item).insertOrAbort(.{ .id = 3, .code = "a" }));
+    var begun = try db.exec("BEGIN;");
+    begun.deinit();
+    var inside = try db.from(Item).insert(.{ .id = 4, .code = "b" });
+    inside.deinit();
+    try std.testing.expectError(error.ConstraintViolation, db.from(Item).insertOrRollback(.{ .id = 5, .code = "b" }));
+    try std.testing.expectError(error.NotInTransaction, db.exec("COMMIT;"));
+    var gone = try db.exec("SELECT count(*) FROM dsl_conflict_items;");
+    defer gone.deinit();
+    try std.testing.expectEqual(@as(i64, 1), gone.rows[0][0].integer);
+}
+
+test "update conflict policies skip or replace conflicting rows" {
+    const path = "sqlite_zig_update_conflict_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    var setup = try db.exec("CREATE TABLE upds (id INTEGER, code TEXT UNIQUE); INSERT INTO upds VALUES (1, 'a'), (2, 'b');");
+    setup.deinit();
+    try std.testing.expectError(error.ConstraintViolation, db.exec("UPDATE upds SET code = 'x';"));
+    var intact = try db.exec("SELECT code FROM upds ORDER BY id;");
+    defer intact.deinit();
+    try std.testing.expectEqualStrings("a", intact.rows[0][0].text);
+    try std.testing.expectEqualStrings("b", intact.rows[1][0].text);
+    var ignored = try db.exec("UPDATE OR IGNORE upds SET code = 'x';");
+    defer ignored.deinit();
+    try std.testing.expectEqual(@as(usize, 1), ignored.changes);
+    var skipped = try db.exec("SELECT code FROM upds ORDER BY id;");
+    defer skipped.deinit();
+    try std.testing.expectEqualStrings("x", skipped.rows[0][0].text);
+    try std.testing.expectEqualStrings("b", skipped.rows[1][0].text);
+    var replaced = try db.exec("UPDATE OR REPLACE upds SET code = 'b' WHERE id = 1;");
+    defer replaced.deinit();
+    try std.testing.expectEqual(@as(usize, 1), replaced.changes);
+    var final = try db.exec("SELECT id, code FROM upds ORDER BY id;");
+    defer final.deinit();
+    try std.testing.expectEqual(@as(usize, 1), final.count());
+    try std.testing.expectEqual(@as(i64, 1), final.rows[0][0].integer);
+    try std.testing.expectEqualStrings("b", final.rows[0][1].text);
+}
+
+test "update or rollback discards the enclosing transaction" {
+    const path = "sqlite_zig_update_rollback_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    var setup = try db.exec("CREATE TABLE rb (id INTEGER, code TEXT UNIQUE); INSERT INTO rb VALUES (1, 'a'), (2, 'b');");
+    setup.deinit();
+    var begun = try db.exec("BEGIN;");
+    begun.deinit();
+    var good = try db.exec("UPDATE rb SET code = 'c' WHERE id = 1;");
+    good.deinit();
+    try std.testing.expectError(error.ConstraintViolation, db.exec("UPDATE OR ROLLBACK rb SET code = 'c' WHERE id = 2;"));
+    try std.testing.expectError(error.NotInTransaction, db.exec("COMMIT;"));
+    var rows = try db.exec("SELECT code FROM rb ORDER BY id;");
+    defer rows.deinit();
+    try std.testing.expectEqualStrings("a", rows.rows[0][0].text);
+    try std.testing.expectEqualStrings("b", rows.rows[1][0].text);
+}
+
+test "delete failures roll back the statement" {
+    const path = "sqlite_zig_delete_atomicity_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    var setup = try db.exec("CREATE TABLE del_parent (id INTEGER PRIMARY KEY); CREATE TABLE del_child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES del_parent(id) ON DELETE RESTRICT); INSERT INTO del_parent VALUES (1), (2); INSERT INTO del_child VALUES (10, 2);");
+    setup.deinit();
+    var off = try db.exec("PRAGMA foreign_keys = ON;");
+    off.deinit();
+    try std.testing.expectError(error.ConstraintViolation, db.exec("DELETE FROM del_parent;"));
+    var parents = try db.exec("SELECT count(*) FROM del_parent;");
+    defer parents.deinit();
+    try std.testing.expectEqual(@as(i64, 2), parents.rows[0][0].integer);
+    var children = try db.exec("SELECT count(*) FROM del_child;");
+    defer children.deinit();
+    try std.testing.expectEqual(@as(i64, 1), children.rows[0][0].integer);
+}
+
+test "statement errors preserve enclosing savepoints" {
+    const path = "sqlite_zig_statement_savepoint_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    var setup = try db.exec("CREATE TABLE sps (id INTEGER, code TEXT UNIQUE);");
+    setup.deinit();
+    var begun = try db.exec("BEGIN;");
+    begun.deinit();
+    var first = try db.exec("INSERT INTO sps VALUES (1, 'a');");
+    first.deinit();
+    var point = try db.exec("SAVEPOINT sp1;");
+    point.deinit();
+    try std.testing.expectError(error.ConstraintViolation, db.exec("INSERT INTO sps VALUES (2, 'a'), (3, 'b');"));
+    var back = try db.exec("ROLLBACK TO sp1;");
+    back.deinit();
+    var released = try db.exec("RELEASE sp1;");
+    released.deinit();
+    var committed = try db.exec("COMMIT;");
+    committed.deinit();
+    var rows = try db.exec("SELECT id FROM sps ORDER BY id;");
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(usize, 1), rows.count());
+    try std.testing.expectEqual(@as(i64, 1), rows.rows[0][0].integer);
+}
+
+test "with clause backs insert, update, and delete" {
+    const path = "sqlite_zig_cte_mutation_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    var setup = try db.exec("CREATE TABLE cte_items (id INTEGER, label TEXT); CREATE TABLE cte_archive (id INTEGER, label TEXT); INSERT INTO cte_items VALUES (1, 'one'), (2, 'two'), (3, 'three');");
+    setup.deinit();
+    var copied = try db.exec("WITH big AS (SELECT id, label FROM cte_items WHERE id > 1) INSERT INTO cte_archive SELECT id, label FROM big;");
+    defer copied.deinit();
+    try std.testing.expectEqual(@as(usize, 2), copied.changes);
+    var archived = try db.exec("SELECT id FROM cte_archive ORDER BY id;");
+    defer archived.deinit();
+    try std.testing.expectEqual(@as(usize, 2), archived.count());
+    try std.testing.expectEqual(@as(i64, 2), archived.rows[0][0].integer);
+    var updated = try db.exec("WITH target AS (SELECT id FROM cte_items WHERE id = 1) UPDATE cte_items SET label = 'ONE' WHERE id IN (SELECT id FROM target);");
+    defer updated.deinit();
+    try std.testing.expectEqual(@as(usize, 1), updated.changes);
+    var renamed = try db.exec("SELECT label FROM cte_items WHERE id = 1;");
+    defer renamed.deinit();
+    try std.testing.expectEqualStrings("ONE", renamed.rows[0][0].text);
+    var deleted = try db.exec("WITH gone AS (SELECT id FROM cte_items WHERE id = 3) DELETE FROM cte_items WHERE id IN (SELECT id FROM gone);");
+    defer deleted.deinit();
+    try std.testing.expectEqual(@as(usize, 1), deleted.changes);
+    var remaining = try db.exec("SELECT count(*) FROM cte_items;");
+    defer remaining.deinit();
+    try std.testing.expectEqual(@as(i64, 2), remaining.rows[0][0].integer);
+}
+
+test "with recursive backs insert with returning" {
+    const path = "sqlite_zig_cte_recursive_mutation_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    var setup = try db.exec("CREATE TABLE fib (n INTEGER);");
+    setup.deinit();
+    var inserted = try db.exec("WITH RECURSIVE nums AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM nums WHERE n < 4) INSERT INTO fib SELECT n FROM nums RETURNING n;");
+    defer inserted.deinit();
+    try std.testing.expectEqual(@as(usize, 4), inserted.count());
+    try std.testing.expectEqual(@as(i64, 1), inserted.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 4), inserted.rows[3][0].integer);
+    var rows = try db.exec("SELECT sum(n) FROM fib;");
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(i64, 10), rows.rows[0][0].integer);
+}
+
+test "writing to a cte name fails without changing state" {
+    const path = "sqlite_zig_cte_write_guard_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    var setup = try db.exec("CREATE TABLE real_items (id INTEGER); INSERT INTO real_items VALUES (1);");
+    setup.deinit();
+    try std.testing.expectError(error.InvalidSql, db.exec("WITH tmp AS (SELECT id FROM real_items) INSERT INTO tmp VALUES (2);"));
+    try std.testing.expectError(error.InvalidSql, db.exec("WITH tmp AS (SELECT id FROM real_items) UPDATE tmp SET id = 9;"));
+    try std.testing.expectError(error.InvalidSql, db.exec("WITH tmp AS (SELECT id FROM real_items) DELETE FROM tmp;"));
+    var rows = try db.exec("SELECT count(*) FROM real_items;");
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(i64, 1), rows.rows[0][0].integer);
+    try std.testing.expectError(error.UnknownTable, db.exec("SELECT count(*) FROM tmp;"));
+}
+
+test "with clause combines with upsert and constraints" {
+    const path = "sqlite_zig_cte_upsert_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    var setup = try db.exec("CREATE TABLE upsert_items (id INTEGER PRIMARY KEY, label TEXT); INSERT INTO upsert_items VALUES (1, 'old');");
+    setup.deinit();
+    var merged = try db.exec("WITH fresh AS (SELECT 1 AS id, 'new' AS label UNION ALL SELECT 2, 'two') INSERT INTO upsert_items SELECT id, label FROM fresh ON CONFLICT(id) DO UPDATE SET label = excluded.label;");
+    defer merged.deinit();
+    var rows = try db.exec("SELECT id, label FROM upsert_items ORDER BY id;");
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(usize, 2), rows.count());
+    try std.testing.expectEqualStrings("new", rows.rows[0][1].text);
+    try std.testing.expectEqualStrings("two", rows.rows[1][1].text);
+    try std.testing.expectError(error.ConstraintViolation, db.exec("WITH bad AS (SELECT 1 AS id) INSERT INTO upsert_items (id) VALUES (1);"));
+    var intact = try db.exec("SELECT count(*) FROM upsert_items;");
+    defer intact.deinit();
+    try std.testing.expectEqual(@as(i64, 2), intact.rows[0][0].integer);
 }

@@ -658,7 +658,7 @@ pub fn buildSelect(allocator: std.mem.Allocator, args: SelectArgs) !BuiltStateme
     return .{ .stmt = stmt, .ownedStrings = ctx.takeStrings(), .allocator = allocator };
 }
 
-pub fn buildInsert(allocator: std.mem.Allocator, table: []const u8, columns: []const []const u8, values: []const Value, conflict: ast.InsertConflict, returning: []const dslExpr.Projection, cases: []const CaseBuilder, upsert: UpsertArgs) !BuiltStatement {
+pub fn buildInsert(allocator: std.mem.Allocator, table: []const u8, columns: []const []const u8, values: []const Value, conflict: ast.ConflictPolicy, returning: []const dslExpr.Projection, cases: []const CaseBuilder, upsert: UpsertArgs) !BuiltStatement {
     if (columns.len == 0 or columns.len != values.len) return error.InvalidSql;
     var ctx = Ctx.init(allocator);
     errdefer ctx.fail();

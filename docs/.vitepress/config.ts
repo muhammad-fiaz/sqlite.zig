@@ -11,7 +11,10 @@ export const ICON_32 = `${SITE_BASE}/favicon-32x32.png`;
 export const ICON_APPLE = `${SITE_BASE}/apple-touch-icon.png`;
 export const ICON_192 = `${SITE_BASE}/android-chrome-192x192.png`;
 export const ICON_512 = `${SITE_BASE}/android-chrome-512x512.png`;
-export const OG_IMAGE = `${SITE_URL}/android-chrome-512x512.png`;
+export const LOGO = `${SITE_BASE}/logo.png`;
+export const OG_IMAGE = `${SITE_URL}/logo.png`;
+export const OG_IMAGE_WIDTH = "1536";
+export const OG_IMAGE_HEIGHT = "1024";
 export const SITE_NAME = "sqlite.zig";
 export const SITE_TAGLINE = "Native SQLite-Compatible Database Engine in Zig";
 export const SITE_DESCRIPTION =
@@ -67,8 +70,8 @@ export default defineConfig({
     ["meta", { property: "og:title", content: `${SITE_TAGLINE} | ${SITE_NAME}` }],
     ["meta", { property: "og:description", content: SITE_DESCRIPTION }],
     ["meta", { property: "og:image", content: OG_IMAGE }],
-    ["meta", { property: "og:image:width", content: "512" }],
-    ["meta", { property: "og:image:height", content: "512" }],
+    ["meta", { property: "og:image:width", content: OG_IMAGE_WIDTH }],
+    ["meta", { property: "og:image:height", content: OG_IMAGE_HEIGHT }],
     ["meta", { property: "og:image:type", content: "image/png" }],
     ["meta", { property: "og:image:alt", content: `${SITE_TAGLINE} | ${SITE_NAME}` }],
     ["meta", { property: "og:site_name", content: SITE_NAME }],
@@ -79,7 +82,7 @@ export default defineConfig({
     ["meta", { name: "twitter:url", content: SITE_URL }],
     ["meta", { name: "twitter:title", content: `${SITE_TAGLINE} | ${SITE_NAME}` }],
     ["meta", { name: "twitter:description", content: SITE_DESCRIPTION }],
-    ["meta", { name: "twitter:image", content: `${SITE_URL}/favicon.png` }],
+    ["meta", { name: "twitter:image", content: OG_IMAGE }],
     ["meta", { name: "twitter:image:alt", content: `${SITE_TAGLINE} | ${SITE_NAME}` }],
     ["meta", { name: "twitter:site", content: "@muhammadfiaz_" }],
     ["meta", { name: "twitter:creator", content: "@muhammadfiaz_" }],
@@ -154,8 +157,8 @@ export default defineConfig({
       ["meta", { property: "og:description", content: pageDescription }],
       ["meta", { property: "og:url", content: canonicalUrl }],
       ["meta", { property: "og:image", content: OG_IMAGE }],
-      ["meta", { property: "og:image:width", content: "512" }],
-      ["meta", { property: "og:image:height", content: "512" }],
+      ["meta", { property: "og:image:width", content: OG_IMAGE_WIDTH }],
+      ["meta", { property: "og:image:height", content: OG_IMAGE_HEIGHT }],
       ["meta", { property: "og:site_name", content: SITE_NAME }],
       ["meta", { property: "og:locale", content: "en_US" }],
       ["meta", { name: "twitter:card", content: "summary_large_image" }],
@@ -185,8 +188,8 @@ export default defineConfig({
       logo: {
         "@type": "ImageObject",
         url: OG_IMAGE,
-        width: 512,
-        height: 512,
+        width: 1536,
+        height: 1024,
       },
     };
 

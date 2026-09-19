@@ -60,7 +60,7 @@ pub const TriggerDef = struct { name: []const u8, table: []const u8, timing: Tri
 pub const VirtualTableDef = struct { name: []const u8, module: []const u8, arguments: []const []const u8, ifNotExists: bool = false };
 pub const CteDef = struct { name: []const u8, querySql: []const u8, recursiveSql: ?[]const u8 = null };
 pub const WithSelect = struct { ctes: []CteDef, bodySql: []const u8, recursive: bool = false };
-pub const InsertConflict = enum { none, ignore, replace, update };
+pub const ConflictPolicy = enum { none, ignore, replace, update, abort, fail, rollback };
 pub const UpsertResult = enum { noConflict, skipped, updated };
 pub const UpdateFrom = struct { table: []const u8, leftTable: []const u8, leftColumn: []const u8, rightTable: []const u8, rightColumn: []const u8 };
 pub const AlterTable = union(enum) {
@@ -88,9 +88,9 @@ pub const Statement = union(enum) {
     dropIndex: struct { name: []const u8, ifExists: bool = false },
     dropView: struct { name: []const u8, ifExists: bool = false },
     dropTrigger: struct { name: []const u8, ifExists: bool = false },
-    insert: struct { table: []const u8, columns: []const []const u8, rows: []const []const Expr, selectSql: ?[]const u8 = null, conflict: InsertConflict = .none, conflictTargetColumns: []const []const u8 = &.{}, conflictTargetWhere: ?Conditions = null, upsertColumns: []const []const u8 = &.{}, upsertValues: []const Expr = &.{}, upsertWhere: ?Conditions = null, returning: []const Projection = &.{} },
+    insert: struct { table: []const u8, columns: []const []const u8, rows: []const []const Expr, selectSql: ?[]const u8 = null, conflict: ConflictPolicy = .none, conflictTargetColumns: []const []const u8 = &.{}, conflictTargetWhere: ?Conditions = null, upsertColumns: []const []const u8 = &.{}, upsertValues: []const Expr = &.{}, upsertWhere: ?Conditions = null, returning: []const Projection = &.{} },
     select: struct { projections: []const Projection, table: ?[]const u8, tableAlias: ?[]const u8 = null, fromSubquery: ?[]const u8 = null, joins: []const Join = &.{}, condition: ?Conditions, groupBy: ?[]const u8 = null, having: ?Having = null, order: ?Order, limit: ?usize, offset: ?usize = null, distinct: bool = false },
-    update: struct { table: []const u8, columns: []const []const u8, values: []const Expr, condition: ?Conditions, from: ?UpdateFrom = null, returning: []const Projection = &.{} },
+    update: struct { table: []const u8, columns: []const []const u8, values: []const Expr, condition: ?Conditions, from: ?UpdateFrom = null, conflict: ConflictPolicy = .none, returning: []const Projection = &.{} },
     delete: struct { table: []const u8, condition: ?Conditions, returning: []const Projection = &.{} },
     begin,
     commit,

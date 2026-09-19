@@ -976,7 +976,7 @@ pub const Schema = struct {
 
     pub fn clone(self: *const Schema) !Schema {
         var result = Schema.init(self.allocator);
-        result.foreignKeysEnabled = self.foreignKeysEnabled;
+        result.foreignKeysEnabled = false;
         errdefer result.deinit();
         for (self.tables.items) |table| {
             if (table.virtualModule) |module| {
@@ -1018,6 +1018,7 @@ pub const Schema = struct {
         }
         for (self.views.items) |view| try result.createView(view.name, view.sql);
         for (self.triggers.items) |trigger| try result.createTrigger(.{ .name = trigger.name, .table = trigger.table, .timing = trigger.timing, .event = trigger.event, .whenSql = trigger.whenSql, .body = trigger.body });
+        result.foreignKeysEnabled = self.foreignKeysEnabled;
         return result;
     }
 };

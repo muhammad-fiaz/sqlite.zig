@@ -279,6 +279,7 @@ pub const Parser = struct {
             defer ast.deinit(self.allocator, &queryStatement);
             const queryEnd = self.current().position;
             var recursiveSql: ?[]const u8 = null;
+            var compoundEnd = queryEnd;
             if (self.acceptWord("union")) {
                 _ = self.acceptWord("all");
                 const recursiveStart = self.current().position;
@@ -286,16 +287,41 @@ pub const Parser = struct {
                 var recursiveStatement = try self.parseSelect();
                 defer ast.deinit(self.allocator, &recursiveStatement);
                 const recursiveEnd = self.current().position;
-                recursiveSql = try self.copy(self.source[recursiveStart..recursiveEnd]);
+                if (recursive) {
+                    recursiveSql = try self.copy(self.source[recursiveStart..recursiveEnd]);
+                } else {
+                    compoundEnd = recursiveEnd;
+                    while (self.acceptWord("union")) {
+                        _ = self.acceptWord("all");
+                        try self.requireWord("select");
+                        var extraStatement = try self.parseSelect();
+                        defer ast.deinit(self.allocator, &extraStatement);
+                        compoundEnd = self.current().position;
+                    }
+                }
             }
             try self.requireTag(.rparen);
-            try ctes.append(self.allocator, .{ .name = name, .querySql = try self.copy(self.source[queryStart..queryEnd]), .recursiveSql = recursiveSql });
+            try ctes.append(self.allocator, .{ .name = name, .querySql = try self.copy(self.source[queryStart..compoundEnd]), .recursiveSql = recursiveSql });
             if (!self.acceptTag(.comma)) break;
         }
         const bodyStart = self.current().position;
-        try self.requireWord("select");
-        var bodyStatement = try self.parseSelect();
-        defer ast.deinit(self.allocator, &bodyStatement);
+        if (self.current().tag == .word and std.ascii.eqlIgnoreCase(self.current().text, "select")) {
+            _ = self.advance();
+            var bodyStatement = try self.parseSelect();
+            defer ast.deinit(self.allocator, &bodyStatement);
+        } else if (self.current().tag == .word and std.ascii.eqlIgnoreCase(self.current().text, "insert")) {
+            _ = self.advance();
+            var bodyStatement = try self.parseInsert();
+            defer ast.deinit(self.allocator, &bodyStatement);
+        } else if (self.current().tag == .word and std.ascii.eqlIgnoreCase(self.current().text, "update")) {
+            _ = self.advance();
+            var bodyStatement = try self.parseUpdate();
+            defer ast.deinit(self.allocator, &bodyStatement);
+        } else if (self.current().tag == .word and std.ascii.eqlIgnoreCase(self.current().text, "delete")) {
+            _ = self.advance();
+            var bodyStatement = try self.parseDelete();
+            defer ast.deinit(self.allocator, &bodyStatement);
+        } else return Error.UnexpectedToken;
         const bodyEnd = self.current().position;
         return .{ .withSelect = .{ .ctes = try ctes.toOwnedSlice(self.allocator), .bodySql = try self.copy(self.source[bodyStart..bodyEnd]), .recursive = recursive } };
     }
@@ -1261,12 +1287,12 @@ pub const Parser = struct {
     }
 
     fn parseInsert(self: *Parser) !ast.Statement {
-        var conflict: ast.InsertConflict = .none;
+        var conflict: ast.ConflictPolicy = .none;
         var upsertColumns: []const []const u8 = &.{};
         var upsertValues: []const ast.Expr = &.{};
         var upsertWhere: ?ast.Conditions = null;
         if (self.acceptWord("or")) {
-            if (self.acceptWord("ignore")) conflict = .ignore else if (self.acceptWord("replace")) conflict = .replace else return Error.UnexpectedToken;
+            if (self.acceptWord("ignore")) conflict = .ignore else if (self.acceptWord("replace")) conflict = .replace else if (self.acceptWord("abort")) conflict = .abort else if (self.acceptWord("fail")) conflict = .fail else if (self.acceptWord("rollback")) conflict = .rollback else return Error.UnexpectedToken;
         }
         try self.requireWord("into");
         const table = try self.word();
@@ -1570,6 +1596,7 @@ pub const Parser = struct {
             std.ascii.eqlIgnoreCase(text, "except") or
             std.ascii.eqlIgnoreCase(text, "on") or
             std.ascii.eqlIgnoreCase(text, "using") or
+            std.ascii.eqlIgnoreCase(text, "returning") or
             std.ascii.eqlIgnoreCase(text, "window");
     }
 
@@ -1790,6 +1817,10 @@ pub const Parser = struct {
     }
 
     fn parseUpdate(self: *Parser) !ast.Statement {
+        var updateConflict: ast.ConflictPolicy = .none;
+        if (self.acceptWord("or")) {
+            if (self.acceptWord("ignore")) updateConflict = .ignore else if (self.acceptWord("replace")) updateConflict = .replace else if (self.acceptWord("abort")) updateConflict = .abort else if (self.acceptWord("fail")) updateConflict = .fail else if (self.acceptWord("rollback")) updateConflict = .rollback else return Error.UnexpectedToken;
+        }
         const table = try self.word();
         try self.requireWord("set");
         var columns = std.ArrayList([]const u8).empty;
@@ -1827,7 +1858,7 @@ pub const Parser = struct {
             }
         } else condition = try self.parseCondition();
         const returning = try self.parseReturning();
-        return .{ .update = .{ .table = table, .columns = try columns.toOwnedSlice(self.allocator), .values = try values.toOwnedSlice(self.allocator), .condition = condition, .from = from, .returning = returning } };
+        return .{ .update = .{ .table = table, .columns = try columns.toOwnedSlice(self.allocator), .values = try values.toOwnedSlice(self.allocator), .condition = condition, .from = from, .conflict = updateConflict, .returning = returning } };
     }
 
     fn tryParseUpdatePair(self: *Parser) ?struct { leftTable: []const u8, leftColumn: []const u8, rightTable: []const u8, rightColumn: []const u8 } {
@@ -2015,6 +2046,50 @@ test "parser parses returning clause for insert, update, and delete" {
     defer ast.deinit(std.testing.allocator, &s3);
     try std.testing.expect(s3 == .delete);
     try std.testing.expectEqual(@as(usize, 1), s3.delete.returning.len);
+}
+
+test "parser parses with clause backing mutations" {
+    var p1 = try Parser.init(std.testing.allocator, "WITH big AS (SELECT id FROM items) INSERT INTO archive SELECT id FROM big;");
+    defer p1.deinit();
+    var s1 = try p1.parse();
+    defer ast.deinit(std.testing.allocator, &s1);
+    try std.testing.expect(s1 == .withSelect);
+    try std.testing.expectEqual(@as(usize, 1), s1.withSelect.ctes.len);
+    var p2 = try Parser.init(std.testing.allocator, "WITH RECURSIVE nums AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM nums WHERE n < 4) INSERT INTO fib SELECT n FROM nums;");
+    defer p2.deinit();
+    var s2 = try p2.parse();
+    defer ast.deinit(std.testing.allocator, &s2);
+    try std.testing.expect(s2 == .withSelect);
+    var p3 = try Parser.init(std.testing.allocator, "INSERT INTO fib SELECT n FROM nums RETURNING n;");
+    defer p3.deinit();
+    var s3 = try p3.parse();
+    defer ast.deinit(std.testing.allocator, &s3);
+    try std.testing.expect(s3 == .insert);
+}
+
+test "parser parses conflict policies on insert and update" {
+    var p1 = try Parser.init(std.testing.allocator, "INSERT OR ROLLBACK INTO users VALUES (1);");
+    defer p1.deinit();
+    var s1 = try p1.parse();
+    defer ast.deinit(std.testing.allocator, &s1);
+    try std.testing.expect(s1 == .insert);
+    try std.testing.expectEqual(ast.ConflictPolicy.rollback, s1.insert.conflict);
+    var p2 = try Parser.init(std.testing.allocator, "INSERT OR FAIL INTO users VALUES (1);");
+    defer p2.deinit();
+    var s2 = try p2.parse();
+    defer ast.deinit(std.testing.allocator, &s2);
+    try std.testing.expectEqual(ast.ConflictPolicy.fail, s2.insert.conflict);
+    var p3 = try Parser.init(std.testing.allocator, "UPDATE OR IGNORE users SET name = 'x';");
+    defer p3.deinit();
+    var s3 = try p3.parse();
+    defer ast.deinit(std.testing.allocator, &s3);
+    try std.testing.expect(s3 == .update);
+    try std.testing.expectEqual(ast.ConflictPolicy.ignore, s3.update.conflict);
+    var p4 = try Parser.init(std.testing.allocator, "UPDATE OR REPLACE users SET name = 'x';");
+    defer p4.deinit();
+    var s4 = try p4.parse();
+    defer ast.deinit(std.testing.allocator, &s4);
+    try std.testing.expectEqual(ast.ConflictPolicy.replace, s4.update.conflict);
 }
 
 test "parser parses table constraints, generated columns, strict, and without rowid" {

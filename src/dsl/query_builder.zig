@@ -564,6 +564,18 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
             return self.insertWithMode(row, "OR REPLACE");
         }
 
+        pub fn insertOrAbort(self: Self, row: anytype) !Result {
+            return self.insertWithMode(row, "OR ABORT");
+        }
+
+        pub fn insertOrFail(self: Self, row: anytype) !Result {
+            return self.insertWithMode(row, "OR FAIL");
+        }
+
+        pub fn insertOrRollback(self: Self, row: anytype) !Result {
+            return self.insertWithMode(row, "OR ROLLBACK");
+        }
+
         pub fn insertSelect(self: Self, source: anytype) !Result {
             return self.insertSelectWithMode(source, "");
         }
@@ -576,8 +588,20 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
             return self.insertSelectWithMode(source, "OR REPLACE");
         }
 
+        pub fn insertSelectOrAbort(self: Self, source: anytype) !Result {
+            return self.insertSelectWithMode(source, "OR ABORT");
+        }
+
+        pub fn insertSelectOrFail(self: Self, source: anytype) !Result {
+            return self.insertSelectWithMode(source, "OR FAIL");
+        }
+
+        pub fn insertSelectOrRollback(self: Self, source: anytype) !Result {
+            return self.insertSelectWithMode(source, "OR ROLLBACK");
+        }
+
         fn insertSelectWithMode(self: Self, source: anytype, comptime mode: []const u8) !Result {
-            const conflict: ast.InsertConflict = if (comptime std.mem.eql(u8, mode, "")) .none else if (comptime std.mem.eql(u8, mode, "OR IGNORE")) .ignore else if (comptime std.mem.eql(u8, mode, "OR REPLACE")) .replace else @compileError("unknown insert mode");
+            const conflict: ast.ConflictPolicy = if (comptime std.mem.eql(u8, mode, "")) .none else if (comptime std.mem.eql(u8, mode, "OR IGNORE")) .ignore else if (comptime std.mem.eql(u8, mode, "OR REPLACE")) .replace else if (comptime std.mem.eql(u8, mode, "OR ABORT")) .abort else if (comptime std.mem.eql(u8, mode, "OR FAIL")) .fail else if (comptime std.mem.eql(u8, mode, "OR ROLLBACK")) .rollback else @compileError("unknown insert mode");
             const Source = @TypeOf(source);
             if (!@hasDecl(Source, "isMapped")) @compileError("insertSelect source must be a query builder from db.from(...)");
             if (Source.isMapped) @compileError("insertSelect source must return raw rows: project columns with .select(...)");
@@ -681,7 +705,7 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
         }
 
         fn insertWithMode(self: Self, row: anytype, comptime mode: []const u8) !Result {
-            const conflict: ast.InsertConflict = if (comptime std.mem.eql(u8, mode, "")) .none else if (comptime std.mem.eql(u8, mode, "OR IGNORE")) .ignore else if (comptime std.mem.eql(u8, mode, "OR REPLACE")) .replace else @compileError("unknown insert mode");
+            const conflict: ast.ConflictPolicy = if (comptime std.mem.eql(u8, mode, "")) .none else if (comptime std.mem.eql(u8, mode, "OR IGNORE")) .ignore else if (comptime std.mem.eql(u8, mode, "OR REPLACE")) .replace else if (comptime std.mem.eql(u8, mode, "OR ABORT")) .abort else if (comptime std.mem.eql(u8, mode, "OR FAIL")) .fail else if (comptime std.mem.eql(u8, mode, "OR ROLLBACK")) .rollback else @compileError("unknown insert mode");
             const RowType = @TypeOf(row);
             validateRow(RowType);
             if (Columns == void) {
@@ -1420,7 +1444,7 @@ pub fn UpsertBuilder(comptime Row: type, comptime Columns: type) type {
 
         pub fn insert(self: Self, row: anytype) !Result {
             if (self.action == .none) return error.InvalidSql;
-            const conflict: ast.InsertConflict = switch (self.action) {
+            const conflict: ast.ConflictPolicy = switch (self.action) {
                 .nothing => .ignore,
                 .update => .update,
                 .none => return error.InvalidSql,

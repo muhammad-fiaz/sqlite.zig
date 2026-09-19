@@ -8,7 +8,7 @@ hero:
   text: "Native SQLite-Compatible Database Engine in Zig"
   tagline: A fully native, zero-dependency SQLite-compatible database engine written entirely in Zig
   image:
-    src: /sqlite.zig/android-chrome-192x192.png
+    src: /logo.png
     alt: sqlite.zig logo
   actions:
     - theme: brand
@@ -51,7 +51,12 @@ const sqlite = @import("sqlite");
 const User = sqlite.table("users", struct { id: i64, name: []const u8 });
 
 pub fn main() !void {
+    // Open the database file. Every fallible call below propagates its
+    // error with `try`, so failures never go unnoticed.
     var db = try sqlite.open(std.heap.page_allocator, "my.db");
+    // Close only after every operation below has finished: `defer` runs
+    // last when `main` returns, on both success and error paths, which
+    // flushes pending writes and releases the file.
     defer db.close();
 
     try db.createTable(User, .{});
@@ -61,6 +66,11 @@ pub fn main() !void {
 
     var result = try db.from(User).fetch();
     defer result.deinit();
+
+    // Validate what came back before using it.
+    if (result.count() != 1) return error.UnexpectedRowCount;
+    const row = result.rows[0];
+    std.debug.print("User: id={d}, name={s}\n", .{ row.id, row.name });
 }
 ```
 
