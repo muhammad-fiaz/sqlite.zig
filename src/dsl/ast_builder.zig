@@ -7,7 +7,7 @@ const WindowBound = @import("column.zig").WindowBound;
 const Value = @import("../vm/value.zig").Value;
 const Result = @import("../connection/result.zig").Result;
 
-pub const CteInput = struct { name: []const u8, querySql: []const u8, recursiveSql: ?[]const u8 = null };
+pub const CteInput = struct { name: []const u8, querySql: []const u8, recursiveSql: ?[]const u8 = null, recursiveAll: bool = false };
 
 pub const ExecFn = *const fn (*anyopaque, *const ast.Statement, []const CteInput, bool) anyerror!Result;
 

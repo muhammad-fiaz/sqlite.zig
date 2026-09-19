@@ -58,7 +58,7 @@ pub const TriggerEvent = enum { insert, update, delete };
 pub const TriggerTiming = enum { before, after };
 pub const TriggerDef = struct { name: []const u8, table: []const u8, timing: TriggerTiming = .after, event: TriggerEvent, updateOf: []const []const u8 = &.{}, whenSql: ?[]const u8 = null, body: []const u8, ifNotExists: bool = false };
 pub const VirtualTableDef = struct { name: []const u8, module: []const u8, arguments: []const []const u8, ifNotExists: bool = false };
-pub const CteDef = struct { name: []const u8, columns: []const []const u8 = &.{}, querySql: []const u8, recursiveSql: ?[]const u8 = null };
+pub const CteDef = struct { name: []const u8, columns: []const []const u8 = &.{}, querySql: []const u8, recursiveSql: ?[]const u8 = null, recursiveAll: bool = false };
 pub const WithSelect = struct { ctes: []CteDef, bodySql: []const u8, recursive: bool = false };
 pub const ConflictPolicy = enum { none, ignore, replace, update, abort, fail, rollback };
 pub const UpsertResult = enum { noConflict, skipped, updated };

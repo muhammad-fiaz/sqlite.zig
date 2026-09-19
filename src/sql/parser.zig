@@ -288,9 +288,10 @@ pub const Parser = struct {
             defer ast.deinit(self.allocator, &queryStatement);
             const queryEnd = self.current().position;
             var recursiveSql: ?[]const u8 = null;
+            var recursiveAll = false;
             var compoundEnd = queryEnd;
             if (self.acceptWord("union")) {
-                _ = self.acceptWord("all");
+                const isAll = self.acceptWord("all");
                 const recursiveStart = self.current().position;
                 try self.requireWord("select");
                 var recursiveStatement = try self.parseSelect();
@@ -298,6 +299,7 @@ pub const Parser = struct {
                 const recursiveEnd = self.current().position;
                 if (recursive) {
                     recursiveSql = try self.copy(self.source[recursiveStart..recursiveEnd]);
+                    recursiveAll = isAll;
                 } else {
                     compoundEnd = recursiveEnd;
                     while (self.acceptWord("union")) {
@@ -310,7 +312,7 @@ pub const Parser = struct {
                 }
             }
             try self.requireTag(.rparen);
-            try ctes.append(self.allocator, .{ .name = name, .columns = try columnList.toOwnedSlice(self.allocator), .querySql = try self.copy(self.source[queryStart..compoundEnd]), .recursiveSql = recursiveSql });
+            try ctes.append(self.allocator, .{ .name = name, .columns = try columnList.toOwnedSlice(self.allocator), .querySql = try self.copy(self.source[queryStart..compoundEnd]), .recursiveSql = recursiveSql, .recursiveAll = recursiveAll });
             if (!self.acceptTag(.comma)) break;
         }
         const bodyStart = self.current().position;

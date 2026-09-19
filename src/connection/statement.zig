@@ -1,5 +1,6 @@
 const std = @import("std");
 const Value = @import("../vm/value.zig").Value;
+const Result = @import("result.zig").Result;
 
 pub const Statement = struct {
     connection: *anyopaque,
@@ -7,6 +8,7 @@ pub const Statement = struct {
     allocator: std.mem.Allocator,
     parameters: std.ArrayList(Value),
     executeFn: *const fn (*anyopaque, []const u8, []const Value) anyerror!void,
+    queryFn: *const fn (*anyopaque, []const u8, []const Value) anyerror!Result,
 
     pub fn bind(self: *Statement, index: usize, value: anytype) !void {
         const converted: Value = bindValue(value);
@@ -17,6 +19,10 @@ pub const Statement = struct {
 
     pub fn step(self: *Statement) !void {
         return self.executeFn(self.connection, self.sql, self.parameters.items);
+    }
+
+    pub fn query(self: *Statement) !Result {
+        return self.queryFn(self.connection, self.sql, self.parameters.items);
     }
 
     pub fn reset(self: *Statement) void {
@@ -49,7 +55,7 @@ pub const Statement = struct {
 test "statement parameter binding stores values" {
     var parameters = std.ArrayList(Value).empty;
     defer parameters.deinit(std.testing.allocator);
-    var statement = Statement{ .connection = undefined, .sql = try std.testing.allocator.dupe(u8, ""), .allocator = std.testing.allocator, .parameters = parameters, .executeFn = undefined };
+    var statement = Statement{ .connection = undefined, .sql = try std.testing.allocator.dupe(u8, ""), .allocator = std.testing.allocator, .parameters = parameters, .executeFn = undefined, .queryFn = undefined };
     defer statement.finalize();
     try statement.bind(1, 12);
     try std.testing.expectEqual(@as(i64, 12), statement.parameters.items[0].integer);

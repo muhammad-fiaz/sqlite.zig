@@ -140,7 +140,7 @@ pub const Connection = struct {
     }
 
     pub fn prepare(self: *Connection, sql: []const u8) !Prepared {
-        return .{ .connection = self, .sql = try self.allocator.dupe(u8, sql), .allocator = self.allocator, .parameters = .empty, .executeFn = executePrepared };
+        return .{ .connection = self, .sql = try self.allocator.dupe(u8, sql), .allocator = self.allocator, .parameters = .empty, .executeFn = executePrepared, .queryFn = queryPrepared };
     }
 
     fn executeBytecode(self: *Connection, sql: []const u8) !Result {
@@ -470,7 +470,7 @@ pub const Connection = struct {
         if (ctes.len == 0) return self.executeStatement(stmt.*, &.{}, null);
         var defs = try self.allocator.alloc(ast.CteDef, ctes.len);
         defer self.allocator.free(defs);
-        for (ctes, 0..) |cte, index| defs[index] = .{ .name = cte.name, .querySql = cte.querySql, .recursiveSql = cte.recursiveSql };
+        for (ctes, 0..) |cte, index| defs[index] = .{ .name = cte.name, .querySql = cte.querySql, .recursiveSql = cte.recursiveSql, .recursiveAll = cte.recursiveAll };
         const created = try self.setupCtes(defs, recursive, &.{});
         errdefer self.teardownCtes(defs[0..created]);
         const result = try self.executeStatement(stmt.*, &.{}, null);
@@ -524,6 +524,11 @@ pub const Connection = struct {
         const self: *Connection = @ptrCast(@alignCast(pointer));
         var result = try self.execute(sql, parameters);
         result.deinit();
+    }
+
+    fn queryPrepared(pointer: *anyopaque, sql: []const u8, parameters: []const Value) anyerror!Result {
+        const self: *Connection = @ptrCast(@alignCast(pointer));
+        return self.execute(sql, parameters);
     }
 
     pub fn begin(self: *Connection) !void {
@@ -1367,24 +1372,49 @@ pub const Connection = struct {
             for (source.rows) |row| try self.store.appendRow(table, row);
             if (cte.recursiveSql) |recursiveSql| {
                 if (!recursive) return error.Unsupported;
-                var iteration: usize = 0;
-                while (iteration < 1000) : (iteration += 1) {
-                    var next = try self.execute(recursiveSql, parameters);
-                    defer next.deinit();
-                    var added: usize = 0;
-                    for (next.rows) |row| {
-                        var exists = false;
-                        for (table.rows.items) |existing| if (rowsEqual(existing.values, row)) {
-                            exists = true;
-                            break;
-                        };
-                        if (!exists) {
-                            try self.store.appendRow(table, row);
-                            added += 1;
+                if (cte.recursiveAll) {
+                    var acc = std.ArrayList([]Value).empty;
+                    defer {
+                        for (acc.items) |row| {
+                            for (row) |item| if (item == .text) self.allocator.free(item.text) else if (item == .blob) self.allocator.free(item.blob);
+                            self.allocator.free(row);
                         }
+                        acc.deinit(self.allocator);
                     }
-                    if (added == 0) break;
-                } else return error.RecursiveCteLimit;
+                    for (table.rows.items) |row| try acc.append(self.allocator, try self.cloneCompoundRow(row.values));
+                    var iteration: usize = 0;
+                    while (iteration < 1000) : (iteration += 1) {
+                        var next = try self.execute(recursiveSql, parameters);
+                        defer next.deinit();
+                        if (next.rows.len == 0) break;
+                        for (next.rows) |row| try acc.append(self.allocator, try self.cloneCompoundRow(row));
+                        try self.store.truncateTable(cte.name);
+                        const batch = self.store.find(cte.name).?;
+                        for (next.rows) |row| try self.store.appendRow(batch, row);
+                    } else return error.RecursiveCteLimit;
+                    try self.store.truncateTable(cte.name);
+                    const full = self.store.find(cte.name).?;
+                    for (acc.items) |row| try self.store.appendRow(full, row);
+                } else {
+                    var iteration: usize = 0;
+                    while (iteration < 1000) : (iteration += 1) {
+                        var next = try self.execute(recursiveSql, parameters);
+                        defer next.deinit();
+                        var added: usize = 0;
+                        for (next.rows) |row| {
+                            var exists = false;
+                            for (table.rows.items) |existing| if (rowsEqual(existing.values, row)) {
+                                exists = true;
+                                break;
+                            };
+                            if (!exists) {
+                                try self.store.appendRow(table, row);
+                                added += 1;
+                            }
+                        }
+                        if (added == 0) break;
+                    } else return error.RecursiveCteLimit;
+                }
             }
             try self.activeCtes.append(self.allocator, cte.name);
             created += 1;
@@ -2461,7 +2491,7 @@ pub const Connection = struct {
     fn evalContext(self: *Connection, table: ?*const Table, row: []const Value, expr: ast.Expr, parameters: []const Value, outer: ?*const OuterRow) anyerror!Value {
         return switch (expr) {
             .literal => |value| value,
-            .parameter => |index| if (index == 0 or index > parameters.len) error.InvalidParameter else parameters[index - 1],
+            .parameter => |index| if (index == 0) error.InvalidParameter else if (index > parameters.len) .null else parameters[index - 1],
             .identifier => |name| {
                 if (table) |concrete| {
                     if (std.mem.indexOfScalar(u8, name, '.')) |dot| {
@@ -4917,6 +4947,40 @@ test "connection persists rows and prepared parameters" {
     defer result.deinit();
     defer db.close();
     try std.testing.expectEqualStrings("saved", result.rows[0][0].text);
+}
+
+test "prepared statements query rows with bound parameters" {
+    const path = "sqlite_zig_prepared_query_test.db";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    var db = try Connection.open(std.testing.allocator, path);
+    defer db.close();
+    var setup = try db.exec("CREATE TABLE lookup (id INTEGER, label TEXT); INSERT INTO lookup VALUES (1, 'one'), (2, 'two');");
+    setup.deinit();
+    var statement = try db.prepare("SELECT label FROM lookup WHERE id = ?;");
+    try statement.bind(1, 2);
+    var rows = try statement.query();
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(usize, 1), rows.count());
+    try std.testing.expectEqualStrings("two", rows.rows[0][0].text);
+    statement.reset();
+    try statement.bind(1, 1);
+    var again = try statement.query();
+    defer again.deinit();
+    try std.testing.expectEqualStrings("one", again.rows[0][0].text);
+    statement.reset();
+    var missing = try statement.query();
+    defer missing.deinit();
+    try std.testing.expectEqual(@as(usize, 0), missing.count());
+    try std.testing.expectError(error.InvalidParameter, statement.bind(0, 1));
+    statement.finalize();
+    var rebound = try db.prepare("SELECT id FROM lookup WHERE label = ? AND id > ?;");
+    defer rebound.finalize();
+    try rebound.bind(1, "two");
+    try rebound.bind(2, 1);
+    var filtered = try rebound.query();
+    defer filtered.deinit();
+    try std.testing.expectEqual(@as(i64, 2), filtered.rows[0][0].integer);
 }
 
 test "connection supports AND predicates, scalar functions, and count" {
@@ -10307,4 +10371,23 @@ test "cte column lists rename projected columns" {
     var intact = try db.exec("SELECT count(*) FROM base_items;");
     defer intact.deinit();
     try std.testing.expectEqual(@as(i64, 2), intact.rows[0][0].integer);
+}
+
+test "recursive union all keeps duplicates while union dedups" {
+    const path = "sqlite_zig_recursive_dup_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    var setup = try db.exec("CREATE TABLE seed (x INTEGER); INSERT INTO seed VALUES (0), (1);");
+    setup.deinit();
+    var kept = try db.exec("WITH RECURSIVE c(x) AS (SELECT x FROM seed UNION ALL SELECT 0 FROM c WHERE x > 0) SELECT x FROM c ORDER BY x;");
+    defer kept.deinit();
+    try std.testing.expectEqual(@as(usize, 3), kept.count());
+    try std.testing.expectEqual(@as(i64, 0), kept.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 0), kept.rows[1][0].integer);
+    try std.testing.expectEqual(@as(i64, 1), kept.rows[2][0].integer);
+    var distinct = try db.exec("WITH RECURSIVE d(x) AS (SELECT x FROM seed UNION SELECT 0 FROM d WHERE x > 0) SELECT x FROM d ORDER BY x;");
+    defer distinct.deinit();
+    try std.testing.expectEqual(@as(usize, 2), distinct.count());
+    try std.testing.expectEqual(@as(i64, 0), distinct.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 1), distinct.rows[1][0].integer);
 }
