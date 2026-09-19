@@ -52,8 +52,11 @@ pub const Connection = struct {
 
     pub fn open(allocator: std.mem.Allocator, path: []const u8) !*Connection {
         const connection = try allocator.create(Connection);
-        errdefer allocator.destroy(connection);
-        connection.* = .{ .allocator = allocator, .file = try DatabaseFile.open(allocator, path), .store = Schema.init(allocator), .savepoints = .empty };
+        const file = DatabaseFile.open(allocator, path) catch |err| {
+            allocator.destroy(connection);
+            return err;
+        };
+        connection.* = .{ .allocator = allocator, .file = file, .store = Schema.init(allocator), .savepoints = .empty };
         errdefer connection.close();
         if (try connection.file.readPayload()) |payload| {
             defer allocator.free(payload);
@@ -203,6 +206,7 @@ pub const Connection = struct {
             }
             try self.createDynamicTable(target, options);
         }
+        self.bumpSchemaVersion();
         if (!self.transactionActive) try self.persist();
     }
 
@@ -238,6 +242,17 @@ pub const Connection = struct {
             try keys.parseFksInto(options.foreignKeys, TableType.tableName, &expected);
         } else if (@hasField(TO, "foreignKeys")) {
             try keys.parseFksInto(TableType.tableOptions.foreignKeys, TableType.tableName, &expected);
+        }
+        if (@hasField(@TypeOf(options), "autoincrement")) {
+            var autoNames: [16][]const u8 = undefined;
+            const autoCount = try keys.normalizeKey(options.autoincrement, TableType.tableName, &autoNames);
+            if (autoCount != 1) return error.InvalidSql;
+            (findDefinition(definitions[0..], autoNames[0]) orelse return error.UnknownColumn).autoincrement = true;
+        } else if (@hasField(TO, "autoincrement")) {
+            var autoNames: [16][]const u8 = undefined;
+            const autoCount = try keys.normalizeKey(TableType.tableOptions.autoincrement, TableType.tableName, &autoNames);
+            if (autoCount != 1) return error.InvalidSql;
+            (findDefinition(definitions[0..], autoNames[0]) orelse return error.UnknownColumn).autoincrement = true;
         }
         var constraints = std.ArrayList(ast.TableConstraint).empty;
         defer constraints.deinit(self.allocator);
@@ -301,6 +316,7 @@ pub const Connection = struct {
         if (@hasField(T, "notNull")) def.notNull = spec.notNull;
         if (@hasField(T, "unique")) def.unique = spec.unique;
         if (@hasField(T, "primaryKey")) def.primaryKey = spec.primaryKey;
+        if (@hasField(T, "autoincrement")) def.autoincrement = spec.autoincrement;
         if (@hasField(T, "default")) def.defaultValue = @import("../dsl/column.zig").toValue(spec.default);
         return def;
     }
@@ -357,6 +373,7 @@ pub const Connection = struct {
             break :blk target.tableName;
         } else target;
         try self.store.dropTable(tableName);
+        self.bumpSchemaVersion();
         if (!self.transactionActive) try self.persist();
     }
 
@@ -368,11 +385,13 @@ pub const Connection = struct {
         var names: [16][]const u8 = undefined;
         const count = try keys.normalizeKey(cols, tableName, &names);
         try self.store.createIndex(.{ .name = name, .table = tableName, .columns = names[0..count], .unique = unique });
+        self.bumpSchemaVersion();
         if (!self.transactionActive) try self.persist();
     }
 
     pub fn dropIndex(self: *Connection, name: []const u8) !void {
         try self.store.dropIndex(name);
+        self.bumpSchemaVersion();
         if (!self.transactionActive) try self.persist();
     }
 
@@ -434,16 +453,19 @@ pub const Connection = struct {
 
     pub fn createView(self: *Connection, name: []const u8, sql: []const u8) !void {
         try self.store.createView(name, sql);
+        self.bumpSchemaVersion();
         if (!self.transactionActive) try self.persist();
     }
 
     pub fn dropView(self: *Connection, name: []const u8) !void {
         try self.store.dropView(name);
+        self.bumpSchemaVersion();
         if (!self.transactionActive) try self.persist();
     }
 
     pub fn dropTrigger(self: *Connection, name: []const u8) !void {
         try self.store.dropTrigger(name);
+        self.bumpSchemaVersion();
         if (!self.transactionActive) try self.persist();
     }
 
@@ -453,6 +475,7 @@ pub const Connection = struct {
             break :blk target.tableName;
         } else target;
         try self.store.renameTable(tableName, newName);
+        self.bumpSchemaVersion();
         if (!self.transactionActive) try self.persist();
     }
 
@@ -471,6 +494,7 @@ pub const Connection = struct {
             break :blk target.tableName;
         } else target;
         try self.store.addColumn(tableName, .{ .name = field, .typeName = keys.dslTypeName(FieldType) });
+        self.bumpSchemaVersion();
         if (!self.transactionActive) try self.persist();
     }
 
@@ -11233,6 +11257,171 @@ test "schema introspection pragmas report catalog state" {
     var filtered = try db.exec("PRAGMA table_list(users);");
     defer filtered.deinit();
     try std.testing.expectEqual(@as(usize, 1), filtered.count());
+}
+
+test "dsl schema version bumps and strict flags persist" {
+    const path = "sqlite_zig_remaining_probe_test.db";
+    var db = try freshDb(path);
+    var setup = try db.exec("CREATE TABLE st (id INTEGER PRIMARY KEY, v TEXT) STRICT; CREATE TABLE wro (k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID;");
+    setup.deinit();
+    var v1 = try db.exec("PRAGMA schema_version;");
+    defer v1.deinit();
+    const DslT = @import("../dsl/table.zig").table("probe_dsl", struct { id: i64 });
+    try db.createTable(DslT, .{ .primaryKey = DslT.columns.id });
+    var v2 = try db.exec("PRAGMA schema_version;");
+    defer v2.deinit();
+    try std.testing.expectEqual(v1.rows[0][0].integer + 1, v2.rows[0][0].integer);
+    db.close();
+    db = try Connection.open(std.testing.allocator, path);
+    errdefer db.close();
+    defer dropDb(db, path);
+    var strictCheck = try db.exec("PRAGMA table_list(st);");
+    defer strictCheck.deinit();
+    try std.testing.expectEqual(@as(i64, 1), strictCheck.rows[0][5].integer);
+    var wrCheck = try db.exec("PRAGMA table_list(wro);");
+    defer wrCheck.deinit();
+    try std.testing.expectEqual(@as(i64, 1), wrCheck.rows[0][4].integer);
+}
+
+test "autoincrement never reuses keys across raw and dsl" {
+    const path = "sqlite_zig_autoincrement_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    var setup = try db.exec("CREATE TABLE ai (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT); INSERT INTO ai VALUES (NULL, 'a'), (NULL, 'b'), (10, 'j');");
+    setup.deinit();
+    var seq = try db.exec("SELECT seq FROM sqlite_sequence WHERE name = 'ai';");
+    defer seq.deinit();
+    try std.testing.expectEqual(@as(i64, 10), seq.rows[0][0].integer);
+    var next = try db.exec("INSERT INTO ai(v) VALUES ('k'); SELECT id FROM ai WHERE v = 'k';");
+    defer next.deinit();
+    try std.testing.expectEqual(@as(i64, 11), next.rows[0][0].integer);
+    var small = try db.exec("INSERT INTO ai VALUES (5, 'e'); INSERT INTO ai(v) VALUES ('f'); SELECT id FROM ai WHERE v = 'f';");
+    defer small.deinit();
+    try std.testing.expectEqual(@as(i64, 12), small.rows[0][0].integer);
+    var wipe = try db.exec("DELETE FROM ai WHERE id >= 11; INSERT INTO ai(v) VALUES ('g'); SELECT id FROM ai WHERE v = 'g';");
+    defer wipe.deinit();
+    try std.testing.expectEqual(@as(i64, 13), wipe.rows[0][0].integer);
+    var bump = try db.exec("UPDATE ai SET id = 50 WHERE v = 'a'; INSERT INTO ai(v) VALUES ('h'); SELECT id FROM ai WHERE v = 'h';");
+    defer bump.deinit();
+    try std.testing.expectEqual(@as(i64, 51), bump.rows[0][0].integer);
+    var nullUpdate = try db.exec("UPDATE ai SET id = NULL WHERE v = 'b'; SELECT id FROM ai WHERE v = 'b';");
+    defer nullUpdate.deinit();
+    try std.testing.expectEqual(@as(i64, 52), nullUpdate.rows[0][0].integer);
+    try std.testing.expectError(error.ConstraintViolation, db.exec("INSERT INTO ai VALUES ('text', 'x');"));
+    try std.testing.expectError(error.InvalidSql, db.exec("CREATE TABLE bad1 (id TEXT PRIMARY KEY AUTOINCREMENT);"));
+    try std.testing.expectError(error.InvalidSql, db.exec("CREATE TABLE bad2 (id INT PRIMARY KEY AUTOINCREMENT);"));
+    try std.testing.expectError(error.InvalidSql, db.exec("CREATE TABLE bad3 (a INTEGER, b INTEGER, PRIMARY KEY (a, b), c INTEGER AUTOINCREMENT);"));
+    try std.testing.expectError(error.InvalidSql, db.exec("CREATE TABLE bad4 (id INTEGER PRIMARY KEY AUTOINCREMENT) WITHOUT ROWID;"));
+    try std.testing.expectError(error.ConstraintViolation, db.exec("ALTER TABLE ai ADD COLUMN extra INTEGER AUTOINCREMENT;"));
+    var renamed = try db.exec("ALTER TABLE ai RENAME TO ai2; SELECT seq FROM sqlite_sequence WHERE name = 'ai2';");
+    defer renamed.deinit();
+    try std.testing.expectEqual(@as(i64, 52), renamed.rows[0][0].integer);
+    var continued = try db.exec("INSERT INTO ai2(v) VALUES ('i'); SELECT id FROM ai2 WHERE v = 'i';");
+    defer continued.deinit();
+    try std.testing.expectEqual(@as(i64, 53), continued.rows[0][0].integer);
+    var dropped = try db.exec("DROP TABLE ai2; SELECT count(*) FROM sqlite_sequence WHERE name = 'ai2';");
+    defer dropped.deinit();
+    try std.testing.expectEqual(@as(i64, 0), dropped.rows[0][0].integer);
+    const DslAi = @import("../dsl/table.zig").table("dsl_ai", struct { id: ?i64, v: []const u8 });
+    try db.createTable(DslAi, .{ .primaryKey = DslAi.columns.id, .autoincrement = DslAi.columns.id });
+    var d1 = try db.from(DslAi).insert(.{ .id = null, .v = "a" });
+    d1.deinit();
+    var d2 = try db.from(DslAi).insert(.{ .id = null, .v = "b" });
+    d2.deinit();
+    var dwipe = try db.from(DslAi).delete().where(DslAi.columns.id.eq(2)).execute();
+    dwipe.deinit();
+    var d3 = try db.from(DslAi).insert(.{ .id = null, .v = "c" });
+    d3.deinit();
+    var drows = try db.from(DslAi).selectAll().fetch();
+    defer drows.deinit();
+    try std.testing.expectEqual(@as(i64, 1), drows.rows[0].id.?);
+    try std.testing.expectEqual(@as(i64, 3), drows.rows[1].id.?);
+    try db.createTable("dyn_ai", .{
+        .columns = &.{ .{ .name = "id", .type = "INTEGER", .primaryKey = true, .autoincrement = true }, .{ .name = "v", .type = "TEXT" } },
+    });
+    var y1 = try db.from("dyn_ai").insert(.{ .v = "a" });
+    y1.deinit();
+    var yrows = try db.exec("SELECT id FROM dyn_ai;");
+    defer yrows.deinit();
+    try std.testing.expectEqual(@as(i64, 1), yrows.rows[0][0].integer);
+    db.close();
+    db = try Connection.open(std.testing.allocator, path);
+    errdefer db.close();
+    var after = try db.exec("INSERT INTO dyn_ai(v) VALUES ('b'); SELECT id FROM dyn_ai WHERE v = 'b';");
+    defer after.deinit();
+    try std.testing.expectEqual(@as(i64, 2), after.rows[0][0].integer);
+}
+
+test "renames follow check generated index and trigger expressions" {
+    const path = "sqlite_zig_rename_expr_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    var setup = try db.exec("CREATE TABLE rx (a INTEGER CHECK (a > 0), email TEXT, g INTEGER GENERATED ALWAYS AS (a * 10) STORED); CREATE INDEX rx_email_idx ON rx(lower(email)); CREATE UNIQUE INDEX rx_a_idx ON rx(a + 1); CREATE TRIGGER rx_audit AFTER UPDATE OF a ON rx BEGIN INSERT INTO rx_log(v) VALUES (NEW.a); END; CREATE TABLE rx_log (v INTEGER);");
+    setup.deinit();
+    var renamed = try db.exec("ALTER TABLE rx RENAME COLUMN a TO alpha; ALTER TABLE rx RENAME COLUMN email TO mail;");
+    renamed.deinit();
+    var valid = try db.exec("INSERT INTO rx(alpha, mail) VALUES (5, 'A@x.test');");
+    valid.deinit();
+    var computed = try db.exec("SELECT g FROM rx;");
+    defer computed.deinit();
+    try std.testing.expectEqual(@as(i64, 50), computed.rows[0][0].integer);
+    try std.testing.expectError(error.ConstraintViolation, db.exec("INSERT INTO rx(alpha, mail) VALUES (-1, 'b@x.test');"));
+    try std.testing.expectError(error.ConstraintViolation, db.exec("INSERT INTO rx(alpha, mail) VALUES (5, 'c@x.test');"));
+    var fired = try db.exec("UPDATE rx SET alpha = 7 WHERE alpha = 5; SELECT v FROM rx_log;");
+    defer fired.deinit();
+    try std.testing.expectEqual(@as(i64, 7), fired.rows[0][0].integer);
+    var quiet = try db.exec("DELETE FROM rx_log; UPDATE rx SET mail = 'd@x.test' WHERE alpha = 7; SELECT count(*) FROM rx_log;");
+    defer quiet.deinit();
+    try std.testing.expectEqual(@as(i64, 0), quiet.rows[0][0].integer);
+    var info = try db.exec("PRAGMA table_xinfo(rx);");
+    defer info.deinit();
+    try std.testing.expectEqualStrings("alpha", info.rows[0][1].text);
+    try std.testing.expectEqualStrings("mail", info.rows[1][1].text);
+    var makeView = try db.exec("CREATE VIEW rx_view AS SELECT alpha, mail FROM rx WHERE alpha > 0;");
+    makeView.deinit();
+    var renameTableView = try db.exec("ALTER TABLE rx RENAME TO people;");
+    renameTableView.deinit();
+    var viaView = try db.exec("SELECT alpha FROM rx_view ORDER BY alpha;");
+    defer viaView.deinit();
+    try std.testing.expectEqual(@as(i64, 7), viaView.rows[0][0].integer);
+    var renameMail = try db.exec("ALTER TABLE people RENAME COLUMN mail TO email;");
+    renameMail.deinit();
+    var viaViewAgain = try db.exec("SELECT email FROM rx_view;");
+    defer viaViewAgain.deinit();
+    try std.testing.expectEqualStrings("d@x.test", viaViewAgain.rows[0][0].text);
+    var multi = try db.exec("CREATE TABLE mm_other (id INTEGER PRIMARY KEY, pid INTEGER, beta TEXT); INSERT INTO mm_other VALUES (1, 7, 'keep'); CREATE VIEW mm_view AS SELECT people.alpha, mm_other.beta AS obeta FROM people JOIN mm_other ON mm_other.pid = people.alpha;");
+    multi.deinit();
+    var renameBeta = try db.exec("ALTER TABLE people RENAME COLUMN alpha TO gamma;");
+    renameBeta.deinit();
+    var viaMulti = try db.exec("SELECT gamma, obeta FROM mm_view;");
+    defer viaMulti.deinit();
+    try std.testing.expectEqual(@as(i64, 7), viaMulti.rows[0][0].integer);
+    try std.testing.expectEqualStrings("keep", viaMulti.rows[0][1].text);
+    db.close();
+    db = try Connection.open(std.testing.allocator, path);
+    errdefer db.close();
+    var persisted = try db.exec("SELECT gamma, obeta FROM mm_view;");
+    defer persisted.deinit();
+    try std.testing.expectEqual(@as(i64, 7), persisted.rows[0][0].integer);
+    try std.testing.expectEqualStrings("keep", persisted.rows[0][1].text);
+    var genPersisted = try db.exec("SELECT g FROM people;");
+    defer genPersisted.deinit();
+    try std.testing.expectEqual(@as(i64, 70), genPersisted.rows[0][0].integer);
+}
+
+test "open failure reports an error instead of crashing" {
+    const path = "sqlite_zig_open_failure_test.db";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    var garbage = try std.Io.Dir.cwd().createFile(std.testing.io, path, .{ .read = true, .truncate = true });
+    try garbage.writePositionalAll(std.testing.io, "not a database file at all", 0);
+    garbage.close(std.testing.io);
+    try std.testing.expectError(error.InvalidHeader, Connection.open(std.testing.allocator, path));
+    var partial = try std.Io.Dir.cwd().createFile(std.testing.io, path, .{ .read = true, .truncate = true });
+    const tiny = [_]u8{ 'S', 'Q', 'L', 'i', 't', 'e' };
+    try partial.writePositionalAll(std.testing.io, &tiny, 0);
+    partial.close(std.testing.io);
+    try std.testing.expectError(error.InvalidHeader, Connection.open(std.testing.allocator, path));
 }
 
 test "integer primary key null auto assigns rowid alias" {

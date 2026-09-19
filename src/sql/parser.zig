@@ -350,7 +350,7 @@ pub const Parser = struct {
     }
 
     fn isTypeNameStop(text: []const u8) bool {
-        return std.ascii.eqlIgnoreCase(text, "primary") or std.ascii.eqlIgnoreCase(text, "foreign") or std.ascii.eqlIgnoreCase(text, "not") or std.ascii.eqlIgnoreCase(text, "unique") or std.ascii.eqlIgnoreCase(text, "check") or std.ascii.eqlIgnoreCase(text, "default") or std.ascii.eqlIgnoreCase(text, "generated") or std.ascii.eqlIgnoreCase(text, "as") or std.ascii.eqlIgnoreCase(text, "references") or std.ascii.eqlIgnoreCase(text, "collate") or std.ascii.eqlIgnoreCase(text, "constraint");
+        return std.ascii.eqlIgnoreCase(text, "primary") or std.ascii.eqlIgnoreCase(text, "foreign") or std.ascii.eqlIgnoreCase(text, "not") or std.ascii.eqlIgnoreCase(text, "unique") or std.ascii.eqlIgnoreCase(text, "autoincrement") or std.ascii.eqlIgnoreCase(text, "check") or std.ascii.eqlIgnoreCase(text, "default") or std.ascii.eqlIgnoreCase(text, "generated") or std.ascii.eqlIgnoreCase(text, "as") or std.ascii.eqlIgnoreCase(text, "references") or std.ascii.eqlIgnoreCase(text, "collate") or std.ascii.eqlIgnoreCase(text, "constraint");
     }
 
     fn parseColumnTypeName(self: *Parser) ![]const u8 {
@@ -396,6 +396,7 @@ pub const Parser = struct {
         var primaryKey = false;
         var notNull = false;
         var unique = false;
+        var autoincrement = false;
         var foreignKey: ?ast.ForeignKeyDef = null;
         var defaultValue: ?Value = null;
         var checkExpr: ?ast.Expr = null;
@@ -410,6 +411,8 @@ pub const Parser = struct {
                 notNull = true;
             } else if (self.acceptWord("unique")) {
                 unique = true;
+            } else if (self.acceptWord("autoincrement")) {
+                autoincrement = true;
             } else if (self.acceptWord("check")) {
                 try self.requireTag(.lparen);
                 checkExpr = try self.parseExpr();
@@ -463,7 +466,7 @@ pub const Parser = struct {
                 foreignKey = .{ .table = foreignTable, .column = foreignColumn, .onDelete = onDelete, .onUpdate = onUpdate };
             } else break;
         }
-        return .{ .name = columnName, .typeName = typeName, .primaryKey = primaryKey, .notNull = notNull, .unique = unique, .foreignKey = foreignKey, .defaultValue = defaultValue, .checkExpr = checkExpr, .generatedExpr = generatedExpr, .generatedStored = generatedStored };
+        return .{ .name = columnName, .typeName = typeName, .primaryKey = primaryKey, .notNull = notNull, .unique = unique, .autoincrement = autoincrement, .foreignKey = foreignKey, .defaultValue = defaultValue, .checkExpr = checkExpr, .generatedExpr = generatedExpr, .generatedStored = generatedStored };
     }
 
     fn parseCreate(self: *Parser) !ast.Statement {

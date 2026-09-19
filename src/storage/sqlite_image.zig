@@ -415,6 +415,7 @@ fn createSql(allocator: std.mem.Allocator, table: anytype) ![]u8 {
             try sql.appendSlice(allocator, column.typeName);
         }
         if (column.primaryKey) try sql.appendSlice(allocator, " PRIMARY KEY");
+        if (column.autoincrement) try sql.appendSlice(allocator, " AUTOINCREMENT");
         if (column.notNull) try sql.appendSlice(allocator, " NOT NULL");
         if (column.unique) try sql.appendSlice(allocator, " UNIQUE");
         if (column.defaultValue) |default| {
@@ -479,7 +480,13 @@ fn createSql(allocator: std.mem.Allocator, table: anytype) ![]u8 {
             }
         }
     }
-    try sql.appendSlice(allocator, ");");
+    try sql.appendSlice(allocator, ")");
+    if (table.withoutRowid) try sql.appendSlice(allocator, " WITHOUT ROWID");
+    if (table.strict) {
+        if (table.withoutRowid) try sql.appendSlice(allocator, ",");
+        try sql.appendSlice(allocator, " STRICT");
+    }
+    try sql.appendSlice(allocator, ";");
     return sql.toOwnedSlice(allocator);
 }
 
@@ -829,7 +836,7 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Schema {
             continue;
         }
         if (statement != .createTable) continue;
-        try schema.createTable(statement.createTable.name, statement.createTable.columns, statement.createTable.constraints);
+        try schema.createTableWithOptions(statement.createTable.name, statement.createTable.columns, statement.createTable.constraints, .{ .strict = statement.createTable.strict, .withoutRowid = statement.createTable.withoutRowid });
         const table = schema.find(statement.createTable.name).?;
 
         var tableRows = std.ArrayList(Cell).empty;

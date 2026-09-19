@@ -4,7 +4,7 @@ const ast = @import("../sql/ast.zig");
 const exprEvaluator = @import("../sql/expr.zig");
 const functions = @import("../sql/functions.zig");
 
-pub const Column = struct { name: []u8, typeName: []u8, primaryKey: bool, notNull: bool, unique: bool = false, defaultValue: ?Value = null, foreignTable: ?[]u8 = null, foreignColumn: ?[]u8 = null, onDelete: ast.ReferentialAction = .restrict, onUpdate: ast.ReferentialAction = .restrict, checkExpr: ?ast.Expr = null, generatedExpr: ?ast.Expr = null, generatedStored: bool = false };
+pub const Column = struct { name: []u8, typeName: []u8, primaryKey: bool, notNull: bool, unique: bool = false, autoincrement: bool = false, defaultValue: ?Value = null, foreignTable: ?[]u8 = null, foreignColumn: ?[]u8 = null, onDelete: ast.ReferentialAction = .restrict, onUpdate: ast.ReferentialAction = .restrict, checkExpr: ?ast.Expr = null, generatedExpr: ?ast.Expr = null, generatedStored: bool = false };
 pub const Row = struct { values: []Value };
 pub const Constraint = struct { kind: enum { primaryKey, unique, foreignKey, check }, columns: [][]u8, foreignTable: ?[]u8 = null, referencedColumns: [][]u8 = &.{}, onDelete: ast.ReferentialAction = .restrict, onUpdate: ast.ReferentialAction = .restrict, checkExpr: ?ast.Expr = null };
 pub const Table = struct { name: []u8, columns: []Column, constraints: []Constraint, rows: std.ArrayList(Row), virtualModule: ?[]u8 = null, virtualArguments: [][]u8 = &.{}, strict: bool = false, withoutRowid: bool = false };
@@ -486,6 +486,7 @@ pub const Schema = struct {
                 .primaryKey = isPk,
                 .notNull = isNotNull,
                 .unique = definition.unique,
+                .autoincrement = definition.autoincrement,
                 .defaultValue = if (definition.defaultValue) |value| try self.copyValue(value) else null,
                 .foreignTable = if (definition.foreignKey) |foreignKey| try self.allocator.dupe(u8, foreignKey.table) else null,
                 .foreignColumn = if (definition.foreignKey) |foreignKey| try self.allocator.dupe(u8, foreignKey.column) else null,
@@ -555,6 +556,13 @@ pub const Schema = struct {
             }
             constraintCount += 1;
         }
+        for (definitions, 0..) |definition, index| {
+            if (!definition.autoincrement) continue;
+            if (options.withoutRowid) return error.InvalidSql;
+            const declared = std.mem.trim(u8, definition.typeName, " \t\n\r");
+            if (!std.ascii.eqlIgnoreCase(declared, "integer")) return error.InvalidSql;
+            if (!columns[index].primaryKey) return error.InvalidSql;
+        }
         try self.tables.append(self.allocator, .{
             .name = ownedName,
             .columns = columns,
@@ -563,6 +571,11 @@ pub const Schema = struct {
             .strict = options.strict,
             .withoutRowid = options.withoutRowid,
         });
+        for (columns) |column| {
+            if (!column.autoincrement) continue;
+            try self.ensureSequenceTable();
+            break;
+        }
         var autoindexNumber: usize = 0;
         for (constraints) |constraint| {
             if (constraint.kind == .foreignKey or constraint.kind == .check) continue;
@@ -661,11 +674,248 @@ pub const Schema = struct {
                     } else triggerPosition += 1;
                 }
                 self.clearStatScope(name, null);
+                if (!std.ascii.eqlIgnoreCase(name, "sqlite_sequence")) {
+                    if (self.find("sqlite_sequence")) |sequence| {
+                        var rowPosition: usize = 0;
+                        while (rowPosition < sequence.rows.items.len) {
+                            const values = sequence.rows.items[rowPosition].values;
+                            var matches = false;
+                            if (values.len == sequence.columns.len and values[0] == .text) {
+                                if (std.ascii.eqlIgnoreCase(values[0].text, name)) matches = true;
+                            }
+                            if (matches) {
+                                const removed = sequence.rows.orderedRemove(rowPosition);
+                                for (removed.values) |value| freeValue(self.allocator, value);
+                                self.allocator.free(removed.values);
+                            } else rowPosition += 1;
+                        }
+                    }
+                }
                 self.removeTable(index);
                 return;
             }
         }
         return error.UnknownTable;
+    }
+
+    fn renameExprIdentifier(self: *Schema, expr: *ast.Expr, scopeTable: []const u8, oldName: []const u8, newName: []const u8, isTableRename: bool) !void {
+        switch (expr.*) {
+            .identifier => |name| {
+                if (std.mem.lastIndexOfScalar(u8, name, '.')) |dot| {
+                    const qualifier = name[0..dot];
+                    const column = name[dot + 1 ..];
+                    if (isTableRename) {
+                        if (!std.ascii.eqlIgnoreCase(qualifier, oldName)) return;
+                        const rebuilt = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ newName, column });
+                        self.allocator.free(name);
+                        expr.* = .{ .identifier = rebuilt };
+                    } else {
+                        if (!std.ascii.eqlIgnoreCase(qualifier, scopeTable)) return;
+                        if (!std.ascii.eqlIgnoreCase(column, oldName)) return;
+                        const rebuilt = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ qualifier, newName });
+                        self.allocator.free(name);
+                        expr.* = .{ .identifier = rebuilt };
+                    }
+                } else if (!isTableRename and std.ascii.eqlIgnoreCase(name, oldName)) {
+                    const owned = try self.allocator.dupe(u8, newName);
+                    self.allocator.free(name);
+                    expr.* = .{ .identifier = owned };
+                }
+            },
+            .function => |*call| {
+                try self.renameExprIdentifier(@constCast(call.argument), scopeTable, oldName, newName, isTableRename);
+                if (call.argument2) |argument| try self.renameExprIdentifier(@constCast(argument), scopeTable, oldName, newName, isTableRename);
+                if (call.argument3) |argument| try self.renameExprIdentifier(@constCast(argument), scopeTable, oldName, newName, isTableRename);
+                for (call.extraArgs) |*argument| try self.renameExprIdentifier(@constCast(argument), scopeTable, oldName, newName, isTableRename);
+            },
+            .binary => |*binary| {
+                try self.renameExprIdentifier(@constCast(binary.left), scopeTable, oldName, newName, isTableRename);
+                try self.renameExprIdentifier(@constCast(binary.right), scopeTable, oldName, newName, isTableRename);
+            },
+            .unary => |*unary| try self.renameExprIdentifier(@constCast(unary.expr), scopeTable, oldName, newName, isTableRename),
+            .caseExpr => |*caseBlock| {
+                if (caseBlock.base) |base| try self.renameExprIdentifier(@constCast(base), scopeTable, oldName, newName, isTableRename);
+                for (caseBlock.whens) |*when| {
+                    try self.renameExprIdentifier(&when.condition, scopeTable, oldName, newName, isTableRename);
+                    try self.renameExprIdentifier(&when.result, scopeTable, oldName, newName, isTableRename);
+                }
+                if (caseBlock.otherwise) |otherwise| try self.renameExprIdentifier(@constCast(otherwise), scopeTable, oldName, newName, isTableRename);
+            },
+            .patternMatch => |*match| {
+                try self.renameExprIdentifier(@constCast(match.value), scopeTable, oldName, newName, isTableRename);
+                try self.renameExprIdentifier(@constCast(match.pattern), scopeTable, oldName, newName, isTableRename);
+                if (match.escape) |escape| try self.renameExprIdentifier(@constCast(escape), scopeTable, oldName, newName, isTableRename);
+            },
+            .collate => |*node| try self.renameExprIdentifier(@constCast(node.expr), scopeTable, oldName, newName, isTableRename),
+            .inList => |*inL| {
+                try self.renameExprIdentifier(@constCast(inL.expr), scopeTable, oldName, newName, isTableRename);
+                for (inL.list) |*item| try self.renameExprIdentifier(@constCast(item), scopeTable, oldName, newName, isTableRename);
+            },
+            .window => |*window| {
+                if (window.argument) |argument| try self.renameExprIdentifier(@constCast(argument), scopeTable, oldName, newName, isTableRename);
+                if (window.argument2) |argument| try self.renameExprIdentifier(@constCast(argument), scopeTable, oldName, newName, isTableRename);
+                for (window.extraArgs) |*argument| try self.renameExprIdentifier(@constCast(argument), scopeTable, oldName, newName, isTableRename);
+                for (window.partitionBy) |*part| try self.renameExprIdentifier(@constCast(part), scopeTable, oldName, newName, isTableRename);
+            },
+            .inSubquery => |*sub| try self.renameExprIdentifier(@constCast(sub.expr), scopeTable, oldName, newName, isTableRename),
+            .literal, .parameter, .wildcard, .scalarSubquery, .existsSubquery => {},
+        }
+    }
+
+    fn viewTargetsSingleTable(self: *Schema, sql: []const u8, tableName: []const u8) bool {
+        const lexer = @import("../sql/lexer.zig");
+        const Tag = @import("../sql/token.zig").Tag;
+        const tokens = lexer.tokenize(self.allocator, sql) catch return false;
+        defer self.allocator.free(tokens);
+        var depth: usize = 0;
+        var fromCount: usize = 0;
+        var index: usize = 0;
+        while (index < tokens.len) : (index += 1) {
+            const token = tokens[index];
+            if (token.tag == Tag.lparen) {
+                depth += 1;
+                continue;
+            }
+            if (token.tag == Tag.rparen) {
+                if (depth > 0) depth -= 1;
+                continue;
+            }
+            if (token.tag != Tag.word) continue;
+            if (depth == 0 and std.ascii.eqlIgnoreCase(token.text, "join")) return false;
+            if (depth == 0 and std.ascii.eqlIgnoreCase(token.text, "from")) {
+                fromCount += 1;
+                if (fromCount > 1) return false;
+                var cursor = index + 1;
+                while (true) {
+                    if (cursor >= tokens.len or tokens[cursor].tag != Tag.word) return false;
+                    if (!std.ascii.eqlIgnoreCase(tokens[cursor].text, tableName)) return false;
+                    cursor += 1;
+                    if (cursor < tokens.len and tokens[cursor].tag == Tag.comma) {
+                        cursor += 1;
+                        continue;
+                    }
+                    break;
+                }
+                index = cursor - 1;
+                continue;
+            }
+            if (depth > 0 and std.ascii.eqlIgnoreCase(token.text, "from")) return false;
+        }
+        return fromCount == 1;
+    }
+
+    fn isRewriteKeyword(name: []const u8) bool {
+        const keywords = [_][]const u8{ "and", "or", "not", "null", "is", "isnull", "notnull", "like", "glob", "between", "in", "case", "when", "then", "else", "end", "cast", "collate", "escape", "exists", "as", "on" };
+        for (keywords) |keyword| if (std.ascii.eqlIgnoreCase(name, keyword)) return true;
+        return false;
+    }
+
+    fn rewriteStoredSql(self: *Schema, sql: []const u8, qualifiers: []const []const u8, oldName: []const u8, newName: []const u8, isTableRename: bool, bareOldName: ?[]const u8) !?[]u8 {
+        const lexer = @import("../sql/lexer.zig");
+        const Tag = @import("../sql/token.zig").Tag;
+        const tokens = lexer.tokenize(self.allocator, sql) catch return null;
+        defer self.allocator.free(tokens);
+        const bareKeyword = if (bareOldName) |bare| isRewriteKeyword(bare) else true;
+        var out = std.ArrayList(u8).empty;
+        errdefer out.deinit(self.allocator);
+        var cursor: usize = 0;
+        var changed = false;
+        for (tokens, 0..) |token, index| {
+            if (token.tag != Tag.word) continue;
+            const bareMatch = if (bareOldName) |bare| std.ascii.eqlIgnoreCase(token.text, bare) else false;
+            if (!bareMatch and !std.ascii.eqlIgnoreCase(token.text, oldName)) continue;
+            var span = token.text.len;
+            if (token.position < sql.len and (sql[token.position] == '"' or sql[token.position] == '`')) span += 2;
+            var replace = bareMatch and !isTableRename and !bareKeyword;
+            if (replace and index + 1 < tokens.len and tokens[index + 1].tag == Tag.lparen) replace = false;
+            if (isTableRename) {
+                if (index + 1 < tokens.len and tokens[index + 1].tag == Tag.dot) {
+                    replace = true;
+                } else if (index == 0 or tokens[index - 1].tag != Tag.dot) {
+                    if (index > 0 and tokens[index - 1].tag == Tag.word) {
+                        const keyword = tokens[index - 1].text;
+                        replace = std.ascii.eqlIgnoreCase(keyword, "from") or std.ascii.eqlIgnoreCase(keyword, "join") or std.ascii.eqlIgnoreCase(keyword, "into") or std.ascii.eqlIgnoreCase(keyword, "update") or std.ascii.eqlIgnoreCase(keyword, "table") or std.ascii.eqlIgnoreCase(keyword, "on");
+                    }
+                }
+            } else {
+                if (index >= 2 and tokens[index - 1].tag == Tag.dot and tokens[index - 2].tag == Tag.word) {
+                    for (qualifiers) |qualifier| {
+                        if (std.ascii.eqlIgnoreCase(tokens[index - 2].text, qualifier)) {
+                            replace = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (!replace) continue;
+            try out.appendSlice(self.allocator, sql[cursor..token.position]);
+            if (token.position < sql.len and (sql[token.position] == '"' or sql[token.position] == '`')) {
+                try out.append(self.allocator, sql[token.position]);
+                try out.appendSlice(self.allocator, newName);
+                try out.append(self.allocator, sql[token.position]);
+            } else {
+                try out.appendSlice(self.allocator, newName);
+            }
+            cursor = token.position + span;
+            changed = true;
+        }
+        if (!changed) {
+            out.deinit(self.allocator);
+            return null;
+        }
+        try out.appendSlice(self.allocator, sql[cursor..]);
+        return try out.toOwnedSlice(self.allocator);
+    }
+
+    fn rewriteTriggerSql(self: *Schema, trigger: *Trigger, qualifiers: []const []const u8, oldName: []const u8, newName: []const u8, isTableRename: bool) !void {
+        if (trigger.whenSql) |when| {
+            if (try self.rewriteStoredSql(when, qualifiers, oldName, newName, isTableRename, null)) |rewritten| {
+                self.allocator.free(when);
+                trigger.whenSql = rewritten;
+            }
+        }
+        if (try self.rewriteStoredSql(trigger.body, qualifiers, oldName, newName, isTableRename, null)) |rewritten| {
+            self.allocator.free(trigger.body);
+            trigger.body = rewritten;
+        }
+    }
+
+    fn renameIndexSqlFragments(self: *Schema, tableName: []const u8, oldName: []const u8, newName: []const u8, isTableRename: bool, allowBare: bool) !void {
+        const qualifiers = [_][]const u8{tableName};
+        for (self.indexes.items) |*index| {
+            if (!std.ascii.eqlIgnoreCase(index.table, tableName)) continue;
+            for (index.columns, 0..) |column, position| {
+                if (position >= index.keyExprs.len or index.keyExprs[position] == null) continue;
+                if (try self.rewriteStoredSql(column, &qualifiers, oldName, newName, isTableRename, if (allowBare) oldName else null)) |rewritten| {
+                    self.allocator.free(column);
+                    index.columns[position] = rewritten;
+                }
+            }
+            if (index.whereSql) |predicate| {
+                if (try self.rewriteStoredSql(predicate, &qualifiers, oldName, newName, isTableRename, if (allowBare) oldName else null)) |rewritten| {
+                    self.allocator.free(predicate);
+                    index.whereSql = rewritten;
+                }
+            }
+        }
+    }
+
+    fn renameStoredExprs(self: *Schema, tableName: []const u8, oldName: []const u8, newName: []const u8, isTableRename: bool) !void {
+        for (self.tables.items) |*other| {
+            if (!std.ascii.eqlIgnoreCase(other.name, tableName)) continue;
+            for (other.columns) |*column| {
+                if (column.checkExpr) |*check| try self.renameExprIdentifier(check, other.name, oldName, newName, isTableRename);
+                if (column.generatedExpr) |*generated| try self.renameExprIdentifier(generated, other.name, oldName, newName, isTableRename);
+            }
+            for (other.constraints) |*constraint| {
+                if (constraint.checkExpr) |*check| try self.renameExprIdentifier(check, other.name, oldName, newName, isTableRename);
+            }
+        }
+        for (self.indexes.items) |*index| {
+            if (!std.ascii.eqlIgnoreCase(index.table, tableName)) continue;
+            for (index.keyExprs) |*maybeKey| if (maybeKey.*) |*key| try self.renameExprIdentifier(key, index.table, oldName, newName, isTableRename);
+            if (index.whereExpr) |*predicate| try self.renameExprIdentifier(predicate, index.table, oldName, newName, isTableRename);
+        }
     }
 
     pub fn renameTable(self: *Schema, oldName: []const u8, newName: []const u8) !void {
@@ -704,6 +954,25 @@ pub const Schema = struct {
                 }
             }
         }
+        if (self.find("sqlite_sequence")) |sequence| {
+            for (sequence.rows.items) |*row| {
+                if (row.values.len != sequence.columns.len) continue;
+                if (row.values[0] != .text) continue;
+                if (!std.ascii.eqlIgnoreCase(row.values[0].text, oldName)) continue;
+                freeValue(self.allocator, row.values[0]);
+                row.values[0] = .{ .text = try self.allocator.dupe(u8, newName) };
+            }
+        }
+        try self.renameStoredExprs(newName, oldName, newName, true);
+        try self.renameIndexSqlFragments(newName, oldName, newName, true, false);
+        const noQualifiers: []const []const u8 = &.{};
+        for (self.triggers.items) |*trigger| try self.rewriteTriggerSql(trigger, noQualifiers, oldName, newName, true);
+        for (self.views.items) |*view| {
+            if (try self.rewriteStoredSql(view.sql, noQualifiers, oldName, newName, true, null)) |rewritten| {
+                self.allocator.free(view.sql);
+                view.sql = rewritten;
+            }
+        }
     }
 
     pub fn truncateTable(self: *Schema, name: []const u8) !void {
@@ -719,7 +988,7 @@ pub const Schema = struct {
         const table = self.find(tableName) orelse return error.UnknownTable;
         for (table.columns) |column| if (std.ascii.eqlIgnoreCase(column.name, definition.name)) return error.ColumnExists;
         if (table.strict and !isValidStrictType(definition.typeName)) return error.ConstraintViolation;
-        if (definition.primaryKey or definition.unique) return error.ConstraintViolation;
+        if (definition.primaryKey or definition.unique or definition.autoincrement) return error.ConstraintViolation;
         if (definition.notNull and definition.defaultValue == null and table.rows.items.len != 0 and definition.generatedExpr == null) return error.ConstraintViolation;
 
         const clonedCheck = if (definition.checkExpr) |chk| try ast.cloneOwnedExpr(self.allocator, chk) else null;
@@ -736,6 +1005,7 @@ pub const Schema = struct {
             .primaryKey = definition.primaryKey,
             .notNull = definition.notNull,
             .unique = definition.unique,
+            .autoincrement = definition.autoincrement,
             .defaultValue = if (definition.defaultValue) |value| try self.copyValue(value) else null,
             .foreignTable = if (definition.foreignKey) |foreignKey| try self.allocator.dupe(u8, foreignKey.table) else null,
             .foreignColumn = if (definition.foreignKey) |foreignKey| try self.allocator.dupe(u8, foreignKey.column) else null,
@@ -834,6 +1104,27 @@ pub const Schema = struct {
                 }
             }
         }
+        for (self.triggers.items) |*trigger| {
+            if (!std.ascii.eqlIgnoreCase(trigger.table, tableName)) continue;
+            for (trigger.updateOf, 0..) |listed, position| {
+                if (std.ascii.eqlIgnoreCase(listed, oldName)) {
+                    self.allocator.free(listed);
+                    trigger.updateOf[position] = try self.allocator.dupe(u8, newName);
+                }
+            }
+            const rowQualifiers = [_][]const u8{ tableName, "NEW", "OLD" };
+            try self.rewriteTriggerSql(trigger, &rowQualifiers, oldName, newName, false);
+        }
+        const tableQualifier = [_][]const u8{tableName};
+        for (self.views.items) |*view| {
+            const bare: ?[]const u8 = if (self.viewTargetsSingleTable(view.sql, tableName)) oldName else null;
+            if (try self.rewriteStoredSql(view.sql, &tableQualifier, oldName, newName, false, bare)) |rewritten| {
+                self.allocator.free(view.sql);
+                view.sql = rewritten;
+            }
+        }
+        try self.renameStoredExprs(tableName, oldName, newName, false);
+        try self.renameIndexSqlFragments(tableName, oldName, newName, false, true);
     }
 
     pub fn dropColumn(self: *Schema, tableName: []const u8, columnName: []const u8) !void {
@@ -987,6 +1278,7 @@ pub const Schema = struct {
             owned[index] = try self.copyValue(value);
             count += 1;
         }
+        try self.applyAutoincrement(table, owned);
         try assignRowidAlias(table, owned);
         var colNames = try self.allocator.alloc([]const u8, table.columns.len);
         defer self.allocator.free(colNames);
@@ -1021,7 +1313,8 @@ pub const Schema = struct {
         try table.rows.append(self.allocator, .{ .values = owned });
     }
 
-    pub fn validateUpdate(self: *const Schema, table: *const Table, rowIndex: usize, values: []Value) !void {
+    pub fn validateUpdate(self: *Schema, table: *const Table, rowIndex: usize, values: []Value) !void {
+        try self.applyAutoincrement(table, values);
         try assignRowidAlias(table, values);
         if (table.strict) {
             for (table.columns, 0..) |col, index| {
@@ -1191,6 +1484,74 @@ pub const Schema = struct {
         return null;
     }
 
+    pub fn ensureSequenceTable(self: *Schema) anyerror!void {
+        if (self.find("sqlite_sequence") != null) return;
+        const definitions = [_]ast.ColumnDef{
+            .{ .name = "name", .typeName = "TEXT" },
+            .{ .name = "seq", .typeName = "INTEGER" },
+        };
+        try self.createTable("sqlite_sequence", &definitions, &.{});
+    }
+
+    pub fn sequenceValue(self: *const Schema, tableName: []const u8) i64 {
+        const sequence = self.findConst("sqlite_sequence") orelse return 0;
+        if (sequence.columns.len < 2) return 0;
+        for (sequence.rows.items) |row| {
+            if (row.values.len != sequence.columns.len) continue;
+            if (row.values[0] != .text) continue;
+            if (!std.ascii.eqlIgnoreCase(row.values[0].text, tableName)) continue;
+            if (row.values[1] == .integer) return row.values[1].integer;
+            return 0;
+        }
+        return 0;
+    }
+
+    pub fn setSequenceValue(self: *Schema, tableName: []const u8, next: i64) anyerror!void {
+        try self.ensureSequenceTable();
+        const sequence = self.find("sqlite_sequence").?;
+        for (sequence.rows.items) |*row| {
+            if (row.values.len != sequence.columns.len) continue;
+            if (row.values[0] != .text) continue;
+            if (!std.ascii.eqlIgnoreCase(row.values[0].text, tableName)) continue;
+            freeValue(self.allocator, row.values[1]);
+            row.values[1] = .{ .integer = next };
+            return;
+        }
+        const nameValue = Value{ .text = tableName };
+        const seqValue = Value{ .integer = next };
+        try self.appendRow(sequence, &.{ nameValue, seqValue });
+    }
+
+    fn applyAutoincrement(self: *Schema, table: *const Table, values: []Value) anyerror!void {
+        var columnIdx: ?usize = null;
+        for (table.columns, 0..) |column, index| if (column.autoincrement) {
+            if (columnIdx != null) return error.InvalidSql;
+            columnIdx = index;
+        };
+        const alias = columnIdx orelse return;
+        switch (values[alias]) {
+            .null => {
+                var max = self.sequenceValue(table.name);
+                for (table.rows.items) |existing| {
+                    switch (existing.values[alias]) {
+                        .integer => |current| {
+                            if (current > max) max = current;
+                        },
+                        else => {},
+                    }
+                }
+                if (max == std.math.maxInt(i64)) return error.ConstraintViolation;
+                const next = max + 1;
+                try self.setSequenceValue(table.name, next);
+                values[alias] = .{ .integer = next };
+            },
+            .integer => |explicit| {
+                if (explicit > self.sequenceValue(table.name)) try self.setSequenceValue(table.name, explicit);
+            },
+            else => return error.ConstraintViolation,
+        }
+    }
+
     fn statKeyValue(self: *const Schema, table: *const Table, index: *const Index, colNames: []const []const u8, position: usize, values: []const Value) !Value {
         if (index.keyExpr(position)) |key| return exprEvaluator.evalTemp(self.allocator, colNames, values, key);
         const columnIdx = self.columnIndex(table, index.columns[position]) orelse return error.UnknownColumn;
@@ -1275,6 +1636,7 @@ pub const Schema = struct {
         result.foreignKeysEnabled = false;
         errdefer result.deinit();
         for (self.tables.items) |table| {
+            if (std.ascii.eqlIgnoreCase(table.name, "sqlite_sequence")) continue;
             if (table.virtualModule) |module| {
                 try result.createVirtualTable(table.name, module, table.virtualArguments);
                 continue;
@@ -1287,6 +1649,7 @@ pub const Schema = struct {
                 .primaryKey = column.primaryKey,
                 .notNull = column.notNull,
                 .unique = column.unique,
+                .autoincrement = column.autoincrement,
                 .defaultValue = column.defaultValue,
                 .foreignKey = if (column.foreignTable != null) .{ .table = column.foreignTable.?, .column = column.foreignColumn.?, .onDelete = column.onDelete, .onUpdate = column.onUpdate } else null,
                 .checkExpr = column.checkExpr,
@@ -1304,6 +1667,12 @@ pub const Schema = struct {
             try result.createTableWithOptions(table.name, definitions, constraintDefinitions, .{ .strict = table.strict, .withoutRowid = table.withoutRowid });
             const target = result.find(table.name).?;
             for (table.rows.items) |row| try result.appendRow(target, row.values);
+        }
+        if (self.findConst("sqlite_sequence")) |sequence| {
+            try result.ensureSequenceTable();
+            try result.truncateTable("sqlite_sequence");
+            const target = result.find("sqlite_sequence").?;
+            for (sequence.rows.items) |row| try result.appendRow(target, row.values);
         }
         for (self.indexes.items) |index| {
             if (std.mem.startsWith(u8, index.name, "sqlite_autoindex_")) continue;

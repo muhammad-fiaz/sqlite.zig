@@ -25,7 +25,7 @@ description: "The hand-written SQL lexer, parser, and bytecode compiler supporti
 | **CREATE VIEW** | `CREATE VIEW [IF NOT EXISTS] name AS SELECT ...` |
 | **CREATE TRIGGER** | `CREATE TRIGGER [IF NOT EXISTS] name [BEFORE\|AFTER] INSERT\|UPDATE\|DELETE ON table [WHEN ...] ...` |
 | **CREATE INDEX** | `CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (columns)` |
-| **ALTER TABLE** | `ADD COLUMN`, `RENAME TO`, `RENAME COLUMN ... TO`, and `DROP COLUMN`; renames follow indexes, triggers, and foreign-key references; drops are refused while a column backs a key, index, or foreign key |
+| **ALTER TABLE** | `ADD COLUMN`, `RENAME TO`, `RENAME COLUMN ... TO`, and `DROP COLUMN`; renames follow indexes, triggers (including `UPDATE OF` and `NEW`/`OLD` body references), views, `CHECK`/generated/index expressions, foreign keys, and `sqlite_sequence`; drops are refused while a column backs a key, index, or foreign key |
 | **UPSERT** | `INSERT ... ON CONFLICT [(cols)] [WHERE ...] DO NOTHING` / `DO UPDATE SET ...` with `excluded` |
 | **RETURNING** | `INSERT/UPDATE/DELETE ... RETURNING ...` |
 | **Compound SELECT** | `UNION [ALL]`, `INTERSECT`, `EXCEPT` with `ORDER BY` / `LIMIT` / `OFFSET` |
@@ -172,6 +172,9 @@ Table definitions support declared types with full SQLite type names
 - Generated columns: `GENERATED ALWAYS AS (...) VIRTUAL` / `STORED`
 - `STRICT` tables (values outside the declared type are rejected) and
   `WITHOUT ROWID` tables (keyed by primary key)
+- `AUTOINCREMENT` on a single `INTEGER PRIMARY KEY`: `NULL` inserts take
+  `max(seq, max(id)) + 1` from the `sqlite_sequence` table and keys are never
+  reused after deletes; explicit larger ids advance the counter
 
 Plain and `UNIQUE` column indexes are supported, as are partial indexes
 (`CREATE INDEX ... WHERE predicate`, uniqueness enforced among matching rows
