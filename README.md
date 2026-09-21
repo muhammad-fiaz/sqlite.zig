@@ -43,27 +43,32 @@
 > [!CAUTION]
 > **Do not use this in production or on data you cannot afford to lose.** There is no stability guarantee on the file format, the API, or correctness of edge cases yet. Back up anything important separately.
 
-**Related Zig projects:**
+---
 
-- For **CUDA/GPU computing** support, check out **[cuda.zig](https://github.com/muhammad-fiaz/cuda.zig)**.
-- For **env.zig** (.env parsing), check out **[env.zig](https://github.com/muhammad-fiaz/env.zig)**.
-- For **TUI** support, check out **[tui.zig](https://github.com/muhammad-fiaz/tui.zig)**.
-- For **ZON file format** support, check out **[zon.zig](https://github.com/muhammad-fiaz/zon.zig)**.
-- For **spinners/loading/progress bar** support, check out **[loaders.zig](https://github.com/muhammad-fiaz/loaders.zig)**.
-- For **MCP** support, check out **[mcp.zig](https://github.com/muhammad-fiaz/mcp.zig)**.
-- For **args parsing** support, check out **[args.zig](https://github.com/muhammad-fiaz/args.zig)**.
-- For **HTTP client/server** support, check out **[httpx.zig](https://github.com/muhammad-fiaz/httpx.zig)**.
-- For **API framework** support, check out **[api.zig](https://github.com/muhammad-fiaz/api.zig)**.
-- For **web framework** support, check out **[zix](https://github.com/muhammad-fiaz/zix)**.
-- For **archive/compression** support, check out **[archive.zig](https://github.com/muhammad-fiaz/archive.zig)**.
-- For **compression file format** support, check out **[zigx](https://github.com/muhammad-fiaz/zigx)**.
-- For **file downloading** support, check out **[downloader.zig](https://github.com/muhammad-fiaz/downloader.zig)**.
-- For **update checker/auto-updater** support, check out **[updater.zig](https://github.com/muhammad-fiaz/updater.zig)**.
-- For **numerical computing** support, check out **[num.zig](https://github.com/muhammad-fiaz/num.zig)**.
-- For **logging** support, check out **[logly.zig](https://github.com/muhammad-fiaz/logly.zig)**.
-- For **data validation and serialization** support, check out **[zigantic](https://github.com/muhammad-fiaz/zigantic)**.
-- For **build tooling** support, check out **[buildx.zig](https://github.com/muhammad-fiaz/buildx.zig)**.
+<details>
+<summary><strong>Related Projects</strong> (click to expand)</summary>
 
+- **CUDA / GPU computing** — For GPU acceleration and CUDA support, check out [cuda.zig](https://github.com/muhammad-fiaz/cuda.zig).
+- **Environment variables** — For `.env` file parsing and environment configuration, check out [env.zig](https://github.com/muhammad-fiaz/env.zig).
+- **TUI** — For terminal user interfaces, check out [tui.zig](https://github.com/muhammad-fiaz/tui.zig).
+- **ZON file format** — For ZON parsing and serialization, check out [zon.zig](https://github.com/muhammad-fiaz/zon.zig).
+- **Spinners / loading / progress bars** — For terminal loading indicators and progress bars, check out [loaders.zig](https://github.com/muhammad-fiaz/loaders.zig).
+- **MCP** — For Model Context Protocol support, check out [mcp.zig](https://github.com/muhammad-fiaz/mcp.zig).
+- **Argument parsing** — For command-line argument parsing, check out [args.zig](https://github.com/muhammad-fiaz/args.zig).
+- **HTTP client / server** — For HTTP client and server functionality, check out [httpx.zig](https://github.com/muhammad-fiaz/httpx.zig).
+- **API framework** — For building APIs, check out [api.zig](https://github.com/muhammad-fiaz/api.zig).
+- **Web framework** — For web application development, check out [zix](https://github.com/muhammad-fiaz/zix).
+- **Archive / compression** — For archive handling and compression, check out [archive.zig](https://github.com/muhammad-fiaz/archive.zig).
+- **Compression file formats** — For compression-oriented file format support, check out [zigx](https://github.com/muhammad-fiaz/zigx).
+- **File downloading** — For downloading files, check out [downloader.zig](https://github.com/muhammad-fiaz/downloader.zig).
+- **Update checker / auto-updater** — For application update checking and automatic updates, check out [updater.zig](https://github.com/muhammad-fiaz/updater.zig).
+- **Numerical computing** — For numerical and scientific computing, check out [num.zig](https://github.com/muhammad-fiaz/num.zig).
+- **Logging** — For structured and application logging, check out [logly.zig](https://github.com/muhammad-fiaz/logly.zig).
+- **Data validation / serialization** — For data validation and serialization, check out [zigantic](https://github.com/muhammad-fiaz/zigantic).
+- **Build tooling** — For advanced Zig build tooling, check out [buildx.zig](https://github.com/muhammad-fiaz/buildx.zig).
+- **Tree-sitter** — For Tree-sitter parsing and syntax-tree support, check out [tree-sitter.zig](https://github.com/muhammad-fiaz/tree-sitter.zig).
+
+</details>
 ---
 
 <details>
@@ -253,7 +258,7 @@ pub fn main() !void {
 
     // Typed JOIN query
     var joined = try db.from(User)
-        .innerJoin(Order, User.columns.id.eq(Order.columns.user_id))
+        .innerJoin(Order, User.id.eq(Order.user_id))
         .selectAll()
         .distinct()
         .fetch();
@@ -272,10 +277,11 @@ defer rows.deinit();
 
 // Dynamic DSL: runtime table/column names, no struct required.
 // For existing databases, legacy schemas, and ad-hoc queries.
-var dyn = try db.from("users")
-    .select(.{ db.col("id"), db.col("name") })
-    .where(db.col("age").gte(18))
-    .orderBy(db.col("name").asc())
+const users = db.table("users");
+var dyn = try db.from(users)
+    .select(.{ users.column("id"), users.column("name") })
+    .where(users.column("age").gte(18))
+    .orderBy(users.column("name").asc())
     .fetch();
 defer dyn.deinit();
 
@@ -283,8 +289,8 @@ defer dyn.deinit();
 const User = sqlite.table("users", struct { id: i64, name: []const u8, age: i64 });
 try db.schema(User).validate();
 var typed = try db.from(User)
-    .where(User.columns.age.gte(18))
-    .orderBy(User.columns.name.asc())
+    .where(User.age.gte(18))
+    .orderBy(User.name.asc())
     .fetch();
 defer typed.deinit();
 for (typed.rows) |user| {
@@ -292,10 +298,25 @@ for (typed.rows) |user| {
 }
 ```
 
-Typed keys use the same descriptors (`.primaryKey = User.columns.id`);
-dynamic keys use strings (`.primaryKey = "id"`). The DSL builds the same
-internal query representation as Raw SQL directly, without generating SQL
-strings. See `docs/api/dsl.md`.
+Side by side, one engine:
+
+```text
+Raw:     SELECT * FROM users WHERE id = 1;
+Dynamic: db.from(users).selectAll().where(users.column("id").eq(1))
+Typed:   db.from(User).select(User.all()).where(User.id.eq(1))
+```
+
+The DSL builds the same internal query representation as Raw SQL directly,
+without generating SQL strings. See `docs/api/dsl.md`.
+
+`users.column("id")` is the canonical explicit Dynamic column reference: it
+carries table identity. `db.col("id")` is optional sugar for an unqualified
+reference resolved with SQLite name-resolution rules; ambiguous references
+are an error, never a silent pick. Typed columns are `User.id`;
+`User.all()` is the typed `table.*` operation and `selectAll()` is the
+`SELECT *` operation on any query; both build the same native projection
+node. Schema columns are always fields — even a column literally named
+`all` stays usable as `User.all` — while operations are always calls.
 
 ### Raw SQL
 
@@ -321,75 +342,6 @@ pub fn main() !void {
 ```
 
 ## Examples
-
-The `examples/` directory contains **64 runnable examples**:
-
-| # | Example | Description |
-|---|---------|-------------|
-| 01 | [`open_and_exec`](examples/01_open_and_exec.zig) | Open a database and execute raw SQL |
-| 02 | [`prepared_statement`](examples/02_prepared_statement.zig) | Parameterized queries with prepared statements |
-| 03 | [`transactions`](examples/03_transactions.zig) | BEGIN, COMMIT, ROLLBACK with typed DSL |
-| 04 | [`dsl_query_builder`](examples/04_dsl_query_builder.zig) | Type-safe comptime query builder basics |
-| 05 | [`migrations`](examples/05_migrations.zig) | Schema migration patterns |
-| 06 | [`error_handling`](examples/06_error_handling.zig) | Error handling and recovery |
-| 07 | [`file_format`](examples/07_file_format.zig) | On-disk image verification with close/reopen |
-| 08 | [`repair_legacy_example`](examples/08_repair_legacy_example.zig) | Repair and legacy database handling |
-| 09 | [`dsl_crud`](examples/09_dsl_crud.zig) | Full CRUD operations via typed DSL |
-| 10 | [`dsl_advanced`](examples/10_dsl_advanced.zig) | Advanced DSL queries and predicates |
-| 11 | [`keys_and_joins`](examples/11_keys_and_joins.zig) | Primary keys, foreign keys, and JOIN queries |
-| 12 | [`complex_queries`](examples/12_complex_queries.zig) | DISTINCT joins and aggregate functions |
-| 13 | [`edge_cases`](examples/13_edge_cases.zig) | NULL handling, savepoints, and error cases |
-| 14 | [`dsl_select_projections`](examples/14_dsl_select_projections.zig) | SELECT field projections with select() |
-| 15 | [`raw_dsl_interoperability`](examples/15_raw_dsl_interoperability.zig) | Verify raw SQL and DSL produce identical results |
-| 16 | [`dsl_predicates_pagination`](examples/16_dsl_predicates_pagination.zig) | WHERE predicates with LIMIT/OFFSET pagination |
-| 17 | [`persistence_reopen_verification`](examples/17_persistence_reopen_verification.zig) | Data persistence across database close/reopen |
-| 18 | [`schema_lifecycle_verification`](examples/18_schema_lifecycle_verification.zig) | CREATE, ALTER, DROP table lifecycle |
-| 19 | [`prepared_parameter_verification`](examples/19_prepared_parameter_verification.zig) | Typed parameter binding in prepared statements |
-| 20 | [`scalar_functions_typed_dsl`](examples/20_scalar_functions_typed_dsl.zig) | ABS, LENGTH, UPPER, LOWER, SUBSTR functions |
-| 21 | [`indexed_queries`](examples/21_indexed_queries.zig) | Index creation and optimized lookups |
-| 22 | [`views_and_typed_reads`](examples/22_views_and_typed_reads.zig) | CREATE VIEW with typed DSL reads |
-| 23 | [`triggers_raw_and_dsl`](examples/23_triggers_raw_and_dsl.zig) | AFTER INSERT triggers |
-| 24 | [`cte_raw_and_typed_reads`](examples/24_cte_raw_and_typed_reads.zig) | Common Table Expressions with typed reads |
-| 25 | [`subqueries_raw_and_typed_dsl`](examples/25_subqueries_raw_and_typed_dsl.zig) | IN subqueries in WHERE clauses |
-| 26 | [`foreign_key_actions`](examples/26_foreign_key_actions.zig) | CASCADE DELETE and SET NULL actions |
-| 27 | [`composite_unique_keys`](examples/27_composite_unique_keys.zig) | Composite unique constraints |
-| 28 | [`foreign_key_update_actions`](examples/28_foreign_key_update_actions.zig) | ON UPDATE CASCADE, SET NULL, RESTRICT |
-| 29 | [`multiple_ctes`](examples/29_multiple_ctes.zig) | Multiple dependent non-recursive CTEs |
-| 30 | [`composite_table_constraints`](examples/30_composite_table_constraints.zig) | Composite PRIMARY KEY and UNIQUE |
-| 31 | [`composite_foreign_keys`](examples/31_composite_foreign_keys.zig) | Composite foreign keys referencing multiple columns |
-| 32 | [`recursive_ctes`](examples/32_recursive_ctes.zig) | Recursive CTEs for hierarchical tree traversal |
-| 33 | [`explain_query_plan`](examples/33_explain_query_plan.zig) | EXPLAIN QUERY PLAN and indexed lookups |
-| 34 | [`virtual_generate_series`](examples/34_virtual_generate_series.zig) | generate_series virtual table |
-| 35 | [`wal_journal_mode`](examples/35_wal_journal_mode.zig) | WAL journal mode and checkpointing |
-| 36 | [`grouped_aggregates`](examples/36_grouped_aggregates.zig) | GROUP BY aggregates |
-| 37 | [`insert_select_copy`](examples/37_insert_select_copy.zig) | INSERT...SELECT copies |
-| 38 | [`insert_or_ignore`](examples/38_insert_or_ignore.zig) | INSERT OR IGNORE conflicts |
-| 39 | [`upsert_do_nothing`](examples/39_upsert_do_nothing.zig) | ON CONFLICT DO NOTHING |
-| 40 | [`upsert_do_update`](examples/40_upsert_do_update.zig) | ON CONFLICT DO UPDATE |
-| 41 | [`insert_or_replace`](examples/41_insert_or_replace.zig) | INSERT OR REPLACE |
-| 42 | [`update_from_join`](examples/42_update_from_join.zig) | UPDATE...FROM joins |
-| 43 | [`not_in_subqueries`](examples/43_not_in_subqueries.zig) | NOT IN subqueries |
-| 44 | [`exists_subqueries`](examples/44_exists_subqueries.zig) | EXISTS / NOT EXISTS |
-| 45 | [`literal_in_lists`](examples/45_literal_in_lists.zig) | Literal IN lists |
-| 46 | [`raw_alter_table`](examples/46_raw_alter_table.zig) | ALTER TABLE variants |
-| 47 | [`column_defaults`](examples/47_column_defaults.zig) | Column DEFAULTs |
-| 48 | [`raw_dsl`](examples/48_raw_dsl.zig) | Schema-less dynamic DSL |
-| 49 | [`sqlite_coverage_layers`](examples/49_sqlite_coverage_layers.zig) | Raw, dynamic, and typed interop |
-| 50 | [`schema_validation_interop`](examples/50_schema_validation_interop.zig) | Strict schema validation |
-| 51 | [`dsl_ctes`](examples/51_dsl_ctes.zig) | WITH and WITH RECURSIVE in the DSL |
-| 52 | [`column_mapping`](examples/52_column_mapping.zig) | camelCase Zig fields over SQL names |
-| 53 | [`expression_operators`](examples/53_expression_operators.zig) | Full operator coverage across raw, dynamic, and typed DSL |
-| 54 | [`derived_tables`](examples/54_derived_tables.zig) | Subqueries in FROM with aliases and persistence |
-| 55 | [`returning`](examples/55_returning.zig) | RETURNING rows from INSERT, UPDATE, and DELETE |
-| 56 | [`upsert_dsl`](examples/56_upsert_dsl.zig) | ON CONFLICT targets and excluded values in the DSL |
-| 57 | [`before_triggers`](examples/57_before_triggers.zig) | BEFORE timing, WHEN filters, and abort behavior |
-| 58 | [`case_dsl`](examples/58_case_dsl.zig) | Searched and simple CASE in SELECT and RETURNING |
-| 59 | [`using_natural_joins`](examples/59_using_natural_joins.zig) | USING and NATURAL joins across Raw, Dynamic, and Typed |
-| 60 | [`multi_column_using`](examples/60_multi_column_using.zig) | Multi-column USING joins with tuple targets |
-| 61 | [`compound_dsl`](examples/61_compound_dsl.zig) | UNION, INTERSECT, and EXCEPT in the DSL |
-| 62 | [`pragma_checks`](examples/62_pragma_checks.zig) | integrity_check, foreign_key_check, and settings |
-| 63 | [`derived_dsl`](examples/63_derived_dsl.zig) | Derived tables in Dynamic and Typed DSL |
-| 64 | [`window_dsl`](examples/64_window_dsl.zig) | Window functions in Dynamic and Typed DSL |
 
 Run any example:
 

@@ -9,8 +9,8 @@ const Order = sqlite.table("subquery_orders", OrderRow);
 pub fn main() !void {
     var db = try sqlite.open(std.heap.page_allocator, "example_25.db");
     defer db.close();
-    try db.createTable(User, .{ .overWrite = true, .primaryKey = User.columns.id });
-    try db.createTable(Order, .{ .overWrite = true, .primaryKey = Order.columns.id });
+    try db.createTable(User, .{ .overWrite = true, .primaryKey = User.id });
+    try db.createTable(Order, .{ .overWrite = true, .primaryKey = Order.id });
     try db.truncate(User);
     try db.truncate(Order);
     var alice = try db.from(User).insert(.{ .id = 1, .name = "Alice" });
@@ -22,8 +22,8 @@ pub fn main() !void {
 
     var raw = try db.exec("SELECT id, name FROM subquery_users WHERE id IN (SELECT user_id FROM subquery_orders);");
     defer raw.deinit();
-    var typed = try db.from(User).whereInQuery(User.columns.id, Order, Order.columns.user_id).select(&.{ User.columns.id, User.columns.name }).fetch();
+    var typed = try db.from(User).whereInQuery(User.id, Order, Order.user_id).select(&.{ User.id, User.name }).fetch();
     defer typed.deinit();
-    if (raw.count() != 1 or typed.count() != 1 or typed.rows[0][0].integer != 1) return error.SubqueryVerificationFailed;
+    if (raw.count() != 1 or typed.count() != 1 or typed.at(0)[0].integer != 1) return error.SubqueryVerificationFailed;
     std.debug.print("25 subqueries: raw IN SELECT and typed whereInQuery verified\n", .{});
 }

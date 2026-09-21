@@ -6,7 +6,7 @@ const Item = sqlite.table("edge_items", struct { id: i64, label: ?[]const u8 });
 pub fn main() !void {
     var db = try sqlite.open(std.heap.page_allocator, "example_13.db");
     defer db.close();
-    try db.createTable(Item, .{ .overWrite = true, .primaryKey = Item.columns.id, .unique = &.{Item.columns.label} });
+    try db.createTable(Item, .{ .overWrite = true, .primaryKey = Item.id, .unique = &.{Item.label} });
     try db.truncate(Item);
     var first = try db.from(Item).insert(.{ .id = 1, .label = "alpha" });
     first.deinit();
@@ -25,7 +25,7 @@ pub fn main() !void {
     try db.rollbackToSavepoint("edge_point");
     try db.releaseSavepoint("edge_point");
     try db.commit();
-    var result = try db.from(Item).where(Item.columns.label.isNull()).fetch();
+    var result = try db.from(Item).where(Item.label.isNull()).fetch();
     result.deinit();
     const invalid = db.exec("SELECT FROM edge_items;") catch null;
     if (invalid) |value| {

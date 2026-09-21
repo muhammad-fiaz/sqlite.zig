@@ -13,10 +13,10 @@ const RestrictedChild = sqlite.table("update_restricted_children", RestrictedChi
 pub fn main() !void {
     var db = try sqlite.open(std.heap.page_allocator, "example_28.db");
     defer db.close();
-    try db.createTable(Parent, .{ .overWrite = true, .primaryKey = Parent.columns.id });
-    try db.createTable(CascadeChild, .{ .overWrite = true, .primaryKey = CascadeChild.columns.id, .foreignKeys = &.{.{ .column = CascadeChild.columns.parent_id, .references = Parent.columns.id, .onUpdate = .cascade }} });
-    try db.createTable(NullableChild, .{ .overWrite = true, .primaryKey = NullableChild.columns.id, .foreignKeys = &.{.{ .column = NullableChild.columns.parent_id, .references = Parent.columns.id, .onUpdate = .setNull }} });
-    try db.createTable(RestrictedChild, .{ .overWrite = true, .primaryKey = RestrictedChild.columns.id, .foreignKeys = &.{.{ .column = RestrictedChild.columns.parent_id, .references = Parent.columns.id, .onUpdate = .restrict }} });
+    try db.createTable(Parent, .{ .overWrite = true, .primaryKey = Parent.id });
+    try db.createTable(CascadeChild, .{ .overWrite = true, .primaryKey = CascadeChild.id, .foreignKeys = &.{.{ .column = CascadeChild.parent_id, .references = Parent.id, .onUpdate = .cascade }} });
+    try db.createTable(NullableChild, .{ .overWrite = true, .primaryKey = NullableChild.id, .foreignKeys = &.{.{ .column = NullableChild.parent_id, .references = Parent.id, .onUpdate = .setNull }} });
+    try db.createTable(RestrictedChild, .{ .overWrite = true, .primaryKey = RestrictedChild.id, .foreignKeys = &.{.{ .column = RestrictedChild.parent_id, .references = Parent.id, .onUpdate = .restrict }} });
     try db.truncate(RestrictedChild);
     try db.truncate(NullableChild);
     try db.truncate(CascadeChild);
@@ -29,21 +29,21 @@ pub fn main() !void {
     var nullable = try db.from(NullableChild).insert(.{ .id = 1, .parent_id = 1 });
     nullable.deinit();
     var update = try db.from(Parent).update(.{ .id = 2 });
-    var result = try update.where(Parent.columns.id.eq(1)).execute();
+    var result = try update.where(Parent.id.eq(1)).execute();
     result.deinit();
 
     var child = try db.from(CascadeChild).selectAll().fetch();
     defer child.deinit();
-    if (child.rows[0].parent_id != 2) return error.CascadeUpdateVerificationFailed;
+    if (child.at(0).parent_id != 2) return error.CascadeUpdateVerificationFailed;
     var cleared = try db.from(NullableChild).selectAll().fetch();
     defer cleared.deinit();
-    if (cleared.rows[0].parent_id != null) return error.SetNullUpdateVerificationFailed;
+    if (cleared.at(0).parent_id != null) return error.SetNullUpdateVerificationFailed;
 
     var restrictedParent = try db.from(Parent).insert(.{ .id = 3, .name = "restricted" });
     restrictedParent.deinit();
     var restrictedChild = try db.from(RestrictedChild).insert(.{ .id = 1, .parent_id = 3 });
     restrictedChild.deinit();
     var blocked = try db.from(Parent).update(.{ .id = 4 });
-    try std.testing.expectError(error.ConstraintViolation, blocked.where(Parent.columns.id.eq(3)).execute());
+    try std.testing.expectError(error.ConstraintViolation, blocked.where(Parent.id.eq(3)).execute());
     std.debug.print("28 foreign keys: ON UPDATE CASCADE, SET NULL, and RESTRICT verified\n", .{});
 }

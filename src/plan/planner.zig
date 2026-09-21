@@ -165,7 +165,7 @@ pub fn planSelect(allocator: std.mem.Allocator, schema: *const Schema, selectStm
         };
     };
 
-    const orderOpt: ?ast.Order = selectStmt.order;
+    const orderList: []const ast.Order = selectStmt.orders;
     const conditionOpt: ?ast.Conditions = selectStmt.condition;
     const joinList: []const ast.Join = selectStmt.joins;
 
@@ -176,7 +176,7 @@ pub fn planSelect(allocator: std.mem.Allocator, schema: *const Schema, selectStm
         .tableName = table.name,
         .scanType = .tableScan,
         .cost = cost.tableScan(rowCount),
-        .needsTempSort = orderOpt != null,
+        .needsTempSort = orderList.len != 0,
         .allocator = allocator,
     };
     if (bestPlan.needsTempSort) {
@@ -195,11 +195,13 @@ pub fn planSelect(allocator: std.mem.Allocator, schema: *const Schema, selectStm
             }
             if ((isRowid or isPkInt) and cond.op == .equal) {
                 var rowidCost = cost.rowidLookup(rowCount);
-                var rowidNeedsSort = orderOpt != null;
-                if (orderOpt) |ord| {
-                    if (std.ascii.eqlIgnoreCase(ord.column, cond.column)) {
-                        rowidNeedsSort = false;
-                    }
+                // A rowid-ordered scan satisfies the ORDER BY only when the
+                // leading key is the looked-up rowid column (prefix rule).
+                var rowidNeedsSort = true;
+                if (orderList.len == 0) {
+                    rowidNeedsSort = false;
+                } else if (std.ascii.eqlIgnoreCase(orderList[0].column, cond.column)) {
+                    rowidNeedsSort = false;
                 }
                 if (rowidNeedsSort) {
                     rowidCost.total += cost.sortCost(1).total;
@@ -299,12 +301,18 @@ pub fn planSelect(allocator: std.mem.Allocator, schema: *const Schema, selectStm
                     }
                 }
 
+                // An index scan satisfies ORDER BY only when the leading sort
+                // keys match the index column prefix past the equality
+                // columns (SQLite may scan the index in either direction).
                 var satisfiesOrder = false;
-                if (orderOpt) |ord| {
+                if (orderList.len != 0) {
+                    satisfiesOrder = true;
                     const nextOrderColIdx = eqCols.items.len;
-                    if (nextOrderColIdx < index.columns.len) {
-                        if (std.ascii.eqlIgnoreCase(ord.column, index.columns[nextOrderColIdx])) {
-                            satisfiesOrder = true;
+                    for (orderList, 0..) |ord, keyOffset| {
+                        const idxPos = nextOrderColIdx + keyOffset;
+                        if (idxPos >= index.columns.len or !std.ascii.eqlIgnoreCase(ord.column, index.columns[idxPos])) {
+                            satisfiesOrder = false;
+                            break;
                         }
                     }
                 }
@@ -314,7 +322,7 @@ pub fn planSelect(allocator: std.mem.Allocator, schema: *const Schema, selectStm
                     idxCost.startup *= 0.5;
                     idxCost.total *= 0.8;
                 }
-                const idxNeedsSort = orderOpt != null and !satisfiesOrder;
+                const idxNeedsSort = orderList.len != 0 and !satisfiesOrder;
                 if (idxNeedsSort) {
                     idxCost.total += cost.sortCost(idxCost.rows).total;
                 }
@@ -348,64 +356,72 @@ pub fn planSelect(allocator: std.mem.Allocator, schema: *const Schema, selectStm
             }
         }
     } else {
-        if (orderOpt) |ord| {
+        // Without WHERE, an index scan in index order satisfies ORDER BY
+        // when the leading sort keys match the index column prefix.
+        if (orderList.len != 0) {
             for (schema.indexes.items) |index| {
                 if (!std.ascii.eqlIgnoreCase(index.table, table.name)) continue;
-                if (index.columns.len > 0 and std.ascii.eqlIgnoreCase(index.columns[0], ord.column)) {
-                    var isCovering = true;
-                    if (selectStmt.projections.len == 0) {
-                        isCovering = false;
+                var prefixMatch = true;
+                for (orderList, 0..) |ord, keyOffset| {
+                    if (keyOffset >= index.columns.len or !std.ascii.eqlIgnoreCase(index.columns[keyOffset], ord.column)) {
+                        prefixMatch = false;
+                        break;
                     }
-                    for (selectStmt.projections) |proj| {
-                        switch (proj.expr) {
-                            .identifier => |id| {
-                                var inIdx = false;
-                                for (index.columns) |idxCol| {
-                                    if (std.ascii.eqlIgnoreCase(idxCol, id)) {
-                                        inIdx = true;
-                                        break;
-                                    }
-                                }
-                                if (!inIdx) {
-                                    isCovering = false;
+                }
+                if (!prefixMatch) continue;
+                var isCovering = true;
+                if (selectStmt.projections.len == 0) {
+                    isCovering = false;
+                }
+                for (selectStmt.projections) |proj| {
+                    switch (proj.expr) {
+                        .identifier => |id| {
+                            var inIdx = false;
+                            for (index.columns) |idxCol| {
+                                if (std.ascii.eqlIgnoreCase(idxCol, id)) {
+                                    inIdx = true;
                                     break;
                                 }
-                            },
-                            .wildcard => {
+                            }
+                            if (!inIdx) {
                                 isCovering = false;
                                 break;
-                            },
-                            else => {},
-                        }
+                            }
+                        },
+                        .wildcard => {
+                            isCovering = false;
+                            break;
+                        },
+                        else => {},
                     }
+                }
 
-                    var scanCost = cost.tableScan(rowCount);
-                    if (isCovering) {
-                        scanCost.startup *= 0.5;
-                        scanCost.total *= 0.8;
+                var scanCost = cost.tableScan(rowCount);
+                if (isCovering) {
+                    scanCost.startup *= 0.5;
+                    scanCost.total *= 0.8;
+                }
+                scanCost.ordered = true;
+
+                if (scanCost.compare(bestPlan.cost) == .lt) {
+                    if (bestPlan.indexMatch) |oldIm| {
+                        if (oldIm.eqColumns.len > 0) allocator.free(oldIm.eqColumns);
                     }
-                    scanCost.ordered = true;
-
-                    if (scanCost.compare(bestPlan.cost) == .lt) {
-                        if (bestPlan.indexMatch) |oldIm| {
-                            if (oldIm.eqColumns.len > 0) allocator.free(oldIm.eqColumns);
-                        }
-                        bestPlan = QueryPlan{
+                    bestPlan = QueryPlan{
+                        .tableName = table.name,
+                        .scanType = .indexScan,
+                        .indexMatch = .{
+                            .indexName = index.name,
                             .tableName = table.name,
-                            .scanType = .indexScan,
-                            .indexMatch = .{
-                                .indexName = index.name,
-                                .tableName = table.name,
-                                .eqColumns = &.{},
-                                .rangeColumn = null,
-                                .isCovering = isCovering,
-                                .satisfiesOrderBy = true,
-                            },
-                            .cost = scanCost,
-                            .needsTempSort = false,
-                            .allocator = allocator,
-                        };
-                    }
+                            .eqColumns = &.{},
+                            .rangeColumn = null,
+                            .isCovering = isCovering,
+                            .satisfiesOrderBy = true,
+                        },
+                        .cost = scanCost,
+                        .needsTempSort = false,
+                        .allocator = allocator,
+                    };
                 }
             }
         }
@@ -483,7 +499,7 @@ test "planner plans full table scan without index" {
     var plan = try planSelect(std.testing.allocator, &schema, .{
         .table = @as(?[]const u8, "items"),
         .condition = @as(?ast.Conditions, null),
-        .order = @as(?ast.Order, null),
+        .orders = @as([]const ast.Order, &.{}),
         .projections = @as([]const ast.Projection, &.{}),
         .joins = @as([]const ast.Join, &.{}),
     });
@@ -516,7 +532,7 @@ test "planner plans index seek for equality on indexed column" {
     var plan = try planSelect(std.testing.allocator, &schema, .{
         .table = @as(?[]const u8, "items"),
         .condition = @as(?ast.Conditions, &conds),
-        .order = @as(?ast.Order, null),
+        .orders = @as([]const ast.Order, &.{}),
         .projections = @as([]const ast.Projection, &.{}),
         .joins = @as([]const ast.Join, &.{}),
     });
@@ -555,7 +571,7 @@ test "planner plans composite index prefix and range scan" {
     var plan = try planSelect(std.testing.allocator, &schema, .{
         .table = @as(?[]const u8, "t1"),
         .condition = @as(?ast.Conditions, &conds),
-        .order = @as(?ast.Order, null),
+        .orders = @as([]const ast.Order, &.{}),
         .projections = @as([]const ast.Projection, &projs),
         .joins = @as([]const ast.Join, &.{}),
     });
@@ -582,7 +598,7 @@ test "planner plans integer primary key rowid search" {
     var plan = try planSelect(std.testing.allocator, &schema, .{
         .table = @as(?[]const u8, "users"),
         .condition = @as(?ast.Conditions, &conds),
-        .order = @as(?ast.Order, null),
+        .orders = @as([]const ast.Order, &.{}),
         .projections = @as([]const ast.Projection, &.{}),
         .joins = @as([]const ast.Join, &.{}),
     });
@@ -612,7 +628,7 @@ test "planner uses index for order by to elide temp sort" {
     var plan = try planSelect(std.testing.allocator, &schema, .{
         .table = @as(?[]const u8, "t2"),
         .condition = @as(?ast.Conditions, null),
-        .order = @as(?ast.Order, .{ .column = "c", .descending = false }),
+        .orders = @as([]const ast.Order, &.{.{ .column = "c", .descending = false }}),
         .projections = @as([]const ast.Projection, &.{}),
         .joins = @as([]const ast.Join, &.{}),
     });
@@ -658,7 +674,7 @@ test "planner plans nested loop join with indexed inner table" {
     var plan = try planSelect(std.testing.allocator, &schema, .{
         .table = @as(?[]const u8, "authors"),
         .condition = @as(?ast.Conditions, null),
-        .order = @as(?ast.Order, null),
+        .orders = @as([]const ast.Order, &.{}),
         .projections = @as([]const ast.Projection, &.{}),
         .joins = @as([]const ast.Join, &[_]ast.Join{joinDef}),
     });
@@ -692,7 +708,7 @@ test "planner row counts follow analyzed statistics" {
     var fresh = try planSelect(std.testing.allocator, &schema, .{
         .table = @as(?[]const u8, "widgets"),
         .condition = @as(?ast.Conditions, null),
-        .order = @as(?ast.Order, null),
+        .orders = @as([]const ast.Order, &.{}),
         .projections = @as([]const ast.Projection, &.{}),
         .joins = @as([]const ast.Join, &.{}),
     });
@@ -703,7 +719,7 @@ test "planner row counts follow analyzed statistics" {
     var analyzed = try planSelect(std.testing.allocator, &schema, .{
         .table = @as(?[]const u8, "widgets"),
         .condition = @as(?ast.Conditions, null),
-        .order = @as(?ast.Order, null),
+        .orders = @as([]const ast.Order, &.{}),
         .projections = @as([]const ast.Projection, &.{}),
         .joins = @as([]const ast.Join, &.{}),
     });
@@ -717,7 +733,7 @@ test "planner row counts follow analyzed statistics" {
     var stale = try planSelect(std.testing.allocator, &schema, .{
         .table = @as(?[]const u8, "widgets"),
         .condition = @as(?ast.Conditions, null),
-        .order = @as(?ast.Order, null),
+        .orders = @as([]const ast.Order, &.{}),
         .projections = @as([]const ast.Projection, &.{}),
         .joins = @as([]const ast.Join, &.{}),
     });

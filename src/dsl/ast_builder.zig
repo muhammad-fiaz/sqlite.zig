@@ -13,23 +13,27 @@ pub const ExecFn = *const fn (*anyopaque, *const ast.Statement, []const CteInput
 
 pub const CompoundArm = struct { stmt: *const ast.Statement, ctes: []const CteInput, recursive: bool };
 
-pub const CompoundExecFn = *const fn (*anyopaque, []const CompoundArm, []const ast.CompoundOp, ?ast.Order, ?usize, ?usize) anyerror!Result;
+pub const CompoundExecFn = *const fn (*anyopaque, []const CompoundArm, []const ast.CompoundOp, []const ast.Order, ?usize, ?usize) anyerror!Result;
 
 pub const DerivedExecFn = *const fn (*anyopaque, sub: CompoundArm, outer: CompoundArm) anyerror!Result;
 
 pub const JoinKind = enum { inner, left, right, full, cross };
+
+pub const StripBase = struct { table: []const u8, schema: []const u8 = "", alias: ?[]const u8 = null };
 
 pub const CondEntry = struct { expr: dslExpr.Expr, joinOr: bool = false };
 
 pub const InQueryArgs = struct {
     column: dslExpr.ColumnRef,
     table: []const u8,
+    schema: []const u8 = "",
     subcolumn: dslExpr.ColumnRef,
     negated: bool = false,
 };
 
 pub const ExistsQueryArgs = struct {
     table: []const u8,
+    schema: []const u8 = "",
     on: ?dslExpr.Expr = null,
     negated: bool = false,
 };
@@ -46,7 +50,7 @@ pub const CaseWhereArgs = struct {
     joinOr: bool = false,
 };
 
-pub const UpsertValue = union(enum) { literal: Value, excluded: []const u8 };
+pub const UpsertValue = union(enum) { literal: Value, excluded: []const u8, set: dslExpr.SetValue };
 
 pub const UpsertSet = struct { name: []const u8, value: UpsertValue };
 
@@ -100,8 +104,20 @@ const Ctx = struct {
         return combined;
     }
 
-    fn refName(self: *Ctx, ref: dslExpr.ColumnRef, stripTable: ?[]const u8) ![]const u8 {
-        if (stripTable) |base| if (ref.table.len != 0 and std.ascii.eqlIgnoreCase(ref.table, base)) return ref.name;
+    fn refName(self: *Ctx, ref: dslExpr.ColumnRef, base: ?StripBase) ![]const u8 {
+        if (base) |b| {
+            if (b.alias) |a| {
+                if (ref.table.len != 0 and std.ascii.eqlIgnoreCase(ref.table, a)) return ref.name;
+            } else if (ref.table.len != 0 and std.ascii.eqlIgnoreCase(ref.table, b.table) and std.ascii.eqlIgnoreCase(ref.schema, b.schema)) {
+                return ref.name;
+            }
+        }
+        if (ref.schema.len != 0) {
+            const combined = try std.fmt.allocPrint(self.alloc, "{s}.{s}.{s}", .{ ref.schema, ref.table, ref.name });
+            errdefer self.alloc.free(combined);
+            try self.owned.append(self.alloc, combined);
+            return combined;
+        }
         return self.dotted(ref.table, ref.name);
     }
 
@@ -150,16 +166,16 @@ fn mapCompareOp(op: dslExpr.Operator) ast.CompareOp {
     };
 }
 
-fn rhsToExpr(ctx: *Ctx, rhs: dslExpr.Rhs, stripTable: ?[]const u8) !ast.Expr {
+fn rhsToExpr(ctx: *Ctx, rhs: dslExpr.Rhs, base: ?StripBase) !ast.Expr {
     return switch (rhs) {
         .value => |v| ast.Expr{ .literal = v },
-        .column => |ref| ast.Expr{ .identifier = try ctx.refName(ref, stripTable) },
+        .column => |ref| ast.Expr{ .identifier = try ctx.refName(ref, base) },
     };
 }
 
-fn funcToNode(ctx: *Ctx, ref: dslExpr.ColumnRef, func: dslExpr.FuncCall, stripTable: ?[]const u8) !*ast.Expr {
+fn funcToNode(ctx: *Ctx, ref: dslExpr.ColumnRef, func: dslExpr.FuncCall, base: ?StripBase) !*ast.Expr {
     const argNode = try ctx.node();
-    argNode.* = .{ .identifier = try ctx.refName(ref, stripTable) };
+    argNode.* = .{ .identifier = try ctx.refName(ref, base) };
     if (std.ascii.eqlIgnoreCase(func.name, "CAST")) {
         const target: []const u8 = if (func.hasArgument and func.argument == .text) func.argument.text else return error.InvalidSql;
         if (target.len == 0) return error.InvalidSql;
@@ -186,18 +202,18 @@ fn funcToNode(ctx: *Ctx, ref: dslExpr.ColumnRef, func: dslExpr.FuncCall, stripTa
     return callNode;
 }
 
-fn predicateToCondition(ctx: *Ctx, expr: dslExpr.Expr, stripTable: ?[]const u8, joinOr: bool) !ast.Condition {
+fn predicateToCondition(ctx: *Ctx, expr: dslExpr.Expr, base: ?StripBase, joinOr: bool) !ast.Condition {
     var leftExpr: ?ast.Expr = null;
     var column: []const u8 = "";
     if (expr.function) |func| {
-        leftExpr = ctx.detach(try funcToNode(ctx, expr.column, func, stripTable));
+        leftExpr = ctx.detach(try funcToNode(ctx, expr.column, func, base));
     } else {
-        column = try ctx.refName(expr.column, stripTable);
+        column = try ctx.refName(expr.column, base);
     }
     var value: ast.Expr = .{ .literal = .null };
-    if (expr.needsRhs()) value = try rhsToExpr(ctx, expr.rhs, stripTable);
+    if (expr.needsRhs()) value = try rhsToExpr(ctx, expr.rhs, base);
     var value2: ?ast.Expr = null;
-    if (expr.needsRhs2()) value2 = try rhsToExpr(ctx, expr.rhs2.?, stripTable);
+    if (expr.needsRhs2()) value2 = try rhsToExpr(ctx, expr.rhs2.?, base);
     var escape: ?ast.Expr = null;
     if (expr.escape) |esc| {
         if (expr.operator != .like and expr.operator != .notLike) return error.InvalidSql;
@@ -216,54 +232,54 @@ fn predicateToCondition(ctx: *Ctx, expr: dslExpr.Expr, stripTable: ?[]const u8, 
     };
 }
 
-fn buildConditionList(ctx: *Ctx, list: *std.ArrayList(ast.Condition), conditions: []const CondEntry, stripTable: ?[]const u8) !void {
-    for (conditions) |entry| try list.append(ctx.alloc, try predicateToCondition(ctx, entry.expr, stripTable, entry.joinOr));
+fn buildConditionList(ctx: *Ctx, list: *std.ArrayList(ast.Condition), conditions: []const CondEntry, base: ?StripBase) !void {
+    for (conditions) |entry| try list.append(ctx.alloc, try predicateToCondition(ctx, entry.expr, base, entry.joinOr));
 }
 
-fn buildCaseWhereList(ctx: *Ctx, list: *std.ArrayList(ast.Condition), cases: []const CaseWhereArgs, stripTable: ?[]const u8) !void {
+fn buildCaseWhereList(ctx: *Ctx, list: *std.ArrayList(ast.Condition), cases: []const CaseWhereArgs, base: ?StripBase) !void {
     for (cases) |entry| {
         try list.append(ctx.alloc, .{
             .column = "",
             .op = .equal,
-            .value = try rhsToExpr(ctx, entry.value, stripTable),
-            .leftExpr = try caseToExpr(ctx, entry.case, stripTable),
+            .value = try rhsToExpr(ctx, entry.value, base),
+            .leftExpr = try caseToExpr(ctx, entry.case, base),
             .joinOr = entry.joinOr,
         });
     }
 }
 
-fn projectionToAst(ctx: *Ctx, proj: dslExpr.Projection, stripTable: ?[]const u8, cases: []const CaseBuilder, windows: []const WindowBuilder) !ast.Projection {
+fn projectionToAst(ctx: *Ctx, proj: dslExpr.Projection, base: ?StripBase, cases: []const CaseBuilder, windows: []const WindowBuilder) !ast.Projection {
     switch (proj.kind) {
-        .star => return .{ .expr = .wildcard },
+        .star => return .{ .expr = .wildcard, .alias = proj.alias },
         .countStar => {
             const argNode = try ctx.node();
             argNode.* = .wildcard;
             const callNode = try ctx.node();
             callNode.* = .{ .function = .{ .name = "COUNT", .argument = argNode } };
-            return .{ .expr = ctx.detach(callNode) };
+            return .{ .expr = ctx.detach(callNode), .alias = proj.alias };
         },
-        .column => return .{ .expr = .{ .identifier = try ctx.refName(proj.column, stripTable) } },
+        .column => return .{ .expr = .{ .identifier = try ctx.refName(proj.column, base) }, .alias = proj.alias },
         .aggregate => {
             const argNode = try ctx.node();
-            argNode.* = .{ .identifier = try ctx.refName(proj.column, stripTable) };
+            argNode.* = .{ .identifier = try ctx.refName(proj.column, base) };
             const callNode = try ctx.node();
             callNode.* = .{ .function = .{ .name = proj.function, .argument = argNode, .distinct = proj.distinct } };
-            return .{ .expr = ctx.detach(callNode) };
+            return .{ .expr = ctx.detach(callNode), .alias = proj.alias };
         },
         .scalar => {
             if (std.ascii.eqlIgnoreCase(proj.function, "CAST")) {
                 const target: []const u8 = if (proj.hasArgument and proj.argument == .text) proj.argument.text else return error.InvalidSql;
                 if (target.len == 0) return error.InvalidSql;
                 const argNode = try ctx.node();
-                argNode.* = .{ .identifier = try ctx.refName(proj.column, stripTable) };
+                argNode.* = .{ .identifier = try ctx.refName(proj.column, base) };
                 const targetNode = try ctx.node();
                 targetNode.* = .{ .identifier = target };
                 const callNode = try ctx.node();
                 callNode.* = .{ .function = .{ .name = proj.function, .argument = argNode, .argument2 = targetNode } };
-                return .{ .expr = ctx.detach(callNode) };
+                return .{ .expr = ctx.detach(callNode), .alias = proj.alias };
             }
             const argNode = try ctx.node();
-            argNode.* = .{ .identifier = try ctx.refName(proj.column, stripTable) };
+            argNode.* = .{ .identifier = try ctx.refName(proj.column, base) };
             var arg2: ?*const ast.Expr = null;
             if (proj.hasArgument) {
                 const created = try ctx.node();
@@ -278,25 +294,25 @@ fn projectionToAst(ctx: *Ctx, proj: dslExpr.Projection, stripTable: ?[]const u8,
             }
             const callNode = try ctx.node();
             callNode.* = .{ .function = .{ .name = proj.function, .argument = argNode, .argument2 = arg2, .argument3 = arg3 } };
-            return .{ .expr = ctx.detach(callNode) };
+            return .{ .expr = ctx.detach(callNode), .alias = proj.alias };
         },
         .caseExpr => {
             if (proj.caseSlot >= cases.len) return error.InvalidSql;
-            return .{ .expr = try caseToExpr(ctx, cases[proj.caseSlot], stripTable) };
+            return .{ .expr = try caseToExpr(ctx, cases[proj.caseSlot], base), .alias = proj.alias };
         },
         .window => {
             if (proj.windowSlot >= windows.len) return error.InvalidSql;
-            return .{ .expr = try windowToExpr(ctx, windows[proj.windowSlot], stripTable) };
+            return .{ .expr = try windowToExpr(ctx, windows[proj.windowSlot], base), .alias = proj.alias };
         },
     }
 }
 
-fn leftSideToExpr(ctx: *Ctx, column: dslExpr.ColumnRef, func: ?dslExpr.FuncCall, stripTable: ?[]const u8) !ast.Expr {
+fn leftSideToExpr(ctx: *Ctx, column: dslExpr.ColumnRef, func: ?dslExpr.FuncCall, base: ?StripBase) !ast.Expr {
     if (func) |call| {
-        const callNode = try funcToNode(ctx, column, call, stripTable);
+        const callNode = try funcToNode(ctx, column, call, base);
         return ctx.detach(callNode);
     }
-    return .{ .identifier = try ctx.refName(column, stripTable) };
+    return .{ .identifier = try ctx.refName(column, base) };
 }
 
 fn binaryNode(ctx: *Ctx, op: ast.BinaryOp, left: ast.Expr, right: ast.Expr) !*ast.Expr {
@@ -309,7 +325,32 @@ fn binaryNode(ctx: *Ctx, op: ast.BinaryOp, left: ast.Expr, right: ast.Expr) !*as
     return parent;
 }
 
-fn predicateToBinary(ctx: *Ctx, expr: dslExpr.Expr, stripTable: ?[]const u8) anyerror!ast.Expr {
+fn setOperandToExpr(ctx: *Ctx, operand: dslExpr.SetOperand, base: ?StripBase) !ast.Expr {
+    return switch (operand) {
+        .literal => |v| .{ .literal = v },
+        .column => |ref| .{ .identifier = try ctx.refName(ref, base) },
+    };
+}
+
+fn setValueToExpr(ctx: *Ctx, setValue: dslExpr.SetValue, base: ?StripBase) !ast.Expr {
+    return switch (setValue) {
+        .literal => |v| .{ .literal = v },
+        .column => |ref| .{ .identifier = try ctx.refName(ref, base) },
+        .arith => |a| {
+            const op: ast.BinaryOp = switch (a.op) {
+                .add => .add,
+                .sub => .subtract,
+                .mul => .multiply,
+                .div => .divide,
+                .mod => .modulo,
+            };
+            const built = try binaryNode(ctx, op, try setOperandToExpr(ctx, a.left, base), try setOperandToExpr(ctx, a.right, base));
+            return ctx.detach(built);
+        },
+    };
+}
+
+fn predicateToBinary(ctx: *Ctx, expr: dslExpr.Expr, base: ?StripBase) anyerror!ast.Expr {
     const root: *ast.Expr = switch (expr.operator) {
         .equal, .notEqual, .less, .lessEqual, .greater, .greaterEqual => try binaryNode(ctx, switch (expr.operator) {
             .equal => ast.BinaryOp.equal,
@@ -318,21 +359,21 @@ fn predicateToBinary(ctx: *Ctx, expr: dslExpr.Expr, stripTable: ?[]const u8) any
             .lessEqual => ast.BinaryOp.lessEqual,
             .greater => ast.BinaryOp.greater,
             else => ast.BinaryOp.greaterEqual,
-        }, try leftSideToExpr(ctx, expr.column, expr.function, stripTable), try rhsToExpr(ctx, expr.rhs, stripTable)),
-        .isValue => try binaryNode(ctx, .isOp, try leftSideToExpr(ctx, expr.column, expr.function, stripTable), try rhsToExpr(ctx, expr.rhs, stripTable)),
-        .isNotValue => try binaryNode(ctx, .isNotOp, try leftSideToExpr(ctx, expr.column, expr.function, stripTable), try rhsToExpr(ctx, expr.rhs, stripTable)),
-        .isNotDistinct => try binaryNode(ctx, .isOp, try leftSideToExpr(ctx, expr.column, expr.function, stripTable), try rhsToExpr(ctx, expr.rhs, stripTable)),
+        }, try leftSideToExpr(ctx, expr.column, expr.function, base), try rhsToExpr(ctx, expr.rhs, base)),
+        .isValue => try binaryNode(ctx, .isOp, try leftSideToExpr(ctx, expr.column, expr.function, base), try rhsToExpr(ctx, expr.rhs, base)),
+        .isNotValue => try binaryNode(ctx, .isNotOp, try leftSideToExpr(ctx, expr.column, expr.function, base), try rhsToExpr(ctx, expr.rhs, base)),
+        .isNotDistinct => try binaryNode(ctx, .isOp, try leftSideToExpr(ctx, expr.column, expr.function, base), try rhsToExpr(ctx, expr.rhs, base)),
         .isDistinct => blk: {
-            const inner = try binaryNode(ctx, .isOp, try leftSideToExpr(ctx, expr.column, expr.function, stripTable), try rhsToExpr(ctx, expr.rhs, stripTable));
+            const inner = try binaryNode(ctx, .isOp, try leftSideToExpr(ctx, expr.column, expr.function, base), try rhsToExpr(ctx, expr.rhs, base));
             const notNode = try ctx.node();
             notNode.* = .{ .unary = .{ .op = .logicalNot, .expr = inner } };
             break :blk notNode;
         },
         .like, .notLike, .glob, .notGlob, .regexp, .notRegexp, .match, .notMatch => blk: {
             const valueNode = try ctx.node();
-            valueNode.* = try leftSideToExpr(ctx, expr.column, expr.function, stripTable);
+            valueNode.* = try leftSideToExpr(ctx, expr.column, expr.function, base);
             const patternNode = try ctx.node();
-            patternNode.* = try rhsToExpr(ctx, expr.rhs, stripTable);
+            patternNode.* = try rhsToExpr(ctx, expr.rhs, base);
             var escapeNode: ?*const ast.Expr = null;
             if (expr.escape) |esc| {
                 if (expr.operator != .like and expr.operator != .notLike) return error.InvalidSql;
@@ -353,15 +394,15 @@ fn predicateToBinary(ctx: *Ctx, expr: dslExpr.Expr, stripTable: ?[]const u8) any
             break :blk matchNode;
         },
         .between => blk: {
-            const lower = try binaryNode(ctx, .greaterEqual, try leftSideToExpr(ctx, expr.column, expr.function, stripTable), try rhsToExpr(ctx, expr.rhs, stripTable));
-            const upper = try binaryNode(ctx, .lessEqual, try leftSideToExpr(ctx, expr.column, expr.function, stripTable), try rhsToExpr(ctx, expr.rhs2.?, stripTable));
+            const lower = try binaryNode(ctx, .greaterEqual, try leftSideToExpr(ctx, expr.column, expr.function, base), try rhsToExpr(ctx, expr.rhs, base));
+            const upper = try binaryNode(ctx, .lessEqual, try leftSideToExpr(ctx, expr.column, expr.function, base), try rhsToExpr(ctx, expr.rhs2.?, base));
             const both = try ctx.node();
             both.* = .{ .binary = .{ .op = .logicalAnd, .left = lower, .right = upper } };
             break :blk both;
         },
         .notBetween => blk: {
-            const lower = try binaryNode(ctx, .less, try leftSideToExpr(ctx, expr.column, expr.function, stripTable), try rhsToExpr(ctx, expr.rhs, stripTable));
-            const upper = try binaryNode(ctx, .greater, try leftSideToExpr(ctx, expr.column, expr.function, stripTable), try rhsToExpr(ctx, expr.rhs2.?, stripTable));
+            const lower = try binaryNode(ctx, .less, try leftSideToExpr(ctx, expr.column, expr.function, base), try rhsToExpr(ctx, expr.rhs, base));
+            const upper = try binaryNode(ctx, .greater, try leftSideToExpr(ctx, expr.column, expr.function, base), try rhsToExpr(ctx, expr.rhs2.?, base));
             const either = try ctx.node();
             either.* = .{ .binary = .{ .op = .logicalOr, .left = lower, .right = upper } };
             break :blk either;
@@ -374,45 +415,45 @@ fn predicateToBinary(ctx: *Ctx, expr: dslExpr.Expr, stripTable: ?[]const u8) any
     return ctx.detach(notNode);
 }
 
-fn baseToExpr(ctx: *Ctx, case: CaseBuilder, stripTable: ?[]const u8) !ast.Expr {
+fn baseToExpr(ctx: *Ctx, case: CaseBuilder, base: ?StripBase) !ast.Expr {
     if (case.base) |baseRef| {
         if (case.baseFunc) |func| {
-            const callNode = try funcToNode(ctx, baseRef, func, stripTable);
+            const callNode = try funcToNode(ctx, baseRef, func, base);
             return ctx.detach(callNode);
         }
-        return .{ .identifier = try ctx.refName(baseRef, stripTable) };
+        return .{ .identifier = try ctx.refName(baseRef, base) };
     }
     const func = case.baseFunc orelse return error.InvalidSql;
-    const callNode = try funcToNode(ctx, .{ .name = "" }, func, stripTable);
+    const callNode = try funcToNode(ctx, .{ .name = "" }, func, base);
     return ctx.detach(callNode);
 }
 
-fn caseToExpr(ctx: *Ctx, case: CaseBuilder, stripTable: ?[]const u8) !ast.Expr {
+fn caseToExpr(ctx: *Ctx, case: CaseBuilder, base: ?StripBase) !ast.Expr {
     if (case.count == 0) return error.InvalidSql;
-    var base: ?*const ast.Expr = null;
+    var baseExpr: ?*const ast.Expr = null;
     if (case.base != null or case.baseFunc != null) {
         const created = try ctx.node();
-        created.* = try baseToExpr(ctx, case, stripTable);
-        base = created;
+        created.* = try baseToExpr(ctx, case, base);
+        baseExpr = created;
     }
     const whens = try ctx.alloc.alloc(ast.CaseWhen, case.count);
     errdefer ctx.alloc.free(whens);
     for (case.whens[0..case.count], 0..) |when, index| {
         if (when.simple) {
-            if (base == null) return error.InvalidSql;
-            whens[index] = .{ .condition = try rhsToExpr(ctx, when.operand, stripTable), .result = try rhsToExpr(ctx, when.result, stripTable) };
+            if (baseExpr == null) return error.InvalidSql;
+            whens[index] = .{ .condition = try rhsToExpr(ctx, when.operand, base), .result = try rhsToExpr(ctx, when.result, base) };
         } else {
             const cond = when.cond orelse return error.InvalidSql;
-            whens[index] = .{ .condition = try predicateToBinary(ctx, cond, stripTable), .result = try rhsToExpr(ctx, when.result, stripTable) };
+            whens[index] = .{ .condition = try predicateToBinary(ctx, cond, base), .result = try rhsToExpr(ctx, when.result, base) };
         }
     }
     const otherwiseNode = try ctx.node();
     if (case.hasOtherwise) {
-        otherwiseNode.* = try rhsToExpr(ctx, case.otherwise, stripTable);
+        otherwiseNode.* = try rhsToExpr(ctx, case.otherwise, base);
     } else {
         otherwiseNode.* = .{ .literal = .null };
     }
-    return .{ .caseExpr = .{ .base = base, .whens = whens, .otherwise = otherwiseNode } };
+    return .{ .caseExpr = .{ .base = baseExpr, .whens = whens, .otherwise = otherwiseNode } };
 }
 
 fn isWindowFunction(name: []const u8) bool {
@@ -431,13 +472,13 @@ fn mapWindowBound(bound: WindowBound) struct { bound: ast.WindowFrameBound, offs
     };
 }
 
-fn windowToExpr(ctx: *Ctx, window: WindowBuilder, stripTable: ?[]const u8) !ast.Expr {
+fn windowToExpr(ctx: *Ctx, window: WindowBuilder, base: ?StripBase) !ast.Expr {
     if (!isWindowFunction(window.func)) return error.InvalidSql;
     const funcIsNtile = std.ascii.eqlIgnoreCase(window.func, "ntile");
     var argument: ?*const ast.Expr = null;
     if (window.arg) |ref| {
         const created = try ctx.node();
-        created.* = .{ .identifier = try ctx.refName(ref, stripTable) };
+        created.* = .{ .identifier = try ctx.refName(ref, base) };
         argument = created;
     } else if (funcIsNtile and window.hasArgInt) {
         const created = try ctx.node();
@@ -454,14 +495,14 @@ fn windowToExpr(ctx: *Ctx, window: WindowBuilder, stripTable: ?[]const u8) !ast.
     if (window.hasDefault) {
         const owned = try ctx.alloc.alloc(ast.Expr, 1);
         errdefer ctx.alloc.free(owned);
-        owned[0] = try rhsToExpr(ctx, window.defaultRhs, stripTable);
+        owned[0] = try rhsToExpr(ctx, window.defaultRhs, base);
         extraArgs = owned;
     }
     var partitions: []const ast.Expr = &.{};
     if (window.partitionCount > 0) {
         const owned = try ctx.alloc.alloc(ast.Expr, window.partitionCount);
         errdefer ctx.alloc.free(owned);
-        for (window.partitions[0..window.partitionCount], 0..) |ref, index| owned[index] = .{ .identifier = try ctx.refName(ref, stripTable) };
+        for (window.partitions[0..window.partitionCount], 0..) |ref, index| owned[index] = .{ .identifier = try ctx.refName(ref, base) };
         partitions = owned;
     }
     var orderBy: []const ast.OrderItem = &.{};
@@ -470,7 +511,7 @@ fn windowToExpr(ctx: *Ctx, window: WindowBuilder, stripTable: ?[]const u8) !ast.
         errdefer ctx.alloc.free(owned);
         for (window.orders[0..window.orderCount], 0..) |ord, index| {
             if (ord.function != null) return error.InvalidSql;
-            owned[index] = .{ .expr = .{ .identifier = try ctx.refName(ord.column, stripTable) }, .descending = ord.descending };
+            owned[index] = .{ .expr = .{ .identifier = try ctx.refName(ord.column, base) }, .descending = ord.descending };
         }
         orderBy = owned;
     }
@@ -515,6 +556,8 @@ fn mapHavingOp(operator: []const u8) !ast.CompareOp {
 
 pub const SelectArgs = struct {
     table: []const u8,
+    schema: []const u8 = "",
+    tableAlias: ?[]const u8 = null,
     allColumns: bool,
     projections: []const dslExpr.Projection,
     cases: []const CaseBuilder = &.{},
@@ -522,13 +565,15 @@ pub const SelectArgs = struct {
     caseWhens: []const CaseWhereArgs = &.{},
     distinct: bool,
     conditions: []const CondEntry,
-    order: ?dslExpr.Order,
+    orders: []const dslExpr.Order = &.{},
     limit: ?usize,
     offset: ?usize,
     groupBy: ?dslExpr.ColumnRef,
-    havingOp: ?[]const u8,
-    havingAmount: usize,
+    having: ?dslExpr.HavingCond,
+    havingValid: bool = true,
     joinTable: ?[]const u8,
+    joinSchema: []const u8 = "",
+    joinAlias: ?[]const u8 = null,
     joinKind: JoinKind,
     joinOn: ?dslExpr.Expr,
     joinUsingCols: []const []const u8 = &.{},
@@ -538,6 +583,22 @@ pub const SelectArgs = struct {
     literalIn: ?LiteralInArgs,
 };
 
+fn qualifiedTable(ctx: *Ctx, schema: []const u8, table: []const u8) ![]const u8 {
+    if (schema.len == 0) return table;
+    const combined = try std.fmt.allocPrint(ctx.alloc, "{s}.{s}", .{ schema, table });
+    errdefer ctx.alloc.free(combined);
+    try ctx.owned.append(ctx.alloc, combined);
+    return combined;
+}
+
+fn qualifiedRef(ctx: *Ctx, ref: dslExpr.ColumnRef) ![]const u8 {
+    return qualifiedTable(ctx, ref.schema, ref.table);
+}
+
+fn stripBase(table: []const u8, schema: []const u8, alias: ?[]const u8) StripBase {
+    return .{ .table = table, .schema = schema, .alias = alias };
+}
+
 pub fn buildSelect(allocator: std.mem.Allocator, args: SelectArgs) !BuiltStatement {
     var ctx = Ctx.init(allocator);
     var projections = std.ArrayList(ast.Projection).empty;
@@ -545,17 +606,21 @@ pub fn buildSelect(allocator: std.mem.Allocator, args: SelectArgs) !BuiltStateme
     var conditions = std.ArrayList(ast.Condition).empty;
     defer conditions.deinit(allocator);
     errdefer ctx.fail();
+    // In joins, qualifiers are load-bearing (ambiguity + scope), so nothing
+    // strips. Single-table queries keep the historical bare rendering.
+    const base: ?StripBase = if (args.joinTable != null) null else stripBase(args.table, args.schema, args.tableAlias);
+    const fromTable = try qualifiedTable(&ctx, args.schema, args.table);
     if (args.allColumns) {
         try projections.append(allocator, .{ .expr = .wildcard });
     } else {
-        for (args.projections) |proj| try projections.append(allocator, try projectionToAst(&ctx, proj, args.table, args.cases, args.windows));
+        for (args.projections) |proj| try projections.append(allocator, try projectionToAst(&ctx, proj, base, args.cases, args.windows));
     }
-    try buildConditionList(&ctx, &conditions, args.conditions, args.table);
-    try buildCaseWhereList(&ctx, &conditions, args.caseWhens, args.table);
+    try buildConditionList(&ctx, &conditions, args.conditions, base);
+    try buildCaseWhereList(&ctx, &conditions, args.caseWhens, base);
     if (args.inQuery) |subquery| {
-        const ts = ast.TableScan{ .table = subquery.table, .column = subquery.subcolumn.name };
+        const ts = ast.TableScan{ .table = try qualifiedTable(&ctx, subquery.schema, subquery.table), .column = subquery.subcolumn.name };
         try conditions.append(allocator, .{
-            .column = try ctx.refName(subquery.column, args.table),
+            .column = try ctx.refName(subquery.column, base),
             .op = if (subquery.negated) .notIn else .in,
             .value = .{ .literal = .null },
             .tableScan = ts,
@@ -570,7 +635,7 @@ pub fn buildSelect(allocator: std.mem.Allocator, args: SelectArgs) !BuiltStateme
             list[0] = try predicateToCondition(&ctx, on, null, false);
             onConds = list;
         }
-        const ts = ast.TableScan{ .table = subquery.table, .conditions = onConds };
+        const ts = ast.TableScan{ .table = try qualifiedTable(&ctx, subquery.schema, subquery.table), .conditions = onConds };
         try conditions.append(allocator, .{
             .column = "",
             .op = if (subquery.negated) .notExists else .exists,
@@ -584,7 +649,7 @@ pub fn buildSelect(allocator: std.mem.Allocator, args: SelectArgs) !BuiltStateme
         errdefer allocator.free(items);
         for (list.values, 0..) |value, index| items[index] = .{ .literal = value };
         try conditions.append(allocator, .{
-            .column = try ctx.refName(list.column, args.table),
+            .column = try ctx.refName(list.column, base),
             .op = if (list.negated) .notIn else .in,
             .value = .{ .literal = .null },
             .listValues = items,
@@ -595,18 +660,19 @@ pub fn buildSelect(allocator: std.mem.Allocator, args: SelectArgs) !BuiltStateme
     var ownedUsing: []const []const u8 = &.{};
     errdefer if (ownedUsing.len != 0) allocator.free(ownedUsing);
     if (args.joinTable) |joined| {
+        const joinedFull = try qualifiedTable(&ctx, args.joinSchema, joined);
         if (args.joinNatural) {
-            join = .{ .kind = mapJoinKind(args.joinKind), .table = joined, .leftTable = "", .leftColumn = "", .rightTable = "", .rightColumn = "", .mergeOutput = true };
+            join = .{ .kind = mapJoinKind(args.joinKind), .table = joinedFull, .tableAlias = args.joinAlias, .leftTable = "", .leftColumn = "", .rightTable = "", .rightColumn = "", .mergeOutput = true };
         } else if (args.joinUsingCols.len == 1) {
             const usingCol = args.joinUsingCols[0];
             if (usingCol.len == 0) return error.InvalidSql;
-            join = .{ .kind = mapJoinKind(args.joinKind), .table = joined, .leftTable = args.table, .leftColumn = usingCol, .rightTable = joined, .rightColumn = usingCol, .mergeOutput = true };
+            join = .{ .kind = mapJoinKind(args.joinKind), .table = joinedFull, .tableAlias = args.joinAlias, .leftTable = fromTable, .leftColumn = usingCol, .rightTable = joinedFull, .rightColumn = usingCol, .mergeOutput = true };
         } else if (args.joinUsingCols.len > 1) {
             for (args.joinUsingCols) |usingCol| if (usingCol.len == 0) return error.InvalidSql;
             ownedUsing = try allocator.dupe([]const u8, args.joinUsingCols);
-            join = .{ .kind = mapJoinKind(args.joinKind), .table = joined, .leftTable = args.table, .leftColumn = "", .rightTable = joined, .rightColumn = "", .mergeOutput = true, .usingColumns = ownedUsing };
+            join = .{ .kind = mapJoinKind(args.joinKind), .table = joinedFull, .tableAlias = args.joinAlias, .leftTable = fromTable, .leftColumn = "", .rightTable = joinedFull, .rightColumn = "", .mergeOutput = true, .usingColumns = ownedUsing };
         } else if (args.joinKind == .cross) {
-            join = .{ .kind = .cross, .table = joined, .leftTable = "", .leftColumn = "", .rightTable = "", .rightColumn = "" };
+            join = .{ .kind = .cross, .table = joinedFull, .tableAlias = args.joinAlias, .leftTable = "", .leftColumn = "", .rightTable = "", .rightColumn = "" };
         } else {
             const on = args.joinOn orelse return error.InvalidSql;
             if (on.operator != .equal) return error.InvalidSql;
@@ -616,40 +682,48 @@ pub fn buildSelect(allocator: std.mem.Allocator, args: SelectArgs) !BuiltStateme
             };
             join = .{
                 .kind = mapJoinKind(args.joinKind),
-                .table = joined,
-                .leftTable = on.column.table,
+                .table = joinedFull,
+                .tableAlias = args.joinAlias,
+                .leftTable = try qualifiedRef(&ctx, on.column),
                 .leftColumn = on.column.name,
-                .rightTable = rightRef.table,
+                .rightTable = try qualifiedRef(&ctx, rightRef),
                 .rightColumn = rightRef.name,
             };
         }
     }
     var groupBy: ?[]const u8 = null;
-    if (args.groupBy) |group| groupBy = group.name;
+    if (args.groupBy) |group| groupBy = try ctx.refName(group, null);
     var having: ?ast.Having = null;
-    if (args.havingOp) |operator| {
-        const countArg = try ctx.node();
-        countArg.* = .wildcard;
-        const countNode = try ctx.node();
-        countNode.* = .{ .function = .{ .name = "COUNT", .argument = countArg } };
-        having = .{ .left = ctx.detach(countNode), .op = try mapHavingOp(operator), .right = .{ .literal = .{ .integer = @intCast(args.havingAmount) } } };
+    if (!args.havingValid) return error.InvalidSql;
+    if (args.having) |cond| {
+        having = .{
+            .left = (try projectionToAst(&ctx, cond.proj, base, args.cases, args.windows)).expr,
+            .op = try mapHavingOp(cond.op),
+            .right = .{ .literal = cond.rhs },
+        };
     }
-    var order: ?ast.Order = null;
-    if (args.order) |ord| {
-        if (ord.function != null) return error.InvalidSql;
-        order = .{ .column = ord.column.name, .descending = ord.descending };
+    var ownedOrders: []const ast.Order = &.{};
+    errdefer if (ownedOrders.len != 0) allocator.free(ownedOrders);
+    if (args.orders.len != 0) {
+        const owned = try allocator.alloc(ast.Order, args.orders.len);
+        ownedOrders = owned;
+        for (args.orders, 0..) |ord, index| {
+            if (ord.function != null) return error.InvalidSql;
+            owned[index] = .{ .column = try ctx.refName(ord.column, null), .descending = ord.descending };
+        }
     }
     var ownedJoins: []const ast.Join = &.{};
     errdefer if (ownedJoins.len != 0) allocator.free(ownedJoins);
     if (join) |single| ownedJoins = try allocator.dupe(ast.Join, &[_]ast.Join{single});
     const stmt = ast.Statement{ .select = .{
         .projections = try projections.toOwnedSlice(allocator),
-        .table = args.table,
+        .table = fromTable,
+        .tableAlias = args.tableAlias,
         .joins = ownedJoins,
         .condition = if (conditions.items.len == 0) null else try conditions.toOwnedSlice(allocator),
         .groupBy = groupBy,
         .having = having,
-        .order = order,
+        .orders = ownedOrders,
         .limit = args.limit,
         .offset = args.offset,
         .distinct = args.distinct,
@@ -658,15 +732,17 @@ pub fn buildSelect(allocator: std.mem.Allocator, args: SelectArgs) !BuiltStateme
     return .{ .stmt = stmt, .ownedStrings = ctx.takeStrings(), .allocator = allocator };
 }
 
-pub fn buildInsert(allocator: std.mem.Allocator, table: []const u8, columns: []const []const u8, values: []const Value, conflict: ast.ConflictPolicy, returning: []const dslExpr.Projection, cases: []const CaseBuilder, upsert: UpsertArgs) !BuiltStatement {
+pub fn buildInsert(allocator: std.mem.Allocator, table: []const u8, schema: []const u8, columns: []const []const u8, values: []const dslExpr.SetValue, conflict: ast.ConflictPolicy, returning: []const dslExpr.Projection, cases: []const CaseBuilder, upsert: UpsertArgs) !BuiltStatement {
     if (columns.len == 0 or columns.len != values.len) return error.InvalidSql;
     var ctx = Ctx.init(allocator);
     errdefer ctx.fail();
+    const base = stripBase(table, schema, null);
+    const fullTable = try qualifiedTable(&ctx, schema, table);
     const ownedColumns = try allocator.dupe([]const u8, columns);
     errdefer allocator.free(ownedColumns);
     const row = try allocator.alloc(ast.Expr, values.len);
     errdefer allocator.free(row);
-    for (values, 0..) |value, index| row[index] = .{ .literal = value };
+    for (values, 0..) |setValue, index| row[index] = try setValueToExpr(&ctx, setValue, base);
     const rows = try allocator.alloc([]const ast.Expr, 1);
     errdefer allocator.free(rows);
     rows[0] = row;
@@ -676,7 +752,7 @@ pub fn buildInsert(allocator: std.mem.Allocator, table: []const u8, columns: []c
     if (upsert.targetWhere) |targetExpr| {
         const list = try allocator.alloc(ast.Condition, 1);
         errdefer allocator.free(list);
-        list[0] = try predicateToCondition(&ctx, targetExpr, table, false);
+        list[0] = try predicateToCondition(&ctx, targetExpr, base, false);
         targetWhere = list;
     }
     const upsertColumns = try allocator.alloc([]const u8, upsert.sets.len);
@@ -688,17 +764,18 @@ pub fn buildInsert(allocator: std.mem.Allocator, table: []const u8, columns: []c
         upsertValues[index] = switch (set.value) {
             .literal => |v| ast.Expr{ .literal = v },
             .excluded => |name| ast.Expr{ .identifier = try ctx.dotted("excluded", name) },
+            .set => |setValue| try setValueToExpr(&ctx, setValue, base),
         };
     }
     var upsertCondList = std.ArrayList(ast.Condition).empty;
     defer upsertCondList.deinit(allocator);
-    try buildConditionList(&ctx, &upsertCondList, upsert.upsertWhere, table);
-    try buildCaseWhereList(&ctx, &upsertCondList, upsert.caseWhens, table);
+    try buildConditionList(&ctx, &upsertCondList, upsert.upsertWhere, base);
+    try buildCaseWhereList(&ctx, &upsertCondList, upsert.caseWhens, base);
     const returningProjs = try allocator.alloc(ast.Projection, returning.len);
     errdefer allocator.free(returningProjs);
-    for (returning, 0..) |proj, index| returningProjs[index] = try projectionToAst(&ctx, proj, table, cases, &.{});
+    for (returning, 0..) |proj, index| returningProjs[index] = try projectionToAst(&ctx, proj, base, cases, &.{});
     const stmt = ast.Statement{ .insert = .{
-        .table = table,
+        .table = fullTable,
         .columns = ownedColumns,
         .rows = rows,
         .conflict = conflict,
@@ -713,24 +790,26 @@ pub fn buildInsert(allocator: std.mem.Allocator, table: []const u8, columns: []c
     return .{ .stmt = stmt, .ownedStrings = ctx.takeStrings(), .allocator = allocator };
 }
 
-pub fn buildUpdate(allocator: std.mem.Allocator, table: []const u8, setNames: []const []const u8, setValues: []const Value, conditions: []const CondEntry, returning: []const dslExpr.Projection, cases: []const CaseBuilder, caseWhens: []const CaseWhereArgs, from: ?ast.UpdateFrom) !BuiltStatement {
+pub fn buildUpdate(allocator: std.mem.Allocator, table: []const u8, schema: []const u8, setNames: []const []const u8, setValues: []const dslExpr.SetValue, conditions: []const CondEntry, returning: []const dslExpr.Projection, cases: []const CaseBuilder, caseWhens: []const CaseWhereArgs, from: ?ast.UpdateFrom) !BuiltStatement {
     if (setNames.len == 0 or setNames.len != setValues.len) return error.InvalidSql;
     var ctx = Ctx.init(allocator);
     var condList = std.ArrayList(ast.Condition).empty;
     defer condList.deinit(allocator);
     errdefer ctx.fail();
+    const base = stripBase(table, schema, null);
+    const fullTable = try qualifiedTable(&ctx, schema, table);
     const ownedColumns = try allocator.dupe([]const u8, setNames);
     errdefer allocator.free(ownedColumns);
     const assigned = try allocator.alloc(ast.Expr, setValues.len);
     errdefer allocator.free(assigned);
-    for (setValues, 0..) |value, index| assigned[index] = .{ .literal = value };
-    try buildConditionList(&ctx, &condList, conditions, table);
-    try buildCaseWhereList(&ctx, &condList, caseWhens, table);
+    for (setValues, 0..) |setValue, index| assigned[index] = try setValueToExpr(&ctx, setValue, base);
+    try buildConditionList(&ctx, &condList, conditions, base);
+    try buildCaseWhereList(&ctx, &condList, caseWhens, base);
     const returningProjs = try allocator.alloc(ast.Projection, returning.len);
     errdefer allocator.free(returningProjs);
-    for (returning, 0..) |proj, index| returningProjs[index] = try projectionToAst(&ctx, proj, table, cases, &.{});
+    for (returning, 0..) |proj, index| returningProjs[index] = try projectionToAst(&ctx, proj, base, cases, &.{});
     const stmt = ast.Statement{ .update = .{
-        .table = table,
+        .table = fullTable,
         .columns = ownedColumns,
         .values = assigned,
         .condition = if (condList.items.len == 0) null else try condList.toOwnedSlice(allocator),
@@ -741,18 +820,20 @@ pub fn buildUpdate(allocator: std.mem.Allocator, table: []const u8, setNames: []
     return .{ .stmt = stmt, .ownedStrings = ctx.takeStrings(), .allocator = allocator };
 }
 
-pub fn buildDelete(allocator: std.mem.Allocator, table: []const u8, conditions: []const CondEntry, returning: []const dslExpr.Projection, cases: []const CaseBuilder, caseWhens: []const CaseWhereArgs) !BuiltStatement {
+pub fn buildDelete(allocator: std.mem.Allocator, table: []const u8, schema: []const u8, conditions: []const CondEntry, returning: []const dslExpr.Projection, cases: []const CaseBuilder, caseWhens: []const CaseWhereArgs) !BuiltStatement {
     var ctx = Ctx.init(allocator);
     var condList = std.ArrayList(ast.Condition).empty;
     defer condList.deinit(allocator);
     errdefer ctx.fail();
-    try buildConditionList(&ctx, &condList, conditions, table);
-    try buildCaseWhereList(&ctx, &condList, caseWhens, table);
+    const base = stripBase(table, schema, null);
+    const fullTable = try qualifiedTable(&ctx, schema, table);
+    try buildConditionList(&ctx, &condList, conditions, base);
+    try buildCaseWhereList(&ctx, &condList, caseWhens, base);
     const returningProjs = try allocator.alloc(ast.Projection, returning.len);
     errdefer allocator.free(returningProjs);
-    for (returning, 0..) |proj, index| returningProjs[index] = try projectionToAst(&ctx, proj, table, cases, &.{});
+    for (returning, 0..) |proj, index| returningProjs[index] = try projectionToAst(&ctx, proj, base, cases, &.{});
     const stmt = ast.Statement{ .delete = .{
-        .table = table,
+        .table = fullTable,
         .condition = if (condList.items.len == 0) null else try condList.toOwnedSlice(allocator),
         .returning = returningProjs,
     } };
@@ -766,12 +847,12 @@ test "predicates convert to conditions without SQL strings" {
     const col = DynamicColumn{ .name = "users.age" };
     var ctx = Ctx.init(allocator);
     defer ctx.fail();
-    const cond = try predicateToCondition(&ctx, col.gte(18), "users", false);
+    const cond = try predicateToCondition(&ctx, col.gte(18), .{ .table = "users" }, false);
     try std.testing.expectEqualStrings("age", cond.column);
     try std.testing.expect(cond.op == .greaterEqual);
     try std.testing.expect(cond.value.literal.integer == 18);
     try std.testing.expect(ctx.owned.items.len == 0);
-    const between = try predicateToCondition(&ctx, col.between(1, 9), "users", true);
+    const between = try predicateToCondition(&ctx, col.between(1, 9), .{ .table = "users" }, true);
     try std.testing.expect(between.op == .between);
     try std.testing.expect(between.joinOr);
     try std.testing.expect(between.value.literal.integer == 1);
@@ -787,12 +868,12 @@ test "function predicates build left expressions" {
     const col = @import("column.zig").DynamicColumn{ .name = "name" };
     var ctx = Ctx.init(allocator);
     defer ctx.fail();
-    const cond = try predicateToCondition(&ctx, col.lower().eq("alice"), "users", false);
+    const cond = try predicateToCondition(&ctx, col.lower().eq("alice"), .{ .table = "users" }, false);
     try std.testing.expectEqualStrings("", cond.column);
     try std.testing.expect(cond.leftExpr.? == .function);
     try std.testing.expectEqualStrings("LOWER", cond.leftExpr.?.function.name);
     try std.testing.expect(cond.value.literal.text.len == 5);
-    const like = try predicateToCondition(&ctx, col.likeEscape("Al%", "\\"), "users", false);
+    const like = try predicateToCondition(&ctx, col.likeEscape("Al%", "\\"), .{ .table = "users" }, false);
     try std.testing.expect(like.op == .like);
     try std.testing.expect(like.escape.?.literal.text.len == 1);
 }
@@ -802,15 +883,15 @@ test "projections convert star, aggregates, and scalars" {
     const column = @import("column.zig").DynamicColumn;
     var ctx = Ctx.init(allocator);
     defer ctx.fail();
-    const star = try projectionToAst(&ctx, .{ .kind = .star }, "t", &.{}, &.{});
+    const star = try projectionToAst(&ctx, .{ .kind = .star }, .{ .table = "t" }, &.{}, &.{});
     try std.testing.expect(star.expr == .wildcard);
-    const total = try projectionToAst(&ctx, (column{ .name = "t.age" }).sum(), "t", &.{}, &.{});
+    const total = try projectionToAst(&ctx, (column{ .name = "t.age" }).sum(), .{ .table = "t" }, &.{}, &.{});
     try std.testing.expect(total.expr == .function);
     try std.testing.expectEqualStrings("SUM", total.expr.function.name);
     try std.testing.expectEqualStrings("age", total.expr.function.argument.*.identifier);
-    const lowered = try projectionToAst(&ctx, (column{ .name = "name" }).lower().projection(), "t", &.{}, &.{});
+    const lowered = try projectionToAst(&ctx, (column{ .name = "name" }).lower().projection(), .{ .table = "t" }, &.{}, &.{});
     try std.testing.expectEqualStrings("LOWER", lowered.expr.function.name);
-    const casted = try projectionToAst(&ctx, (column{ .name = "v" }).cast("INTEGER").projection(), "t", &.{}, &.{});
+    const casted = try projectionToAst(&ctx, (column{ .name = "v" }).cast("INTEGER").projection(), .{ .table = "t" }, &.{}, &.{});
     try std.testing.expectEqualStrings("CAST", casted.expr.function.name);
     try std.testing.expectEqualStrings("INTEGER", casted.expr.function.argument2.?.*.identifier);
 }

@@ -72,14 +72,14 @@ fn readInteger(bytes: []const u8, count: usize) i64 {
 }
 
 pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) ![]Value {
-    const first = try varint.decode(bytes);
+    const first = varint.decode(bytes) catch return Error.InvalidRecord;
     const headerSize: usize = @intCast(first.value);
     if (headerSize > bytes.len or headerSize == 0) return Error.InvalidRecord;
     var types = std.ArrayList(u64).empty;
     defer types.deinit(allocator);
     var offset: usize = first.length;
     while (offset < headerSize) {
-        const item = try varint.decode(bytes[offset..]);
+        const item = varint.decode(bytes[offset..]) catch return Error.InvalidRecord;
         try types.append(allocator, item.value);
         offset += item.length;
     }
@@ -130,4 +130,68 @@ test "record format round trip" {
     defer std.testing.allocator.free(decoded);
     try std.testing.expectEqual(@as(i64, -12), decoded[0].integer);
     try std.testing.expectEqualStrings("hello", decoded[1].text);
+}
+
+test "record serial types cover every integer width and empty payloads" {
+    const values = [_]Value{
+        .null,
+        .{ .integer = 0 },
+        .{ .integer = 1 },
+        .{ .integer = -1 },
+        .{ .integer = 127 },
+        .{ .integer = 128 },
+        .{ .integer = -129 },
+        .{ .integer = 32767 },
+        .{ .integer = 32768 },
+        .{ .integer = -8388609 },
+        .{ .integer = std.math.maxInt(i64) },
+        .{ .integer = std.math.minInt(i64) },
+        .{ .real = -0.0 },
+        .{ .text = "" },
+        .{ .blob = &[_]u8{} },
+        .{ .text = "x" },
+        .{ .blob = &[_]u8{0x00} },
+    };
+    const bytes = try encode(std.testing.allocator, &values);
+    defer std.testing.allocator.free(bytes);
+    const decoded = try decode(std.testing.allocator, bytes);
+    defer std.testing.allocator.free(decoded);
+    try std.testing.expectEqual(values.len, decoded.len);
+    try std.testing.expect(decoded[0] == .null);
+    try std.testing.expectEqual(@as(i64, 0), decoded[1].integer);
+    try std.testing.expectEqual(@as(i64, 1), decoded[2].integer);
+    try std.testing.expectEqual(@as(i64, -1), decoded[3].integer);
+    try std.testing.expectEqual(@as(i64, 127), decoded[4].integer);
+    try std.testing.expectEqual(@as(i64, 128), decoded[5].integer);
+    try std.testing.expectEqual(@as(i64, -129), decoded[6].integer);
+    try std.testing.expectEqual(@as(i64, 32767), decoded[7].integer);
+    try std.testing.expectEqual(@as(i64, 32768), decoded[8].integer);
+    try std.testing.expectEqual(@as(i64, -8388609), decoded[9].integer);
+    try std.testing.expectEqual(std.math.maxInt(i64), decoded[10].integer);
+    try std.testing.expectEqual(std.math.minInt(i64), decoded[11].integer);
+    try std.testing.expect(decoded[12].real == 0);
+    try std.testing.expectEqual(@as(usize, 0), decoded[13].text.len);
+    try std.testing.expectEqual(@as(usize, 0), decoded[14].blob.len);
+    try std.testing.expectEqualStrings("x", decoded[15].text);
+    try std.testing.expectEqual(@as(u8, 0x00), decoded[16].blob[0]);
+}
+
+test "record decoder rejects reserved serial types and truncation" {
+    // Reserved serial types 10 and 11 are never valid on disk.
+    const reserved10 = [_]u8{ 0x02, 0x0a, 0x00 };
+    try std.testing.expectError(Error.InvalidRecord, decode(std.testing.allocator, &reserved10));
+    const reserved11 = [_]u8{ 0x02, 0x0b, 0x00 };
+    try std.testing.expectError(Error.InvalidRecord, decode(std.testing.allocator, &reserved11));
+    // Empty input and truncated payloads fail closed.
+    try std.testing.expectError(Error.InvalidRecord, decode(std.testing.allocator, &[_]u8{}));
+    const values = [_]Value{ .{ .integer = std.math.maxInt(i64) }, .{ .text = "hello" } };
+    const bytes = try encode(std.testing.allocator, &values);
+    defer std.testing.allocator.free(bytes);
+    var cut: usize = 1;
+    while (cut < bytes.len) : (cut += 1) {
+        try std.testing.expectError(Error.InvalidRecord, decode(std.testing.allocator, bytes[0..cut]));
+    }
+    const ok = try decode(std.testing.allocator, bytes);
+    defer std.testing.allocator.free(ok);
+    try std.testing.expectEqual(@as(usize, 2), ok.len);
 }

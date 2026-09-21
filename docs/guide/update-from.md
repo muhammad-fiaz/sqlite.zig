@@ -35,7 +35,7 @@ The typed and dynamic DSL expose the same behavior through
 ```zig
 var updated = try db.from(Bal)
     .update(.{ .flag = 1 })
-    .updateFrom(Adj, Bal.columns.id.eq(Adj.columns.bal_id))
+    .updateFrom(Adj, Bal.id.eq(Adj.bal_id))
     .execute();
 defer updated.deinit();
 ```

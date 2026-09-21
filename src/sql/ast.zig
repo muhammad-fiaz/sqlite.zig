@@ -62,7 +62,7 @@ pub const CteDef = struct { name: []const u8, columns: []const []const u8 = &.{}
 pub const WithSelect = struct { ctes: []CteDef, bodySql: []const u8, recursive: bool = false };
 pub const ConflictPolicy = enum { none, ignore, replace, update, abort, fail, rollback };
 pub const UpsertResult = enum { noConflict, skipped, updated };
-pub const UpdateFrom = struct { table: []const u8, leftTable: []const u8, leftColumn: []const u8, rightTable: []const u8, rightColumn: []const u8 };
+pub const UpdateFrom = struct { table: []const u8, tableSchema: []const u8 = "", leftTable: []const u8, leftColumn: []const u8, rightTable: []const u8, rightColumn: []const u8 };
 pub const AlterTable = union(enum) {
     addColumn: struct { table: []const u8, definition: ColumnDef },
     renameTable: struct { table: []const u8, newName: []const u8 },
@@ -71,7 +71,7 @@ pub const AlterTable = union(enum) {
 };
 
 pub const CompoundOp = enum { unionOp, unionAllOp, intersectOp, exceptOp };
-pub const CompoundSelect = struct { leftSql: []const u8, op: CompoundOp, rightSql: []const u8, order: ?Order = null, limit: ?usize = null, offset: ?usize = null };
+pub const CompoundSelect = struct { leftSql: []const u8, op: CompoundOp, rightSql: []const u8, orders: []const Order = &.{}, limit: ?usize = null, offset: ?usize = null };
 
 pub const Statement = union(enum) {
     createTable: struct { name: []const u8, columns: []ColumnDef, constraints: []TableConstraint = &.{}, ifNotExists: bool = false, strict: bool = false, withoutRowid: bool = false, temporary: bool = false },
@@ -89,7 +89,7 @@ pub const Statement = union(enum) {
     dropView: struct { name: []const u8, ifExists: bool = false },
     dropTrigger: struct { name: []const u8, ifExists: bool = false },
     insert: struct { table: []const u8, columns: []const []const u8, rows: []const []const Expr, selectSql: ?[]const u8 = null, conflict: ConflictPolicy = .none, conflictTargetColumns: []const []const u8 = &.{}, conflictTargetWhere: ?Conditions = null, upsertColumns: []const []const u8 = &.{}, upsertValues: []const Expr = &.{}, upsertWhere: ?Conditions = null, returning: []const Projection = &.{} },
-    select: struct { projections: []const Projection, table: ?[]const u8, tableAlias: ?[]const u8 = null, fromSubquery: ?[]const u8 = null, joins: []const Join = &.{}, condition: ?Conditions, groupBy: ?[]const u8 = null, having: ?Having = null, order: ?Order, limit: ?usize, offset: ?usize = null, distinct: bool = false },
+    select: struct { projections: []const Projection, table: ?[]const u8, tableAlias: ?[]const u8 = null, fromSubquery: ?[]const u8 = null, joins: []const Join = &.{}, condition: ?Conditions, groupBy: ?[]const u8 = null, having: ?Having = null, orders: []const Order = &.{}, limit: ?usize, offset: ?usize = null, distinct: bool = false },
     update: struct { table: []const u8, columns: []const []const u8, values: []const Expr, condition: ?Conditions, from: ?UpdateFrom = null, conflict: ConflictPolicy = .none, returning: []const Projection = &.{} },
     delete: struct { table: []const u8, condition: ?Conditions, returning: []const Projection = &.{} },
     begin,
@@ -595,7 +595,9 @@ pub fn deinit(allocator: anytype, statement: *Statement) void {
             for (value.ctes) |cte| if (cte.columns.len != 0) allocator.free(cte.columns);
             allocator.free(value.ctes);
         },
-        .compoundSelect => {},
+        .compoundSelect => |value| {
+            if (value.orders.len != 0) allocator.free(value.orders);
+        },
         .explainQueryPlan => {},
         .pragma => {},
         .insert => |value| {
@@ -655,6 +657,7 @@ pub fn deinit(allocator: anytype, statement: *Statement) void {
                 freeExpr(allocator, having.left);
                 freeExpr(allocator, having.right);
             }
+            if (value.orders.len != 0) allocator.free(value.orders);
             for (value.joins) |join| if (join.usingColumns.len != 0) allocator.free(join.usingColumns);
             if (value.joins.len != 0) allocator.free(value.joins);
         },

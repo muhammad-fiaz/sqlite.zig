@@ -9,8 +9,8 @@ const Order = sqlite.table("complex_orders", OrderRow);
 pub fn main() !void {
     var db = try sqlite.open(std.heap.page_allocator, "example_12.db");
     defer db.close();
-    try db.createTable(User, .{ .overWrite = true, .primaryKey = User.columns.id });
-    try db.createTable(Order, .{ .overWrite = true, .primaryKey = Order.columns.id });
+    try db.createTable(User, .{ .overWrite = true, .primaryKey = User.id });
+    try db.createTable(Order, .{ .overWrite = true, .primaryKey = Order.id });
     try db.truncate(Order);
     try db.truncate(User);
 
@@ -27,9 +27,9 @@ pub fn main() !void {
 
     var raw = try db.exec("SELECT DISTINCT * FROM complex_users INNER JOIN complex_orders ON complex_users.id = complex_orders.user_id;");
     raw.deinit();
-    var dsl = try db.from(User).innerJoin(Order, User.columns.id.eq(Order.columns.user_id)).selectAll().distinct().fetch();
+    var dsl = try db.from(User).innerJoin(Order, User.id.eq(Order.user_id)).selectAll().distinct().fetch();
     dsl.deinit();
-    var aggregate = try db.from(Order).select(.{Order.columns.amount.sum()}).fetch();
+    var aggregate = try db.from(Order).select(.{Order.amount.sum()}).fetch();
     aggregate.deinit();
     std.debug.print("12 complex queries: distinct joins and aggregates verified\n", .{});
 }

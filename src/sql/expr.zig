@@ -150,16 +150,20 @@ pub fn eval(allocator: std.mem.Allocator, columnNames: []const []const u8, row: 
         .binary => |bin| {
             if (bin.op == .logicalAnd) {
                 const left = try eval(allocator, columnNames, row, bin.left.*);
+                defer freeValue(allocator, left);
                 if (left != .null and !isTruthy(left)) return .{ .integer = 0 };
                 const right = try eval(allocator, columnNames, row, bin.right.*);
+                defer freeValue(allocator, right);
                 if (right != .null and !isTruthy(right)) return .{ .integer = 0 };
                 if (left == .null or right == .null) return .null;
                 return .{ .integer = if (isTruthy(left) and isTruthy(right)) 1 else 0 };
             }
             if (bin.op == .logicalOr) {
                 const left = try eval(allocator, columnNames, row, bin.left.*);
+                defer freeValue(allocator, left);
                 if (left != .null and isTruthy(left)) return .{ .integer = 1 };
                 const right = try eval(allocator, columnNames, row, bin.right.*);
+                defer freeValue(allocator, right);
                 if (right != .null and isTruthy(right)) return .{ .integer = 1 };
                 if (left == .null or right == .null) return .null;
                 return .{ .integer = 0 };
@@ -485,4 +489,40 @@ test "evalCheck accepts truthy and null and rejects zero" {
     try std.testing.expect(try evalCheck(std.testing.allocator, &colNames, &rowTrue, idExpr));
     try std.testing.expect(!try evalCheck(std.testing.allocator, &colNames, &rowFalse, idExpr));
     try std.testing.expect(try evalCheck(std.testing.allocator, &colNames, &rowNull, idExpr));
+}
+
+test "logical operators follow SQLite three-valued truth tables" {
+    const noCols = [_][]const u8{};
+    const noRow = [_]Value{};
+    const nullLit = ast.Expr{ .literal = .null };
+    const trueLit = ast.Expr{ .literal = .{ .integer = 1 } };
+    const falseLit = ast.Expr{ .literal = .{ .integer = 0 } };
+    const textLit = ast.Expr{ .literal = .{ .text = "abc" } };
+    const cases = [_]struct { op: ast.BinaryOp, left: ast.Expr, right: ast.Expr, expectNull: bool, expectInt: i64 }{
+        .{ .op = .logicalAnd, .left = nullLit, .right = trueLit, .expectNull = true, .expectInt = 0 },
+        .{ .op = .logicalAnd, .left = nullLit, .right = falseLit, .expectNull = false, .expectInt = 0 },
+        .{ .op = .logicalAnd, .left = trueLit, .right = trueLit, .expectNull = false, .expectInt = 1 },
+        .{ .op = .logicalAnd, .left = nullLit, .right = nullLit, .expectNull = true, .expectInt = 0 },
+        .{ .op = .logicalOr, .left = nullLit, .right = trueLit, .expectNull = false, .expectInt = 1 },
+        .{ .op = .logicalOr, .left = nullLit, .right = falseLit, .expectNull = true, .expectInt = 0 },
+        .{ .op = .logicalOr, .left = falseLit, .right = falseLit, .expectNull = false, .expectInt = 0 },
+        .{ .op = .logicalOr, .left = nullLit, .right = nullLit, .expectNull = true, .expectInt = 0 },
+        // Text operands are cloned by eval and must not leak through AND/OR.
+        .{ .op = .logicalAnd, .left = textLit, .right = falseLit, .expectNull = false, .expectInt = 0 },
+        .{ .op = .logicalOr, .left = textLit, .right = trueLit, .expectNull = false, .expectInt = 1 },
+    };
+    for (cases) |c| {
+        const expr = ast.Expr{ .binary = .{ .op = c.op, .left = &c.left, .right = &c.right } };
+        const got = try eval(std.testing.allocator, &noCols, &noRow, expr);
+        defer freeValue(std.testing.allocator, got);
+        if (c.expectNull) {
+            try std.testing.expect(got == .null);
+        } else {
+            try std.testing.expectEqual(c.expectInt, got.integer);
+        }
+    }
+    const notNull = ast.Expr{ .unary = .{ .op = .logicalNot, .expr = &nullLit } };
+    const notGot = try eval(std.testing.allocator, &noCols, &noRow, notNull);
+    defer freeValue(std.testing.allocator, notGot);
+    try std.testing.expect(notGot == .null);
 }

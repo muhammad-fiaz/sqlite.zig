@@ -8,6 +8,7 @@ pub const Error = error{
     UnexpectedToken,
     UnknownTable,
     UnknownColumn,
+    AmbiguousColumn,
     ColumnExists,
     TableExists,
     IndexExists,
@@ -25,6 +26,8 @@ pub const Error = error{
     Unsupported,
     SchemaMismatch,
     TriggerDepthExceeded,
+    NoRows,
+    TooManyRows,
 };
 
 pub fn message(err: Error) []const u8 {
@@ -36,6 +39,7 @@ pub fn message(err: Error) []const u8 {
         error.UnexpectedToken => "unexpected SQL token",
         error.UnknownTable => "unknown table",
         error.UnknownColumn => "unknown column",
+        error.AmbiguousColumn => "ambiguous column name",
         error.ColumnExists => "column already exists",
         error.TableExists => "table already exists",
         error.IndexExists => "index already exists",
@@ -53,6 +57,8 @@ pub fn message(err: Error) []const u8 {
         error.Unsupported => "unsupported feature",
         error.SchemaMismatch => "database schema does not match the declared table",
         error.TriggerDepthExceeded => "triggers nested too deep",
+        error.NoRows => "query returned no rows",
+        error.TooManyRows => "query returned more than one row",
     };
 }
 

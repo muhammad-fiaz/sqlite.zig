@@ -32,3 +32,21 @@ test "page one has a database header offset" {
     try std.testing.expectEqual(@as(usize, 100), page.headerOffset());
     try std.testing.expectEqual(PageType.tableLeaf, page.pageType().?);
 }
+
+test "page types round trip and unknown types stay unknown" {
+    var bytes: [512]u8 = std.mem.zeroes([512]u8);
+    const kinds = [_]PageType{ .tableInterior, .tableLeaf, .indexInterior, .indexLeaf };
+    for (kinds) |kind| {
+        var page = Page.init(&bytes, 7);
+        try std.testing.expectEqual(@as(usize, 0), page.headerOffset());
+        page.setPageType(kind);
+        try std.testing.expectEqual(kind, page.pageType().?);
+    }
+    bytes[0] = 0x09; // no SQLite page type uses this flag byte
+    try std.testing.expect(Page.init(&bytes, 7).pageType() == null);
+    // A short buffer can never yield a page type: untrusted sizes stay safe.
+    var tiny: [0]u8 = .{};
+    try std.testing.expect(Page.init(&tiny, 2).pageType() == null);
+    var short: [99]u8 = std.mem.zeroes([99]u8);
+    try std.testing.expect(Page.init(&short, 1).pageType() == null);
+}

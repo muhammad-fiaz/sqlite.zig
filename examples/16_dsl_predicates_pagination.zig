@@ -20,15 +20,15 @@ pub fn main() !void {
     }
 
     var page = try db.from(Event)
-        .select(&.{ Event.columns.id, Event.columns.label, Event.columns.rank })
-        .where(Event.columns.rank.between(10, 30))
-        .andWhere(Event.columns.label.like("%a%"))
-        .orderBy(Event.columns.rank.asc())
+        .select(&.{ Event.id, Event.label, Event.rank })
+        .where(Event.rank.between(10, 30))
+        .andWhere(Event.label.like("%a%"))
+        .orderBy(Event.rank.asc())
         .limit(2)
         .offset(1)
         .fetch();
     defer page.deinit();
-    std.debug.print("16 typed DSL pagination: rows={d} first_id={d}\n", .{ page.count(), if (page.count() == 0) -1 else page.rows[0][0].integer });
-    if (page.count() != 2 or page.rows[0][0].integer != 2) return error.PaginationVerificationFailed;
+    std.debug.print("16 typed DSL pagination: rows={d} first_id={d}\n", .{ page.count(), if (page.count() == 0) -1 else page.at(0)[0].integer });
+    if (page.count() != 2 or page.at(0)[0].integer != 2) return error.PaginationVerificationFailed;
     std.debug.print("16 typed DSL pagination: {d} verified row\n", .{page.count()});
 }

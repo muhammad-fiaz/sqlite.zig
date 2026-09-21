@@ -20,13 +20,14 @@ Aggregates work with and without `GROUP BY`: `COUNT` (including
 `GROUP_CONCAT`. The typed DSL exposes the same set through column aggregate
 methods (`.sum()`, `.avg()`, `.min()`, `.max()`, `.count()`,
 `.countDistinct()`), plus grouped aggregate filters with
-`groupBy(...).havingCount(...)`.
+`groupBy(...).having(...)` over the same expression system (for example
+`Sale.id.count().gt(1)`).
 
 ```zig
 var rows = try db.from(Sale)
-    .select(.{Sale.columns.amount.sum()})
-    .groupBy(Sale.columns.category)
-    .havingCount(">", 1)
+    .select(.{Sale.amount.sum()})
+    .groupBy(Sale.category)
+    .having(Sale.id.count().gt(1))
     .fetch();
 defer rows.deinit();
 ```

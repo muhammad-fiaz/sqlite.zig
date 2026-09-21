@@ -15,6 +15,6 @@ pub fn main() !void {
     statement.finalize();
     var result = try db.exec("SELECT id, label FROM prepared_items WHERE id = 7;");
     defer result.deinit();
-    if (result.count() != 1 or result.rows[0][0].integer != 7 or !std.mem.eql(u8, result.rows[0][1].text, "bound value")) return error.PreparedValueVerificationFailed;
+    if (result.count() != 1 or result.at(0)[0].integer != 7 or !std.mem.eql(u8, result.at(0)[1].text, "bound value")) return error.PreparedValueVerificationFailed;
     std.debug.print("19 prepared parameters: prepared_items contains {d} verified row\n", .{result.count()});
 }

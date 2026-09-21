@@ -9,15 +9,15 @@ const Child = sqlite.table("cascade_children", ChildRow);
 pub fn main() !void {
     var db = try sqlite.open(std.heap.page_allocator, "example_26.db");
     defer db.close();
-    try db.createTable(Parent, .{ .overWrite = true, .primaryKey = Parent.columns.id });
-    try db.createTable(Child, .{ .overWrite = true, .primaryKey = Child.columns.id, .foreignKeys = &.{.{ .column = Child.columns.parent_id, .references = Parent.columns.id, .onDelete = .cascade }} });
+    try db.createTable(Parent, .{ .overWrite = true, .primaryKey = Parent.id });
+    try db.createTable(Child, .{ .overWrite = true, .primaryKey = Child.id, .foreignKeys = &.{.{ .column = Child.parent_id, .references = Parent.id, .onDelete = .cascade }} });
     try db.truncate(Child);
     try db.truncate(Parent);
     var parent = try db.from(Parent).insert(.{ .id = 1, .name = "parent" });
     parent.deinit();
     var child = try db.from(Child).insert(.{ .id = 1, .parent_id = 1 });
     child.deinit();
-    var deleted = db.from(Parent).delete().where(Parent.columns.id.eq(1));
+    var deleted = db.from(Parent).delete().where(Parent.id.eq(1));
     var result = try deleted.execute();
     result.deinit();
     var remaining = try db.from(Child).selectAll().fetch();

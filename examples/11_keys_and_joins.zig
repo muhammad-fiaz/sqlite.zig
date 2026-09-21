@@ -7,8 +7,8 @@ const Order = sqlite.table("relation_orders", struct { id: i64, user_id: i64 });
 pub fn main() !void {
     var db = try sqlite.open(std.heap.page_allocator, "example_11.db");
     defer db.close();
-    try db.createTable(User, .{ .overWrite = true, .primaryKey = User.columns.id, .unique = &.{User.columns.email} });
-    try db.createTable(Order, .{ .overWrite = true, .primaryKey = Order.columns.id, .foreignKeys = &.{.{ .column = Order.columns.user_id, .references = User.columns.id }} });
+    try db.createTable(User, .{ .overWrite = true, .primaryKey = User.id, .unique = &.{User.email} });
+    try db.createTable(Order, .{ .overWrite = true, .primaryKey = Order.id, .foreignKeys = &.{.{ .column = Order.user_id, .references = User.id }} });
     try db.truncate(Order);
     try db.truncate(User);
 
@@ -17,9 +17,9 @@ pub fn main() !void {
     var order = try db.from(Order).insert(.{ .id = 1, .user_id = 1 });
     order.deinit();
 
-    var inner = try db.from(User).innerJoin(Order, User.columns.id.eq(Order.columns.user_id)).fetch();
+    var inner = try db.from(User).innerJoin(Order, User.id.eq(Order.user_id)).fetch();
     inner.deinit();
-    var left = try db.from(User).leftJoin(Order, User.columns.id.eq(Order.columns.user_id)).fetch();
+    var left = try db.from(User).leftJoin(Order, User.id.eq(Order.user_id)).fetch();
     left.deinit();
     var raw = try db.exec("SELECT * FROM relation_users JOIN relation_orders ON relation_users.id = relation_orders.user_id;");
     raw.deinit();

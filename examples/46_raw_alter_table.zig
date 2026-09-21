@@ -8,6 +8,6 @@ pub fn main() !void {
     result.deinit();
     var rows = try db.exec("SELECT id, name FROM altered_demo;");
     defer rows.deinit();
-    if (rows.count() != 1 or !std.mem.eql(u8, rows.rows[0][1].text, "before")) return error.AlterVerificationFailed;
+    if (rows.count() != 1 or !std.mem.eql(u8, rows.at(0)[1].text, "before")) return error.AlterVerificationFailed;
     std.debug.print("46 ALTER TABLE: add, rename, drop, and table rename verified\n", .{});
 }

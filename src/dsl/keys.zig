@@ -59,14 +59,14 @@ pub fn coerceName(value: anytype) []const u8 {
 
 pub fn colNameOf(c: anytype) []const u8 {
     const T = @TypeOf(c);
-    if (T == DynamicColumn) return dslColumn.splitRef(c.name).name;
+    if (T == DynamicColumn) return dslColumn.dynRef(c).name;
     if (comptime isDslColumn(T)) return T.dslName;
     return coerceName(c);
 }
 
 pub fn colTableOf(c: anytype) []const u8 {
     const T = @TypeOf(c);
-    if (T == DynamicColumn) return dslColumn.splitRef(c.name).table;
+    if (T == DynamicColumn) return dslColumn.dynRef(c).table;
     if (comptime isDslColumn(T)) return T.dslTable;
     return "";
 }
@@ -119,7 +119,7 @@ pub const ForeignKeySpec = struct {
 fn normalizeRefList(ref: anytype, outTable: *[]const u8, outCols: *[16][]const u8) !usize {
     const R = @TypeOf(ref);
     if (R == DynamicColumn) {
-        const split = dslColumn.splitRef(ref.name);
+        const split = dslColumn.dynRef(ref);
         if (split.table.len == 0) return error.InvalidSql;
         outTable.* = split.table;
         outCols[0] = split.name;

@@ -14,8 +14,8 @@ pub fn main() !void {
 
     db = try sqlite.open(std.heap.page_allocator, path);
     defer db.close();
-    var rows = try db.from(Note).select(.{ Note.columns.id, Note.columns.body }).fetch();
+    var rows = try db.from(Note).select(.{ Note.id, Note.body }).fetch();
     defer rows.deinit();
-    if (rows.count() != 1 or rows.rows[0][0].integer != 1 or !std.mem.eql(u8, rows.rows[0][1].text, "stored on disk")) return error.PersistenceVerificationFailed;
+    if (rows.count() != 1 or rows.at(0)[0].integer != 1 or !std.mem.eql(u8, rows.at(0)[1].text, "stored on disk")) return error.PersistenceVerificationFailed;
     std.debug.print("17 persistence: persisted_notes contains {d} verified row\n", .{rows.count()});
 }

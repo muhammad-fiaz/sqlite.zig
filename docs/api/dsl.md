@@ -16,10 +16,11 @@ var rows = try db.exec("SELECT id, name FROM users WHERE age >= 18;");
 defer rows.deinit();
 
 // Dynamic DSL: runtime table/column names, no struct required.
-var dyn = try db.from("users")
-    .select(.{ db.col("id"), db.col("name") })
+const users = db.table("users");
+var dyn = try db.from(users)
+    .select(.{ users.column("id"), users.column("name") })
     .where(db.col("age").gte(18))
-    .orderBy(db.col("name").asc())
+    .orderBy(users.column("name").asc())
     .fetch();
 defer dyn.deinit();
 
@@ -30,8 +31,8 @@ const User = sqlite.table("users", struct {
     age: i64,
 });
 var typed = try db.from(User)
-    .where(User.columns.age.gte(18))
-    .orderBy(User.columns.name.asc())
+    .where(User.age.gte(18))
+    .orderBy(User.name.asc())
     .fetch();
 defer typed.deinit();
 ```
@@ -49,8 +50,25 @@ const User = sqlite.table("users", struct {
 Type mapping: `int`/`bool` to `INTEGER`, `float` to `REAL`,
 `[]const u8` to `TEXT`, anything else to `BLOB`. Non-optional fields are
 `NOT NULL`; `?T` fields are nullable. A struct field default becomes a
-`DEFAULT` clause. Every struct field is exposed as `User.columns.<field>`,
+`DEFAULT` clause. Every struct field is exposed as `User.<field>`,
 so an unknown column is a compile error.
+
+## Columns named like DSL operations
+
+The API rule is simple: **fields are schema data, methods are operations**.
+`User.id`, `User.count`, even `User.where` are always plain column
+descriptors, so a table may legally declare columns named `all`, `count`,
+`select`, `where`, `limit`, and friends — they keep working as columns
+with full expression methods (`Weird.where.eq("x")`,
+`Weird.limit.desc()`).
+
+The all-columns operation is `User.all()` (a generated call), which builds
+the native all-columns node behind `select(User.all())`. One hard limit
+comes from Zig itself: a struct cannot hold a field and a function under
+one name, so when the schema defines its own `all` column, that real
+column owns the `all` member and the operation moves to
+`db.from(User).selectAll()` — which builds the exact same node. See
+`examples/70_collision_free_dsl.zig`.
 
 Keys and constraints can be declared once with field names so schema
 validation and table creation share them:
@@ -65,39 +83,49 @@ const User = sqlite.tableWith("users", struct {
 });
 ```
 
-## Columns
+## Columns: `table.column()` vs `db.col()`
 
-Typed: `User.columns.id`. Dynamic: `db.col("id")` (qualified form
-`db.col("users.id")` is accepted). Both spell every predicate the same way:
+The canonical explicit Dynamic form is `users.column("id")`: the column
+carries its table identity, so joins and self-joins resolve unambiguously.
+`db.col("id")` is optional syntactic sugar for an unqualified runtime column
+reference. Both construct the same native column-reference node; the resolver
+applies SQLite's normal name-resolution rules, and an ambiguous unqualified
+reference (two tables exposing `id` in one query) is an error rather than a
+silent pick of one side. Prefer `table.column()` whenever the table is known
+and reach for `db.col()` for concise single-table predicates. Dotted sugar
+`db.col("users.id")` is accepted and resolves as a qualified reference.
+
+Typed: `User.id`. Dynamic: `users.column("id")`, sugar `db.col("id")`
+(qualified form `db.col("users.id")` is accepted). Both spell every predicate the same way:
 
 ```zig
-User.columns.age.eq(18)      // =          db.col("age").eq(18)
-User.columns.age.ne(18)      // <>
-User.columns.age.lt(18)      // <
-User.columns.age.lte(18)     // <=
-User.columns.age.gt(18)      // >
-User.columns.age.gte(18)     // >=
-User.columns.name.like("A%") // LIKE (also notLike)
-User.columns.name.glob("A*") // GLOB, case-sensitive (also notGlob)
-User.columns.age.is(18)      // IS (also isNot)
-User.columns.name.isNull()   // IS NULL (also isNotNull)
-User.columns.age.isDistinctFrom(18) // IS DISTINCT FROM (also isNotDistinctFrom)
-User.columns.age.between(18, 30)    // BETWEEN (also notBetween)
+User.age.eq(18)      // =          db.col("age").eq(18)
+User.age.ne(18)      // <>
+User.age.lt(18)      // <
+User.age.lte(18)     // <=
+User.age.gt(18)      // >
+User.age.gte(18)     // >=
+User.name.like("A%") // LIKE (also notLike)
+User.name.glob("A*") // GLOB, case-sensitive (also notGlob)
+User.age.is(18)      // IS (also isNot)
+User.name.isNull()   // IS NULL (also isNotNull)
+User.age.isDistinctFrom(18) // IS DISTINCT FROM (also isNotDistinctFrom)
+User.age.between(18, 30)    // BETWEEN (also notBetween)
 ```
 
-Ordering: `User.columns.name.asc()` / `.desc()`. Aggregates are column
+Ordering: `User.name.asc()` / `.desc()`. Aggregates are column
 projections used with `select`:
 
 ```zig
-.select(.{Order.columns.amount.sum()})   // also avg/min/max/count/countDistinct
+.select(.{Order.amount.sum()})   // also avg/min/max/count/countDistinct
 ```
 
 Scalar wrappers (engine-supported functions only) compose with predicates
 and projections:
 
 ```zig
-.where(User.columns.name.lower().eq("alice"))
-.select(.{User.columns.payload.jsonExtract("$.city")})
+.where(User.name.lower().eq("alice"))
+.select(.{User.payload.jsonExtract("$.city")})
 ```
 
 Available: `lower/upper/trim/ltrim/rtrim/length/abs/typeOf/round/coalesce/
@@ -106,37 +134,42 @@ ifNull/instr/substr/replace/cast/jsonExtract/jsonSet`.
 A predicate can compare two columns (JOIN ON, correlated EXISTS):
 
 ```zig
-User.columns.id.eq(Order.columns.user_id)
+User.id.eq(Order.user_id)
 ```
 
 ## Queries
 
 ```zig
-db.from(User)      // typed
-db.from("users")   // dynamic
+db.from(User)      // typed table value from sqlite.table(...)
+const users = db.table("users");
+db.from(users)     // dynamic table handle
+users.selectAll()  // dynamic SELECT * without spelling db.from
 ```
 
 One builder, one method chain:
 
 ```zig
-.select(.{ User.columns.id, User.columns.name }) // heterogeneous tuple/array
-.selectAll()                                     // SELECT *
+.select(.{ User.id, User.name }) // heterogeneous tuple/array
+.select(User.all())              // typed table.* (call the operation)
+.selectAll()                     // SELECT * on any db.from(...) query
 .distinct()
 .where(expr).andWhere(expr).orWhere(expr)
-.whereInValues(User.columns.id, .{ 1, 2, 3 })
-.whereNotInValues(User.columns.id, .{ 1, 2, 3 })
-.whereInQuery(User.columns.id, Order, Order.columns.user_id)
-.whereNotInQuery(User.columns.id, Order, Order.columns.user_id)
-.whereExists(Order, Order.columns.user_id.eq(User.columns.id))
-.whereNotExists(Order, Order.columns.user_id.eq(User.columns.id))
-.orderBy(User.columns.name.asc())
+.whereInValues(User.id, .{ 1, 2, 3 })
+.whereNotInValues(User.id, .{ 1, 2, 3 })
+.whereInQuery(User.id, Order, Order.user_id)
+.whereNotInQuery(User.id, Order, Order.user_id)
+.whereExists(Order, Order.user_id.eq(User.id))
+.whereNotExists(Order, Order.user_id.eq(User.id))
+.orderBy(User.name.asc())
+.orderBy(.{ User.name.asc(), User.age.desc() }) // multi-key ORDER BY
 .limit(10).offset(20)
-.groupBy(User.columns.age).havingCount(">", 1)
+.groupBy(User.age).having(User.id.count().gt(1))
 .countStar() // COUNT(*)
 .with("live", "SELECT ...") // CTE with a raw SQL body
 .withRecursive("nums", "SELECT 1 AS n", "SELECT n + 1 AS n FROM nums WHERE n < 5")
 .fetch()     // one canonical fetch; see below
-.fetchOne()  // typed full-row queries only: ?Row
+.fetchOne()  // single row or error.NoRows / error.TooManyRows
+.fetchOptional() // single row or null
 ```
 
 ## Fetch
@@ -146,34 +179,34 @@ full-row queries map into structs, everything else returns raw rows. Both
 provide `rows`, `count()`, and `deinit()`.
 
 ```zig
-var dyn = try db.from("users").where(db.col("age").gte(18)).fetch();
+const users = db.table("users");
+var dyn = try db.from(users).where(users.column("age").gte(18)).fetch();
 defer dyn.deinit();
 dyn.rows[0][0].integer;
 
-var typed = try db.from(User).where(User.columns.age.gte(18)).fetch();
+var typed = try db.from(User).where(User.age.gte(18)).fetch();
 defer typed.deinit();
 typed.rows[0].name;
 ```
 
 `select()` projections and `countStar()` return raw rows even on typed
-tables, because a projection is not a full struct row. `fetchOne()` is the
-zero-or-one-row accessor for typed full-row queries; free its row with
-`freeRow` when done.
+tables, because a projection is not a full struct row. `fetchOne()` returns
+the single row or `error.NoRows` / `error.TooManyRows`; `fetchOptional()`
+returns `null` when no row matches. Free typed rows with `freeRow` when done.
 
 ```zig
-if (try db.from(User).where(User.columns.id.eq(1)).fetchOne()) |*user| {
-    defer db.from(User).freeRow(user);
-}
+var user = try db.from(User).where(User.id.eq(1)).fetchOne();
+defer db.from(User).freeRow(&user);
 ```
 
 Joins take the other table (typed or name) plus a column-comparison
 expression:
 
 ```zig
-.innerJoin(Order, User.columns.id.eq(Order.columns.user_id))
-.leftJoin(Order, User.columns.id.eq(Order.columns.user_id))
-.rightJoin(Order, User.columns.id.eq(Order.columns.user_id))
-.fullJoin(Order, User.columns.id.eq(Order.columns.user_id))
+.innerJoin(Order, User.id.eq(Order.user_id))
+.leftJoin(Order, User.id.eq(Order.user_id))
+.rightJoin(Order, User.id.eq(Order.user_id))
+.fullJoin(Order, User.id.eq(Order.user_id))
 .crossJoin(Order)
 ```
 
@@ -188,10 +221,10 @@ var replaced = try db.from(User).insertOrReplace(.{ .id = 1, .name = "Alice", .a
 replaced.deinit();
 
 var mutation = try db.from(User).update(.{ .name = "Bob" });
-var updated = try mutation.where(User.columns.id.eq(1)).execute();
+var updated = try mutation.where(User.id.eq(1)).execute();
 defer updated.deinit();
 
-var deleted = try db.from(User).delete().where(User.columns.id.eq(1)).execute();
+var deleted = try db.from(User).delete().where(User.id.eq(1)).execute();
 defer deleted.deinit();
 ```
 
@@ -201,7 +234,7 @@ constraint, trigger, and `RETURNING` handling as single-row inserts:
 
 ```zig
 var copied = try db.from(Archive)
-    .insertSelect(db.from(Active).select(.{ Active.columns.id, Active.columns.name }));
+    .insertSelect(db.from(Active).select(.{ Active.id, Active.name }));
 defer copied.deinit();
 ```
 
@@ -210,7 +243,7 @@ predicate (assignments are literals; `delete` rejects a source table):
 
 ```zig
 var updated = try db.from(Bal).update(.{ .flag = 1 })
-    .updateFrom(Adj, Bal.columns.id.eq(Adj.columns.bal_id))
+    .updateFrom(Adj, Bal.id.eq(Adj.bal_id))
     .execute();
 defer updated.deinit();
 ```
@@ -223,11 +256,11 @@ examples.
 
 ```zig
 // Typed: columns inferred; keys are descriptors (single or composite).
-try db.createTable(User, .{ .primaryKey = User.columns.id });
-try db.createTable(Member, .{ .primaryKey = &.{ Member.columns.tenant_id, Member.columns.user_id } });
-try db.createTable(User, .{ .unique = &.{User.columns.email} });
+try db.createTable(User, .{ .primaryKey = User.id });
+try db.createTable(Member, .{ .primaryKey = &.{ Member.tenant_id, Member.user_id } });
+try db.createTable(User, .{ .unique = &.{User.email} });
 try db.createTable(Order, .{ .foreignKeys = &.{
-    .{ .column = Order.columns.user_id, .references = User.columns.id, .onDelete = .cascade },
+    .{ .column = Order.user_id, .references = User.id, .onDelete = .cascade },
 } });
 
 // Dynamic: explicit columns plus string keys.
@@ -237,7 +270,7 @@ try db.createTable("users", .{
     .unique = &.{ "email" },
 });
 
-try db.createIndex(User, "users_email_idx", .{User.columns.email}, true);
+try db.createIndex(User, "users_email_idx", .{User.email}, true);
 try db.schema(User).validate(); // error.SchemaMismatch on divergence
 ```
 
@@ -246,7 +279,7 @@ plus a predicate) and `createIndexExpr` (column names or SQL expressions,
 with an optional predicate), covering typed and dynamic tables alike:
 
 ```zig
-try db.createIndexWhere(User, "users_active_id", .{User.columns.id}, false, "active = 1");
+try db.createIndexWhere(User, "users_active_id", .{User.id}, false, "active = 1");
 try db.createIndexExpr("users", "users_lower_email", &.{ "lower(email)" }, true, null);
 ```
 

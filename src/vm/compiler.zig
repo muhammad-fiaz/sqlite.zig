@@ -423,7 +423,7 @@ test "compiler compiles arithmetic and function expression" {
     defer result.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), result.rows.len);
-    try std.testing.expectEqual(@as(i64, 13), result.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 13), result.at(0)[0].integer);
 }
 
 test "compiler compiles constant select statement" {
@@ -451,6 +451,6 @@ test "compiler compiles constant select statement" {
     defer result.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), result.rows.len);
-    try std.testing.expectEqual(@as(i64, 100), result.rows[0][0].integer);
-    try std.testing.expectEqualStrings("sqlite.zig", result.rows[0][1].text);
+    try std.testing.expectEqual(@as(i64, 100), result.at(0)[0].integer);
+    try std.testing.expectEqualStrings("sqlite.zig", result.at(0)[1].text);
 }

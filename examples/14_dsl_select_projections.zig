@@ -15,13 +15,13 @@ pub fn main() !void {
     second.deinit();
 
     var projected = try db.from(Product)
-        .select(&.{ Product.columns.id, Product.columns.name })
-        .where(Product.columns.price.gte(30))
-        .orderBy(Product.columns.price.desc())
+        .select(&.{ Product.id, Product.name })
+        .where(Product.price.gte(30))
+        .orderBy(Product.price.desc())
         .fetch();
     projected.deinit();
 
-    var distinctNames = try db.from(Product).select(.{Product.columns.name}).distinct().fetch();
+    var distinctNames = try db.from(Product).select(.{Product.name}).distinct().fetch();
     distinctNames.deinit();
 
     var total = try db.from(Product).countStar().fetch();

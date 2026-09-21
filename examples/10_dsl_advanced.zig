@@ -5,10 +5,10 @@ const Account = sqlite.table("dsl_accounts", struct { id: i64, owner: []const u8
 
 fn transfer(db: *sqlite.Connection) !void {
     var debitMutation = try db.from(Account).update(.{ .balance = 75 });
-    var debit = try debitMutation.where(Account.columns.id.eq(1)).execute();
+    var debit = try debitMutation.where(Account.id.eq(1)).execute();
     debit.deinit();
     var creditMutation = try db.from(Account).update(.{ .balance = 125 });
-    var credit = try creditMutation.where(Account.columns.id.eq(2)).execute();
+    var credit = try creditMutation.where(Account.id.eq(2)).execute();
     credit.deinit();
 }
 
@@ -24,16 +24,16 @@ pub fn main() !void {
 
     try db.transaction(transfer);
     try db.savepoint("report");
-    var rows = try db.from(Account).select(.{ Account.columns.id, Account.columns.owner, Account.columns.balance })
-        .where(Account.columns.balance.gte(75))
-        .andWhere(Account.columns.id.gt(0))
-        .orderBy(Account.columns.balance.desc())
+    var rows = try db.from(Account).select(.{ Account.id, Account.owner, Account.balance })
+        .where(Account.balance.gte(75))
+        .andWhere(Account.id.gt(0))
+        .orderBy(Account.balance.desc())
         .limit(10)
         .fetch();
     rows.deinit();
     try db.releaseSavepoint("report");
 
-    var total = try db.from(Account).select(.{Account.columns.balance.sum()}).fetch();
+    var total = try db.from(Account).select(.{Account.balance.sum()}).fetch();
     total.deinit();
     std.debug.print("10 dsl advanced: transactions, savepoints, and aggregates verified\n", .{});
 }

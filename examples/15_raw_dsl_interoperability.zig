@@ -13,13 +13,13 @@ pub fn main() !void {
     rawInsert.deinit();
 
     var typedUpdate = try db.from(Task).update(.{ .done = 1 });
-    var updated = try typedUpdate.where(Task.columns.id.eq(1)).execute();
+    var updated = try typedUpdate.where(Task.id.eq(1)).execute();
     updated.deinit();
 
     var rawQuery = try db.exec("SELECT id, title FROM interop_tasks WHERE done = 1;");
     rawQuery.deinit();
 
-    var typedDelete = db.from(Task).delete().where(Task.columns.id.eq(2));
+    var typedDelete = db.from(Task).delete().where(Task.id.eq(2));
     var deleted = try typedDelete.execute();
     deleted.deinit();
     std.debug.print("15 raw dsl interop: raw SQL and DSL produce identical results\n", .{});

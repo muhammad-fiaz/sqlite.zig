@@ -43,6 +43,11 @@ pub fn splitRef(name: []const u8) ColumnRef {
     return .{ .name = name };
 }
 
+pub fn dynRef(col: DynamicColumn) ColumnRef {
+    if (col.schema.len != 0 or col.table.len != 0) return .{ .schema = col.schema, .table = col.table, .name = col.name };
+    return splitRef(col.name);
+}
+
 fn isTypedColumn(comptime T: type) bool {
     if (@typeInfo(T) != .@"struct") return false;
     return @hasDecl(T, "isDslColumn") and T.isDslColumn;
@@ -54,9 +59,9 @@ pub fn toRhs(value: anytype) dslExpr.Rhs {
 
 pub fn toColumnRef(col: anytype) dslExpr.ColumnRef {
     const T = @TypeOf(col);
-    if (T == DynamicColumn) return splitRef(col.name);
+    if (T == DynamicColumn) return dynRef(col);
     if (comptime isTypedColumn(T)) return .{ .table = T.dslTable, .name = T.dslName };
-    @compileError("expected a column descriptor (User.columns.x or db.col(\"x\"))");
+    @compileError("expected a column descriptor (User.id or table.column(\"x\"))");
 }
 
 pub const CaseWhen = struct { cond: ?Expr = null, operand: dslExpr.Rhs, result: dslExpr.Rhs, simple: bool };
@@ -105,7 +110,7 @@ pub fn caseWhen(cond: Expr, result: anytype) CaseBuilder {
 pub fn caseValue(col: anytype) CaseBuilder {
     const T = @TypeOf(col);
     if (T == DynamicColumn) {
-        const ref = splitRef(col.name);
+        const ref = dynRef(col);
         return .{ .base = ref, .baseFunc = col.func };
     }
     if (comptime isTypedColumn(T)) {
@@ -172,7 +177,7 @@ pub const WindowBuilder = struct {
         const T = @TypeOf(cols);
         if (T == DynamicColumn) {
             if (copy.partitionCount >= copy.partitions.len) @panic("too many window partition columns");
-            copy.partitions[copy.partitionCount] = splitRef(cols.name);
+            copy.partitions[copy.partitionCount] = dynRef(cols);
             copy.partitionCount += 1;
         } else if (comptime isTypedColumn(T)) {
             if (copy.partitionCount >= copy.partitions.len) @panic("too many window partition columns");
@@ -306,13 +311,106 @@ pub fn nthValue(col: anytype, n: i64) WindowBuilder {
 
 fn rhsFrom(value: anytype) dslExpr.Rhs {
     const T = @TypeOf(value);
-    if (T == DynamicColumn) return .{ .column = splitRef(value.name) };
+    if (T == DynamicColumn) return .{ .column = dynRef(value) };
     if (comptime isTypedColumn(T)) return .{ .column = .{ .table = T.dslTable, .name = T.dslName } };
     return .{ .value = toValue(value) };
 }
 
 fn orderFromRef(ref: ColumnRef, func: ?FuncCall, descending: bool) Order {
     return .{ .column = ref, .descending = descending, .function = func };
+}
+
+pub const ExplicitValue = struct {
+    value: Value,
+    pub const isExplicitValue = true;
+};
+
+pub const ExplicitDefault = struct {
+    pub const isExplicitDefault = true;
+};
+
+fn checkExplicitValue(comptime FieldType: type, comptime V: type) void {
+    if (V == Value) return;
+    if (V == @TypeOf(null)) {
+        if (@typeInfo(FieldType) != .optional) @compileError("cannot assign NULL to non-nullable column");
+        return;
+    }
+    if (@typeInfo(V) == .optional) {
+        // Runtime-checked like the concise path; literal null handled above.
+        checkExplicitValueOptional(FieldType, @typeInfo(V).optional.child);
+        return;
+    }
+    const Target = if (@typeInfo(FieldType) == .optional) @typeInfo(FieldType).optional.child else FieldType;
+    if (Target == bool) {
+        if (V != bool) @compileError("column expects a boolean value");
+        return;
+    }
+    switch (@typeInfo(Target)) {
+        .int => {
+            if (@typeInfo(V) != .int and @typeInfo(V) != .comptime_int) @compileError("column expects an integer value");
+        },
+        .float => {
+            const vi = @typeInfo(V);
+            if (vi != .int and vi != .float and vi != .comptime_int and vi != .comptime_float) @compileError("column expects a numeric value");
+        },
+        .pointer => |ptr| {
+            if (!(ptr.size == .slice and ptr.child == u8)) @compileError("unsupported column type");
+            const vi = @typeInfo(V);
+            const okSlice = vi == .pointer and vi.pointer.size == .slice and vi.pointer.child == u8;
+            const okArray = vi == .pointer and vi.pointer.size == .one and @typeInfo(vi.pointer.child) == .array and @typeInfo(vi.pointer.child).array.child == u8;
+            if (!okSlice and !okArray) @compileError("column expects text");
+        },
+        else => @compileError("unsupported column type"),
+    }
+}
+
+fn checkExplicitValueOptional(comptime FieldType: type, comptime Child: type) void {
+    // An optional value may hold null at runtime; non-nullable columns then
+    // fail at execution with a constraint error, matching concise behavior.
+    if (Child == @TypeOf(null)) return;
+    const Target = if (@typeInfo(FieldType) == .optional) @typeInfo(FieldType).optional.child else FieldType;
+    if (Target == bool and Child != bool) @compileError("column expects a boolean value");
+    switch (@typeInfo(Target)) {
+        .int => {
+            if (@typeInfo(Child) != .int and @typeInfo(Child) != .comptime_int and Child != Value) @compileError("column expects an integer value");
+        },
+        .float => {
+            const ci = @typeInfo(Child);
+            if (ci != .int and ci != .float and ci != .comptime_int and ci != .comptime_float and Child != Value) @compileError("column expects a numeric value");
+        },
+        .pointer => {
+            const ci = @typeInfo(Child);
+            const okSlice = ci == .pointer and ci.pointer.size == .slice and ci.pointer.child == u8;
+            const okArray = ci == .pointer and ci.pointer.size == .one and @typeInfo(ci.pointer.child) == .array and @typeInfo(ci.pointer.child).array.child == u8;
+            if (!okSlice and !okArray and Child != Value) @compileError("column expects text");
+        },
+        else => {
+            if (Child != Value) @compileError("unsupported column type");
+        },
+    }
+}
+
+fn setOperandOf(value: anytype) dslExpr.SetOperand {
+    const T = @TypeOf(value);
+    if (comptime isTypedColumn(T)) return .{ .column = .{ .table = T.dslTable, .name = T.dslName } };
+    if (T == DynamicColumn) return .{ .column = dynRef(value) };
+    if (comptime @typeInfo(T) == .@"struct" and @hasDecl(T, "isExplicitValue")) {
+        return .{ .literal = value.value };
+    }
+    if (comptime @typeInfo(T) == .@"struct" and @hasDecl(T, "isExplicitDefault")) {
+        @compileError("defaultValue() cannot appear inside an arithmetic expression");
+    }
+    return .{ .literal = toValue(value) };
+}
+
+fn checkNumericColumn(comptime FieldType: type) void {
+    const Target = if (@typeInfo(FieldType) == .optional) @typeInfo(FieldType).optional.child else FieldType;
+    const ti = @typeInfo(Target);
+    if (ti != .int and ti != .float and ti != .comptime_int and ti != .comptime_float) @compileError("arithmetic assignment requires a numeric column");
+}
+
+fn arithOf(ref: ColumnRef, op: dslExpr.ArithOp, other: anytype) dslExpr.ArithExpr {
+    return .{ .op = op, .left = .{ .column = ref }, .right = setOperandOf(other) };
 }
 
 pub fn Column(comptime tableName: []const u8, comptime columnName: []const u8, comptime FieldType: type) type {
@@ -332,81 +430,81 @@ pub fn Column(comptime tableName: []const u8, comptime columnName: []const u8, c
             return .{ .table = tableName, .name = columnName };
         }
 
-        fn pred(self: Self, op: Operator, value: anytype) Expr {
-            return .{ .column = self.ref(), .operator = op, .rhs = rhsFrom(value), .function = self.func };
+        fn pred(self: Self, op: Operator, val: anytype) Expr {
+            return .{ .column = self.ref(), .operator = op, .rhs = rhsFrom(val), .function = self.func };
         }
 
-        pub fn eq(self: Self, value: anytype) Expr {
-            return self.pred(.equal, value);
+        pub fn eq(self: Self, val: anytype) Expr {
+            return self.pred(.equal, val);
         }
-        pub fn ne(self: Self, value: anytype) Expr {
-            return self.pred(.notEqual, value);
+        pub fn ne(self: Self, val: anytype) Expr {
+            return self.pred(.notEqual, val);
         }
-        pub fn lt(self: Self, value: anytype) Expr {
-            return self.pred(.less, value);
+        pub fn lt(self: Self, val: anytype) Expr {
+            return self.pred(.less, val);
         }
-        pub fn lte(self: Self, value: anytype) Expr {
-            return self.pred(.lessEqual, value);
+        pub fn lte(self: Self, val: anytype) Expr {
+            return self.pred(.lessEqual, val);
         }
-        pub fn gt(self: Self, value: anytype) Expr {
-            return self.pred(.greater, value);
+        pub fn gt(self: Self, val: anytype) Expr {
+            return self.pred(.greater, val);
         }
-        pub fn gte(self: Self, value: anytype) Expr {
-            return self.pred(.greaterEqual, value);
+        pub fn gte(self: Self, val: anytype) Expr {
+            return self.pred(.greaterEqual, val);
         }
-        pub fn like(self: Self, value: anytype) Expr {
-            return self.pred(.like, value);
+        pub fn like(self: Self, val: anytype) Expr {
+            return self.pred(.like, val);
         }
-        pub fn notLike(self: Self, value: anytype) Expr {
-            return self.pred(.notLike, value);
+        pub fn notLike(self: Self, val: anytype) Expr {
+            return self.pred(.notLike, val);
         }
-        pub fn likeEscape(self: Self, value: anytype, escape: anytype) Expr {
-            var expr = self.pred(.like, value);
+        pub fn likeEscape(self: Self, val: anytype, escape: anytype) Expr {
+            var expr = self.pred(.like, val);
             expr.escape = toValue(escape);
             return expr;
         }
-        pub fn notLikeEscape(self: Self, value: anytype, escape: anytype) Expr {
-            var expr = self.pred(.notLike, value);
+        pub fn notLikeEscape(self: Self, val: anytype, escape: anytype) Expr {
+            var expr = self.pred(.notLike, val);
             expr.escape = toValue(escape);
             return expr;
         }
-        pub fn glob(self: Self, value: anytype) Expr {
-            return self.pred(.glob, value);
+        pub fn glob(self: Self, val: anytype) Expr {
+            return self.pred(.glob, val);
         }
-        pub fn notGlob(self: Self, value: anytype) Expr {
-            return self.pred(.notGlob, value);
+        pub fn notGlob(self: Self, val: anytype) Expr {
+            return self.pred(.notGlob, val);
         }
-        pub fn regexp(self: Self, value: anytype) Expr {
-            return self.pred(.regexp, value);
+        pub fn regexp(self: Self, val: anytype) Expr {
+            return self.pred(.regexp, val);
         }
-        pub fn notRegexp(self: Self, value: anytype) Expr {
-            return self.pred(.notRegexp, value);
+        pub fn notRegexp(self: Self, val: anytype) Expr {
+            return self.pred(.notRegexp, val);
         }
-        pub fn matchPattern(self: Self, value: anytype) Expr {
-            return self.pred(.match, value);
+        pub fn matchPattern(self: Self, val: anytype) Expr {
+            return self.pred(.match, val);
         }
-        pub fn match(self: Self, value: anytype) Expr {
-            return self.pred(.match, value);
+        pub fn match(self: Self, val: anytype) Expr {
+            return self.pred(.match, val);
         }
-        pub fn notMatch(self: Self, value: anytype) Expr {
-            return self.pred(.notMatch, value);
+        pub fn notMatch(self: Self, val: anytype) Expr {
+            return self.pred(.notMatch, val);
         }
-        pub fn collate(self: Self, comptime collation: []const u8, value: anytype) Expr {
-            var expr = self.pred(.equal, value);
+        pub fn collate(self: Self, comptime collation: []const u8, val: anytype) Expr {
+            var expr = self.pred(.equal, val);
             expr.collate = collation;
             return expr;
         }
-        pub fn is(self: Self, value: anytype) Expr {
-            return self.pred(.isValue, value);
+        pub fn is(self: Self, val: anytype) Expr {
+            return self.pred(.isValue, val);
         }
-        pub fn isNot(self: Self, value: anytype) Expr {
-            return self.pred(.isNotValue, value);
+        pub fn isNot(self: Self, val: anytype) Expr {
+            return self.pred(.isNotValue, val);
         }
-        pub fn isDistinctFrom(self: Self, value: anytype) Expr {
-            return self.pred(.isDistinct, value);
+        pub fn isDistinctFrom(self: Self, val: anytype) Expr {
+            return self.pred(.isDistinct, val);
         }
-        pub fn isNotDistinctFrom(self: Self, value: anytype) Expr {
-            return self.pred(.isNotDistinct, value);
+        pub fn isNotDistinctFrom(self: Self, val: anytype) Expr {
+            return self.pred(.isNotDistinct, val);
         }
         pub fn isNull(self: Self) Expr {
             return .{ .column = self.ref(), .operator = .isNull, .function = self.func };
@@ -515,8 +613,8 @@ pub fn Column(comptime tableName: []const u8, comptime columnName: []const u8, c
         pub fn jsonExtract(self: Self, path: anytype) Self {
             return self.wrap(.{ .name = "json_extract", .argument = toValue(path), .hasArgument = true });
         }
-        pub fn jsonSet(self: Self, path: anytype, value: anytype) Self {
-            return self.wrap(.{ .name = "json_set", .argument = toValue(path), .argument2 = toValue(value), .hasArgument = true, .hasArgument2 = true });
+        pub fn jsonSet(self: Self, path: anytype, val: anytype) Self {
+            return self.wrap(.{ .name = "json_set", .argument = toValue(path), .argument2 = toValue(val), .hasArgument = true, .hasArgument2 = true });
         }
 
         pub fn projection(self: Self) Projection {
@@ -533,99 +631,140 @@ pub fn Column(comptime tableName: []const u8, comptime columnName: []const u8, c
             }
             return .{ .kind = .column, .column = self.ref() };
         }
+
+        pub fn as(self: Self, alias: []const u8) Projection {
+            return self.projection().as(alias);
+        }
+
+        pub fn value(_: Self, v: anytype) ExplicitValue {
+            checkExplicitValue(FieldType, @TypeOf(v));
+            return .{ .value = toValue(v) };
+        }
+
+        pub fn nullValue(_: Self) ExplicitValue {
+            if (@typeInfo(FieldType) != .optional) @compileError("nullValue() requires a nullable (?T) column");
+            return .{ .value = .null };
+        }
+
+        pub fn defaultValue(_: Self) ExplicitDefault {
+            return .{};
+        }
+
+        pub fn add(self: Self, other: anytype) dslExpr.ArithExpr {
+            checkNumericColumn(FieldType);
+            return arithOf(self.ref(), .add, other);
+        }
+        pub fn sub(self: Self, other: anytype) dslExpr.ArithExpr {
+            checkNumericColumn(FieldType);
+            return arithOf(self.ref(), .sub, other);
+        }
+        pub fn mul(self: Self, other: anytype) dslExpr.ArithExpr {
+            checkNumericColumn(FieldType);
+            return arithOf(self.ref(), .mul, other);
+        }
+        pub fn div(self: Self, other: anytype) dslExpr.ArithExpr {
+            checkNumericColumn(FieldType);
+            return arithOf(self.ref(), .div, other);
+        }
+        pub fn mod(self: Self, other: anytype) dslExpr.ArithExpr {
+            checkNumericColumn(FieldType);
+            return arithOf(self.ref(), .mod, other);
+        }
     };
 }
 
 pub const DynamicColumn = struct {
     name: []const u8,
+    schema: []const u8 = "",
+    table: []const u8 = "",
     func: ?FuncCall = null,
 
     fn ref(self: @This()) ColumnRef {
-        return splitRef(self.name);
+        return dynRef(self);
     }
 
-    fn pred(self: @This(), op: Operator, value: anytype) Expr {
-        const T = @TypeOf(value);
+    fn pred(self: @This(), op: Operator, val: anytype) Expr {
+        const T = @TypeOf(val);
         const rhs: dslExpr.Rhs = if (T == DynamicColumn)
-            .{ .column = splitRef(value.name) }
+            .{ .column = dynRef(val) }
         else if (comptime isTypedColumn(T))
             .{ .column = .{ .table = T.dslTable, .name = T.dslName } }
         else
-            .{ .value = toValue(value) };
+            .{ .value = toValue(val) };
         return .{ .column = self.ref(), .operator = op, .rhs = rhs, .function = self.func };
     }
 
-    pub fn eq(self: @This(), value: anytype) Expr {
-        return self.pred(.equal, value);
+    pub fn eq(self: @This(), val: anytype) Expr {
+        return self.pred(.equal, val);
     }
-    pub fn ne(self: @This(), value: anytype) Expr {
-        return self.pred(.notEqual, value);
+    pub fn ne(self: @This(), val: anytype) Expr {
+        return self.pred(.notEqual, val);
     }
-    pub fn lt(self: @This(), value: anytype) Expr {
-        return self.pred(.less, value);
+    pub fn lt(self: @This(), val: anytype) Expr {
+        return self.pred(.less, val);
     }
-    pub fn lte(self: @This(), value: anytype) Expr {
-        return self.pred(.lessEqual, value);
+    pub fn lte(self: @This(), val: anytype) Expr {
+        return self.pred(.lessEqual, val);
     }
-    pub fn gt(self: @This(), value: anytype) Expr {
-        return self.pred(.greater, value);
+    pub fn gt(self: @This(), val: anytype) Expr {
+        return self.pred(.greater, val);
     }
-    pub fn gte(self: @This(), value: anytype) Expr {
-        return self.pred(.greaterEqual, value);
+    pub fn gte(self: @This(), val: anytype) Expr {
+        return self.pred(.greaterEqual, val);
     }
-    pub fn like(self: @This(), value: anytype) Expr {
-        return self.pred(.like, value);
+    pub fn like(self: @This(), val: anytype) Expr {
+        return self.pred(.like, val);
     }
-    pub fn notLike(self: @This(), value: anytype) Expr {
-        return self.pred(.notLike, value);
+    pub fn notLike(self: @This(), val: anytype) Expr {
+        return self.pred(.notLike, val);
     }
-    pub fn likeEscape(self: @This(), value: anytype, escape: anytype) Expr {
-        var expr = self.pred(.like, value);
+    pub fn likeEscape(self: @This(), val: anytype, escape: anytype) Expr {
+        var expr = self.pred(.like, val);
         expr.escape = toValue(escape);
         return expr;
     }
-    pub fn notLikeEscape(self: @This(), value: anytype, escape: anytype) Expr {
-        var expr = self.pred(.notLike, value);
+    pub fn notLikeEscape(self: @This(), val: anytype, escape: anytype) Expr {
+        var expr = self.pred(.notLike, val);
         expr.escape = toValue(escape);
         return expr;
     }
-    pub fn glob(self: @This(), value: anytype) Expr {
-        return self.pred(.glob, value);
+    pub fn glob(self: @This(), val: anytype) Expr {
+        return self.pred(.glob, val);
     }
-    pub fn notGlob(self: @This(), value: anytype) Expr {
-        return self.pred(.notGlob, value);
+    pub fn notGlob(self: @This(), val: anytype) Expr {
+        return self.pred(.notGlob, val);
     }
-    pub fn regexp(self: @This(), value: anytype) Expr {
-        return self.pred(.regexp, value);
+    pub fn regexp(self: @This(), val: anytype) Expr {
+        return self.pred(.regexp, val);
     }
-    pub fn notRegexp(self: @This(), value: anytype) Expr {
-        return self.pred(.notRegexp, value);
+    pub fn notRegexp(self: @This(), val: anytype) Expr {
+        return self.pred(.notRegexp, val);
     }
-    pub fn matchPattern(self: @This(), value: anytype) Expr {
-        return self.pred(.match, value);
+    pub fn matchPattern(self: @This(), val: anytype) Expr {
+        return self.pred(.match, val);
     }
-    pub fn match(self: @This(), value: anytype) Expr {
-        return self.pred(.match, value);
+    pub fn match(self: @This(), val: anytype) Expr {
+        return self.pred(.match, val);
     }
-    pub fn notMatch(self: @This(), value: anytype) Expr {
-        return self.pred(.notMatch, value);
+    pub fn notMatch(self: @This(), val: anytype) Expr {
+        return self.pred(.notMatch, val);
     }
-    pub fn collate(self: @This(), comptime collationName: []const u8, value: anytype) Expr {
-        var expr = self.pred(.equal, value);
+    pub fn collate(self: @This(), comptime collationName: []const u8, val: anytype) Expr {
+        var expr = self.pred(.equal, val);
         expr.collate = collationName;
         return expr;
     }
-    pub fn is(self: @This(), value: anytype) Expr {
-        return self.pred(.isValue, value);
+    pub fn is(self: @This(), val: anytype) Expr {
+        return self.pred(.isValue, val);
     }
-    pub fn isNot(self: @This(), value: anytype) Expr {
-        return self.pred(.isNotValue, value);
+    pub fn isNot(self: @This(), val: anytype) Expr {
+        return self.pred(.isNotValue, val);
     }
-    pub fn isDistinctFrom(self: @This(), value: anytype) Expr {
-        return self.pred(.isDistinct, value);
+    pub fn isDistinctFrom(self: @This(), val: anytype) Expr {
+        return self.pred(.isDistinct, val);
     }
-    pub fn isNotDistinctFrom(self: @This(), value: anytype) Expr {
-        return self.pred(.isNotDistinct, value);
+    pub fn isNotDistinctFrom(self: @This(), val: anytype) Expr {
+        return self.pred(.isNotDistinct, val);
     }
     pub fn isNull(self: @This()) Expr {
         return .{ .column = self.ref(), .operator = .isNull, .function = self.func };
@@ -746,8 +885,8 @@ pub const DynamicColumn = struct {
     pub fn jsonExtract(self: @This(), path: anytype) @This() {
         return self.wrap(.{ .name = "json_extract", .argument = toValue(path), .hasArgument = true });
     }
-    pub fn jsonSet(self: @This(), path: anytype, value: anytype) @This() {
-        return self.wrap(.{ .name = "json_set", .argument = toValue(path), .argument2 = toValue(value), .hasArgument = true, .hasArgument2 = true });
+    pub fn jsonSet(self: @This(), path: anytype, val: anytype) @This() {
+        return self.wrap(.{ .name = "json_set", .argument = toValue(path), .argument2 = toValue(val), .hasArgument = true, .hasArgument2 = true });
     }
 
     pub fn projection(self: @This()) Projection {
@@ -763,6 +902,38 @@ pub const DynamicColumn = struct {
             };
         }
         return .{ .kind = .column, .column = self.ref() };
+    }
+
+    pub fn as(self: @This(), alias: []const u8) Projection {
+        return self.projection().as(alias);
+    }
+
+    pub fn value(_: @This(), v: anytype) ExplicitValue {
+        return .{ .value = toValue(v) };
+    }
+
+    pub fn nullValue(_: @This()) ExplicitValue {
+        return .{ .value = .null };
+    }
+
+    pub fn defaultValue(_: @This()) ExplicitDefault {
+        return .{};
+    }
+
+    pub fn add(self: @This(), other: anytype) dslExpr.ArithExpr {
+        return arithOf(self.ref(), .add, other);
+    }
+    pub fn sub(self: @This(), other: anytype) dslExpr.ArithExpr {
+        return arithOf(self.ref(), .sub, other);
+    }
+    pub fn mul(self: @This(), other: anytype) dslExpr.ArithExpr {
+        return arithOf(self.ref(), .mul, other);
+    }
+    pub fn div(self: @This(), other: anytype) dslExpr.ArithExpr {
+        return arithOf(self.ref(), .div, other);
+    }
+    pub fn mod(self: @This(), other: anytype) dslExpr.ArithExpr {
+        return arithOf(self.ref(), .mod, other);
     }
 };
 

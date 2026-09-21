@@ -14,6 +14,6 @@ pub fn main() !void {
     }
     var grouped = try db.exec("SELECT category, COUNT(*), SUM(amount), AVG(amount), MIN(amount), MAX(amount) FROM grouped_sales GROUP BY category;");
     defer grouped.deinit();
-    if (grouped.count() != 2 or grouped.rows[0][1].integer != 2 or grouped.rows[0][2].integer != 30) return error.GroupedAggregateVerificationFailed;
+    if (grouped.count() != 2 or grouped.at(0)[1].integer != 2 or grouped.at(0)[2].integer != 30) return error.GroupedAggregateVerificationFailed;
     std.debug.print("36 grouped aggregates: COUNT, SUM, AVG, MIN, and MAX verified\n", .{});
 }

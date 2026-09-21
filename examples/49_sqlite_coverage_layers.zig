@@ -9,6 +9,7 @@ const User = sqlite.table("coverage_users", struct {
 
 pub fn main() !void {
     var db = try sqlite.open(std.heap.page_allocator, "example_49.db");
+    const t_db_coverage_users = db.table("coverage_users");
     defer db.close();
 
     var setup = try db.exec(
@@ -24,30 +25,32 @@ pub fn main() !void {
     defer raw.deinit();
     if (raw.count() != 2) return error.UnexpectedResult;
 
-    var rawDsl = try db.from("coverage_users")
-        .select(.{ db.col("id"), db.col("name") })
-        .where(db.col("age").gte(18))
-        .andWhere(db.col("name").glob("A*"))
+    var rawDsl = try t_db_coverage_users
+        .select(.{ t_db_coverage_users.column("id"), t_db_coverage_users.column("name") })
+        .where(t_db_coverage_users.column("age").gte(18))
+        .andWhere(t_db_coverage_users.column("name").glob("A*"))
         .fetch();
     defer rawDsl.deinit();
     if (rawDsl.count() != 1) return error.UnexpectedResult;
 
-    var text = try db.from("coverage_users")
-        .where(db.col("name").like("Al%"))
-        .andWhere(db.col("name").like("%ce"))
+    var text = try t_db_coverage_users
+        .selectAll()
+        .where(t_db_coverage_users.column("name").like("Al%"))
+        .andWhere(t_db_coverage_users.column("name").like("%ce"))
         .fetch();
     defer text.deinit();
     if (text.count() != 1) return error.UnexpectedResult;
 
-    var ranged = try db.from("coverage_users")
-        .where(db.col("age").between(18, 40))
+    var ranged = try t_db_coverage_users
+        .selectAll()
+        .where(t_db_coverage_users.column("age").between(18, 40))
         .fetch();
     defer ranged.deinit();
     if (ranged.count() != 1) return error.UnexpectedResult;
 
     var typed = try db.from(User)
-        .where(User.columns.age.gte(18))
-        .orderBy(User.columns.id.asc())
+        .where(User.age.gte(18))
+        .orderBy(User.id.asc())
         .fetch();
     defer typed.deinit();
     if (typed.count() != 2) return error.UnexpectedResult;

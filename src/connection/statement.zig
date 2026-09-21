@@ -60,3 +60,26 @@ test "statement parameter binding stores values" {
     try statement.bind(1, 12);
     try std.testing.expectEqual(@as(i64, 12), statement.parameters.items[0].integer);
 }
+
+test "statement binding rejects index zero fills gaps and rebinds" {
+    var parameters = std.ArrayList(Value).empty;
+    defer parameters.deinit(std.testing.allocator);
+    var statement = Statement{ .connection = undefined, .sql = try std.testing.allocator.dupe(u8, ""), .allocator = std.testing.allocator, .parameters = parameters, .executeFn = undefined, .queryFn = undefined };
+    defer statement.finalize();
+    try std.testing.expectError(error.InvalidParameter, statement.bind(0, 1));
+    // Skipped positions fill with NULL, like an unbound parameter.
+    try statement.bind(3, "late");
+    try std.testing.expectEqual(@as(usize, 3), statement.parameters.items.len);
+    try std.testing.expect(statement.parameters.items[0] == .null);
+    try std.testing.expect(statement.parameters.items[1] == .null);
+    try std.testing.expectEqualStrings("late", statement.parameters.items[2].text);
+    // Rebinding overwrites in place without growing the list.
+    try statement.bind(1, 42);
+    try statement.bind(3, null);
+    try std.testing.expectEqual(@as(usize, 3), statement.parameters.items.len);
+    try std.testing.expectEqual(@as(i64, 42), statement.parameters.items[0].integer);
+    try std.testing.expect(statement.parameters.items[2] == .null);
+    // reset() clears bindings for statement reuse.
+    statement.reset();
+    try std.testing.expectEqual(@as(usize, 0), statement.parameters.items.len);
+}

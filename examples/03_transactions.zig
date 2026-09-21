@@ -16,8 +16,8 @@ pub fn main() !void {
     var committedInsert = try db.from(Ledger).insert(.{ .id = 1, .amount = 100 });
     committedInsert.deinit();
     try db.commit();
-    var result = try db.from(Ledger).select(.{ Ledger.columns.id, Ledger.columns.amount }).fetch();
+    var result = try db.from(Ledger).select(.{ Ledger.id, Ledger.amount }).fetch();
     defer result.deinit();
-    if (result.count() != 1 or result.rows[0][0].integer != 1 or result.rows[0][1].integer != 100) return error.TransactionExampleFailed;
+    if (result.count() != 1 or result.at(0)[0].integer != 1 or result.at(0)[1].integer != 100) return error.TransactionExampleFailed;
     std.debug.print("03 transactions: rollback and commit verified\n", .{});
 }

@@ -14,8 +14,8 @@ const sqlite = @import("sqlite");
 
 // Engine version string, e.g. "3.54.0".
 const engine = sqlite.version.sqliteEngineVersion;
-// Exact contents of the sqlite/VERSION snapshot this engine implements.
-const source = sqlite.version.sqliteSourceVersion;
+// sqlite.zig library version, e.g. "0.0.1".
+const library = sqlite.version.sqliteVersion;
 ```
 
 ## Database Version

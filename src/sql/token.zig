@@ -34,6 +34,7 @@ pub const Token = struct {
     tag: Tag,
     text: []const u8,
     position: usize,
+    quoted: bool = false,
 };
 
 pub fn eql(token: Token, word: []const u8) bool {

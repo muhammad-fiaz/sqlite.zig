@@ -12,8 +12,11 @@ const astBuilder = @import("ast_builder.zig");
 const ast = @import("../sql/ast.zig");
 const Result = @import("../connection/result.zig").Result;
 
-pub fn Query(comptime TableType: type) type {
-    return Builder(TableType.rowType, @TypeOf(TableType.columns), true);
+const tableMod = @import("table.zig");
+
+pub fn Query(comptime TableValueType: type) type {
+    if (!tableMod.isTableValue(TableValueType)) @compileError("db.from() takes a typed table value from sqlite.table(...); use db.table(\"name\") for runtime/dynamic tables");
+    return Builder(tableMod.rowTypeOfValue(TableValueType), tableMod.columnsTypeOfValue(TableValueType), true);
 }
 
 pub const DynamicQuery = Builder(void, void, false);
@@ -48,25 +51,119 @@ fn toProjection(item: anytype) Projection {
     const T = @TypeOf(item);
     if (T == Projection) return item;
     if (T == columnMod.DynamicColumn) return item.projection();
+    if (T == tableMod.AllProjection) return .{ .kind = .star };
     if (T == dslExpr.Order) @compileError("select() takes columns, not orders; pass col.asc()/col.desc() to orderBy()");
     if (comptime isTypedColumnInstance(T)) return item.projection();
-    @compileError("select() takes column descriptors (User.columns.x / db.col(\"x\")) or their aggregates");
+    @compileError("select() takes column descriptors (User.id / table.column(\"x\")) or their aggregates");
 }
 
 fn toRef(item: anytype) ColumnRef {
     const T = @TypeOf(item);
-    if (T == columnMod.DynamicColumn) return columnMod.splitRef(item.name);
+    if (T == columnMod.DynamicColumn) return columnMod.dynRef(item);
     if (comptime isTypedColumnInstance(T)) return .{ .table = T.dslTable, .name = T.dslName };
-    @compileError("expected a column descriptor (User.columns.x or db.col(\"x\"))");
+    @compileError("expected a column descriptor (User.id or table.column(\"x\"))");
 }
 
-fn tableNameOf(other: anytype) []const u8 {
+fn toOrder(item: anytype) Order {
+    const T = @TypeOf(item);
+    if (T == Order) return item;
+    if (T == columnMod.DynamicColumn) return .{ .column = columnMod.dynRef(item) };
+    if (comptime isTypedColumnInstance(T)) return .{ .column = .{ .table = T.dslTable, .name = T.dslName } };
+    @compileError("orderBy() takes a column order such as col.asc()/col.desc() or a bare column for ascending order");
+}
+
+fn destSqlFor(comptime Columns: type, want: []const u8) ?[]const u8 {
+    inline for (@typeInfo(Columns).@"struct".fields) |colField| {
+        if (std.mem.eql(u8, colField.name, want)) return colField.type.dslName;
+    }
+    return null;
+}
+
+fn insertFieldOf(value: anytype) Value {
+    const T = @TypeOf(value);
+    if (comptime @typeInfo(T) == .@"struct" and @hasDecl(T, "isExplicitValue")) {
+        return value.value;
+    }
+    return columnMod.toValue(value);
+}
+
+fn isExplicitDefault(comptime T: type) bool {
+    return @typeInfo(T) == .@"struct" and @hasDecl(T, "isExplicitDefault");
+}
+fn setValueOf(value: anytype) dslExpr.SetValue {
+    const T = @TypeOf(value);
+    if (comptime @typeInfo(T) == .@"struct" and @hasDecl(T, "isExplicitValue")) {
+        return .{ .literal = value.value };
+    }
+    if (comptime @typeInfo(T) == .@"struct" and @hasDecl(T, "isArithExpr")) {
+        return value.toSetValue();
+    }
+    if (T == columnMod.DynamicColumn) return .{ .column = columnMod.dynRef(value) };
+    if (comptime isTypedColumnInstance(T)) return .{ .column = .{ .table = T.dslTable, .name = T.dslName } };
+    return .{ .literal = columnMod.toValue(value) };
+}
+
+pub fn tableNameOf(other: anytype) []const u8 {
     const T = @TypeOf(other);
+    if (comptime @import("table.zig").isTableValue(T)) return other.tableName;
     if (T == type) {
         if (!@hasDecl(other, "tableName")) @compileError("join target must be a typed table or a table-name string");
         return other.tableName;
     }
     return other;
+}
+
+pub const JoinTarget = struct { name: []const u8, schema: []const u8 = "", alias: ?[]const u8 = null };
+
+pub fn joinTargetOf(other: anytype) JoinTarget {
+    const T = @TypeOf(other);
+    if (comptime T != type and @typeInfo(T) == .@"struct" and @hasDecl(T, "isDynamicTable")) {
+        return .{ .name = other.name, .schema = other.schema, .alias = if (other.alias.len != 0) other.alias else null };
+    }
+    if (comptime @import("table.zig").isTableValue(T)) {
+        return .{ .name = other.tableName, .alias = if (other.tableAlias.len != 0) other.tableAlias else null };
+    }
+    return .{ .name = tableNameOf(other) };
+}
+
+fn containsAllMarker(comptime T: type) bool {
+    if (T == tableMod.AllProjection) return true;
+    const info = @typeInfo(T);
+    if (info == .pointer) return containsAllMarker(info.pointer.child);
+    if (info == .array) return containsAllMarker(info.array.child);
+    if (info == .@"struct" and info.@"struct".is_tuple) {
+        inline for (info.@"struct".fields) |field| {
+            if (containsAllMarker(field.type)) return true;
+        }
+    }
+    return false;
+}
+
+pub fn SelectOut(comptime Row: type, comptime Columns: type, comptime T: type) type {
+    if (containsAllMarker(T)) return Builder(Row, Columns, true);
+    return Builder(Row, Columns, false);
+}
+
+fn havingCondFromExpr(pred: dslExpr.Expr) ?dslExpr.HavingCond {
+    if (pred.escape != null or pred.collate != null) return null;
+    if (pred.rhs2 != null) return null;
+    const rhs: Value = switch (pred.rhs) {
+        .value => |v| v,
+        .column => return null,
+    };
+    const proj: dslExpr.Projection = if (pred.function) |call| .{
+        .kind = .scalar,
+        .column = pred.column,
+        .function = call.name,
+        .argument = call.argument,
+        .argument2 = call.argument2,
+        .hasArgument = call.hasArgument,
+        .hasArgument2 = call.hasArgument2,
+    } else .{
+        .kind = .column,
+        .column = pred.column,
+    };
+    return .{ .proj = proj, .op = pred.operator.sql(), .rhs = rhs };
 }
 
 fn storeCaseProjection(cases: *[2]CaseBuilder, caseCount: *usize, out: []Projection, outCount: *usize, item: CaseBuilder) void {
@@ -101,6 +198,8 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
         compoundExecuteFn: astBuilder.CompoundExecFn,
         derivedExecuteFn: astBuilder.DerivedExecFn,
         table: []const u8,
+        schema: []const u8 = "",
+        tableAlias: ?[]const u8 = null,
 
         allColumns: bool = true,
         projections: [32]Projection = undefined,
@@ -118,14 +217,17 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
         caseWhens: [2]astBuilder.CaseWhereArgs = undefined,
         caseWhenCount: usize = 0,
 
-        order: ?Order = null,
+        orders: [8]Order = undefined,
+        orderCount: usize = 0,
         limitValue: ?usize = null,
         offsetValue: ?usize = null,
         groupByColumn: ?ColumnRef = null,
-        havingOp: ?[]const u8 = null,
-        havingAmount: usize = 0,
+        havingCond: ?dslExpr.HavingCond = null,
+        havingValid: bool = true,
 
         joinTable: ?[]const u8 = null,
+        joinSchema: []const u8 = "",
+        joinAlias: ?[]const u8 = null,
         joinKind: JoinKind = .inner,
         joinOn: ?Expr = null,
         joinUsingCols: [8][]const u8 = undefined,
@@ -142,7 +244,11 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
         subquery: ?SubSnapshot = null,
 
         pub fn init(connection: anytype, table: []const u8, executeFn: astBuilder.ExecFn, compoundExecuteFn: astBuilder.CompoundExecFn, derivedExecuteFn: astBuilder.DerivedExecFn) Self {
-            return .{ .allocator = connection.allocator, .connection = connection, .executeFn = executeFn, .compoundExecuteFn = compoundExecuteFn, .derivedExecuteFn = derivedExecuteFn, .table = table };
+            return initRaw(connection.allocator, connection, table, executeFn, compoundExecuteFn, derivedExecuteFn);
+        }
+
+        pub fn initRaw(allocator: std.mem.Allocator, connection: *anyopaque, table: []const u8, executeFn: astBuilder.ExecFn, compoundExecuteFn: astBuilder.CompoundExecFn, derivedExecuteFn: astBuilder.DerivedExecFn) Self {
+            return .{ .allocator = allocator, .connection = connection, .executeFn = executeFn, .compoundExecuteFn = compoundExecuteFn, .derivedExecuteFn = derivedExecuteFn, .table = table };
         }
 
         pub fn with(self: Self, name: []const u8, body: []const u8) Self {
@@ -160,6 +266,10 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
             return copy;
         }
 
+        pub fn column(_: Self, name: []const u8) columnMod.DynamicColumn {
+            return .{ .name = name };
+        }
+
         fn retype(self: Self, comptime nextMapped: bool) Builder(Row, Columns, nextMapped) {
             return .{
                 .allocator = self.allocator,
@@ -168,6 +278,8 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
                 .compoundExecuteFn = self.compoundExecuteFn,
                 .derivedExecuteFn = self.derivedExecuteFn,
                 .table = self.table,
+                .schema = self.schema,
+                .tableAlias = self.tableAlias,
                 .allColumns = self.allColumns,
                 .projections = self.projections,
                 .projectionCount = self.projectionCount,
@@ -182,13 +294,16 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
                 .conditionCount = self.conditionCount,
                 .caseWhens = self.caseWhens,
                 .caseWhenCount = self.caseWhenCount,
-                .order = self.order,
+                .orders = self.orders,
+                .orderCount = self.orderCount,
                 .limitValue = self.limitValue,
                 .offsetValue = self.offsetValue,
                 .groupByColumn = self.groupByColumn,
-                .havingOp = self.havingOp,
-                .havingAmount = self.havingAmount,
+                .havingCond = self.havingCond,
+                .havingValid = self.havingValid,
                 .joinTable = self.joinTable,
+                .joinSchema = self.joinSchema,
+                .joinAlias = self.joinAlias,
                 .joinKind = self.joinKind,
                 .joinOn = self.joinOn,
                 .joinUsingCols = self.joinUsingCols,
@@ -204,13 +319,21 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
             };
         }
 
-        pub fn select(self: Self, cols: anytype) Builder(Row, Columns, false) {
+        pub fn select(self: Self, cols: anytype) SelectOut(Row, Columns, @TypeOf(cols)) {
+            if (comptime @TypeOf(cols) == tableMod.AllOpFn) @compileError("use User.all() (call it) for the all-columns projection, or db.from(User).selectAll()");
+            if (comptime containsAllMarker(@TypeOf(cols))) {
+                return self.selectAll();
+            }
             var copy = self.retype(false);
             copy.allColumns = false;
             copy.projectionCount = 0;
             copy.caseCount = 0;
             copy.windowCount = 0;
-            const items = if (@typeInfo(@TypeOf(cols)) == .pointer) cols.* else cols;
+            const T = @TypeOf(cols);
+            if (T == Projection or T == columnMod.DynamicColumn or comptime isTypedColumnInstance(T) or T == CaseBuilder or T == WindowBuilder) {
+                return copy.selectOne(cols);
+            }
+            const items = if (@typeInfo(T) == .pointer) cols.* else cols;
             inline for (items) |item| {
                 if (@TypeOf(item) == CaseBuilder) {
                     storeCaseProjection(&copy.cases, &copy.caseCount, copy.projections[0..], &copy.projectionCount, item);
@@ -228,6 +351,21 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
             return copy;
         }
 
+        fn selectOne(self: Builder(Row, Columns, false), col: anytype) Builder(Row, Columns, false) {
+            var copy = self;
+            if (@TypeOf(col) == CaseBuilder) {
+                storeCaseProjection(&copy.cases, &copy.caseCount, copy.projections[0..], &copy.projectionCount, col);
+                return copy;
+            }
+            if (@TypeOf(col) == WindowBuilder) {
+                storeWindowProjection(&copy.windows, &copy.windowCount, copy.projections[0..], &copy.projectionCount, col);
+                return copy;
+            }
+            copy.projections[copy.projectionCount] = toProjection(col);
+            copy.projectionCount += 1;
+            return copy;
+        }
+
         pub fn selectAll(self: Self) Builder(Row, Columns, true) {
             var copy = self.retype(true);
             copy.allColumns = true;
@@ -242,6 +380,7 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
         }
 
         pub fn returning(self: Self, cols: anytype) Self {
+            if (comptime @TypeOf(cols) == tableMod.AllOpFn) @compileError("use User.all() (call it) for RETURNING all columns");
             var copy = self;
             copy.returningCount = 0;
             const items = if (@typeInfo(@TypeOf(cols)) == .pointer) cols.* else cols;
@@ -347,31 +486,47 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
 
         pub fn whereInQuery(self: Self, col: anytype, other: anytype, otherCol: anytype) Self {
             var copy = self;
-            copy.inQuery = .{ .column = toRef(col), .table = tableNameOf(other), .subcolumn = toRef(otherCol) };
+            const target = joinTargetOf(other);
+            copy.inQuery = .{ .column = toRef(col), .table = target.name, .schema = target.schema, .subcolumn = toRef(otherCol) };
             return copy;
         }
 
         pub fn whereNotInQuery(self: Self, col: anytype, other: anytype, otherCol: anytype) Self {
             var copy = self;
-            copy.inQuery = .{ .column = toRef(col), .table = tableNameOf(other), .subcolumn = toRef(otherCol), .negated = true };
+            const target = joinTargetOf(other);
+            copy.inQuery = .{ .column = toRef(col), .table = target.name, .schema = target.schema, .subcolumn = toRef(otherCol), .negated = true };
             return copy;
         }
 
         pub fn whereExists(self: Self, other: anytype, on: ?Expr) Self {
             var copy = self;
-            copy.existsQuery = .{ .table = tableNameOf(other), .on = on };
+            const target = joinTargetOf(other);
+            copy.existsQuery = .{ .table = target.name, .schema = target.schema, .on = on };
             return copy;
         }
 
         pub fn whereNotExists(self: Self, other: anytype, on: ?Expr) Self {
             var copy = self;
-            copy.existsQuery = .{ .table = tableNameOf(other), .on = on, .negated = true };
+            const target = joinTargetOf(other);
+            copy.existsQuery = .{ .table = target.name, .schema = target.schema, .on = on, .negated = true };
             return copy;
         }
 
-        pub fn orderBy(self: Self, order: Order) Self {
+        pub fn orderBy(self: Self, order: anytype) Self {
             var copy = self;
-            copy.order = order;
+            const T = @TypeOf(order);
+            if (comptime @typeInfo(T) == .@"struct" and @typeInfo(T).@"struct".is_tuple) {
+                inline for (order) |item| {
+                    if (copy.orderCount >= copy.orders.len) @panic("too many order columns");
+                    copy.orders[copy.orderCount] = toOrder(item);
+                    copy.orderCount += 1;
+                }
+                if (copy.orderCount == 0) @panic("orderBy() requires at least one order");
+            } else {
+                if (copy.orderCount >= copy.orders.len) @panic("too many order columns");
+                copy.orders[copy.orderCount] = toOrder(order);
+                copy.orderCount += 1;
+            }
             return copy;
         }
 
@@ -393,10 +548,18 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
             return copy;
         }
 
-        pub fn havingCount(self: Self, operator: []const u8, amount: usize) Self {
+        pub fn having(self: Self, cond: anytype) Self {
             var copy = self;
-            copy.havingOp = operator;
-            copy.havingAmount = amount;
+            const T = @TypeOf(cond);
+            if (T == dslExpr.HavingCond) {
+                copy.havingCond = cond;
+                copy.havingValid = true;
+            } else if (T == dslExpr.Expr) {
+                copy.havingCond = havingCondFromExpr(cond);
+                copy.havingValid = copy.havingCond != null;
+            } else {
+                @compileError("having() takes an aggregate/scalar comparison such as col.count().gt(1) or a column predicate");
+            }
             return copy;
         }
 
@@ -414,7 +577,10 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
         }
         pub fn crossJoin(self: Self, other: anytype) Self {
             var copy = self;
-            copy.joinTable = tableNameOf(other);
+            const target = joinTargetOf(other);
+            copy.joinTable = target.name;
+            copy.joinSchema = target.schema;
+            copy.joinAlias = target.alias;
             copy.joinKind = .cross;
             copy.joinOn = null;
             copy.joinUsingCount = 0;
@@ -424,7 +590,10 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
 
         fn joinAs(self: Self, other: anytype, on: Expr, kind: JoinKind) Self {
             var copy = self;
-            copy.joinTable = tableNameOf(other);
+            const target = joinTargetOf(other);
+            copy.joinTable = target.name;
+            copy.joinSchema = target.schema;
+            copy.joinAlias = target.alias;
             copy.joinKind = kind;
             copy.joinOn = on;
             copy.joinUsingCount = 0;
@@ -447,14 +616,17 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
 
         fn joinUsingAs(self: Self, other: anytype, col: anytype, kind: JoinKind) Self {
             var copy = self;
-            copy.joinTable = tableNameOf(other);
+            const target = joinTargetOf(other);
+            copy.joinTable = target.name;
+            copy.joinSchema = target.schema;
+            copy.joinAlias = target.alias;
             copy.joinKind = kind;
             copy.joinOn = null;
             copy.joinNatural = false;
             copy.joinUsingCount = 0;
             const T = @TypeOf(col);
             if (T == columnMod.DynamicColumn) {
-                copy.joinUsingCols[0] = columnMod.splitRef(col.name).name;
+                copy.joinUsingCols[0] = columnMod.dynRef(col).name;
                 copy.joinUsingCount = 1;
             } else if (comptime isTypedColumnInstance(T)) {
                 copy.joinUsingCols[0] = T.dslName;
@@ -464,7 +636,7 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
                     if (copy.joinUsingCount >= copy.joinUsingCols.len) @panic("too many USING columns");
                     const IT = @TypeOf(item);
                     if (IT == columnMod.DynamicColumn) {
-                        copy.joinUsingCols[copy.joinUsingCount] = columnMod.splitRef(item.name).name;
+                        copy.joinUsingCols[copy.joinUsingCount] = columnMod.dynRef(item).name;
                     } else if (comptime isTypedColumnInstance(IT)) {
                         copy.joinUsingCols[copy.joinUsingCount] = IT.dslName;
                     } else {
@@ -494,7 +666,10 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
 
         fn naturalAs(self: Self, other: anytype, kind: JoinKind) Self {
             var copy = self;
-            copy.joinTable = tableNameOf(other);
+            const target = joinTargetOf(other);
+            copy.joinTable = target.name;
+            copy.joinSchema = target.schema;
+            copy.joinAlias = target.alias;
             copy.joinKind = kind;
             copy.joinOn = null;
             copy.joinUsingCount = 0;
@@ -580,6 +755,35 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
             return self.insertSelectWithMode(source, "");
         }
 
+        pub fn insertFrom(self: Self, source: anytype, mapping: anytype) !Result {
+            const MappingType = @TypeOf(mapping);
+            if (@typeInfo(MappingType) != .@"struct") @compileError("insertFrom mapping must be a struct of destination-field = source-column pairs");
+            const mapFields = @typeInfo(MappingType).@"struct".fields;
+            if (mapFields.len == 0) @compileError("insertFrom mapping must name at least one column");
+            const SourceT = @TypeOf(source);
+            const isDynamicSource = SourceT != type and @typeInfo(SourceT) == .@"struct" and @hasDecl(SourceT, "isDynamicTable");
+            if (comptime !isDynamicSource and !@import("table.zig").isTableValue(SourceT)) @compileError("insertFrom source must be a typed table value or a DynamicTable");
+            var projs: [mapFields.len]Projection = undefined;
+            var count: usize = 0;
+            inline for (mapFields) |mapField| {
+                const destSql: []const u8 = if (Columns == void)
+                    mapField.name
+                else
+                    destSqlFor(Columns, mapField.name) orelse return error.InvalidSql;
+                var proj = toProjection(@field(mapping, mapField.name));
+                proj.alias = destSql;
+                projs[count] = proj;
+                count += 1;
+            }
+            if (isDynamicSource) {
+                var srcQuery = DynamicQuery.initRaw(self.allocator, self.connection, source.name, self.executeFn, self.compoundExecuteFn, self.derivedExecuteFn);
+                srcQuery.schema = source.schema;
+                return self.insertSelect(srcQuery.select(projs));
+            }
+            var srcQuery = Query(SourceT).initRaw(self.allocator, self.connection, source.tableName, self.executeFn, self.compoundExecuteFn, self.derivedExecuteFn);
+            return self.insertSelect(srcQuery.select(projs));
+        }
+
         pub fn insertSelectOrIgnore(self: Self, source: anytype) !Result {
             return self.insertSelectWithMode(source, "OR IGNORE");
         }
@@ -628,7 +832,13 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
             }
             var changes: usize = 0;
             for (data.rows) |row| {
-                var built = try astBuilder.buildInsert(self.allocator, self.table, data.columns, row, conflict, self.returningCols[0..self.returningCount], self.cases[0..self.caseCount], .{});
+                const setVals = try self.allocator.alloc(dslExpr.SetValue, row.len);
+                for (row, 0..) |item, index| setVals[index] = .{ .literal = item };
+                var built = astBuilder.buildInsert(self.allocator, self.table, self.schema, data.columns, setVals, conflict, self.returningCols[0..self.returningCount], self.cases[0..self.caseCount], .{}) catch |err| {
+                    self.allocator.free(setVals);
+                    return err;
+                };
+                self.allocator.free(setVals);
                 defer built.deinit();
                 const one = try self.executeFn(self.connection, &built.stmt, &.{}, false);
                 changes += one.changes;
@@ -653,6 +863,7 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
                 .connection = self.connection,
                 .executeFn = self.executeFn,
                 .table = self.table,
+                .schema = self.schema,
                 .cases = self.cases,
                 .caseCount = self.caseCount,
                 .caseWhens = self.caseWhens,
@@ -666,7 +877,7 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
             var up = self.upsertBase();
             const T = @TypeOf(target);
             if (T == columnMod.DynamicColumn) {
-                up.targetCols[0] = columnMod.splitRef(target.name).name;
+                up.targetCols[0] = columnMod.dynRef(target).name;
                 up.targetCount = 1;
             } else if (comptime isTypedColumnInstance(T)) {
                 up.targetCols[0] = T.dslName;
@@ -676,7 +887,7 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
                     if (up.targetCount >= up.targetCols.len) @panic("too many upsert target columns");
                     const IT = @TypeOf(item);
                     if (IT == columnMod.DynamicColumn) {
-                        up.targetCols[up.targetCount] = columnMod.splitRef(item.name).name;
+                        up.targetCols[up.targetCount] = columnMod.dynRef(item).name;
                     } else if (comptime isTypedColumnInstance(IT)) {
                         up.targetCols[up.targetCount] = IT.dslName;
                     } else {
@@ -711,28 +922,33 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
             if (Columns == void) {
                 const fields = @typeInfo(RowType).@"struct".fields;
                 var names: [fields.len][]const u8 = undefined;
-                var vals: [fields.len]Value = undefined;
-                inline for (fields, 0..) |field, index| {
-                    names[index] = field.name;
-                    vals[index] = columnMod.toValue(@field(row, field.name));
+                var vals: [fields.len]dslExpr.SetValue = undefined;
+                var count: usize = 0;
+                inline for (fields) |field| {
+                    if (comptime isExplicitDefault(@TypeOf(@field(row, field.name)))) continue;
+                    names[count] = field.name;
+                    vals[count] = .{ .literal = insertFieldOf(@field(row, field.name)) };
+                    count += 1;
                 }
-                var built = try astBuilder.buildInsert(self.allocator, self.table, &names, &vals, conflict, self.returningCols[0..self.returningCount], self.cases[0..self.caseCount], .{});
+                if (count == 0) return error.InvalidSql;
+                var built = try astBuilder.buildInsert(self.allocator, self.table, self.schema, names[0..count], vals[0..count], conflict, self.returningCols[0..self.returningCount], self.cases[0..self.caseCount], .{});
                 defer built.deinit();
                 return self.executeFn(self.connection, &built.stmt, &.{}, false);
             } else {
                 const colFields = @typeInfo(Columns).@"struct".fields;
                 var names: [colFields.len][]const u8 = undefined;
-                var vals: [colFields.len]Value = undefined;
+                var vals: [colFields.len]dslExpr.SetValue = undefined;
                 var count: usize = 0;
                 inline for (colFields) |colField| {
                     if (@hasField(RowType, colField.name)) {
+                        if (comptime isExplicitDefault(@TypeOf(@field(row, colField.name)))) continue;
                         names[count] = colField.type.dslName;
-                        vals[count] = columnMod.toValue(@field(row, colField.name));
+                        vals[count] = .{ .literal = insertFieldOf(@field(row, colField.name)) };
                         count += 1;
                     }
                 }
                 if (count == 0) return error.InvalidSql;
-                var built = try astBuilder.buildInsert(self.allocator, self.table, names[0..count], vals[0..count], conflict, self.returningCols[0..self.returningCount], self.cases[0..self.caseCount], .{});
+                var built = try astBuilder.buildInsert(self.allocator, self.table, self.schema, names[0..count], vals[0..count], conflict, self.returningCols[0..self.returningCount], self.cases[0..self.caseCount], .{});
                 defer built.deinit();
                 return self.executeFn(self.connection, &built.stmt, &.{}, false);
             }
@@ -746,6 +962,7 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
                 .connection = self.connection,
                 .executeFn = self.executeFn,
                 .table = self.table,
+                .schema = self.schema,
                 .operation = .update,
                 .cases = self.cases,
                 .caseCount = self.caseCount,
@@ -756,21 +973,24 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
             };
             if (Columns == void) {
                 inline for (@typeInfo(RowType).@"struct".fields) |field| {
+                    if (comptime isExplicitDefault(@TypeOf(@field(assignments, field.name)))) continue;
                     if (mutation.setCount >= mutation.setNames.len) return error.InvalidSql;
                     mutation.setNames[mutation.setCount] = field.name;
-                    mutation.setValues[mutation.setCount] = columnMod.toValue(@field(assignments, field.name));
+                    mutation.setValues[mutation.setCount] = setValueOf(@field(assignments, field.name));
                     mutation.setCount += 1;
                 }
             } else {
                 inline for (@typeInfo(Columns).@"struct".fields) |colField| {
                     if (@hasField(RowType, colField.name)) {
+                        if (comptime isExplicitDefault(@TypeOf(@field(assignments, colField.name)))) continue;
                         if (mutation.setCount >= mutation.setNames.len) return error.InvalidSql;
                         mutation.setNames[mutation.setCount] = colField.type.dslName;
-                        mutation.setValues[mutation.setCount] = columnMod.toValue(@field(assignments, colField.name));
+                        mutation.setValues[mutation.setCount] = setValueOf(@field(assignments, colField.name));
                         mutation.setCount += 1;
                     }
                 }
             }
+            if (mutation.setCount == 0) return error.InvalidSql;
             return mutation;
         }
 
@@ -780,6 +1000,7 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
                 .connection = self.connection,
                 .executeFn = self.executeFn,
                 .table = self.table,
+                .schema = self.schema,
                 .operation = .delete,
                 .cases = self.cases,
                 .caseCount = self.caseCount,
@@ -816,6 +1037,18 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
             pub fn count(result: @This()) usize {
                 return result.rows.len;
             }
+
+            pub fn isEmpty(result: @This()) bool {
+                return result.rows.len == 0;
+            }
+
+            pub fn at(result: @This(), index: usize) Row {
+                return result.rows[index];
+            }
+
+            pub fn slice(result: @This()) []Row {
+                return result.rows;
+            }
         };
 
         fn fetchMapped(self: *const Self) !MappedResult {
@@ -825,16 +1058,58 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
             return .{ .allocator = self.allocator, .rows = rows };
         }
 
-        pub fn fetchOne(self: Self) !?Row {
-            if (!isMapped) @compileError("fetchOne requires a typed full-row query");
-            var single = try self.limit(1).fetchMapped();
-            if (single.rows.len == 0) {
-                single.deinit();
-                return null;
+        pub fn fetchOne(self: Self) !if (isMapped) Row else Value {
+            if (isMapped) {
+                var two = try self.limit(2).fetchMapped();
+                switch (two.rows.len) {
+                    0 => {
+                        two.deinit();
+                        return error.NoRows;
+                    },
+                    1 => {
+                        const row = two.rows[0];
+                        self.allocator.free(two.rows);
+                        return row;
+                    },
+                    else => {
+                        two.deinit();
+                        return error.TooManyRows;
+                    },
+                }
             }
-            const row = single.rows[0];
-            self.allocator.free(single.rows);
-            return row;
+            if (self.projectionCount != 1 or self.allColumns) return error.InvalidSql;
+            var two = try self.limit(2).fetchRaw();
+            defer two.deinit();
+            if (two.rows.len == 0) return error.NoRows;
+            if (two.rows.len > 1) return error.TooManyRows;
+            return try dupeValue(self.allocator, two.rows[0][0]);
+        }
+
+        pub fn fetchOptional(self: Self) !if (isMapped) ?Row else ?Value {
+            if (isMapped) {
+                var two = try self.limit(2).fetchMapped();
+                switch (two.rows.len) {
+                    0 => {
+                        two.deinit();
+                        return null;
+                    },
+                    1 => {
+                        const row = two.rows[0];
+                        self.allocator.free(two.rows);
+                        return row;
+                    },
+                    else => {
+                        two.deinit();
+                        return error.TooManyRows;
+                    },
+                }
+            }
+            if (self.projectionCount != 1 or self.allColumns) return error.InvalidSql;
+            var two = try self.limit(2).fetchRaw();
+            defer two.deinit();
+            if (two.rows.len == 0) return null;
+            if (two.rows.len > 1) return error.TooManyRows;
+            return try dupeValue(self.allocator, two.rows[0][0]);
         }
 
         pub fn freeRow(self: *const Self, row: *Row) void {
@@ -859,7 +1134,8 @@ pub fn CompoundBuilder(comptime Row: type, comptime Columns: type, comptime mapp
         armCount: usize = 0,
         ops: [3]ast.CompoundOp = undefined,
         opCount: usize = 0,
-        order: ?Order = null,
+        orders: [8]Order = undefined,
+        orderCount: usize = 0,
         limitValue: ?usize = null,
         offsetValue: ?usize = null,
 
@@ -895,9 +1171,21 @@ pub fn CompoundBuilder(comptime Row: type, comptime Columns: type, comptime mapp
             return self.compoundAs(other, .exceptOp);
         }
 
-        pub fn orderBy(self: Self, order: Order) Self {
+        pub fn orderBy(self: Self, order: anytype) Self {
             var copy = self;
-            copy.order = order;
+            const T = @TypeOf(order);
+            if (comptime @typeInfo(T) == .@"struct" and @typeInfo(T).@"struct".is_tuple) {
+                inline for (order) |item| {
+                    if (copy.orderCount >= copy.orders.len) @panic("too many order columns");
+                    copy.orders[copy.orderCount] = toOrder(item);
+                    copy.orderCount += 1;
+                }
+                if (copy.orderCount == 0) @panic("orderBy() requires at least one order");
+            } else {
+                if (copy.orderCount >= copy.orders.len) @panic("too many order columns");
+                copy.orders[copy.orderCount] = toOrder(order);
+                copy.orderCount += 1;
+            }
             return copy;
         }
 
@@ -925,6 +1213,18 @@ pub fn CompoundBuilder(comptime Row: type, comptime Columns: type, comptime mapp
             pub fn count(result: @This()) usize {
                 return result.rows.len;
             }
+
+            pub fn isEmpty(result: @This()) bool {
+                return result.rows.len == 0;
+            }
+
+            pub fn at(result: @This(), index: usize) Row {
+                return result.rows[index];
+            }
+
+            pub fn slice(result: @This()) []Row {
+                return result.rows;
+            }
         };
 
         pub fn fetch(self: *const Self) !if (isMapped) MappedResult else Result {
@@ -934,7 +1234,7 @@ pub fn CompoundBuilder(comptime Row: type, comptime Columns: type, comptime mapp
 
         fn fetchRaw(self: *const Self) !Result {
             for (self.arms[0..self.armCount]) |snapshot| {
-                if (snapshot.order != null or snapshot.limitValue != null or snapshot.offsetValue != null) return error.InvalidSql;
+                if (snapshot.orderCount != 0 or snapshot.limitValue != null or snapshot.offsetValue != null) return error.InvalidSql;
             }
             var builts: [4]astBuilder.BuiltStatement = undefined;
             var count: usize = 0;
@@ -948,12 +1248,14 @@ pub fn CompoundBuilder(comptime Row: type, comptime Columns: type, comptime mapp
                 for (snapshot.ctes[0..snapshot.cteCount], 0..) |cte, cteIndex| cteBufs[index][cteIndex] = .{ .name = cte.name, .querySql = cte.base, .recursiveSql = cte.recursive };
                 armInputs[index] = .{ .stmt = &builts[index].stmt, .ctes = cteBufs[index][0..snapshot.cteCount], .recursive = snapshot.cteRecursive };
             }
-            var compoundOrder: ?ast.Order = null;
-            if (self.order) |ord| {
+            var compoundOrders: [8]ast.Order = undefined;
+            var compoundOrderCount: usize = 0;
+            for (self.orders[0..self.orderCount]) |ord| {
                 if (ord.function != null) return error.InvalidSql;
-                compoundOrder = .{ .column = ord.column.name, .descending = ord.descending };
+                compoundOrders[compoundOrderCount] = .{ .column = ord.column.name, .descending = ord.descending };
+                compoundOrderCount += 1;
             }
-            const result = try self.compoundExecuteFn(self.connection, armInputs[0..self.armCount], self.ops[0..self.opCount], compoundOrder, self.limitValue, self.offsetValue);
+            const result = try self.compoundExecuteFn(self.connection, armInputs[0..self.armCount], self.ops[0..self.opCount], compoundOrders[0..compoundOrderCount], self.limitValue, self.offsetValue);
             for (builts[0..count]) |*built| built.deinit();
             return result;
         }
@@ -965,16 +1267,64 @@ pub fn CompoundBuilder(comptime Row: type, comptime Columns: type, comptime mapp
             return .{ .allocator = self.allocator, .rows = rows };
         }
 
-        pub fn fetchOne(self: Self) !?Row {
-            if (!isMapped) @compileError("fetchOne requires a typed full-row query");
-            var single = try self.limit(1).fetchMapped();
-            if (single.rows.len == 0) {
-                single.deinit();
-                return null;
+        pub fn fetchOne(self: Self) !if (isMapped) Row else Value {
+            if (isMapped) {
+                var two = try self.limit(2).fetchMapped();
+                switch (two.rows.len) {
+                    0 => {
+                        two.deinit();
+                        return error.NoRows;
+                    },
+                    1 => {
+                        const row = two.rows[0];
+                        self.allocator.free(two.rows);
+                        return row;
+                    },
+                    else => {
+                        two.deinit();
+                        return error.TooManyRows;
+                    },
+                }
             }
-            const row = single.rows[0];
-            self.allocator.free(single.rows);
-            return row;
+            for (self.arms[0..self.armCount]) |arm| {
+                if (arm.allColumns or arm.projectionCount != 1) return error.InvalidSql;
+            }
+            var two = try self.limit(2).fetchRaw();
+            defer two.deinit();
+            if (two.rows.len == 0) return error.NoRows;
+            if (two.rows.len > 1) return error.TooManyRows;
+            if (two.rows[0].len != 1) return error.InvalidSql;
+            return try dupeValue(self.allocator, two.rows[0][0]);
+        }
+
+        pub fn fetchOptional(self: Self) !if (isMapped) ?Row else ?Value {
+            if (isMapped) {
+                var two = try self.limit(2).fetchMapped();
+                switch (two.rows.len) {
+                    0 => {
+                        two.deinit();
+                        return null;
+                    },
+                    1 => {
+                        const row = two.rows[0];
+                        self.allocator.free(two.rows);
+                        return row;
+                    },
+                    else => {
+                        two.deinit();
+                        return error.TooManyRows;
+                    },
+                }
+            }
+            for (self.arms[0..self.armCount]) |arm| {
+                if (arm.allColumns or arm.projectionCount != 1) return error.InvalidSql;
+            }
+            var two = try self.limit(2).fetchRaw();
+            defer two.deinit();
+            if (two.rows.len == 0) return null;
+            if (two.rows.len > 1) return error.TooManyRows;
+            if (two.rows[0].len != 1) return error.InvalidSql;
+            return try dupeValue(self.allocator, two.rows[0][0]);
         }
 
         pub fn freeRow(self: *const Self, row: *Row) void {
@@ -993,6 +1343,22 @@ fn freeMappedValue(allocator: std.mem.Allocator, value: anytype) void {
     const T = @TypeOf(value);
     if (@typeInfo(T) == .pointer and @typeInfo(T).pointer.size == .slice and @typeInfo(T).pointer.child == u8) allocator.free(value);
     if (@typeInfo(T) == .optional) if (value) |present| freeMappedValue(allocator, present);
+}
+
+fn dupeValue(allocator: std.mem.Allocator, value: Value) !Value {
+    return switch (value) {
+        .text => |bytes| .{ .text = try allocator.dupe(u8, bytes) },
+        .blob => |bytes| .{ .blob = try allocator.dupe(u8, bytes) },
+        else => value,
+    };
+}
+
+pub fn freeValue(allocator: std.mem.Allocator, value: Value) void {
+    switch (value) {
+        .text => |bytes| allocator.free(bytes),
+        .blob => |bytes| allocator.free(bytes),
+        else => {},
+    }
 }
 
 fn assignMappedValue(allocator: std.mem.Allocator, destination: anytype, value: Value) !void {
@@ -1073,6 +1439,8 @@ fn mapResultRows(comptime Row: type, comptime Columns: type, allocator: std.mem.
 
 const SelectSnapshot = struct {
     table: []const u8,
+    schema: []const u8 = "",
+    tableAlias: ?[]const u8 = null,
     allColumns: bool = true,
     projections: [32]Projection = undefined,
     projectionCount: usize = 0,
@@ -1085,13 +1453,16 @@ const SelectSnapshot = struct {
     conditionCount: usize = 0,
     caseWhens: [2]astBuilder.CaseWhereArgs = undefined,
     caseWhenCount: usize = 0,
-    order: ?Order = null,
+    orders: [8]Order = undefined,
+    orderCount: usize = 0,
     limitValue: ?usize = null,
     offsetValue: ?usize = null,
     groupByColumn: ?ColumnRef = null,
-    havingOp: ?[]const u8 = null,
-    havingAmount: usize = 0,
+    havingCond: ?dslExpr.HavingCond = null,
+    havingValid: bool = true,
     joinTable: ?[]const u8 = null,
+    joinSchema: []const u8 = "",
+    joinAlias: ?[]const u8 = null,
     joinKind: JoinKind = .inner,
     joinOn: ?Expr = null,
     joinUsingCols: [8][]const u8 = undefined,
@@ -1107,6 +1478,8 @@ const SelectSnapshot = struct {
 
 const SubSnapshot = struct {
     table: []const u8,
+    schema: []const u8 = "",
+    tableAlias: ?[]const u8 = null,
     allColumns: bool = true,
     projections: [32]Projection = undefined,
     projectionCount: usize = 0,
@@ -1119,13 +1492,16 @@ const SubSnapshot = struct {
     conditionCount: usize = 0,
     caseWhens: [2]astBuilder.CaseWhereArgs = undefined,
     caseWhenCount: usize = 0,
-    order: ?Order = null,
+    orders: [8]Order = undefined,
+    orderCount: usize = 0,
     limitValue: ?usize = null,
     offsetValue: ?usize = null,
     groupByColumn: ?ColumnRef = null,
-    havingOp: ?[]const u8 = null,
-    havingAmount: usize = 0,
+    havingCond: ?dslExpr.HavingCond = null,
+    havingValid: bool = true,
     joinTable: ?[]const u8 = null,
+    joinSchema: []const u8 = "",
+    joinAlias: ?[]const u8 = null,
     joinKind: JoinKind = .inner,
     joinOn: ?Expr = null,
     joinUsingCols: [8][]const u8 = undefined,
@@ -1143,6 +1519,8 @@ fn snapshotSelect(source: anytype, comptime allowSubquery: bool) SelectSnapshot 
     if (!allowSubquery and source.subquery != null) @panic("compound arms cannot select from a derived table");
     return .{
         .table = source.table,
+        .schema = source.schema,
+        .tableAlias = source.tableAlias,
         .allColumns = source.allColumns,
         .projections = source.projections,
         .projectionCount = source.projectionCount,
@@ -1155,13 +1533,16 @@ fn snapshotSelect(source: anytype, comptime allowSubquery: bool) SelectSnapshot 
         .conditionCount = source.conditionCount,
         .caseWhens = source.caseWhens,
         .caseWhenCount = source.caseWhenCount,
-        .order = source.order,
+        .orders = source.orders,
+        .orderCount = source.orderCount,
         .limitValue = source.limitValue,
         .offsetValue = source.offsetValue,
         .groupByColumn = source.groupByColumn,
-        .havingOp = source.havingOp,
-        .havingAmount = source.havingAmount,
+        .havingCond = source.havingCond,
+        .havingValid = source.havingValid,
         .joinTable = source.joinTable,
+        .joinSchema = source.joinSchema,
+        .joinAlias = source.joinAlias,
         .joinKind = source.joinKind,
         .joinOn = source.joinOn,
         .joinUsingCols = source.joinUsingCols,
@@ -1179,6 +1560,8 @@ fn snapshotSelect(source: anytype, comptime allowSubquery: bool) SelectSnapshot 
 fn snapshotSub(source: anytype) SubSnapshot {
     return .{
         .table = source.table,
+        .schema = source.schema,
+        .tableAlias = source.tableAlias,
         .allColumns = source.allColumns,
         .projections = source.projections,
         .projectionCount = source.projectionCount,
@@ -1191,13 +1574,16 @@ fn snapshotSub(source: anytype) SubSnapshot {
         .conditionCount = source.conditionCount,
         .caseWhens = source.caseWhens,
         .caseWhenCount = source.caseWhenCount,
-        .order = source.order,
+        .orders = source.orders,
+        .orderCount = source.orderCount,
         .limitValue = source.limitValue,
         .offsetValue = source.offsetValue,
         .groupByColumn = source.groupByColumn,
-        .havingOp = source.havingOp,
-        .havingAmount = source.havingAmount,
+        .havingCond = source.havingCond,
+        .havingValid = source.havingValid,
         .joinTable = source.joinTable,
+        .joinSchema = source.joinSchema,
+        .joinAlias = source.joinAlias,
         .joinKind = source.joinKind,
         .joinOn = source.joinOn,
         .joinUsingCols = source.joinUsingCols,
@@ -1215,6 +1601,8 @@ fn snapshotSub(source: anytype) SubSnapshot {
 fn selectFromSub(sub: *const SubSnapshot) SelectSnapshot {
     return .{
         .table = sub.table,
+        .schema = sub.schema,
+        .tableAlias = sub.tableAlias,
         .allColumns = sub.allColumns,
         .projections = sub.projections,
         .projectionCount = sub.projectionCount,
@@ -1227,13 +1615,16 @@ fn selectFromSub(sub: *const SubSnapshot) SelectSnapshot {
         .conditionCount = sub.conditionCount,
         .caseWhens = sub.caseWhens,
         .caseWhenCount = sub.caseWhenCount,
-        .order = sub.order,
+        .orders = sub.orders,
+        .orderCount = sub.orderCount,
         .limitValue = sub.limitValue,
         .offsetValue = sub.offsetValue,
         .groupByColumn = sub.groupByColumn,
-        .havingOp = sub.havingOp,
-        .havingAmount = sub.havingAmount,
+        .havingCond = sub.havingCond,
+        .havingValid = sub.havingValid,
         .joinTable = sub.joinTable,
+        .joinSchema = sub.joinSchema,
+        .joinAlias = sub.joinAlias,
         .joinKind = sub.joinKind,
         .joinOn = sub.joinOn,
         .joinUsingCols = sub.joinUsingCols,
@@ -1253,6 +1644,8 @@ fn buildSnapshotSelect(allocator: std.mem.Allocator, snapshot: *const SelectSnap
     if (snapshot.literalIn) |entry| literalIn = .{ .column = entry.column, .values = entry.values[0..entry.count], .negated = entry.negated };
     return astBuilder.buildSelect(allocator, .{
         .table = snapshot.table,
+        .schema = snapshot.schema,
+        .tableAlias = snapshot.tableAlias,
         .allColumns = snapshot.allColumns,
         .projections = snapshot.projections[0..snapshot.projectionCount],
         .cases = snapshot.cases[0..snapshot.caseCount],
@@ -1260,13 +1653,15 @@ fn buildSnapshotSelect(allocator: std.mem.Allocator, snapshot: *const SelectSnap
         .caseWhens = snapshot.caseWhens[0..snapshot.caseWhenCount],
         .distinct = snapshot.distinctValue,
         .conditions = snapshot.conditions[0..snapshot.conditionCount],
-        .order = snapshot.order,
+        .orders = snapshot.orders[0..snapshot.orderCount],
         .limit = snapshot.limitValue,
         .offset = snapshot.offsetValue,
         .groupBy = snapshot.groupByColumn,
-        .havingOp = snapshot.havingOp,
-        .havingAmount = snapshot.havingAmount,
+        .having = snapshot.havingCond,
+        .havingValid = snapshot.havingValid,
         .joinTable = snapshot.joinTable,
+        .joinSchema = snapshot.joinSchema,
+        .joinAlias = snapshot.joinAlias,
         .joinKind = snapshot.joinKind,
         .joinOn = snapshot.joinOn,
         .joinUsingCols = snapshot.joinUsingCols[0..snapshot.joinUsingCount],
@@ -1303,7 +1698,7 @@ test "typed and dynamic builders share one engine" {
     try std.testing.expect(!Builder(void, void, false).isTyped);
     try std.testing.expect(DynamicQuery.isTyped == false);
     const T = @import("table.zig").table("t", struct { id: i64 });
-    try std.testing.expect(Query(T).isTyped);
+    try std.testing.expect(Query(@TypeOf(T)).isTyped);
 }
 
 pub fn UpsertBuilder(comptime Row: type, comptime Columns: type) type {
@@ -1315,6 +1710,7 @@ pub fn UpsertBuilder(comptime Row: type, comptime Columns: type) type {
         connection: *anyopaque,
         executeFn: astBuilder.ExecFn,
         table: []const u8,
+        schema: []const u8 = "",
         targetCols: [8][]const u8 = undefined,
         targetCount: usize = 0,
         targetWhere: ?Expr = null,
@@ -1398,6 +1794,7 @@ pub fn UpsertBuilder(comptime Row: type, comptime Columns: type) type {
         }
 
         pub fn returning(self: Self, cols: anytype) Self {
+            if (comptime @TypeOf(cols) == tableMod.AllOpFn) @compileError("use User.all() (call it) for RETURNING all columns");
             var copy = self;
             copy.returningCount = 0;
             const items = if (@typeInfo(@TypeOf(cols)) == .pointer) cols.* else cols;
@@ -1426,6 +1823,7 @@ pub fn UpsertBuilder(comptime Row: type, comptime Columns: type) type {
             self.setCount = 0;
             if (Columns == void) {
                 inline for (@typeInfo(RowType).@"struct".fields) |field| {
+                    if (comptime isExplicitDefault(@TypeOf(@field(assignments, field.name)))) continue;
                     if (self.setCount >= self.sets.len) return error.InvalidSql;
                     self.sets[self.setCount] = .{ .name = field.name, .value = upsertValueOf(@field(assignments, field.name)) };
                     self.setCount += 1;
@@ -1433,6 +1831,7 @@ pub fn UpsertBuilder(comptime Row: type, comptime Columns: type) type {
             } else {
                 inline for (@typeInfo(Columns).@"struct".fields) |colField| {
                     if (@hasField(RowType, colField.name)) {
+                        if (comptime isExplicitDefault(@TypeOf(@field(assignments, colField.name)))) continue;
                         if (self.setCount >= self.sets.len) return error.InvalidSql;
                         self.sets[self.setCount] = .{ .name = colField.type.dslName, .value = upsertValueOf(@field(assignments, colField.name)) };
                         self.setCount += 1;
@@ -1459,12 +1858,16 @@ pub fn UpsertBuilder(comptime Row: type, comptime Columns: type) type {
             if (Columns == void) {
                 const fields = @typeInfo(RowType).@"struct".fields;
                 var names: [fields.len][]const u8 = undefined;
-                var vals: [fields.len]Value = undefined;
-                inline for (fields, 0..) |field, index| {
-                    names[index] = field.name;
-                    vals[index] = columnMod.toValue(@field(row, field.name));
+                var vals: [fields.len]dslExpr.SetValue = undefined;
+                var count: usize = 0;
+                inline for (fields) |field| {
+                    if (comptime isExplicitDefault(@TypeOf(@field(row, field.name)))) continue;
+                    names[count] = field.name;
+                    vals[count] = .{ .literal = insertFieldOf(@field(row, field.name)) };
+                    count += 1;
                 }
-                var built = try astBuilder.buildInsert(self.allocator, self.table, &names, &vals, conflict, self.returningCols[0..self.returningCount], self.cases[0..self.caseCount], .{
+                if (count == 0) return error.InvalidSql;
+                var built = try astBuilder.buildInsert(self.allocator, self.table, self.schema, names[0..count], vals[0..count], conflict, self.returningCols[0..self.returningCount], self.cases[0..self.caseCount], .{
                     .targets = self.targetCols[0..self.targetCount],
                     .targetWhere = self.targetWhere,
                     .sets = self.sets[0..self.setCount],
@@ -1476,17 +1879,18 @@ pub fn UpsertBuilder(comptime Row: type, comptime Columns: type) type {
             } else {
                 const colFields = @typeInfo(Columns).@"struct".fields;
                 var names: [colFields.len][]const u8 = undefined;
-                var vals: [colFields.len]Value = undefined;
+                var vals: [colFields.len]dslExpr.SetValue = undefined;
                 var count: usize = 0;
                 inline for (colFields) |colField| {
                     if (@hasField(RowType, colField.name)) {
+                        if (comptime isExplicitDefault(@TypeOf(@field(row, colField.name)))) continue;
                         names[count] = colField.type.dslName;
-                        vals[count] = columnMod.toValue(@field(row, colField.name));
+                        vals[count] = .{ .literal = insertFieldOf(@field(row, colField.name)) };
                         count += 1;
                     }
                 }
                 if (count == 0) return error.InvalidSql;
-                var built = try astBuilder.buildInsert(self.allocator, self.table, names[0..count], vals[0..count], conflict, self.returningCols[0..self.returningCount], self.cases[0..self.caseCount], .{
+                var built = try astBuilder.buildInsert(self.allocator, self.table, self.schema, names[0..count], vals[0..count], conflict, self.returningCols[0..self.returningCount], self.cases[0..self.caseCount], .{
                     .targets = self.targetCols[0..self.targetCount],
                     .targetWhere = self.targetWhere,
                     .sets = self.sets[0..self.setCount],
@@ -1503,6 +1907,12 @@ pub fn UpsertBuilder(comptime Row: type, comptime Columns: type) type {
 fn upsertValueOf(value: anytype) astBuilder.UpsertValue {
     const T = @TypeOf(value);
     if (T == columnMod.ExcludedColumn) return .{ .excluded = value.name };
+    if (comptime @typeInfo(T) == .@"struct" and @hasDecl(T, "isExplicitValue")) {
+        return .{ .literal = value.value };
+    }
+    if (comptime @typeInfo(T) == .@"struct" and @hasDecl(T, "isArithExpr")) return .{ .set = value.toSetValue() };
+    if (T == columnMod.DynamicColumn) return .{ .set = .{ .column = columnMod.dynRef(value) } };
+    if (comptime isTypedColumnInstance(T)) return .{ .set = .{ .column = .{ .table = T.dslTable, .name = T.dslName } } };
     return .{ .literal = columnMod.toValue(value) };
 }
 
@@ -1511,9 +1921,10 @@ pub const Mutation = struct {
     connection: *anyopaque,
     executeFn: astBuilder.ExecFn,
     table: []const u8,
+    schema: []const u8 = "",
     operation: enum { update, delete },
     setNames: [32][]const u8 = undefined,
-    setValues: [32]Value = undefined,
+    setValues: [32]dslExpr.SetValue = undefined,
     setCount: usize = 0,
     conditions: [16]ConditionEntry = undefined,
     conditionCount: usize = 0,
@@ -1524,12 +1935,15 @@ pub const Mutation = struct {
     returningCols: [16]Projection = undefined,
     returningCount: usize = 0,
     fromTable: ?[]const u8 = null,
+    fromSchema: []const u8 = "",
     fromLeft: dslExpr.ColumnRef = .{ .name = "" },
     fromRight: dslExpr.ColumnRef = .{ .name = "" },
 
     pub fn updateFrom(self: Mutation, other: anytype, on: Expr) Mutation {
         var copy = self;
-        copy.fromTable = tableNameOf(other);
+        const target = joinTargetOf(other);
+        copy.fromTable = target.name;
+        copy.fromSchema = target.schema;
         if (on.operator != .equal) @panic("updateFrom requires an equality predicate");
         const rightRef = switch (on.rhs) {
             .column => |ref| ref,
@@ -1589,6 +2003,7 @@ pub const Mutation = struct {
     }
 
     pub fn returning(self: Mutation, cols: anytype) Mutation {
+        if (comptime @TypeOf(cols) == tableMod.AllOpFn) @compileError("use User.all() (call it) for RETURNING all columns");
         var copy = self;
         copy.returningCount = 0;
         const items = if (@typeInfo(@TypeOf(cols)) == .pointer) cols.* else cols;
@@ -1608,15 +2023,42 @@ pub const Mutation = struct {
 
     pub fn execute(self: Mutation) !Result {
         if (self.operation == .update) {
-            const fromSpec: ?ast.UpdateFrom = if (self.fromTable) |source| .{ .table = source, .leftTable = self.fromLeft.table, .leftColumn = self.fromLeft.name, .rightTable = self.fromRight.table, .rightColumn = self.fromRight.name } else null;
-            var built = try astBuilder.buildUpdate(self.allocator, self.table, self.setNames[0..self.setCount], self.setValues[0..self.setCount], self.conditions[0..self.conditionCount], self.returningCols[0..self.returningCount], self.cases[0..self.caseCount], self.caseWhens[0..self.caseWhenCount], fromSpec);
+            const fromSpec: ?ast.UpdateFrom = if (self.fromTable) |source| .{ .table = source, .tableSchema = self.fromSchema, .leftTable = self.fromLeft.table, .leftColumn = self.fromLeft.name, .rightTable = self.fromRight.table, .rightColumn = self.fromRight.name } else null;
+            var built = try astBuilder.buildUpdate(self.allocator, self.table, self.schema, self.setNames[0..self.setCount], self.setValues[0..self.setCount], self.conditions[0..self.conditionCount], self.returningCols[0..self.returningCount], self.cases[0..self.caseCount], self.caseWhens[0..self.caseWhenCount], fromSpec);
             defer built.deinit();
             return self.executeFn(self.connection, &built.stmt, &.{}, false);
         } else {
             if (self.fromTable != null) return error.InvalidSql;
-            var built = try astBuilder.buildDelete(self.allocator, self.table, self.conditions[0..self.conditionCount], self.returningCols[0..self.returningCount], self.cases[0..self.caseCount], self.caseWhens[0..self.caseWhenCount]);
+            var built = try astBuilder.buildDelete(self.allocator, self.table, self.schema, self.conditions[0..self.conditionCount], self.returningCols[0..self.returningCount], self.cases[0..self.caseCount], self.caseWhens[0..self.caseWhenCount]);
             defer built.deinit();
             return self.executeFn(self.connection, &built.stmt, &.{}, false);
         }
     }
 };
+
+test "orderBy accepts single orders and tuples of orders" {
+    const conn = @as(*anyopaque, @ptrFromInt(0x1000));
+    const base = DynamicQuery.initRaw(std.testing.allocator, conn, "t", undefined, undefined, undefined);
+    const colA = columnMod.DynamicColumn{ .name = "a" };
+    const colB = columnMod.DynamicColumn{ .name = "b" };
+    const single = base.orderBy(colA.asc());
+    try std.testing.expectEqual(@as(usize, 1), single.orderCount);
+    try std.testing.expectEqualStrings("a", single.orders[0].column.name);
+    try std.testing.expect(!single.orders[0].descending);
+    const pair = .{ colA.desc(), colB.asc() };
+    const multi = base.orderBy(pair);
+    try std.testing.expectEqual(@as(usize, 2), multi.orderCount);
+    try std.testing.expectEqualStrings("a", multi.orders[0].column.name);
+    try std.testing.expect(multi.orders[0].descending);
+    try std.testing.expectEqualStrings("b", multi.orders[1].column.name);
+    try std.testing.expect(!multi.orders[1].descending);
+    const chained = base.orderBy(colA.asc()).orderBy(colB.desc());
+    try std.testing.expectEqual(@as(usize, 2), chained.orderCount);
+    try std.testing.expect(!chained.orders[0].descending);
+    try std.testing.expect(chained.orders[1].descending);
+    const compound = CompoundBuilder(void, void, false){ .allocator = std.testing.allocator, .connection = conn, .compoundExecuteFn = undefined };
+    const compoundOrdered = compound.orderBy(pair);
+    try std.testing.expectEqual(@as(usize, 2), compoundOrdered.orderCount);
+    try std.testing.expect(compoundOrdered.orders[0].descending);
+    try std.testing.expect(!compoundOrdered.orders[1].descending);
+}

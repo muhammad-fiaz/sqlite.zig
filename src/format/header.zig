@@ -73,3 +73,14 @@ test "database header round trip" {
     try std.testing.expectEqual(original.pageSize, decoded.pageSize);
     try std.testing.expectEqual(original.databaseSizePages, decoded.databaseSizePages);
 }
+
+test "database header rejects bad magic" {
+    var bytes: [size]u8 = undefined;
+    (Header{}).encode(&bytes);
+    try std.testing.expectEqualStrings(magic, bytes[0..16]);
+    bytes[0] ^= 0xff;
+    try std.testing.expectError(error.InvalidHeader, Header.decode(&bytes));
+    bytes[0] ^= 0xff;
+    bytes[15] = 'X';
+    try std.testing.expectError(error.InvalidHeader, Header.decode(&bytes));
+}

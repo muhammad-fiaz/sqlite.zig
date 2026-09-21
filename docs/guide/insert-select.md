@@ -28,6 +28,6 @@ handling as single-row inserts:
 
 ```zig
 var copied = try db.from(Archive)
-    .insertSelect(db.from(Active).select(.{ Active.columns.id, Active.columns.label }));
+    .insertSelect(db.from(Active).select(.{ Active.id, Active.label }));
 defer copied.deinit();
 ```

@@ -6,7 +6,7 @@ const Item = sqlite.table("upsert_items", struct { id: i64, label: []const u8 })
 pub fn main() !void {
     var db = try sqlite.open(std.heap.page_allocator, "example_39.db");
     defer db.close();
-    try db.createTable(Item, .{ .overWrite = true, .primaryKey = Item.columns.id });
+    try db.createTable(Item, .{ .overWrite = true, .primaryKey = Item.id });
     try db.truncate(Item);
     var original = try db.from(Item).insert(.{ .id = 1, .label = "original" });
     original.deinit();

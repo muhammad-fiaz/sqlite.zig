@@ -13,8 +13,8 @@ pub fn main() !void {
     var raw = try db.exec("SELECT id FROM literal_in_items WHERE id IN (1, 3, 4) ORDER BY id;");
     defer raw.deinit();
     if (raw.count() != 3) return error.RawInListVerificationFailed;
-    var typed = try db.from(Item).whereNotInValues(Item.columns.id, .{ 1, 3, 4 }).fetch();
+    var typed = try db.from(Item).whereNotInValues(Item.id, .{ 1, 3, 4 }).fetch();
     defer typed.deinit();
-    if (typed.count() != 1 or typed.rows[0].id != 2) return error.TypedInListVerificationFailed;
+    if (typed.count() != 1 or typed.at(0).id != 2) return error.TypedInListVerificationFailed;
     std.debug.print("45 literal IN lists: raw and typed membership verified\n", .{});
 }

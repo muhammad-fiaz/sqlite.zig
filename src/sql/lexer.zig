@@ -45,7 +45,7 @@ pub fn tokenize(allocator: std.mem.Allocator, sql: []const u8) ![]Token {
                             i += 1;
                             continue;
                         }
-                        try tokens.append(allocator, .{ .tag = if (quote == '\'') .string else .word, .text = sql[content..i], .position = start });
+                        try tokens.append(allocator, .{ .tag = if (quote == '\'') .string else .word, .text = sql[content..i], .position = start, .quoted = quote != '\'' });
                         i += 1;
                         break;
                     }

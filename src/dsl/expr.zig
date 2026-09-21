@@ -4,6 +4,7 @@ const Value = @import("../vm/value.zig").Value;
 pub const ColumnRef = struct {
     table: []const u8 = "",
     name: []const u8,
+    schema: []const u8 = "",
 };
 
 pub const FuncCall = struct {
@@ -113,7 +114,97 @@ pub const Projection = struct {
     distinct: bool = false,
     caseSlot: u8 = 0,
     windowSlot: u8 = 0,
+    alias: ?[]const u8 = null,
+
+    pub fn as(self: @This(), name: []const u8) @This() {
+        var copy = self;
+        copy.alias = name;
+        return copy;
+    }
+
+    fn havingCond(self: @This(), op: []const u8, value: anytype) HavingCond {
+        return .{ .proj = self, .op = op, .rhs = toHavingValue(value) };
+    }
+
+    pub fn gt(self: @This(), value: anytype) HavingCond {
+        return self.havingCond(">", value);
+    }
+    pub fn gte(self: @This(), value: anytype) HavingCond {
+        return self.havingCond(">=", value);
+    }
+    pub fn lt(self: @This(), value: anytype) HavingCond {
+        return self.havingCond("<", value);
+    }
+    pub fn lte(self: @This(), value: anytype) HavingCond {
+        return self.havingCond("<=", value);
+    }
+    pub fn eq(self: @This(), value: anytype) HavingCond {
+        return self.havingCond("=", value);
+    }
+    pub fn ne(self: @This(), value: anytype) HavingCond {
+        return self.havingCond("<>", value);
+    }
 };
+
+pub const HavingCond = struct {
+    proj: Projection,
+    op: []const u8,
+    rhs: Value,
+};
+
+pub const ArithOp = enum { add, sub, mul, div, mod };
+
+pub const SetOperand = union(enum) {
+    literal: Value,
+    column: ColumnRef,
+};
+
+pub const SetArith = struct {
+    op: ArithOp,
+    left: SetOperand,
+    right: SetOperand,
+};
+
+pub const SetValue = union(enum) {
+    literal: Value,
+    column: ColumnRef,
+    arith: SetArith,
+};
+
+pub const ArithExpr = struct {
+    op: ArithOp,
+    left: SetOperand,
+    right: SetOperand,
+    pub const isArithExpr = true;
+
+    pub fn toSetValue(self: @This()) SetValue {
+        return .{ .arith = .{ .op = self.op, .left = self.left, .right = self.right } };
+    }
+};
+
+fn toHavingValue(value: anytype) Value {
+    const T = @TypeOf(value);
+    if (T == Value) return value;
+    if (@typeInfo(T) == .optional) {
+        if (value) |present| return toHavingValue(present);
+        return .null;
+    }
+    return switch (@typeInfo(T)) {
+        .bool => .{ .integer = if (value) 1 else 0 },
+        .int, .comptime_int => .{ .integer = @intCast(value) },
+        .float, .comptime_float => .{ .real = @floatCast(value) },
+        .pointer => |ptr| {
+            if (ptr.size == .slice and ptr.child == u8) return .{ .text = value };
+            if (ptr.size == .one) {
+                const child = @typeInfo(ptr.child);
+                if (child == .array and child.array.child == u8) return .{ .text = value };
+            }
+            @compileError("unsupported HAVING value type");
+        },
+        .null => .null,
+        else => @compileError("unsupported HAVING value type"),
+    };
+}
 
 pub fn countStar() Projection {
     return .{ .kind = .countStar };

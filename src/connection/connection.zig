@@ -15,7 +15,10 @@ pub const Result = @import("result.zig").Result;
 const DynamicColumn = @import("../dsl/column.zig").DynamicColumn;
 const ExcludedColumn = @import("../dsl/column.zig").ExcludedColumn;
 const Builder = @import("../dsl/query_builder.zig").Builder;
+const Query = @import("../dsl/query_builder.zig").Query;
 const DynamicQuery = @import("../dsl/query_builder.zig").DynamicQuery;
+const DynamicTable = @import("../dsl/dynamic.zig").DynamicTable;
+const SchemaHandle = @import("../dsl/dynamic.zig").SchemaHandle;
 const keys = @import("../dsl/keys.zig");
 const planner = @import("../plan/planner.zig");
 const exprEvaluator = @import("../sql/expr.zig");
@@ -264,19 +267,19 @@ pub const Connection = struct {
 
     fn findTableQualified(self: *Connection, qualifier: ?[]const u8, name: []const u8) ?ResolvedTable {
         const ref = self.resolveSchema(qualifier) orelse return null;
-        const table = self.storeFor(ref).find(name) orelse return null;
-        return .{ .ref = ref, .table = table };
+        const tbl = self.storeFor(ref).find(name) orelse return null;
+        return .{ .ref = ref, .table = tbl };
     }
 
     fn findTableOrdered(self: *Connection, name: []const u8) ?ResolvedTable {
         if (self.cteActive(name)) {
-            if (self.store.find(name)) |table| return .{ .ref = .main, .table = table };
+            if (self.store.find(name)) |tbl| return .{ .ref = .main, .table = tbl };
             return null;
         }
-        if (self.tempStore.find(name)) |table| return .{ .ref = .temp, .table = table };
-        if (self.store.find(name)) |table| return .{ .ref = .main, .table = table };
+        if (self.tempStore.find(name)) |tbl| return .{ .ref = .temp, .table = tbl };
+        if (self.store.find(name)) |tbl| return .{ .ref = .main, .table = tbl };
         for (self.attached.items, 0..) |*db, index| {
-            if (db.store.find(name)) |table| return .{ .ref = .{ .attached = index }, .table = table };
+            if (db.store.find(name)) |tbl| return .{ .ref = .{ .attached = index }, .table = tbl };
         }
         return null;
     }
@@ -424,12 +427,27 @@ pub const Connection = struct {
         return virtualMachine.execute(&compiled.program, compiled.columnNames);
     }
 
-    pub fn from(self: *Connection, source: anytype) if (@TypeOf(source) == type) Builder(source.rowType, @TypeOf(source.columns), true) else DynamicQuery {
-        if (@TypeOf(source) == type) {
-            if (!@hasDecl(source, "tableName") or !@hasDecl(source, "rowType")) @compileError("db.from() expects a sqlite.table(...) type or a table-name string");
-            return Builder(source.rowType, @TypeOf(source.columns), true).init(self, source.tableName, executeForDsl, executeCompoundForDsl, executeDerivedForDsl);
+    pub fn from(self: *Connection, source: anytype) FromOut(@TypeOf(source)) {
+        const T = @TypeOf(source);
+        if (comptime T != type and @typeInfo(T) == .@"struct" and @hasDecl(T, "isDynamicTable")) {
+            var q = DynamicQuery.initRaw(self.allocator, self, source.name, executeForDsl, executeCompoundForDsl, executeDerivedForDsl);
+            q.schema = source.schema;
+            q.tableAlias = if (source.alias.len != 0) source.alias else null;
+            return q;
         }
-        return DynamicQuery.init(self, source, executeForDsl, executeCompoundForDsl, executeDerivedForDsl);
+        var q = Query(T).init(self, source.tableName, executeForDsl, executeCompoundForDsl, executeDerivedForDsl);
+        q.tableAlias = if (source.tableAlias.len != 0) source.tableAlias else null;
+        return q;
+    }
+
+    fn FromOut(comptime T: type) type {
+        if (T != type and @typeInfo(T) == .@"struct" and @hasDecl(T, "isDynamicTable")) return DynamicQuery;
+        return Query(T);
+    }
+
+    // The returned handle borrows this connection; do not use it after close.
+    pub fn table(self: *Connection, name: []const u8) DynamicTable {
+        return DynamicTable.init(self.allocator, self, executeForDsl, executeCompoundForDsl, executeDerivedForDsl, "", name);
     }
 
     pub fn col(_: *Connection, name: []const u8) DynamicColumn {
@@ -440,12 +458,35 @@ pub const Connection = struct {
         return .{ .name = name };
     }
 
-    pub fn schema(self: *Connection, comptime TableType: type) SchemaValidator(TableType) {
-        return .{ .connection = self };
+    pub fn schema(self: *Connection, source: anytype) SchemaTarget(@TypeOf(source)) {
+        const T = @TypeOf(source);
+        if (comptime keys.isStringLike(T)) {
+            return SchemaHandle{
+                .allocator = self.allocator,
+                .connection = self,
+                .executeFn = executeForDsl,
+                .compoundExecuteFn = executeCompoundForDsl,
+                .derivedExecuteFn = executeDerivedForDsl,
+                .name = keys.coerceName(source),
+            };
+        }
+        return SchemaValidator(T){ .connection = self, .tableName = targetTableName(source) };
     }
 
-    pub fn tableExists(self: *Connection, comptime TableType: type) bool {
-        return self.store.find(TableType.tableName) != null;
+    fn SchemaTarget(comptime T: type) type {
+        if (comptime keys.isStringLike(T)) return SchemaHandle;
+        return SchemaValidator(T);
+    }
+
+    pub fn tableExists(self: *Connection, source: anytype) bool {
+        const T = @TypeOf(source);
+        if (comptime @import("../dsl/table.zig").isTableValue(T)) {
+            return self.store.find(source.tableName) != null;
+        }
+        if (T == type) {
+            return self.store.find(source.tableName) != null;
+        }
+        return self.store.find(source) != null;
     }
 
     pub fn userVersion(self: *Connection) u32 {
@@ -477,8 +518,14 @@ pub const Connection = struct {
 
     pub fn createTable(self: *Connection, target: anytype, options: anytype) !void {
         const T = @TypeOf(target);
-        if (T == type) {
-            if (!@hasDecl(target, "tableName") or !@hasDecl(target, "rowType")) @compileError("createTable expects a sqlite.table(...) type or a table-name string");
+        if (comptime @import("../dsl/table.zig").isTableValue(T)) {
+            if (self.store.find(target.tableName) != null) {
+                if (!@hasField(@TypeOf(options), "overWrite") or !options.overWrite) return error.TableExists;
+                try self.store.dropTable(target.tableName);
+            }
+            try self.createTypedTableValue(target, options);
+        } else if (T == type) {
+            if (!@hasDecl(target, "tableName") or !@hasDecl(target, "rowType")) @compileError("createTable expects a sqlite.table(...) value or a table-name string");
             if (self.tableExists(target)) {
                 if (!@hasField(@TypeOf(options), "overWrite") or !options.overWrite) return error.TableExists;
                 try self.store.dropTable(target.tableName);
@@ -549,6 +596,65 @@ pub const Connection = struct {
         if (@hasField(@TypeOf(options), "withoutRowid")) isWithoutRowid = options.withoutRowid;
         if (@hasField(TO, "withoutRowid")) isWithoutRowid = TableType.tableOptions.withoutRowid;
         try self.store.createTableWithOptions(TableType.tableName, &definitions, constraints.items, .{ .strict = isStrict, .withoutRowid = isWithoutRowid });
+    }
+
+    fn createTypedTableValue(self: *Connection, target: anytype, options: anytype) !void {
+        const tableMod = @import("../dsl/table.zig");
+        const T = @TypeOf(target);
+        const Row = tableMod.rowTypeOfValue(T);
+        const Cols = tableMod.columnsTypeOfValue(T);
+        const tableOpts = tableMod.tableOptionsField(T).value;
+        const tname: []const u8 = target.tableName;
+        const rowFields = @typeInfo(Row).@"struct".fields;
+        const colFields = @typeInfo(Cols).@"struct".fields;
+        var definitions: [colFields.len]ast.ColumnDef = undefined;
+        inline for (colFields, 0..) |colField, index| {
+            const F = colField.type.fieldType;
+            definitions[index] = .{
+                .name = colField.type.dslName,
+                .typeName = keys.dslTypeName(F),
+                .notNull = @typeInfo(F) != .optional,
+                .defaultValue = keys.zigDefault(rowFields[index].type, rowFields[index].default_value_ptr),
+            };
+        }
+        var expected = keys.ExpectedKeys{};
+        const TO = @TypeOf(tableOpts);
+        if (@hasField(@TypeOf(options), "primaryKey")) {
+            try keys.parsePkInto(options.primaryKey, tname, &expected);
+        } else if (@hasField(TO, "primaryKey")) {
+            try keys.parsePkInto(tableOpts.primaryKey, tname, &expected);
+        }
+        if (@hasField(@TypeOf(options), "unique")) {
+            try keys.parseUniqueInto(options.unique, tname, &expected);
+        } else if (@hasField(TO, "unique")) {
+            try keys.parseUniqueInto(tableOpts.unique, tname, &expected);
+        }
+        if (@hasField(@TypeOf(options), "foreignKeys")) {
+            try keys.parseFksInto(options.foreignKeys, tname, &expected);
+        } else if (@hasField(TO, "foreignKeys")) {
+            try keys.parseFksInto(tableOpts.foreignKeys, tname, &expected);
+        }
+        if (@hasField(@TypeOf(options), "autoincrement")) {
+            var autoNames: [16][]const u8 = undefined;
+            const autoCount = try keys.normalizeKey(options.autoincrement, tname, &autoNames);
+            if (autoCount != 1) return error.InvalidSql;
+            (findDefinition(definitions[0..], autoNames[0]) orelse return error.UnknownColumn).autoincrement = true;
+        } else if (@hasField(TO, "autoincrement")) {
+            var autoNames: [16][]const u8 = undefined;
+            const autoCount = try keys.normalizeKey(tableOpts.autoincrement, tname, &autoNames);
+            if (autoCount != 1) return error.InvalidSql;
+            (findDefinition(definitions[0..], autoNames[0]) orelse return error.UnknownColumn).autoincrement = true;
+        }
+        var constraints = std.ArrayList(ast.TableConstraint).empty;
+        defer constraints.deinit(self.allocator);
+        try self.applyExpectedKeys(tname, &definitions, &constraints, &expected);
+        var isStrict = false;
+        var isWithoutRowid = false;
+        if (@hasField(@TypeOf(options), "strict")) isStrict = options.strict;
+        if (@hasField(TO, "strict")) isStrict = tableOpts.strict;
+        if (@hasField(@TypeOf(options), "withoutRowid")) isWithoutRowid = options.withoutRowid;
+        if (@hasField(TO, "withoutRowid")) isWithoutRowid = tableOpts.withoutRowid;
+        try self.store.createTableWithOptions(tname, &definitions, constraints.items, .{ .strict = isStrict, .withoutRowid = isWithoutRowid });
     }
 
     fn createDynamicTable(self: *Connection, name: []const u8, options: anytype) !void {
@@ -652,21 +758,25 @@ pub const Connection = struct {
         return null;
     }
 
+    fn targetTableName(target: anytype) []const u8 {
+        const T = @TypeOf(target);
+        if (comptime @import("../dsl/table.zig").isTableValue(T)) return target.tableName;
+        if (T == type) {
+            if (!@hasDecl(target, "tableName")) @compileError("expected a sqlite.table(...) value or a table-name string");
+            return target.tableName;
+        }
+        return target;
+    }
+
     pub fn dropTable(self: *Connection, target: anytype) !void {
-        const tableName: []const u8 = if (@TypeOf(target) == type) blk: {
-            if (!@hasDecl(target, "tableName")) @compileError("dropTable expects a sqlite.table(...) type or a table-name string");
-            break :blk target.tableName;
-        } else target;
+        const tableName: []const u8 = targetTableName(target);
         try self.store.dropTable(tableName);
         self.bumpSchemaVersion();
         if (!self.transactionActive) try self.persist();
     }
 
     pub fn createIndex(self: *Connection, target: anytype, name: []const u8, cols: anytype, unique: bool) !void {
-        const tableName: []const u8 = if (@TypeOf(target) == type) blk: {
-            if (!@hasDecl(target, "tableName")) @compileError("createIndex expects a sqlite.table(...) type or a table-name string");
-            break :blk target.tableName;
-        } else target;
+        const tableName: []const u8 = targetTableName(target);
         var names: [16][]const u8 = undefined;
         const count = try keys.normalizeKey(cols, tableName, &names);
         try self.store.createIndex(.{ .name = name, .table = tableName, .columns = names[0..count], .unique = unique });
@@ -682,10 +792,7 @@ pub const Connection = struct {
 
     pub fn createIndexWhere(self: *Connection, target: anytype, name: []const u8, cols: anytype, unique: bool, whereSql: []const u8) !void {
         if (whereSql.len == 0) return error.InvalidSql;
-        const tableName: []const u8 = if (@TypeOf(target) == type) blk: {
-            if (!@hasDecl(target, "tableName")) @compileError("createIndexWhere expects a sqlite.table(...) type or a table-name string");
-            break :blk target.tableName;
-        } else target;
+        const tableName: []const u8 = targetTableName(target);
         var names: [16][]const u8 = undefined;
         const count = try keys.normalizeKey(cols, tableName, &names);
         var ddl = std.ArrayList(u8).empty;
@@ -710,10 +817,7 @@ pub const Connection = struct {
     pub fn createIndexExpr(self: *Connection, target: anytype, name: []const u8, indexKeys: []const []const u8, unique: bool, whereSql: ?[]const u8) !void {
         if (indexKeys.len == 0) return error.InvalidSql;
         if (whereSql) |predicate| if (predicate.len == 0) return error.InvalidSql;
-        const tableName: []const u8 = if (@TypeOf(target) == type) blk: {
-            if (!@hasDecl(target, "tableName")) @compileError("createIndexExpr expects a sqlite.table(...) type or a table-name string");
-            break :blk target.tableName;
-        } else target;
+        const tableName: []const u8 = targetTableName(target);
         var ddl = std.ArrayList(u8).empty;
         defer ddl.deinit(self.allocator);
         try ddl.appendSlice(self.allocator, "CREATE ");
@@ -755,41 +859,32 @@ pub const Connection = struct {
     }
 
     pub fn renameTable(self: *Connection, target: anytype, newName: []const u8) !void {
-        const tableName: []const u8 = if (@TypeOf(target) == type) blk: {
-            if (!@hasDecl(target, "tableName")) @compileError("renameTable expects a sqlite.table(...) type or a table-name string");
-            break :blk target.tableName;
-        } else target;
+        const tableName: []const u8 = targetTableName(target);
         try self.store.renameTable(tableName, newName);
         self.bumpSchemaVersion();
         if (!self.transactionActive) try self.persist();
     }
 
     pub fn truncate(self: *Connection, target: anytype) !void {
-        const tableName: []const u8 = if (@TypeOf(target) == type) blk: {
-            if (!@hasDecl(target, "tableName")) @compileError("truncate expects a sqlite.table(...) type or a table-name string");
-            break :blk target.tableName;
-        } else target;
+        const tableName: []const u8 = targetTableName(target);
         try self.store.truncateTable(tableName);
         if (!self.transactionActive) try self.persist();
     }
 
     pub fn addColumn(self: *Connection, target: anytype, field: []const u8, FieldType: type) !void {
-        const tableName: []const u8 = if (@TypeOf(target) == type) blk: {
-            if (!@hasDecl(target, "tableName")) @compileError("addColumn expects a sqlite.table(...) type or a table-name string");
-            break :blk target.tableName;
-        } else target;
+        const tableName: []const u8 = targetTableName(target);
         try self.store.addColumn(tableName, .{ .name = field, .typeName = keys.dslTypeName(FieldType) });
         self.bumpSchemaVersion();
         if (!self.transactionActive) try self.persist();
     }
 
-    pub fn renameColumn(self: *Connection, comptime TableType: type, comptime oldName: []const u8, comptime newName: []const u8) !void {
-        try self.store.renameColumn(TableType.tableName, oldName, newName);
+    pub fn renameColumn(self: *Connection, source: anytype, comptime oldName: []const u8, comptime newName: []const u8) !void {
+        try self.store.renameColumn(targetTableName(source), oldName, newName);
         if (!self.transactionActive) try self.persist();
     }
 
-    pub fn dropColumn(self: *Connection, comptime TableType: type, comptime field: []const u8) !void {
-        try self.store.dropColumn(TableType.tableName, field);
+    pub fn dropColumn(self: *Connection, source: anytype, comptime field: []const u8) !void {
+        try self.store.dropColumn(targetTableName(source), field);
         if (!self.transactionActive) try self.persist();
     }
 
@@ -810,14 +905,19 @@ pub const Connection = struct {
         return result;
     }
 
-    pub fn SchemaValidator(comptime TableType: type) type {
+    pub fn SchemaValidator(comptime TableValueType: type) type {
+        const tableMod = @import("../dsl/table.zig");
+        const Row = if (comptime tableMod.isTableValue(TableValueType)) tableMod.rowTypeOfValue(TableValueType) else TableValueType.rowType;
+        const Cols = if (comptime tableMod.isTableValue(TableValueType)) tableMod.columnsTypeOfValue(TableValueType) else @TypeOf(TableValueType.columns);
+        const TableOpts = if (comptime tableMod.isTableValue(TableValueType)) tableMod.tableOptionsField(TableValueType).value else TableValueType.tableOptions;
         return struct {
             connection: *Connection,
+            tableName: []const u8,
 
             pub fn validate(self: @This()) !void {
-                const t = self.connection.store.findConst(TableType.tableName) orelse return error.UnknownTable;
-                const rowFields = @typeInfo(TableType.rowType).@"struct".fields;
-                const colFields = @typeInfo(@TypeOf(TableType.columns)).@"struct".fields;
+                const t = self.connection.store.findConst(self.tableName) orelse return error.UnknownTable;
+                const rowFields = @typeInfo(Row).@"struct".fields;
+                const colFields = @typeInfo(Cols).@"struct".fields;
                 if (t.columns.len != colFields.len) return error.SchemaMismatch;
                 if (rowFields.len != colFields.len) return error.SchemaMismatch;
                 var pkBuf: [16][]const u8 = undefined;
@@ -833,10 +933,10 @@ pub const Connection = struct {
                     if (!keys.sameDefault(keys.zigDefault(rowFields[index].type, rowFields[index].default_value_ptr), column.defaultValue)) return error.SchemaMismatch;
                 }
                 var expected = keys.ExpectedKeys{};
-                const TO = @TypeOf(TableType.tableOptions);
-                if (@hasField(TO, "primaryKey")) try keys.parsePkInto(TableType.tableOptions.primaryKey, TableType.tableName, &expected);
-                if (@hasField(TO, "unique")) try keys.parseUniqueInto(TableType.tableOptions.unique, TableType.tableName, &expected);
-                if (@hasField(TO, "foreignKeys")) try keys.parseFksInto(TableType.tableOptions.foreignKeys, TableType.tableName, &expected);
+                const TO = @TypeOf(TableOpts);
+                if (@hasField(TO, "primaryKey")) try keys.parsePkInto(TableOpts.primaryKey, self.tableName, &expected);
+                if (@hasField(TO, "unique")) try keys.parseUniqueInto(TableOpts.unique, self.tableName, &expected);
+                if (@hasField(TO, "foreignKeys")) try keys.parseFksInto(TableOpts.foreignKeys, self.tableName, &expected);
                 try keys.validateKeys(t, &expected);
             }
         };
@@ -1541,17 +1641,17 @@ pub const Connection = struct {
             if (!pragmaSchemaIsTemp(value)) {
                 const resolvedTable = self.resolveTableName(name);
                 if (resolvedTable) |resolved| {
-                    const table = resolved.table;
+                    const tbl = resolved.table;
                     var pkOrder: [64][]const u8 = undefined;
                     var pkCount: usize = 0;
-                    for (table.columns) |column| {
+                    for (tbl.columns) |column| {
                         if (column.primaryKey and pkCount < pkOrder.len) {
                             pkOrder[pkCount] = column.name;
                             pkCount += 1;
                         }
                     }
                     if (pkCount == 0) {
-                        for (table.constraints) |constraint| {
+                        for (tbl.constraints) |constraint| {
                             if (constraint.kind != .primaryKey) continue;
                             for (constraint.columns) |columnName| {
                                 if (pkCount >= pkOrder.len) break;
@@ -1561,7 +1661,7 @@ pub const Connection = struct {
                         }
                     }
                     var cid: i64 = 0;
-                    for (table.columns) |column| {
+                    for (tbl.columns) |column| {
                         const generated = column.generatedExpr != null;
                         if (generated and !extended) continue;
                         const row = try self.allocator.alloc(Value, headers.len);
@@ -1645,17 +1745,17 @@ pub const Connection = struct {
             if (!pragmaSchemaIsTemp(value)) {
                 const resolvedTable = self.resolveTableName(name);
                 if (resolvedTable) |resolved| {
-                    const table = resolved.table;
+                    const tbl = resolved.table;
                     const store = self.storeFor(resolved.ref);
                     var seq: i64 = 0;
                     for (store.indexes.items) |index| {
-                        if (!std.ascii.eqlIgnoreCase(index.table, table.name)) continue;
+                        if (!std.ascii.eqlIgnoreCase(index.table, tbl.name)) continue;
                         const row = try self.allocator.alloc(Value, names.len);
                         errdefer self.allocator.free(row);
                         row[0] = .{ .integer = seq };
                         row[1] = .{ .text = try self.allocator.dupe(u8, index.name) };
                         row[2] = .{ .integer = if (index.unique) 1 else 0 };
-                        row[3] = .{ .text = try self.allocator.dupe(u8, self.indexOrigin(table, &index)) };
+                        row[3] = .{ .text = try self.allocator.dupe(u8, self.indexOrigin(tbl, &index)) };
                         row[4] = .{ .integer = if (index.whereExpr != null) 1 else 0 };
                         try rows.append(self.allocator, row);
                         seq += 1;
@@ -1666,10 +1766,10 @@ pub const Connection = struct {
         return .{ .allocator = self.allocator, .columns = columns, .rows = try rows.toOwnedSlice(self.allocator) };
     }
 
-    fn indexOrigin(self: *Connection, table: *const Table, index: *const Index) []const u8 {
+    fn indexOrigin(self: *Connection, tbl: *const Table, index: *const Index) []const u8 {
         _ = self;
         if (!std.mem.startsWith(u8, index.name, "sqlite_autoindex_")) return "c";
-        for (table.constraints) |constraint| {
+        for (tbl.constraints) |constraint| {
             if (constraint.kind != .primaryKey and constraint.kind != .unique) continue;
             if (constraint.columns.len != index.columns.len) continue;
             var columnsMatch = true;
@@ -1682,8 +1782,8 @@ pub const Connection = struct {
             if (columnsMatch) return if (constraint.kind == .primaryKey) "pk" else "u";
         }
         if (index.columns.len == 1 and index.keyExpr(0) == null) {
-            if (columnIndex(table, index.columns[0])) |position| {
-                if (table.columns[position].primaryKey) return "pk";
+            if (columnIndex(tbl, index.columns[0])) |position| {
+                if (tbl.columns[position].primaryKey) return "pk";
             } else |_| {}
         }
         return "u";
@@ -1708,7 +1808,7 @@ pub const Connection = struct {
                 if (resolvedIndex) |resolved| {
                     const index = resolved.index;
                     const store = self.storeFor(resolved.ref);
-                    if (store.findConst(index.table)) |table| {
+                    if (store.findConst(index.table)) |tbl| {
                         for (index.columns, 0..) |keyColumn, position| {
                             const row = try self.allocator.alloc(Value, headers.len);
                             errdefer self.allocator.free(row);
@@ -1716,9 +1816,9 @@ pub const Connection = struct {
                             if (index.keyExpr(position) != null) {
                                 row[1] = .{ .integer = -1 };
                                 row[2] = .null;
-                            } else if (columnIndex(table, keyColumn)) |columnPosition| {
+                            } else if (columnIndex(tbl, keyColumn)) |columnPosition| {
                                 row[1] = .{ .integer = @intCast(columnPosition) };
-                                row[2] = .{ .text = try self.allocator.dupe(u8, table.columns[columnPosition].name) };
+                                row[2] = .{ .text = try self.allocator.dupe(u8, tbl.columns[columnPosition].name) };
                             } else |_| {
                                 row[1] = .{ .integer = -1 };
                                 row[2] = .null;
@@ -1754,9 +1854,9 @@ pub const Connection = struct {
             if (!pragmaSchemaIsTemp(value)) {
                 const resolvedTable = self.resolveTableName(name);
                 if (resolvedTable) |resolved| {
-                    const table = resolved.table;
+                    const tbl = resolved.table;
                     var id: i64 = 0;
-                    for (table.columns) |column| {
+                    for (tbl.columns) |column| {
                         const foreignTable = column.foreignTable orelse continue;
                         const row = try self.allocator.alloc(Value, names.len);
                         errdefer self.allocator.free(row);
@@ -1771,7 +1871,7 @@ pub const Connection = struct {
                         try rows.append(self.allocator, row);
                         id += 1;
                     }
-                    for (table.constraints) |constraint| {
+                    for (tbl.constraints) |constraint| {
                         if (constraint.kind != .foreignKey) continue;
                         const foreignTable = constraint.foreignTable orelse continue;
                         for (constraint.columns, 0..) |childColumn, position| {
@@ -1856,16 +1956,16 @@ pub const Connection = struct {
     }
 
     fn appendTableListRows(self: *Connection, store: *const Schema, schemaName: []const u8, filter: ?[]const u8, rows: *std.ArrayList([]Value)) !void {
-        for (store.tables.items) |table| {
-            if (filter) |wanted| if (!std.ascii.eqlIgnoreCase(wanted, table.name)) continue;
+        for (store.tables.items) |tbl| {
+            if (filter) |wanted| if (!std.ascii.eqlIgnoreCase(wanted, tbl.name)) continue;
             const row = try self.allocator.alloc(Value, 6);
             errdefer self.allocator.free(row);
             row[0] = .{ .text = try self.allocator.dupe(u8, schemaName) };
-            row[1] = .{ .text = try self.allocator.dupe(u8, table.name) };
-            row[2] = .{ .text = try self.allocator.dupe(u8, if (table.virtualModule != null) "virtual" else "table") };
-            row[3] = .{ .integer = @intCast(table.columns.len) };
-            row[4] = .{ .integer = if (table.withoutRowid) 1 else 0 };
-            row[5] = .{ .integer = if (table.strict) 1 else 0 };
+            row[1] = .{ .text = try self.allocator.dupe(u8, tbl.name) };
+            row[2] = .{ .text = try self.allocator.dupe(u8, if (tbl.virtualModule != null) "virtual" else "table") };
+            row[3] = .{ .integer = @intCast(tbl.columns.len) };
+            row[4] = .{ .integer = if (tbl.withoutRowid) 1 else 0 };
+            row[5] = .{ .integer = if (tbl.strict) 1 else 0 };
             try rows.append(self.allocator, row);
         }
         for (store.views.items) |view| {
@@ -2015,9 +2115,9 @@ pub const Connection = struct {
             }
             for (store.indexes.items) |index| {
                 if (std.ascii.eqlIgnoreCase(index.name, name)) {
-                    const table = store.find(index.table) orelse return error.UnknownTable;
-                    store.clearStatScope(table.name, index.name);
-                    return store.collectIndexStats(table, &index);
+                    const tbl = store.find(index.table) orelse return error.UnknownTable;
+                    store.clearStatScope(tbl.name, index.name);
+                    return store.collectIndexStats(tbl, &index);
                 }
             }
             return error.UnknownTable;
@@ -2040,14 +2140,14 @@ pub const Connection = struct {
                 self.bumpSchemaVersion();
             }
         }
-        for (store.tables.items) |table| {
-            if (std.ascii.eqlIgnoreCase(table.name, "sqlite_stat1")) continue;
-            if (tableName) |wanted| if (!std.ascii.eqlIgnoreCase(table.name, wanted)) continue;
-            store.clearStatScope(table.name, null);
-            try store.collectTableStats(&table);
+        for (store.tables.items) |tbl| {
+            if (std.ascii.eqlIgnoreCase(tbl.name, "sqlite_stat1")) continue;
+            if (tableName) |wanted| if (!std.ascii.eqlIgnoreCase(tbl.name, wanted)) continue;
+            store.clearStatScope(tbl.name, null);
+            try store.collectTableStats(tbl);
             for (store.indexes.items) |index| {
-                if (!std.ascii.eqlIgnoreCase(index.table, table.name)) continue;
-                try store.collectIndexStats(&table, &index);
+                if (!std.ascii.eqlIgnoreCase(index.table, tbl.name)) continue;
+                try store.collectIndexStats(tbl, &index);
             }
         }
     }
@@ -2123,7 +2223,7 @@ pub const Connection = struct {
     }
 
     fn compareStoredSchema(self: *Connection, rows: *std.ArrayList([]Value), cap: usize, stored: *const Schema, scope: ?[]const u8) !void {
-        for (self.store.tables.items) |*live| {
+        for (self.store.tables.items) |live| {
             if (scope != null and !std.ascii.eqlIgnoreCase(scope.?, live.name)) continue;
             if (live.virtualModule != null) continue;
             const saved = stored.findConst(live.name) orelse {
@@ -2157,7 +2257,7 @@ pub const Connection = struct {
                 try self.integrityProblem(rows, cap, "table {s} content differs from the stored image: {d} live rows unmatched, {d} stored rows unmatched", .{ live.name, missing, extra });
             }
         }
-        for (stored.tables.items) |*saved| {
+        for (stored.tables.items) |saved| {
             if (scope != null and !std.ascii.eqlIgnoreCase(scope.?, saved.name)) continue;
             if (self.store.findConst(saved.name) == null) {
                 try self.integrityProblem(rows, cap, "table {s} is missing from the live schema", .{saved.name});
@@ -2179,16 +2279,16 @@ pub const Connection = struct {
         const savedFlag = self.store.foreignKeysEnabled;
         self.store.foreignKeysEnabled = false;
         defer self.store.foreignKeysEnabled = savedFlag;
-        for (self.store.tables.items) |*table| {
-            if (scope != null and !std.ascii.eqlIgnoreCase(scope.?, table.name)) continue;
-            if (table.virtualModule != null) continue;
-            for (table.rows.items, 0..) |row, rowIndex| {
-                if (row.values.len != table.columns.len) {
-                    try self.integrityProblem(rows, cap, "table {s} row {d} has {d} values but table has {d} columns", .{ table.name, rowIndex + 1, row.values.len, table.columns.len });
+        for (self.store.tables.items) |tbl| {
+            if (scope != null and !std.ascii.eqlIgnoreCase(scope.?, tbl.name)) continue;
+            if (tbl.virtualModule != null) continue;
+            for (tbl.rows.items, 0..) |row, rowIndex| {
+                if (row.values.len != tbl.columns.len) {
+                    try self.integrityProblem(rows, cap, "table {s} row {d} has {d} values but table has {d} columns", .{ tbl.name, rowIndex + 1, row.values.len, tbl.columns.len });
                     continue;
                 }
-                self.store.validateExistingRow(table, rowIndex) catch |err| switch (err) {
-                    error.ConstraintViolation, error.UnknownColumn => try self.integrityProblem(rows, cap, "table {s} row {d} violates a stored constraint", .{ table.name, rowIndex + 1 }),
+                self.store.validateExistingRow(tbl, rowIndex) catch |err| switch (err) {
+                    error.ConstraintViolation, error.UnknownColumn => try self.integrityProblem(rows, cap, "table {s} row {d} violates a stored constraint", .{ tbl.name, rowIndex + 1 }),
                     else => return err,
                 };
             }
@@ -2216,13 +2316,13 @@ pub const Connection = struct {
             }
             rowList.deinit(self.allocator);
         }
-        for (self.store.tables.items) |*table| {
-            if (scope != null and !std.ascii.eqlIgnoreCase(scope.?, table.name)) continue;
-            if (table.virtualModule != null) continue;
-            for (table.rows.items, 0..) |row, rowIndex| {
-                if (row.values.len != table.columns.len) continue;
+        for (self.store.tables.items) |tbl| {
+            if (scope != null and !std.ascii.eqlIgnoreCase(scope.?, tbl.name)) continue;
+            if (tbl.virtualModule != null) continue;
+            for (tbl.rows.items, 0..) |row, rowIndex| {
+                if (row.values.len != tbl.columns.len) continue;
                 var fkid: i64 = 0;
-                for (table.columns, 0..) |*column, childIndex| {
+                for (tbl.columns, 0..) |*column, childIndex| {
                     const foreignTableName = column.foreignTable orelse continue;
                     const parent = self.store.findConst(foreignTableName) orelse return error.ConstraintViolation;
                     const foreignColumnName = column.foreignColumn orelse return error.ConstraintViolation;
@@ -2237,16 +2337,16 @@ pub const Connection = struct {
                             break;
                         }
                     }
-                    if (!found) try self.foreignKeyViolation(&rowList, table, rowIndex, foreignTableName, fkid);
+                    if (!found) try self.foreignKeyViolation(&rowList, tbl, rowIndex, foreignTableName, fkid);
                 }
-                for (table.constraints) |*constraint| {
+                for (tbl.constraints) |*constraint| {
                     if (constraint.kind != .foreignKey) continue;
                     const foreignTableName = constraint.foreignTable orelse return error.ConstraintViolation;
                     const parent = self.store.findConst(foreignTableName) orelse return error.ConstraintViolation;
                     defer fkid += 1;
                     var hasNull = false;
                     for (constraint.columns) |childName| {
-                        const childIndex = columnIndex(table, childName) catch return error.ConstraintViolation;
+                        const childIndex = columnIndex(tbl, childName) catch return error.ConstraintViolation;
                         if (row.values[childIndex] == .null) hasNull = true;
                     }
                     if (hasNull) continue;
@@ -2255,7 +2355,7 @@ pub const Connection = struct {
                         if (parentRow.values.len != parent.columns.len) continue;
                         var matched = true;
                         for (constraint.columns, constraint.referencedColumns) |childName, parentName| {
-                            const childIndex = columnIndex(table, childName) catch return error.ConstraintViolation;
+                            const childIndex = columnIndex(tbl, childName) catch return error.ConstraintViolation;
                             const parentIndex = columnIndex(parent, parentName) catch return error.ConstraintViolation;
                             if (!@import("../catalog/schema.zig").valuesEqual(row.values[childIndex], parentRow.values[parentIndex])) matched = false;
                         }
@@ -2264,7 +2364,7 @@ pub const Connection = struct {
                             break;
                         }
                     }
-                    if (!found) try self.foreignKeyViolation(&rowList, table, rowIndex, foreignTableName, fkid);
+                    if (!found) try self.foreignKeyViolation(&rowList, tbl, rowIndex, foreignTableName, fkid);
                 }
             }
         }
@@ -2272,15 +2372,15 @@ pub const Connection = struct {
         return .{ .allocator = self.allocator, .columns = columns, .rows = rows };
     }
 
-    fn foreignKeyViolation(self: *Connection, rows: *std.ArrayList([]Value), table: *const Table, rowIndex: usize, parentName: []const u8, fkid: i64) !void {
+    fn foreignKeyViolation(self: *Connection, rows: *std.ArrayList([]Value), tbl: *const Table, rowIndex: usize, parentName: []const u8, fkid: i64) !void {
         const row = try self.allocator.alloc(Value, 4);
         row[0] = .null;
         row[1] = .null;
         row[2] = .null;
         row[3] = .null;
         errdefer self.freeCompoundRow(row);
-        row[0] = .{ .text = try self.allocator.dupe(u8, table.name) };
-        row[1] = if (table.withoutRowid) .null else .{ .integer = @intCast(rowIndex + 1) };
+        row[0] = .{ .text = try self.allocator.dupe(u8, tbl.name) };
+        row[1] = if (tbl.withoutRowid) .null else .{ .integer = @intCast(rowIndex + 1) };
         row[2] = .{ .text = try self.allocator.dupe(u8, parentName) };
         row[3] = .{ .integer = fkid };
         try rows.append(self.allocator, row);
@@ -2474,8 +2574,8 @@ pub const Connection = struct {
                 definitions[index] = .{ .name = resolved, .typeName = if (source.rows.len == 0) "" else source.rows[0][index].typeName() };
             }
             try self.store.createTable(cte.name, definitions, &.{});
-            const table = self.store.find(cte.name).?;
-            for (source.rows) |row| try self.store.appendRow(table, row);
+            const tbl = self.store.find(cte.name).?;
+            for (source.rows) |row| try self.store.appendRow(tbl, row);
             if (cte.recursiveSql) |recursiveSql| {
                 if (!recursive) return error.Unsupported;
                 if (cte.recursiveAll) {
@@ -2487,7 +2587,7 @@ pub const Connection = struct {
                         }
                         acc.deinit(self.allocator);
                     }
-                    for (table.rows.items) |row| try acc.append(self.allocator, try self.cloneCompoundRow(row.values));
+                    for (tbl.rows.items) |row| try acc.append(self.allocator, try self.cloneCompoundRow(row.values));
                     var iteration: usize = 0;
                     while (iteration < 1000) : (iteration += 1) {
                         var next = try self.execute(recursiveSql, parameters);
@@ -2509,12 +2609,12 @@ pub const Connection = struct {
                         var added: usize = 0;
                         for (next.rows) |row| {
                             var exists = false;
-                            for (table.rows.items) |existing| if (rowsEqual(existing.values, row)) {
+                            for (tbl.rows.items) |existing| if (rowsEqual(existing.values, row)) {
                                 exists = true;
                                 break;
                             };
                             if (!exists) {
-                                try self.store.appendRow(table, row);
+                                try self.store.appendRow(tbl, row);
                                 added += 1;
                             }
                         }
@@ -2632,30 +2732,40 @@ pub const Connection = struct {
         acc.rows = try list.toOwnedSlice(self.allocator);
     }
 
-    fn finalizeCompound(self: *Connection, result: *Result, order: ?ast.Order, limit: ?usize, offset: ?usize) !void {
-        if (order) |ord| {
-            var sortIdx: ?usize = null;
-            if (std.fmt.parseInt(usize, ord.column, 10)) |pos| {
-                if (pos >= 1 and pos <= result.columns.len) sortIdx = pos - 1;
-            } else |_| {
-                for (result.columns, 0..) |colName, idx| {
-                    if (std.ascii.eqlIgnoreCase(colName, ord.column)) {
-                        sortIdx = idx;
-                        break;
+    fn finalizeCompound(self: *Connection, result: *Result, orders: []const ast.Order, limit: ?usize, offset: ?usize) !void {
+        if (orders.len != 0) {
+            const sortKeys = try self.allocator.alloc(ResolvedSortKey, orders.len);
+            defer self.allocator.free(sortKeys);
+            for (orders, 0..) |ord, keyIndex| {
+                var sortIdx: ?usize = null;
+                if (std.fmt.parseInt(usize, ord.column, 10)) |pos| {
+                    if (pos >= 1 and pos <= result.columns.len) sortIdx = pos - 1;
+                } else |_| {
+                    for (result.columns, 0..) |colName, idx| {
+                        if (std.ascii.eqlIgnoreCase(colName, ord.column)) {
+                            sortIdx = idx;
+                            break;
+                        }
+                    }
+                    if (sortIdx == null) {
+                        const want = splitQualifier(ord.column).column;
+                        for (result.columns, 0..) |colName, idx| {
+                            if (std.ascii.eqlIgnoreCase(splitQualifier(colName).column, want)) {
+                                sortIdx = idx;
+                                break;
+                            }
+                        }
                     }
                 }
+                sortKeys[keyIndex] = .{ .colIdx = sortIdx orelse return error.UnknownColumn, .descending = ord.descending };
             }
-            const idx = sortIdx orelse return error.UnknownColumn;
             const SortCtx = struct {
-                colIdx: usize,
-                desc: bool,
+                keys: []const ResolvedSortKey,
                 pub fn lessThan(ctx: @This(), a: []Value, b: []Value) bool {
-                    const ordVal = a[ctx.colIdx].order(b[ctx.colIdx], .binary);
-                    if (ctx.desc) return ordVal == .gt;
-                    return ordVal == .lt;
+                    return compareRowsByKeys(a, b, ctx.keys) == .lt;
                 }
             };
-            std.sort.pdq([]Value, @constCast(result.rows), SortCtx{ .colIdx = idx, .desc = ord.descending }, SortCtx.lessThan);
+            std.sort.pdq([]Value, @constCast(result.rows), SortCtx{ .keys = sortKeys }, SortCtx.lessThan);
         }
         const startIdx: usize = offset orelse 0;
         var keptCount: usize = 0;
@@ -2685,16 +2795,16 @@ pub const Connection = struct {
         errdefer left.deinit();
         var right = try self.executeWithOuter(compound.rightSql, parameters, outer);
         try self.mergeCompoundRightIntoLeft(&left, &right, compound.op);
-        try self.finalizeCompound(&left, compound.order, compound.limit, compound.offset);
+        try self.finalizeCompound(&left, compound.orders, compound.limit, compound.offset);
         return left;
     }
 
-    fn executeCompoundForDsl(pointer: *anyopaque, arms: []const @import("../dsl/ast_builder.zig").CompoundArm, ops: []const ast.CompoundOp, order: ?ast.Order, limit: ?usize, offset: ?usize) anyerror!Result {
+    fn executeCompoundForDsl(pointer: *anyopaque, arms: []const @import("../dsl/ast_builder.zig").CompoundArm, ops: []const ast.CompoundOp, orders: []const ast.Order, limit: ?usize, offset: ?usize) anyerror!Result {
         const self: *Connection = @ptrCast(@alignCast(pointer));
-        return self.executeCompoundArms(arms, ops, order, limit, offset);
+        return self.executeCompoundArms(arms, ops, orders, limit, offset);
     }
 
-    fn executeCompoundArms(self: *Connection, arms: []const @import("../dsl/ast_builder.zig").CompoundArm, ops: []const ast.CompoundOp, order: ?ast.Order, limit: ?usize, offset: ?usize) anyerror!Result {
+    fn executeCompoundArms(self: *Connection, arms: []const @import("../dsl/ast_builder.zig").CompoundArm, ops: []const ast.CompoundOp, orders: []const ast.Order, limit: ?usize, offset: ?usize) anyerror!Result {
         if (arms.len < 2 or ops.len != arms.len - 1) return error.InvalidSql;
         var acc = try self.executeDslStatement(arms[0].stmt, arms[0].ctes, arms[0].recursive);
         errdefer acc.deinit();
@@ -2702,7 +2812,7 @@ pub const Connection = struct {
             var nxt = try self.executeDslStatement(arm.stmt, arm.ctes, arm.recursive);
             try self.mergeCompoundRightIntoLeft(&acc, &nxt, op);
         }
-        try self.finalizeCompound(&acc, order, limit, offset);
+        try self.finalizeCompound(&acc, orders, limit, offset);
         return acc;
     }
 
@@ -2739,7 +2849,7 @@ pub const Connection = struct {
         }
     }
 
-    fn renderTriggerBody(self: *Connection, body: []const u8, table: *const Table, event: ast.TriggerEvent, newRow: ?[]const Value, oldRow: ?[]const Value) ![]u8 {
+    fn renderTriggerBody(self: *Connection, body: []const u8, tbl: *const Table, event: ast.TriggerEvent, newRow: ?[]const Value, oldRow: ?[]const Value) ![]u8 {
         var output = std.ArrayList(u8).empty;
         errdefer output.deinit(self.allocator);
         var index: usize = 0;
@@ -2749,7 +2859,7 @@ pub const Connection = struct {
                 var end = index + 4;
                 while (end < body.len and (std.ascii.isAlphanumeric(body[end]) or body[end] == '_')) : (end += 1) {}
                 const name = body[index + 4 .. end];
-                const column = columnIndex(table, name) catch {
+                const column = columnIndex(tbl, name) catch {
                     try output.append(self.allocator, body[index]);
                     index += 1;
                     continue;
@@ -2766,20 +2876,20 @@ pub const Connection = struct {
         return try output.toOwnedSlice(self.allocator);
     }
 
-    fn triggerWhenMatched(self: *Connection, table: *const Table, trigger: anytype, event: ast.TriggerEvent, newRow: ?[]const Value, oldRow: ?[]const Value) anyerror!bool {
+    fn triggerWhenMatched(self: *Connection, tbl: *const Table, trigger: anytype, event: ast.TriggerEvent, newRow: ?[]const Value, oldRow: ?[]const Value) anyerror!bool {
         const whenSql = trigger.whenSql orelse return true;
-        const rendered = try self.renderTriggerBody(whenSql, table, event, newRow, oldRow);
+        const rendered = try self.renderTriggerBody(whenSql, tbl, event, newRow, oldRow);
         defer self.allocator.free(rendered);
         const wrapped = try std.fmt.allocPrint(self.allocator, "SELECT ({s})", .{rendered});
         defer self.allocator.free(wrapped);
         var result = try self.execute(wrapped, &.{});
         defer result.deinit();
-        if (result.rows.len == 0 or result.rows[0].len == 0) return false;
-        return isTruthy(result.rows[0][0]);
+        if (result.rows.len == 0 or result.at(0).len == 0) return false;
+        return isTruthy(result.at(0)[0]);
     }
 
-    fn fireTriggers(self: *Connection, store: *Schema, table: *const Table, timing: ast.TriggerTiming, event: ast.TriggerEvent, newRow: ?[]const Value, oldRow: ?[]const Value, updatedColumns: []const []const u8) anyerror!void {
-        const tableName = table.name;
+    fn fireTriggers(self: *Connection, store: *Schema, tbl: *const Table, timing: ast.TriggerTiming, event: ast.TriggerEvent, newRow: ?[]const Value, oldRow: ?[]const Value, updatedColumns: []const []const u8) anyerror!void {
+        const tableName = tbl.name;
         const PendingBody = struct { name: []u8, sql: []u8 };
         var pending = std.ArrayList(PendingBody).empty;
         defer {
@@ -2793,10 +2903,10 @@ pub const Connection = struct {
             if (trigger.timing != timing) continue;
             if (trigger.event == event and std.ascii.eqlIgnoreCase(trigger.table, tableName)) {
                 if (!trigger.firesOnUpdate(updatedColumns)) continue;
-                if (!try self.triggerWhenMatched(table, trigger, event, newRow, oldRow)) continue;
+                if (!try self.triggerWhenMatched(tbl, trigger, event, newRow, oldRow)) continue;
                 const ownedName = try self.allocator.dupe(u8, trigger.name);
                 errdefer self.allocator.free(ownedName);
-                const sql = try self.renderTriggerBody(trigger.body, table, event, newRow, oldRow);
+                const sql = try self.renderTriggerBody(trigger.body, tbl, event, newRow, oldRow);
                 errdefer self.allocator.free(sql);
                 try pending.append(self.allocator, .{ .name = ownedName, .sql = sql });
             }
@@ -2838,10 +2948,10 @@ pub const Connection = struct {
         };
     }
 
-    fn freeResolvedTemps(self: *Connection, table: *const Table, row: []Value, columns: []const []const u8, rowExprs: []const ast.Expr) void {
+    fn freeResolvedTemps(self: *Connection, tbl: *const Table, row: []Value, columns: []const []const u8, rowExprs: []const ast.Expr) void {
         if (columns.len == 0) {
             var nonGenIdx: usize = 0;
-            for (table.columns, 0..) |column, index| {
+            for (tbl.columns, 0..) |column, index| {
                 if (column.generatedExpr == null) {
                     if (nonGenIdx < rowExprs.len) {
                         const expr = rowExprs[nonGenIdx];
@@ -2854,7 +2964,7 @@ pub const Connection = struct {
         }
         for (columns, rowExprs) |name, expr| {
             if (expr != .binary and expr != .unary) continue;
-            const index = columnIndex(table, name) catch continue;
+            const index = columnIndex(tbl, name) catch continue;
             self.freeConcatText(row[index]);
         }
     }
@@ -2874,8 +2984,8 @@ pub const Connection = struct {
         return false;
     }
 
-    fn columnIndex(table: *const Table, name: []const u8) !usize {
-        for (table.columns, 0..) |column, index| if (std.ascii.eqlIgnoreCase(column.name, name)) return index;
+    fn columnIndex(tbl: *const Table, name: []const u8) !usize {
+        for (tbl.columns, 0..) |column, index| if (std.ascii.eqlIgnoreCase(column.name, name)) return index;
         return error.UnknownColumn;
     }
 
@@ -2960,11 +3070,11 @@ pub const Connection = struct {
         };
     }
 
-    fn matches(self: *Connection, table: *const Table, row: []const Value, condition: ?ast.Conditions, parameters: []const Value) anyerror!bool {
-        return self.matchesContext(table, row, condition, parameters, null);
+    fn matches(self: *Connection, tbl: *const Table, row: []const Value, condition: ?ast.Conditions, parameters: []const Value) anyerror!bool {
+        return self.matchesContext(tbl, row, condition, parameters, null);
     }
 
-    fn matchesContext(self: *Connection, table: *const Table, row: []const Value, condition: ?ast.Conditions, parameters: []const Value, outer: ?*const OuterRow) anyerror!bool {
+    fn matchesContext(self: *Connection, tbl: *const Table, row: []const Value, condition: ?ast.Conditions, parameters: []const Value, outer: ?*const OuterRow) anyerror!bool {
         if (condition) |items| {
             var total = false;
             var group = true;
@@ -2974,7 +3084,7 @@ pub const Connection = struct {
                     const ts = item.tableScan.?;
                     const resolvedInner = self.resolveTableName(ts.table) orelse return error.UnknownTable;
                     const inner = resolvedInner.table;
-                    const currentOuter = OuterRow{ .table = table, .alias = if (outer) |o| (if (o.table == table) o.alias else null) else null, .values = row, .prev = if (outer != null and outer.?.table == table) outer.?.prev else outer };
+                    const currentOuter = OuterRow{ .table = tbl, .alias = if (outer) |o| (if (o.table == tbl) o.alias else null) else null, .values = row, .prev = if (outer != null and outer.?.table == tbl) outer.?.prev else outer };
                     var found = false;
                     for (inner.rows.items) |innerRow| {
                         const matched = if (ts.conditions) |conds| try self.matchesContext(inner, innerRow.values, conds, parameters, &currentOuter) else true;
@@ -2986,18 +3096,18 @@ pub const Connection = struct {
                     break :tableScanExists if (item.op == .exists) found else !found;
                 } else if (item.op == .exists or item.op == .notExists) blk: {
                     const sql = item.subquery orelse return error.InvalidSql;
-                    const currentOuter = OuterRow{ .table = table, .alias = if (outer) |o| (if (o.table == table) o.alias else null) else null, .values = row, .prev = if (outer != null and outer.?.table == table) outer.?.prev else outer };
+                    const currentOuter = OuterRow{ .table = tbl, .alias = if (outer) |o| (if (o.table == tbl) o.alias else null) else null, .values = row, .prev = if (outer != null and outer.?.table == tbl) outer.?.prev else outer };
                     var sub = try self.executeWithOuter(sql, parameters, &currentOuter);
                     defer sub.deinit();
                     const hasRows = sub.rows.len > 0;
                     break :blk if (item.op == .exists) hasRows else !hasRows;
                 } else blk: {
-                    const current = if (item.leftExpr) |left| try self.evalContext(table, row, left, parameters, outer) else currentColumn: {
+                    const current = if (item.leftExpr) |left| try self.evalContext(tbl, row, left, parameters, outer) else currentColumn: {
                         const parts = splitQualifier(item.column);
                         if (parts.qualifier.len != 0) {
                             const outerAlias = if (outer) |ctx| ctx.alias else null;
-                            if (groupQualifierMatches(parts.qualifier, table, outerAlias)) {
-                                break :currentColumn row[try columnIndex(table, parts.column)];
+                            if (groupQualifierMatches(parts.qualifier, tbl, outerAlias)) {
+                                break :currentColumn row[try columnIndex(tbl, parts.column)];
                             }
                             var currOuter = outer;
                             while (currOuter) |ctx| {
@@ -3006,9 +3116,9 @@ pub const Connection = struct {
                                 }
                                 currOuter = ctx.prev;
                             }
-                            break :currentColumn row[try columnIndex(table, parts.column)];
+                            break :currentColumn row[try columnIndex(tbl, parts.column)];
                         }
-                        if (columnIndex(table, item.column)) |idx| {
+                        if (columnIndex(tbl, item.column)) |idx| {
                             break :currentColumn row[idx];
                         } else |_| {
                             var currOuter = outer;
@@ -3019,14 +3129,14 @@ pub const Connection = struct {
                                 currOuter = ctx.prev;
                             }
                         }
-                        break :currentColumn row[try columnIndex(table, item.column)];
+                        break :currentColumn row[try columnIndex(tbl, item.column)];
                     };
                     defer if (item.leftExpr) |left| {
                         if (left == .binary or left == .unary or left == .function) self.freeConcatText(current);
                     };
-                    const base: bool = if (item.op == .isTrue) functions.scalar.isTruthyValue(current) else if (item.op == .isNull) current == .null else if (item.op == .isNotNull) current != .null else if (item.op == .isValue) sameValue(current, try self.evalContext(table, row, item.value, parameters, outer)) else if (item.op == .isNotValue) !sameValue(current, try self.evalContext(table, row, item.value, parameters, outer)) else if (item.op == .isDistinct) !sameValue(current, try self.evalContext(table, row, item.value, parameters, outer)) else if (item.op == .isNotDistinct) sameValue(current, try self.evalContext(table, row, item.value, parameters, outer)) else if (item.op == .in and item.subquery != null) inSubquery: {
+                    const base: bool = if (item.op == .isTrue) functions.scalar.isTruthyValue(current) else if (item.op == .isNull) current == .null else if (item.op == .isNotNull) current != .null else if (item.op == .isValue) sameValue(current, try self.evalContext(tbl, row, item.value, parameters, outer)) else if (item.op == .isNotValue) !sameValue(current, try self.evalContext(tbl, row, item.value, parameters, outer)) else if (item.op == .isDistinct) !sameValue(current, try self.evalContext(tbl, row, item.value, parameters, outer)) else if (item.op == .isNotDistinct) sameValue(current, try self.evalContext(tbl, row, item.value, parameters, outer)) else if (item.op == .in and item.subquery != null) inSubquery: {
                         const sql = item.subquery orelse return error.InvalidSql;
-                        const currentOuter = OuterRow{ .table = table, .alias = if (outer) |o| (if (o.table == table) o.alias else null) else null, .values = row, .prev = if (outer != null and outer.?.table == table) outer.?.prev else outer };
+                        const currentOuter = OuterRow{ .table = tbl, .alias = if (outer) |o| (if (o.table == tbl) o.alias else null) else null, .values = row, .prev = if (outer != null and outer.?.table == tbl) outer.?.prev else outer };
                         var subquery = try self.executeWithOuter(sql, parameters, &currentOuter);
                         defer subquery.deinit();
                         var found = false;
@@ -3050,7 +3160,7 @@ pub const Connection = struct {
                     } else if (item.op == .notIn and item.subquery != null) notInSubquery: {
                         if (current == .null) break :notInSubquery false;
                         const sql = item.subquery orelse return error.InvalidSql;
-                        const currentOuter = OuterRow{ .table = table, .alias = if (outer) |o| (if (o.table == table) o.alias else null) else null, .values = row, .prev = if (outer != null and outer.?.table == table) outer.?.prev else outer };
+                        const currentOuter = OuterRow{ .table = tbl, .alias = if (outer) |o| (if (o.table == tbl) o.alias else null) else null, .values = row, .prev = if (outer != null and outer.?.table == tbl) outer.?.prev else outer };
                         var subquery = try self.executeWithOuter(sql, parameters, &currentOuter);
                         defer subquery.deinit();
                         var found = false;
@@ -3062,43 +3172,43 @@ pub const Connection = struct {
                     } else if ((item.op == .in or item.op == .notIn) and item.listValues.len != 0) listValues: {
                         if (current == .null) break :listValues false;
                         var found = false;
-                        for (item.listValues) |candidate| if (compareCollated(current, .equal, try self.evalContext(table, row, candidate, parameters, outer), item.collate)) {
+                        for (item.listValues) |candidate| if (compareCollated(current, .equal, try self.evalContext(tbl, row, candidate, parameters, outer), item.collate)) {
                             found = true;
                             break;
                         };
                         break :listValues if (item.op == .in) found else !found;
                     } else if (item.op == .between or item.op == .notBetween) betweenPattern: {
                         if (current == .null) break :betweenPattern false;
-                        const inRange = compareCollated(current, .greaterEqual, try self.evalContext(table, row, item.value, parameters, outer), item.collate) and compareCollated(current, .lessEqual, try self.evalContext(table, row, item.value2 orelse return error.InvalidSql, parameters, outer), item.collate);
+                        const inRange = compareCollated(current, .greaterEqual, try self.evalContext(tbl, row, item.value, parameters, outer), item.collate) and compareCollated(current, .lessEqual, try self.evalContext(tbl, row, item.value2 orelse return error.InvalidSql, parameters, outer), item.collate);
                         break :betweenPattern if (item.op == .between) inRange else !inRange;
                     } else if (item.op == .like or item.op == .notLike) likePattern: {
-                        const pattern = try self.evalContext(table, row, item.value, parameters, outer);
+                        const pattern = try self.evalContext(tbl, row, item.value, parameters, outer);
                         var escapeValue: ?Value = null;
-                        if (item.escape) |escapeExpr| escapeValue = try self.evalContext(table, row, escapeExpr, parameters, outer);
+                        if (item.escape) |escapeExpr| escapeValue = try self.evalContext(tbl, row, escapeExpr, parameters, outer);
                         const tri = try self.evalPattern(current, pattern, escapeValue, false);
                         break :likePattern if (tri) |matched| (if (item.op == .like) matched else !matched) else false;
                     } else if (item.op == .glob or item.op == .notGlob) globPattern: {
-                        const pattern = try self.evalContext(table, row, item.value, parameters, outer);
+                        const pattern = try self.evalContext(tbl, row, item.value, parameters, outer);
                         const tri = try self.evalPattern(current, pattern, null, true);
                         break :globPattern if (tri) |matched| (if (item.op == .glob) matched else !matched) else false;
                     } else if (item.op == .regexp or item.op == .notRegexp) regexpPattern: {
-                        const pattern = try self.evalContext(table, row, item.value, parameters, outer);
+                        const pattern = try self.evalContext(tbl, row, item.value, parameters, outer);
                         const tri = try self.evalRegexp(current, pattern);
                         break :regexpPattern if (tri) |matched| (if (item.op == .regexp) matched else !matched) else false;
                     } else if (item.op == .match or item.op == .notMatch) matchPattern: {
-                        const pattern = try self.evalContext(table, row, item.value, parameters, outer);
+                        const pattern = try self.evalContext(tbl, row, item.value, parameters, outer);
                         const tri = try self.evalMatch(current, pattern);
                         break :matchPattern if (tri) |matched| (if (item.op == .match) matched else !matched) else false;
-                    } else compareCollated(current, item.op, try self.evalContext(table, row, item.value, parameters, outer), item.collate);
+                    } else compareCollated(current, item.op, try self.evalContext(tbl, row, item.value, parameters, outer), item.collate);
                     if (item.negated) {
                         if (base) break :blk false;
                         const nullSafe = item.op == .isNull or item.op == .isNotNull or item.op == .isValue or item.op == .isNotValue or item.op == .isDistinct or item.op == .isNotDistinct or item.op == .isTrue;
                         if (!nullSafe) {
                             if (current == .null) break :blk false;
-                            const v = try self.evalContext(table, row, item.value, parameters, outer);
+                            const v = try self.evalContext(tbl, row, item.value, parameters, outer);
                             if (v == .null) break :blk false;
                             if (item.value2) |second| {
-                                const w = try self.evalContext(table, row, second, parameters, outer);
+                                const w = try self.evalContext(tbl, row, second, parameters, outer);
                                 if (w == .null) break :blk false;
                             }
                         }
@@ -3309,8 +3419,8 @@ pub const Connection = struct {
         return false;
     }
 
-    fn eval(self: *Connection, table: *const Table, row: []const Value, expr: ast.Expr, parameters: []const Value) !Value {
-        return self.evalContext(table, row, expr, parameters, null);
+    fn eval(self: *Connection, tbl: *const Table, row: []const Value, expr: ast.Expr, parameters: []const Value) !Value {
+        return self.evalContext(tbl, row, expr, parameters, null);
     }
 
     const Numeric = struct { isInt: bool, i: i64, r: f64 };
@@ -3403,24 +3513,29 @@ pub const Connection = struct {
         }
     }
 
-    fn evalBinary(self: *Connection, table: ?*const Table, row: []const Value, binary: anytype, parameters: []const Value, outer: ?*const OuterRow) anyerror!Value {
-        const left = try self.evalContext(table, row, binary.left.*, parameters, outer);
-        const right = try self.evalContext(table, row, binary.right.*, parameters, outer);
+    fn evalBinary(self: *Connection, tbl: ?*const Table, row: []const Value, binary: anytype, parameters: []const Value, outer: ?*const OuterRow) anyerror!Value {
+        const left = try self.evalContext(tbl, row, binary.left.*, parameters, outer);
+        const right = try self.evalContext(tbl, row, binary.right.*, parameters, outer);
         defer freeBinaryOwned(binary.left.*, left, self.allocator);
         defer freeBinaryOwned(binary.right.*, right, self.allocator);
         if (binary.op == .logicalAnd or binary.op == .logicalOr) {
-            const l = if (left == .null) false else isTruthy(left);
-            const r = if (right == .null) false else isTruthy(right);
-            if (left == .null or right == .null) {
-                if (binary.op == .logicalAnd) {
-                    if (!l or !r) return .{ .integer = 0 };
-                    return .null;
-                } else {
-                    if (l or r) return .{ .integer = 1 };
-                    return .null;
-                }
+            // SQLite three-valued logic: a decisive non-NULL side wins,
+            // otherwise NULL propagates. (Matches sql/expr.zig eval.)
+            const lNull = left == .null;
+            const rNull = right == .null;
+            const l = !lNull and isTruthy(left);
+            const r = !rNull and isTruthy(right);
+            if (binary.op == .logicalAnd) {
+                if (!lNull and !l) return .{ .integer = 0 };
+                if (!rNull and !r) return .{ .integer = 0 };
+                if (lNull or rNull) return .null;
+                return .{ .integer = 1 };
+            } else {
+                if (l) return .{ .integer = 1 };
+                if (r) return .{ .integer = 1 };
+                if (lNull or rNull) return .null;
+                return .{ .integer = 0 };
             }
-            return .{ .integer = if (binary.op == .logicalAnd) (if (l and r) 1 else 0) else (if (l or r) 1 else 0) };
         }
         if (binary.op == .concat) {
             if (left == .null or right == .null) return .null;
@@ -3619,13 +3734,30 @@ pub const Connection = struct {
         }
     }
 
-    fn evalContext(self: *Connection, table: ?*const Table, row: []const Value, expr: ast.Expr, parameters: []const Value, outer: ?*const OuterRow) anyerror!Value {
+    fn valueBorrowsFrom(value: Value, pools: []const []const Value) bool {
+        const bytes = switch (value) {
+            .text => |b| b,
+            .blob => |b| b,
+            else => return false,
+        };
+        for (pools) |pool| for (pool) |item| {
+            const owned = switch (item) {
+                .text => |b| b,
+                .blob => |b| b,
+                else => continue,
+            };
+            if (owned.ptr == bytes.ptr and owned.len == bytes.len) return true;
+        };
+        return false;
+    }
+
+    fn evalContext(self: *Connection, tbl: ?*const Table, row: []const Value, expr: ast.Expr, parameters: []const Value, outer: ?*const OuterRow) anyerror!Value {
         return switch (expr) {
             .literal => |value| value,
             .parameter => |index| if (index == 0) error.InvalidParameter else if (index > parameters.len) .null else parameters[index - 1],
             .identifier => |rawName| {
                 const name = self.stripSchemaQualifier(rawName);
-                if (table) |concrete| {
+                if (tbl) |concrete| {
                     if (std.mem.indexOfScalar(u8, name, '.')) |dot| {
                         const prefix = name[0..dot];
                         const colName = name[dot + 1 ..];
@@ -3663,11 +3795,11 @@ pub const Connection = struct {
                 return error.UnknownColumn;
             },
             .wildcard => error.InvalidSql,
-            .binary => |binary| try self.evalBinary(table, row, binary, parameters, outer),
-            .collate => |node| try self.evalContext(table, row, node.expr.*, parameters, outer),
+            .binary => |binary| try self.evalBinary(tbl, row, binary, parameters, outer),
+            .collate => |node| try self.evalContext(tbl, row, node.expr.*, parameters, outer),
             .patternMatch => |match| blk: {
-                const value = try self.evalContext(table, row, match.value.*, parameters, outer);
-                const pattern = try self.evalContext(table, row, match.pattern.*, parameters, outer);
+                const value = try self.evalContext(tbl, row, match.value.*, parameters, outer);
+                const pattern = try self.evalContext(tbl, row, match.pattern.*, parameters, outer);
                 if (match.isRegexp) {
                     if (try self.evalRegexp(value, pattern)) |matched| {
                         break :blk .{ .integer = if (matched == !match.negated) 1 else 0 };
@@ -3681,7 +3813,7 @@ pub const Connection = struct {
                     break :blk .null;
                 }
                 var escapeValue: ?Value = null;
-                if (match.escape) |escape| escapeValue = try self.evalContext(table, row, escape.*, parameters, outer);
+                if (match.escape) |escape| escapeValue = try self.evalContext(tbl, row, escape.*, parameters, outer);
                 if (try self.evalPattern(value, pattern, escapeValue, match.glob)) |matched| {
                     break :blk .{ .integer = if (matched == !match.negated) 1 else 0 };
                 }
@@ -3689,11 +3821,11 @@ pub const Connection = struct {
             },
             .unary => |unary| blk: {
                 if (unary.op == .logicalNot) {
-                    const operand = try self.evalContext(table, row, unary.expr.*, parameters, outer);
+                    const operand = try self.evalContext(tbl, row, unary.expr.*, parameters, outer);
                     if (operand == .null) break :blk .null;
                     break :blk .{ .integer = if (isTruthy(operand)) 0 else 1 };
                 }
-                const operand = try self.evalContext(table, row, unary.expr.*, parameters, outer);
+                const operand = try self.evalContext(tbl, row, unary.expr.*, parameters, outer);
                 if (operand == .null) break :blk .null;
                 break :blk switch (unary.op) {
                     .negate => blkNeg: {
@@ -3712,29 +3844,29 @@ pub const Connection = struct {
             },
             .caseExpr => |caseBlock| blk: {
                 if (caseBlock.base) |base| {
-                    const baseValue = try self.evalContext(table, row, base.*, parameters, outer);
+                    const baseValue = try self.evalContext(tbl, row, base.*, parameters, outer);
                     const baseOwned = base.* == .binary or base.* == .unary or base.* == .function;
                     for (caseBlock.whens) |when| {
-                        const candidate = try self.evalContext(table, row, when.condition, parameters, outer);
+                        const candidate = try self.evalContext(tbl, row, when.condition, parameters, outer);
                         const candOwned = when.condition == .binary or when.condition == .unary or when.condition == .function;
                         if (compare(baseValue, .equal, candidate)) {
                             if (candOwned) self.freeConcatText(candidate);
                             if (baseOwned) self.freeConcatText(baseValue);
-                            break :blk try self.evalContext(table, row, when.result, parameters, outer);
+                            break :blk try self.evalContext(tbl, row, when.result, parameters, outer);
                         }
                         if (candOwned) self.freeConcatText(candidate);
                     }
                     if (baseOwned) self.freeConcatText(baseValue);
                 } else {
                     for (caseBlock.whens) |when| {
-                        const candidate = try self.evalContext(table, row, when.condition, parameters, outer);
+                        const candidate = try self.evalContext(tbl, row, when.condition, parameters, outer);
                         const candOwned = when.condition == .binary or when.condition == .unary or when.condition == .function;
                         const taken = isTruthy(candidate);
                         if (candOwned) self.freeConcatText(candidate);
-                        if (taken) break :blk try self.evalContext(table, row, when.result, parameters, outer);
+                        if (taken) break :blk try self.evalContext(tbl, row, when.result, parameters, outer);
                     }
                 }
-                if (caseBlock.otherwise) |otherwise| break :blk try self.evalContext(table, row, otherwise.*, parameters, outer);
+                if (caseBlock.otherwise) |otherwise| break :blk try self.evalContext(tbl, row, otherwise.*, parameters, outer);
                 break :blk .null;
             },
             .function => |call| blk: {
@@ -3754,7 +3886,7 @@ pub const Connection = struct {
                     ownedList.deinit(self.allocator);
                 }
                 if (call.argument.* != .wildcard) {
-                    const v1 = try self.evalContext(table, row, call.argument.*, parameters, outer);
+                    const v1 = try self.evalContext(tbl, row, call.argument.*, parameters, outer);
                     try argList.append(self.allocator, v1);
                     try ownedList.append(self.allocator, call.argument.* == .function or call.argument.* == .binary);
                 }
@@ -3763,66 +3895,83 @@ pub const Connection = struct {
                         try argList.append(self.allocator, .{ .text = a2.identifier });
                         try ownedList.append(self.allocator, false);
                     } else {
-                        const v2 = try self.evalContext(table, row, a2.*, parameters, outer);
+                        const v2 = try self.evalContext(tbl, row, a2.*, parameters, outer);
                         try argList.append(self.allocator, v2);
                         try ownedList.append(self.allocator, a2.* == .function or a2.* == .binary);
                     }
                 }
                 if (call.argument3) |a3| {
-                    const v3 = try self.evalContext(table, row, a3.*, parameters, outer);
+                    const v3 = try self.evalContext(tbl, row, a3.*, parameters, outer);
                     try argList.append(self.allocator, v3);
                     try ownedList.append(self.allocator, a3.* == .function or a3.* == .binary);
                 }
                 for (call.extraArgs) |ea| {
-                    const vea = try self.evalContext(table, row, ea, parameters, outer);
+                    const vea = try self.evalContext(tbl, row, ea, parameters, outer);
                     try argList.append(self.allocator, vea);
                     try ownedList.append(self.allocator, ea == .function or ea == .binary);
                 }
                 break :blk functions.evalScalar(self.allocator, call.name, argList.items) catch return error.Unsupported;
             },
             .scalarSubquery => |sql| blk: {
-                const currentOuter: OuterRow = if (table != null and row.len > 0) .{ .table = table.?, .alias = if (outer) |o| (if (o.table == table.?) o.alias else null) else null, .values = row, .prev = if (outer != null and outer.?.table == table.?) outer.?.prev else outer } else if (outer) |o| o.* else .{ .table = undefined, .values = &.{} };
-                const effectiveOuter: ?*const OuterRow = if (table != null and row.len > 0) &currentOuter else outer;
+                const currentOuter: OuterRow = if (tbl != null and row.len > 0) .{ .table = tbl.?, .alias = if (outer) |o| (if (o.table == tbl.?) o.alias else null) else null, .values = row, .prev = if (outer != null and outer.?.table == tbl.?) outer.?.prev else outer } else if (outer) |o| o.* else .{ .table = undefined, .values = &.{} };
+                const effectiveOuter: ?*const OuterRow = if (tbl != null and row.len > 0) &currentOuter else outer;
                 var sub = try self.executeWithOuter(sql, parameters, effectiveOuter);
                 defer sub.deinit();
                 if (sub.rows.len == 0 or sub.columns.len == 0) break :blk .null;
                 break :blk try self.copyValue(sub.rows[0][0]);
             },
             .existsSubquery => |sql| blk: {
-                const currentOuter: OuterRow = if (table != null and row.len > 0) .{ .table = table.?, .alias = if (outer) |o| (if (o.table == table.?) o.alias else null) else null, .values = row, .prev = if (outer != null and outer.?.table == table.?) outer.?.prev else outer } else if (outer) |o| o.* else .{ .table = undefined, .values = &.{} };
-                const effectiveOuter: ?*const OuterRow = if (table != null and row.len > 0) &currentOuter else outer;
+                const currentOuter: OuterRow = if (tbl != null and row.len > 0) .{ .table = tbl.?, .alias = if (outer) |o| (if (o.table == tbl.?) o.alias else null) else null, .values = row, .prev = if (outer != null and outer.?.table == tbl.?) outer.?.prev else outer } else if (outer) |o| o.* else .{ .table = undefined, .values = &.{} };
+                const effectiveOuter: ?*const OuterRow = if (tbl != null and row.len > 0) &currentOuter else outer;
                 var sub = try self.executeWithOuter(sql, parameters, effectiveOuter);
                 defer sub.deinit();
                 break :blk .{ .integer = if (sub.rows.len > 0) 1 else 0 };
             },
             .inSubquery => |inSub| blk: {
-                const target = try self.evalContext(table, row, inSub.expr.*, parameters, outer);
+                const target = try self.evalContext(tbl, row, inSub.expr.*, parameters, outer);
+                defer freeBinaryOwned(inSub.expr.*, target, self.allocator);
                 if (target == .null) break :blk .null;
-                const currentOuter: OuterRow = if (table != null and row.len > 0) .{ .table = table.?, .alias = if (outer) |o| (if (o.table == table.?) o.alias else null) else null, .values = row, .prev = if (outer != null and outer.?.table == table.?) outer.?.prev else outer } else if (outer) |o| o.* else .{ .table = undefined, .values = &.{} };
-                const effectiveOuter: ?*const OuterRow = if (table != null and row.len > 0) &currentOuter else outer;
+                const currentOuter: OuterRow = if (tbl != null and row.len > 0) .{ .table = tbl.?, .alias = if (outer) |o| (if (o.table == tbl.?) o.alias else null) else null, .values = row, .prev = if (outer != null and outer.?.table == tbl.?) outer.?.prev else outer } else if (outer) |o| o.* else .{ .table = undefined, .values = &.{} };
+                const effectiveOuter: ?*const OuterRow = if (tbl != null and row.len > 0) &currentOuter else outer;
                 var sub = try self.executeWithOuter(inSub.subquery, parameters, effectiveOuter);
                 defer sub.deinit();
                 var found = false;
+                var sawNull = false;
                 for (sub.rows) |r| {
-                    if (r.len != 0 and compare(target, .equal, r[0])) {
+                    if (r.len == 0) continue;
+                    if (r[0] == .null) {
+                        sawNull = true;
+                        continue;
+                    }
+                    if (compare(target, .equal, r[0])) {
                         found = true;
                         break;
                     }
                 }
+                // No match but a NULL was seen: the answer is unknown, not false.
+                if (!found and sawNull) break :blk .null;
                 const result = if (inSub.negated) !found else found;
                 break :blk .{ .integer = if (result) 1 else 0 };
             },
             .inList => |inL| blk: {
-                const target = try self.evalContext(table, row, inL.expr.*, parameters, outer);
+                const target = try self.evalContext(tbl, row, inL.expr.*, parameters, outer);
+                defer freeBinaryOwned(inL.expr.*, target, self.allocator);
                 if (target == .null) break :blk .null;
                 var found = false;
+                var sawNull = false;
                 for (inL.list) |candidate| {
-                    const candidateVal = try self.evalContext(table, row, candidate, parameters, outer);
+                    const candidateVal = try self.evalContext(tbl, row, candidate, parameters, outer);
+                    defer freeBinaryOwned(candidate, candidateVal, self.allocator);
+                    if (candidateVal == .null) {
+                        sawNull = true;
+                        continue;
+                    }
                     if (compare(target, .equal, candidateVal)) {
                         found = true;
                         break;
                     }
                 }
+                if (!found and sawNull) break :blk .null;
                 const result = if (inL.negated) !found else found;
                 break :blk .{ .integer = if (result) 1 else 0 };
             },
@@ -3856,83 +4005,83 @@ pub const Connection = struct {
         return text[0] == pattern[0] and globMatch(text[1..], pattern[1..]);
     }
 
-    fn materialize(self: *Connection, table: *const Table, row: []const Value, expr: ast.Expr, parameters: []const Value) !Value {
-        return self.materializeContext(table, row, expr, parameters, null);
+    fn materialize(self: *Connection, tbl: *const Table, row: []const Value, expr: ast.Expr, parameters: []const Value) !Value {
+        return self.materializeContext(tbl, row, expr, parameters, null);
     }
 
-    fn materializeContext(self: *Connection, table: *const Table, row: []const Value, expr: ast.Expr, parameters: []const Value, outer: ?*const OuterRow) !Value {
-        const raw = try self.evalContext(table, row, expr, parameters, outer);
+    fn materializeContext(self: *Connection, tbl: *const Table, row: []const Value, expr: ast.Expr, parameters: []const Value, outer: ?*const OuterRow) !Value {
+        const raw = try self.evalContext(tbl, row, expr, parameters, outer);
         return switch (expr) {
             .binary, .unary, .function => raw,
             else => try self.copyValue(raw),
         };
     }
 
-    fn initializeInsertRow(self: *Connection, table: *const Table, row: []Value) !void {
+    fn initializeInsertRow(self: *Connection, tbl: *const Table, row: []Value) !void {
         _ = self;
         @memset(row, .null);
-        for (table.columns, 0..) |column, index| {
+        for (tbl.columns, 0..) |column, index| {
             if (column.defaultValue) |default| row[index] = default;
         }
     }
 
-    fn validateReturningExpr(table: *const Table, expr: ast.Expr) !void {
+    fn validateReturningExpr(tbl: *const Table, expr: ast.Expr) !void {
         switch (expr) {
             .wildcard, .literal, .parameter, .scalarSubquery, .existsSubquery => {},
             .identifier => |name| {
                 const colName = if (std.mem.lastIndexOfScalar(u8, name, '.')) |dot| name[dot + 1 ..] else name;
-                _ = try columnIndex(table, colName);
+                _ = try columnIndex(tbl, colName);
             },
             .function => |call| {
-                try validateReturningExpr(table, call.argument.*);
-                if (call.argument2) |arg| try validateReturningExpr(table, arg.*);
-                if (call.argument3) |arg| try validateReturningExpr(table, arg.*);
-                for (call.extraArgs) |arg| try validateReturningExpr(table, arg);
+                try validateReturningExpr(tbl, call.argument.*);
+                if (call.argument2) |arg| try validateReturningExpr(tbl, arg.*);
+                if (call.argument3) |arg| try validateReturningExpr(tbl, arg.*);
+                for (call.extraArgs) |arg| try validateReturningExpr(tbl, arg);
             },
             .binary => |binary| {
-                try validateReturningExpr(table, binary.left.*);
-                try validateReturningExpr(table, binary.right.*);
+                try validateReturningExpr(tbl, binary.left.*);
+                try validateReturningExpr(tbl, binary.right.*);
             },
-            .unary => |unary| try validateReturningExpr(table, unary.expr.*),
+            .unary => |unary| try validateReturningExpr(tbl, unary.expr.*),
             .caseExpr => |caseBlock| {
-                if (caseBlock.base) |base| try validateReturningExpr(table, base.*);
+                if (caseBlock.base) |base| try validateReturningExpr(tbl, base.*);
                 for (caseBlock.whens) |when| {
-                    try validateReturningExpr(table, when.condition);
-                    try validateReturningExpr(table, when.result);
+                    try validateReturningExpr(tbl, when.condition);
+                    try validateReturningExpr(tbl, when.result);
                 }
-                if (caseBlock.otherwise) |otherwise| try validateReturningExpr(table, otherwise.*);
+                if (caseBlock.otherwise) |otherwise| try validateReturningExpr(tbl, otherwise.*);
             },
             .patternMatch => |match| {
-                try validateReturningExpr(table, match.value.*);
-                try validateReturningExpr(table, match.pattern.*);
-                if (match.escape) |escape| try validateReturningExpr(table, escape.*);
+                try validateReturningExpr(tbl, match.value.*);
+                try validateReturningExpr(tbl, match.pattern.*);
+                if (match.escape) |escape| try validateReturningExpr(tbl, escape.*);
             },
-            .collate => |node| try validateReturningExpr(table, node.expr.*),
+            .collate => |node| try validateReturningExpr(tbl, node.expr.*),
             .inList => |inL| {
-                try validateReturningExpr(table, inL.expr.*);
-                for (inL.list) |item| try validateReturningExpr(table, item);
+                try validateReturningExpr(tbl, inL.expr.*);
+                for (inL.list) |item| try validateReturningExpr(tbl, item);
             },
-            .inSubquery => |inSub| try validateReturningExpr(table, inSub.expr.*),
+            .inSubquery => |inSub| try validateReturningExpr(tbl, inSub.expr.*),
             .window => |w| {
-                if (w.argument) |arg| try validateReturningExpr(table, arg.*);
-                if (w.argument2) |arg| try validateReturningExpr(table, arg.*);
-                for (w.extraArgs) |arg| try validateReturningExpr(table, arg);
-                for (w.partitionBy) |arg| try validateReturningExpr(table, arg);
-                for (w.orderBy) |item| try validateReturningExpr(table, item.expr);
+                if (w.argument) |arg| try validateReturningExpr(tbl, arg.*);
+                if (w.argument2) |arg| try validateReturningExpr(tbl, arg.*);
+                for (w.extraArgs) |arg| try validateReturningExpr(tbl, arg);
+                for (w.partitionBy) |arg| try validateReturningExpr(tbl, arg);
+                for (w.orderBy) |item| try validateReturningExpr(tbl, item.expr);
             },
         }
     }
 
-    fn validateReturningColumns(table: *const Table, returning: []const ast.Projection) !void {
-        for (returning) |projection| try validateReturningExpr(table, projection.expr);
+    fn validateReturningColumns(tbl: *const Table, returning: []const ast.Projection) !void {
+        for (returning) |projection| try validateReturningExpr(tbl, projection.expr);
     }
 
-    fn evaluateReturning(self: *Connection, table: *const Table, returning: []const ast.Projection, affectedRows: []const []const Value, parameters: []const Value) !Result {
+    fn evaluateReturning(self: *Connection, tbl: *const Table, returning: []const ast.Projection, affectedRows: []const []const Value, parameters: []const Value) !Result {
         var columns = std.ArrayList([]const u8).empty;
         defer columns.deinit(self.allocator);
         for (returning) |projection| {
             switch (projection.expr) {
-                .wildcard => for (table.columns) |column| try columns.append(self.allocator, column.name),
+                .wildcard => for (tbl.columns) |column| try columns.append(self.allocator, column.name),
                 .identifier => try columns.append(self.allocator, projection.alias orelse projection.expr.identifier),
                 .function => try columns.append(self.allocator, projection.alias orelse projection.expr.function.name),
                 else => try columns.append(self.allocator, projection.alias orelse "?column?"),
@@ -3961,7 +4110,7 @@ pub const Connection = struct {
                         outIndex += 1;
                     }
                 } else {
-                    resultRow[outIndex] = try self.materialize(table, rowValues, projection.expr, parameters);
+                    resultRow[outIndex] = try self.materialize(tbl, rowValues, projection.expr, parameters);
                     outIndex += 1;
                 }
             }
@@ -3976,10 +4125,10 @@ pub const Connection = struct {
         };
     }
 
-    fn noteInsertedRowid(self: *Connection, table: *const Table) void {
-        if (Schema.rowidAliasColumn(table)) |alias| {
-            if (table.rows.items.len == 0) return;
-            switch (table.rows.items[table.rows.items.len - 1].values[alias]) {
+    fn noteInsertedRowid(self: *Connection, tbl: *const Table) void {
+        if (Schema.rowidAliasColumn(tbl)) |alias| {
+            if (tbl.rows.items.len == 0) return;
+            switch (tbl.rows.items[tbl.rows.items.len - 1].values[alias]) {
                 .integer => |id| self.lastRowid = id,
                 else => {},
             }
@@ -3990,16 +4139,16 @@ pub const Connection = struct {
         if (self.cteActive(value.table)) return error.InvalidSql;
         const resolved = self.resolveTableName(value.table) orelse return error.UnknownTable;
         const store = self.storeFor(resolved.ref);
-        const table = resolved.table;
-        try validateReturningColumns(table, value.returning);
+        const tbl = resolved.table;
+        try validateReturningColumns(tbl, value.returning);
         var nonGenCount: usize = 0;
-        for (table.columns) |c| if (c.generatedExpr == null) {
+        for (tbl.columns) |c| if (c.generatedExpr == null) {
             nonGenCount += 1;
         };
         if (value.columns.len > 0) {
             for (value.columns) |name| {
-                const idx = try columnIndex(table, name);
-                if (table.columns[idx].generatedExpr != null) return error.ConstraintViolation;
+                const idx = try columnIndex(tbl, name);
+                if (tbl.columns[idx].generatedExpr != null) return error.ConstraintViolation;
             }
         }
         var affectedRows = std.ArrayList([]const Value).empty;
@@ -4009,13 +4158,13 @@ pub const Connection = struct {
             defer source.deinit();
             var changes: usize = 0;
             for (source.rows) |sourceRow| {
-                var row = try self.allocator.alloc(Value, table.columns.len);
+                var row = try self.allocator.alloc(Value, tbl.columns.len);
                 defer self.allocator.free(row);
-                try self.initializeInsertRow(table, row);
+                try self.initializeInsertRow(tbl, row);
                 if (value.columns.len == 0) {
                     if (sourceRow.len != nonGenCount) return error.ColumnCountMismatch;
                     var nonGenIdx: usize = 0;
-                    for (table.columns, 0..) |column, index| {
+                    for (tbl.columns, 0..) |column, index| {
                         if (column.generatedExpr == null) {
                             row[index] = sourceRow[nonGenIdx];
                             nonGenIdx += 1;
@@ -4023,13 +4172,13 @@ pub const Connection = struct {
                     }
                 } else {
                     if (value.columns.len != sourceRow.len) return error.ColumnCountMismatch;
-                    for (value.columns, sourceRow) |name, item| row[try columnIndex(table, name)] = item;
+                    for (value.columns, sourceRow) |name, item| row[try columnIndex(tbl, name)] = item;
                 }
-                try self.fireTriggers(store, table, .before, .insert, row, null, &.{});
-                store.appendRow(table, row) catch |err| {
+                try self.fireTriggers(store, tbl, .before, .insert, row, null, &.{});
+                store.appendRow(tbl, row) catch |err| {
                     if (value.conflict == .ignore and err == error.ConstraintViolation) {
                         if (value.conflictTargetColumns.len > 0 or value.conflictTargetWhere != null) {
-                            if (try self.conflictRowTarget(store, table, row, value.conflictTargetColumns, value.conflictTargetWhere, parameters) != null) {
+                            if (try self.conflictRowTarget(store, tbl, row, value.conflictTargetColumns, value.conflictTargetWhere, parameters) != null) {
                                 continue;
                             } else {
                                 return err;
@@ -4038,20 +4187,20 @@ pub const Connection = struct {
                         continue;
                     }
                     if (value.conflict == .replace and err == error.ConstraintViolation) {
-                        if (try self.replaceConflict(store, table, row)) {
-                            try store.appendRow(table, row);
-                            self.noteInsertedRowid(table);
-                            try self.fireTriggers(store, table, .after, .insert, row, null, &.{});
+                        if (try self.replaceConflict(store, tbl, row)) {
+                            try store.appendRow(tbl, row);
+                            self.noteInsertedRowid(tbl);
+                            try self.fireTriggers(store, tbl, .after, .insert, row, null, &.{});
                             changes += 1;
-                            try affectedRows.append(self.allocator, table.rows.items[table.rows.items.len - 1].values);
+                            try affectedRows.append(self.allocator, tbl.rows.items[tbl.rows.items.len - 1].values);
                             continue;
                         }
                     }
                     if (value.conflict == .update and err == error.ConstraintViolation) {
-                        switch (try self.applyUpsert(store, table, row, value.conflictTargetColumns, value.conflictTargetWhere, value.upsertColumns, value.upsertValues, value.upsertWhere, parameters)) {
+                        switch (try self.applyUpsert(store, tbl, row, value.conflictTargetColumns, value.conflictTargetWhere, value.upsertColumns, value.upsertValues, value.upsertWhere, parameters)) {
                             .updated => |upIdx| {
                                 changes += 1;
-                                try affectedRows.append(self.allocator, table.rows.items[upIdx].values);
+                                try affectedRows.append(self.allocator, tbl.rows.items[upIdx].values);
                                 continue;
                             },
                             .skipped => continue,
@@ -4060,23 +4209,23 @@ pub const Connection = struct {
                     }
                     return err;
                 };
-                self.noteInsertedRowid(table);
-                try self.fireTriggers(store, table, .after, .insert, row, null, &.{});
+                self.noteInsertedRowid(tbl);
+                try self.fireTriggers(store, tbl, .after, .insert, row, null, &.{});
                 changes += 1;
-                try affectedRows.append(self.allocator, table.rows.items[table.rows.items.len - 1].values);
+                try affectedRows.append(self.allocator, tbl.rows.items[tbl.rows.items.len - 1].values);
             }
-            if (value.returning.len > 0) return self.evaluateReturning(table, value.returning, affectedRows.items, parameters);
+            if (value.returning.len > 0) return self.evaluateReturning(tbl, value.returning, affectedRows.items, parameters);
             return .{ .allocator = self.allocator, .columns = try self.allocator.alloc([]const u8, 0), .rows = try self.allocator.alloc([]Value, 0), .changes = changes };
         }
         var changes: usize = 0;
         for (value.rows) |rowExprs| {
-            var row = try self.allocator.alloc(Value, table.columns.len);
+            var row = try self.allocator.alloc(Value, tbl.columns.len);
             defer self.allocator.free(row);
-            try self.initializeInsertRow(table, row);
+            try self.initializeInsertRow(tbl, row);
             if (value.columns.len == 0) {
                 if (rowExprs.len != 0 and rowExprs.len != nonGenCount) return error.ColumnCountMismatch;
                 var nonGenIdx: usize = 0;
-                for (table.columns, 0..) |column, index| {
+                for (tbl.columns, 0..) |column, index| {
                     if (column.generatedExpr == null) {
                         if (nonGenIdx < rowExprs.len) {
                             row[index] = try self.resolve(rowExprs[nonGenIdx], parameters);
@@ -4086,15 +4235,15 @@ pub const Connection = struct {
                 }
             } else {
                 if (value.columns.len != rowExprs.len) return error.ColumnCountMismatch;
-                for (value.columns, rowExprs) |name, expr| row[try columnIndex(table, name)] = try self.resolve(expr, parameters);
+                for (value.columns, rowExprs) |name, expr| row[try columnIndex(tbl, name)] = try self.resolve(expr, parameters);
             }
             {
-                defer self.freeResolvedTemps(table, row, value.columns, rowExprs);
-                try self.fireTriggers(store, table, .before, .insert, row, null, &.{});
-                store.appendRow(table, row) catch |err| {
+                defer self.freeResolvedTemps(tbl, row, value.columns, rowExprs);
+                try self.fireTriggers(store, tbl, .before, .insert, row, null, &.{});
+                store.appendRow(tbl, row) catch |err| {
                     if (value.conflict == .ignore and err == error.ConstraintViolation) {
                         if (value.conflictTargetColumns.len > 0 or value.conflictTargetWhere != null) {
-                            if (try self.conflictRowTarget(store, table, row, value.conflictTargetColumns, value.conflictTargetWhere, parameters) != null) {
+                            if (try self.conflictRowTarget(store, tbl, row, value.conflictTargetColumns, value.conflictTargetWhere, parameters) != null) {
                                 continue;
                             } else {
                                 return err;
@@ -4103,20 +4252,20 @@ pub const Connection = struct {
                         continue;
                     }
                     if (value.conflict == .replace and err == error.ConstraintViolation) {
-                        if (try self.replaceConflict(store, table, row)) {
-                            try store.appendRow(table, row);
-                            self.noteInsertedRowid(table);
-                            try self.fireTriggers(store, table, .after, .insert, row, null, &.{});
+                        if (try self.replaceConflict(store, tbl, row)) {
+                            try store.appendRow(tbl, row);
+                            self.noteInsertedRowid(tbl);
+                            try self.fireTriggers(store, tbl, .after, .insert, row, null, &.{});
                             changes += 1;
-                            try affectedRows.append(self.allocator, table.rows.items[table.rows.items.len - 1].values);
+                            try affectedRows.append(self.allocator, tbl.rows.items[tbl.rows.items.len - 1].values);
                             continue;
                         }
                     }
                     if (value.conflict == .update and err == error.ConstraintViolation) {
-                        switch (try self.applyUpsert(store, table, row, value.conflictTargetColumns, value.conflictTargetWhere, value.upsertColumns, value.upsertValues, value.upsertWhere, parameters)) {
+                        switch (try self.applyUpsert(store, tbl, row, value.conflictTargetColumns, value.conflictTargetWhere, value.upsertColumns, value.upsertValues, value.upsertWhere, parameters)) {
                             .updated => |upIdx| {
                                 changes += 1;
-                                try affectedRows.append(self.allocator, table.rows.items[upIdx].values);
+                                try affectedRows.append(self.allocator, tbl.rows.items[upIdx].values);
                                 continue;
                             },
                             .skipped => continue,
@@ -4125,21 +4274,21 @@ pub const Connection = struct {
                     }
                     return err;
                 };
-                self.noteInsertedRowid(table);
-                try self.fireTriggers(store, table, .after, .insert, row, null, &.{});
+                self.noteInsertedRowid(tbl);
+                try self.fireTriggers(store, tbl, .after, .insert, row, null, &.{});
                 changes += 1;
-                try affectedRows.append(self.allocator, table.rows.items[table.rows.items.len - 1].values);
+                try affectedRows.append(self.allocator, tbl.rows.items[tbl.rows.items.len - 1].values);
             }
         }
-        if (value.returning.len > 0) return self.evaluateReturning(table, value.returning, affectedRows.items, parameters);
+        if (value.returning.len > 0) return self.evaluateReturning(tbl, value.returning, affectedRows.items, parameters);
         return .{ .allocator = self.allocator, .columns = try self.allocator.alloc([]const u8, 0), .rows = try self.allocator.alloc([]Value, 0), .changes = changes };
     }
 
-    fn selectGrouped(self: *Connection, table: *const Table, value: anytype, groupName: []const u8, parameters: []const Value) !Result {
+    fn selectGrouped(self: *Connection, tbl: *const Table, value: anytype, groupName: []const u8, parameters: []const Value) !Result {
         const Group = struct { key: Value, rows: std.ArrayList(usize) };
         const groupParts = splitQualifier(groupName);
-        if (!groupQualifierMatches(groupParts.qualifier, table, value.tableAlias)) return error.UnknownColumn;
-        const groupIndex = try columnIndex(table, groupParts.column);
+        if (!groupQualifierMatches(groupParts.qualifier, tbl, value.tableAlias)) return error.UnknownColumn;
+        const groupIndex = try columnIndex(tbl, groupParts.column);
         var groups = std.ArrayList(Group).empty;
         defer {
             for (groups.items) |*group| {
@@ -4148,8 +4297,8 @@ pub const Connection = struct {
             }
             groups.deinit(self.allocator);
         }
-        for (table.rows.items, 0..) |row, rowIndex| {
-            if (!try self.matches(table, row.values, value.condition, parameters)) continue;
+        for (tbl.rows.items, 0..) |row, rowIndex| {
+            if (!try self.matches(tbl, row.values, value.condition, parameters)) continue;
             var found: ?usize = null;
             for (groups.items, 0..) |group, position| if (sameValue(group.key, row.values[groupIndex])) {
                 found = position;
@@ -4178,20 +4327,26 @@ pub const Connection = struct {
             rows.deinit(self.allocator);
         }
         var sortAfter = false;
-        if (value.order) |ord| {
-            const orderName = splitQualifier(ord.column).column;
-            for (columns.items) |name| if (std.ascii.eqlIgnoreCase(splitQualifier(name).column, orderName)) {
-                sortAfter = true;
-                break;
-            };
+        if (value.orders.len != 0) {
+            sortAfter = true;
+            for (value.orders) |keyOrder| {
+                if (resolveSortOutputIndex(columns.items, value.projections, keyOrder.column) == null) {
+                    sortAfter = false;
+                    break;
+                }
+            }
             if (!sortAfter) {
-                if (!std.ascii.eqlIgnoreCase(orderName, groupParts.column) or !groupQualifierMatches(splitQualifier(ord.column).qualifier, table, value.tableAlias)) return error.Unsupported;
+                if (value.orders.len != 1) return error.Unsupported;
+                const ord = value.orders[0];
+                const orderName = splitQualifier(ord.column).column;
+                if (!std.ascii.eqlIgnoreCase(orderName, groupParts.column) or !groupQualifierMatches(splitQualifier(ord.column).qualifier, tbl, value.tableAlias)) return error.Unsupported;
                 var gi: usize = 0;
                 while (gi < groups.items.len) : (gi += 1) {
                     var gj = gi + 1;
                     while (gj < groups.items.len) : (gj += 1) {
-                        const swap = if (ord.descending) compare(groups.items[gi].key, .less, groups.items[gj].key) else compare(groups.items[gi].key, .greater, groups.items[gj].key);
-                        if (swap) std.mem.swap(Group, &groups.items[gi], &groups.items[gj]);
+                        const placed = groups.items[gi].key.order(groups.items[gj].key, .binary);
+                        if ((if (ord.descending) placed.invert() else placed) == .gt)
+                            std.mem.swap(Group, &groups.items[gi], &groups.items[gj]);
                     }
                 }
             }
@@ -4201,7 +4356,7 @@ pub const Connection = struct {
                 const leftValue: Value = switch (having.left) {
                     .identifier => |name| blk: {
                         const parts = splitQualifier(name);
-                        if (!std.ascii.eqlIgnoreCase(parts.column, groupParts.column) or !groupQualifierMatches(parts.qualifier, table, value.tableAlias)) return error.Unsupported;
+                        if (!std.ascii.eqlIgnoreCase(parts.column, groupParts.column) or !groupQualifierMatches(parts.qualifier, tbl, value.tableAlias)) return error.Unsupported;
                         break :blk try self.copyValue(group.key);
                     },
                     .function => |function| blk: {
@@ -4217,7 +4372,7 @@ pub const Connection = struct {
                                 if (function.argument.* == .wildcard) {
                                     agg.stepWildcard();
                                 } else {
-                                    const item = try self.eval(table, table.rows.items[rowIndex].values, function.argument.*, parameters);
+                                    const item = try self.eval(tbl, tbl.rows.items[rowIndex].values, function.argument.*, parameters);
                                     try agg.step(item, function.distinct);
                                 }
                             }
@@ -4239,7 +4394,7 @@ pub const Connection = struct {
             for (value.projections, 0..) |projection, outputIndex| switch (projection.expr) {
                 .identifier => {
                     const parts = splitQualifier(projection.expr.identifier);
-                    if (!std.ascii.eqlIgnoreCase(parts.column, groupParts.column) or !groupQualifierMatches(parts.qualifier, table, value.tableAlias)) return error.Unsupported;
+                    if (!std.ascii.eqlIgnoreCase(parts.column, groupParts.column) or !groupQualifierMatches(parts.qualifier, tbl, value.tableAlias)) return error.Unsupported;
                     output[outputIndex] = try self.copyValue(group.key);
                 },
                 .function => |function| {
@@ -4255,7 +4410,7 @@ pub const Connection = struct {
                             if (function.argument.* == .wildcard) {
                                 agg.stepWildcard();
                             } else {
-                                const item = try self.eval(table, table.rows.items[rowIndex].values, function.argument.*, parameters);
+                                const item = try self.eval(tbl, tbl.rows.items[rowIndex].values, function.argument.*, parameters);
                                 try agg.step(item, function.distinct);
                             }
                         }
@@ -4268,26 +4423,26 @@ pub const Connection = struct {
             };
             try rows.append(self.allocator, output);
         }
-        if (sortAfter) try sortJoinRows(&rows, columns.items, value.order);
+        if (sortAfter) try self.sortJoinRows(&rows, columns.items, value.projections, value.orders);
         try self.paginateJoinRows(&rows, value.limit, value.offset);
         return .{ .allocator = self.allocator, .columns = try self.ownedColumns(columns.items), .rows = try rows.toOwnedSlice(self.allocator) };
     }
 
-    fn conflictRow(self: *Connection, store: *Schema, table: *const Table, values: []const Value, ignoreIndex: ?usize) anyerror!?usize {
-        for (table.rows.items, 0..) |existing, rowIndex| {
+    fn conflictRow(self: *Connection, store: *Schema, tbl: *const Table, values: []const Value, ignoreIndex: ?usize) anyerror!?usize {
+        for (tbl.rows.items, 0..) |existing, rowIndex| {
             if (ignoreIndex != null and ignoreIndex.? == rowIndex) continue;
             var matched = false;
-            for (table.columns, 0..) |column, columnIdx| if ((column.primaryKey or column.unique) and values[columnIdx] != .null and sameValue(existing.values[columnIdx], values[columnIdx])) {
+            for (tbl.columns, 0..) |column, columnIdx| if ((column.primaryKey or column.unique) and values[columnIdx] != .null and sameValue(existing.values[columnIdx], values[columnIdx])) {
                 matched = true;
                 break;
             };
             if (matched) return rowIndex;
-            for (table.constraints) |constraint| {
+            for (tbl.constraints) |constraint| {
                 if (constraint.kind == .foreignKey) continue;
                 var valid = true;
                 var hasNull = false;
                 for (constraint.columns) |name| {
-                    const columnIdx = columnIndex(table, name) catch {
+                    const columnIdx = columnIndex(tbl, name) catch {
                         valid = false;
                         break;
                     };
@@ -4296,7 +4451,7 @@ pub const Connection = struct {
                 }
                 if (valid and (constraint.kind == .primaryKey or !hasNull)) return rowIndex;
             }
-            for (store.indexes.items) |index| if (index.unique and std.ascii.eqlIgnoreCase(index.table, table.name)) {
+            for (store.indexes.items) |index| if (index.unique and std.ascii.eqlIgnoreCase(index.table, tbl.name)) {
                 var colNames: ?[][]const u8 = null;
                 defer if (colNames) |names| self.allocator.free(names);
                 var valid = true;
@@ -4304,8 +4459,8 @@ pub const Connection = struct {
                 for (index.columns, 0..) |name, position| {
                     if (index.keyExpr(position) != null) {
                         if (colNames == null) {
-                            const names = try self.allocator.alloc([]const u8, table.columns.len);
-                            for (table.columns, 0..) |tableColumn, idx| names[idx] = tableColumn.name;
+                            const names = try self.allocator.alloc([]const u8, tbl.columns.len);
+                            for (tbl.columns, 0..) |tableColumn, idx| names[idx] = tableColumn.name;
                             colNames = names;
                         }
                         const leftVal = try exprEvaluator.evalTemp(self.allocator, colNames.?, existing.values, index.keyExpr(position).?);
@@ -4319,7 +4474,7 @@ pub const Connection = struct {
                         if (!leftVal.sameValue(rightVal)) valid = false;
                         continue;
                     }
-                    const columnIdx = columnIndex(table, name) catch {
+                    const columnIdx = columnIndex(tbl, name) catch {
                         valid = false;
                         break;
                     };
@@ -4327,26 +4482,26 @@ pub const Connection = struct {
                     if (!sameValue(existing.values[columnIdx], values[columnIdx])) valid = false;
                 }
                 if (!valid or hasNull) continue;
-                if (!try store.indexPredicateHolds(table, &index, values)) continue;
-                if (!try store.indexPredicateHolds(table, &index, existing.values)) continue;
+                if (!try store.indexPredicateHolds(tbl, &index, values)) continue;
+                if (!try store.indexPredicateHolds(tbl, &index, existing.values)) continue;
                 return rowIndex;
             };
         }
         return null;
     }
 
-    fn conflictRowTarget(self: *Connection, store: *Schema, table: *const Table, values: []const Value, targetColumns: []const []const u8, targetWhere: ?ast.Conditions, parameters: []const Value) anyerror!?usize {
+    fn conflictRowTarget(self: *Connection, store: *Schema, tbl: *const Table, values: []const Value, targetColumns: []const []const u8, targetWhere: ?ast.Conditions, parameters: []const Value) anyerror!?usize {
         if (targetColumns.len == 0) {
-            const rowIdx = (try self.conflictRow(store, table, values, null)) orelse return null;
+            const rowIdx = (try self.conflictRow(store, tbl, values, null)) orelse return null;
             if (targetWhere) |whereCond| {
-                if (!try self.matches(table, table.rows.items[rowIdx].values, whereCond, parameters)) return null;
+                if (!try self.matches(tbl, tbl.rows.items[rowIdx].values, whereCond, parameters)) return null;
             }
             return rowIdx;
         }
-        for (table.rows.items, 0..) |existing, rowIndex| {
+        for (tbl.rows.items, 0..) |existing, rowIndex| {
             var allMatch = true;
             for (targetColumns) |name| {
-                const columnIdx = columnIndex(table, name) catch {
+                const columnIdx = columnIndex(tbl, name) catch {
                     allMatch = false;
                     break;
                 };
@@ -4357,7 +4512,7 @@ pub const Connection = struct {
             }
             if (!allMatch) continue;
             if (targetWhere) |whereCond| {
-                if (!try self.matches(table, existing.values, whereCond, parameters)) continue;
+                if (!try self.matches(tbl, existing.values, whereCond, parameters)) continue;
             }
             return rowIndex;
         }
@@ -4370,15 +4525,15 @@ pub const Connection = struct {
         updated: usize,
     };
 
-    fn recomputeGeneratedColumns(self: *Connection, table: *const Table, row: []Value, freeOld: bool) !void {
-        var colNames = try self.allocator.alloc([]const u8, table.columns.len);
+    fn recomputeGeneratedColumns(self: *Connection, tbl: *const Table, row: []Value, freeOld: bool) !void {
+        var colNames = try self.allocator.alloc([]const u8, tbl.columns.len);
         defer self.allocator.free(colNames);
-        for (table.columns, 0..) |column, idx| colNames[idx] = column.name;
+        for (tbl.columns, 0..) |column, idx| colNames[idx] = column.name;
 
         var pass: usize = 0;
-        while (pass < table.columns.len) : (pass += 1) {
+        while (pass < tbl.columns.len) : (pass += 1) {
             var anyChanged = false;
-            for (table.columns, 0..) |column, index| {
+            for (tbl.columns, 0..) |column, index| {
                 if (column.generatedExpr) |genExpr| {
                     const genVal = try exprEvaluator.eval(self.allocator, colNames, row, genExpr);
                     if (!sameValue(row[index], genVal)) {
@@ -4400,7 +4555,7 @@ pub const Connection = struct {
     fn applyUpsert(
         self: *Connection,
         store: *Schema,
-        table: *Table,
+        tbl: *Table,
         values: []const Value,
         targetColumns: []const []const u8,
         targetWhere: ?ast.Conditions,
@@ -4410,19 +4565,19 @@ pub const Connection = struct {
         parameters: []const Value,
     ) anyerror!UpsertOutcome {
         for (columns) |name| {
-            const index = try columnIndex(table, name);
-            if (table.columns[index].generatedExpr != null) return error.ConstraintViolation;
+            const index = try columnIndex(tbl, name);
+            if (tbl.columns[index].generatedExpr != null) return error.ConstraintViolation;
         }
-        const rowIndex = (try self.conflictRowTarget(store, table, values, targetColumns, targetWhere, parameters)) orelse return .noConflict;
-        const row = &table.rows.items[rowIndex];
+        const rowIndex = (try self.conflictRowTarget(store, tbl, values, targetColumns, targetWhere, parameters)) orelse return .noConflict;
+        const row = &tbl.rows.items[rowIndex];
         const excludedOuter = OuterRow{
-            .table = table,
+            .table = tbl,
             .alias = "excluded",
             .values = values,
             .prev = null,
         };
         if (where) |conditions| {
-            if (!try self.matchesContext(table, row.values, conditions, parameters, &excludedOuter)) return .skipped;
+            if (!try self.matchesContext(tbl, row.values, conditions, parameters, &excludedOuter)) return .skipped;
         }
         const oldSnapshot = try self.allocator.alloc(Value, row.values.len);
         defer {
@@ -4434,10 +4589,10 @@ pub const Connection = struct {
         defer {
             for (columns, expressions) |name, expr| {
                 if (expr != .binary and expr != .unary and expr != .function and expr != .caseExpr) continue;
-                const index = columnIndex(table, name) catch continue;
+                const index = columnIndex(tbl, name) catch continue;
                 self.freeConcatText(candidate[index]);
             }
-            for (table.columns, 0..) |column, index| {
+            for (tbl.columns, 0..) |column, index| {
                 if (column.generatedExpr != null and !sameValue(candidate[index], row.values[index])) {
                     exprEvaluator.freeValue(self.allocator, candidate[index]);
                 }
@@ -4446,63 +4601,74 @@ pub const Connection = struct {
         }
         @memcpy(candidate, row.values);
         for (columns, expressions) |name, expression| {
-            const index = try columnIndex(table, name);
-            var newValue = try self.evalContext(table, row.values, expression, parameters, &excludedOuter);
-            if (table.strict) newValue = try Schema.coerceStrict(table.columns[index].typeName, newValue);
+            const index = try columnIndex(tbl, name);
+            var newValue = try self.evalContext(tbl, row.values, expression, parameters, &excludedOuter);
+            if (tbl.strict) newValue = try Schema.coerceStrict(tbl.columns[index].typeName, newValue);
             candidate[index] = newValue;
         }
-        try self.recomputeGeneratedColumns(table, candidate, false);
-        try self.fireTriggers(store, table, .before, .update, candidate, oldSnapshot, columns);
-        try store.validateUpdate(table, rowIndex, candidate);
-        try self.applyUpdateActions(store, table.name, row.values, candidate);
+        try self.recomputeGeneratedColumns(tbl, candidate, false);
+        try self.fireTriggers(store, tbl, .before, .update, candidate, oldSnapshot, columns);
+        try store.validateUpdate(tbl, rowIndex, candidate);
+        try self.applyUpdateActions(store, tbl.name, row.values, candidate);
         for (columns, expressions) |name, expression| {
-            const index = try columnIndex(table, name);
-            var newValue = try self.evalContext(table, row.values, expression, parameters, &excludedOuter);
-            if (newValue == .null and candidate[index] != .null) newValue = candidate[index];
-            if (table.strict) newValue = try Schema.coerceStrict(table.columns[index].typeName, newValue);
-            if (row.values[index] == .text) self.allocator.free(row.values[index].text);
-            if (row.values[index] == .blob) self.allocator.free(row.values[index].blob);
-            row.values[index] = switch (newValue) {
+            const index = try columnIndex(tbl, name);
+            var newValue = try self.evalContext(tbl, row.values, expression, parameters, &excludedOuter);
+            // Tracks eval-produced ownership: complex expressions yield fresh
+            // text/blobs that must be freed; plain references borrow storage.
+            var ownedResult = expression == .binary or expression == .unary or expression == .function or expression == .caseExpr;
+            if (newValue == .null and candidate[index] != .null) {
+                newValue = candidate[index];
+                ownedResult = false;
+            }
+            if (tbl.strict) newValue = try Schema.coerceStrict(tbl.columns[index].typeName, newValue);
+            // Duplicate before freeing: newValue may borrow the storage being
+            // replaced (e.g. DO UPDATE SET label = label).
+            const ownedCopy: Value = switch (newValue) {
                 .text => |text| .{ .text = try self.allocator.dupe(u8, text) },
                 .blob => |blob| .{ .blob = try self.allocator.dupe(u8, blob) },
                 else => newValue,
             };
-            if (expression == .binary or expression == .unary or expression == .function or expression == .caseExpr) self.freeConcatText(newValue);
+            if (row.values[index] == .text) self.allocator.free(row.values[index].text);
+            if (row.values[index] == .blob) self.allocator.free(row.values[index].blob);
+            row.values[index] = ownedCopy;
+            // Free eval-owned text only when it cannot alias live storage
+            // (CASE branches may pass a borrowed column through).
+            if (ownedResult and !valueBorrowsFrom(newValue, &.{ row.values, candidate, excludedOuter.values })) self.freeConcatText(newValue);
         }
-        try self.recomputeGeneratedColumns(table, row.values, true);
-        try self.fireTriggers(store, table, .after, .update, row.values, oldSnapshot, columns);
+        try self.recomputeGeneratedColumns(tbl, row.values, true);
+        try self.fireTriggers(store, tbl, .after, .update, row.values, oldSnapshot, columns);
         return .{ .updated = rowIndex };
     }
 
-    fn deleteRowAt(self: *Connection, store: *Schema, table: *Table, rowIndex: usize) !void {
-        try self.applyDeleteActions(store, table.name, table.rows.items[rowIndex].values);
-        try self.fireTriggers(store, table, .before, .delete, null, table.rows.items[rowIndex].values, &.{});
-        const removed = table.rows.orderedRemove(rowIndex);
-        try self.fireTriggers(store, table, .after, .delete, null, removed.values, &.{});
+    fn deleteRowAt(self: *Connection, store: *Schema, tbl: *Table, rowIndex: usize) !void {
+        try self.applyDeleteActions(store, tbl.name, tbl.rows.items[rowIndex].values);
+        try self.fireTriggers(store, tbl, .before, .delete, null, tbl.rows.items[rowIndex].values, &.{});
+        const removed = tbl.rows.orderedRemove(rowIndex);
+        try self.fireTriggers(store, tbl, .after, .delete, null, removed.values, &.{});
         for (removed.values) |item| if (item == .text) self.allocator.free(item.text) else if (item == .blob) self.allocator.free(item.blob);
         self.allocator.free(removed.values);
     }
 
-    fn replaceConflict(self: *Connection, store: *Schema, table: *Table, values: []const Value) anyerror!bool {
-        const rowIndex = (try self.conflictRow(store, table, values, null)) orelse return false;
-        try self.deleteRowAt(store, table, rowIndex);
+    fn replaceConflict(self: *Connection, store: *Schema, tbl: *Table, values: []const Value) anyerror!bool {
+        const rowIndex = (try self.conflictRow(store, tbl, values, null)) orelse return false;
+        try self.deleteRowAt(store, tbl, rowIndex);
         return true;
     }
 
-    fn resolveOrderColumnIndex(table: *const Table, projections: []const ast.Projection, orderCol: []const u8) ?usize {
+    fn resolveOrderColumnIndex(tbl: *const Table, projections: []const ast.Projection, orderCol: []const u8) ?usize {
         const targetCol = if (std.mem.lastIndexOfScalar(u8, orderCol, '.')) |dot| orderCol[dot + 1 ..] else orderCol;
         if (std.fmt.parseInt(usize, targetCol, 10)) |num| {
-            if (num >= 1 and num <= table.columns.len) return num - 1;
+            if (num >= 1 and num <= tbl.columns.len) return num - 1;
         } else |_| {}
-        if (columnIndex(table, targetCol)) |idx| return idx else |_| {}
+        if (columnIndex(tbl, targetCol)) |idx| return idx else |_| {}
         for (projections, 0..) |p, pIdx| {
             if (p.alias) |a| {
                 if (std.ascii.eqlIgnoreCase(a, targetCol)) {
                     if (p.expr == .identifier) {
                         const pCol = if (std.mem.lastIndexOfScalar(u8, p.expr.identifier, '.')) |dot| p.expr.identifier[dot + 1 ..] else p.expr.identifier;
-                        if (columnIndex(table, pCol)) |idx| return idx else |_| {}
+                        if (columnIndex(tbl, pCol)) |idx| return idx else |_| {}
                     }
-                    if (pIdx < table.columns.len) return pIdx;
+                    if (pIdx < tbl.columns.len) return pIdx;
                 }
             }
         }
@@ -4513,18 +4679,18 @@ pub const Connection = struct {
         return self.selectWithOuter(value, parameters, null);
     }
 
-    fn restoreStashedTable(self: *Connection, stashed: *?Table, index: usize) void {
-        const table = stashed.* orelse return;
+    fn restoreStashedTable(self: *Connection, stashed: *?*Table, index: usize) void {
+        const tbl = stashed.* orelse return;
         stashed.* = null;
-        self.store.tables.insert(self.allocator, index, table) catch {
-            self.store.tables.append(self.allocator, table) catch {};
+        self.store.tables.insert(self.allocator, index, tbl) catch {
+            self.store.tables.append(self.allocator, tbl) catch {};
         };
     }
 
     const EphemeralScope = struct {
         connection: *Connection,
         name: []const u8,
-        stashed: ?Table,
+        stashed: ?*Table,
         stashIndex: usize,
 
         fn deinit(self: *@This()) void {
@@ -4596,9 +4762,9 @@ pub const Connection = struct {
                 subValue.table = ephemeralName;
                 return self.selectWithOuter(subValue, parameters, outer);
             };
-            const table = resolved.table;
-            if (value.joins.len != 0) return try self.selectJoin(value, table, parameters, outer);
-            if (value.groupBy) |groupName| return try self.selectGrouped(table, value, groupName, parameters);
+            const tbl = resolved.table;
+            if (value.joins.len != 0) return try self.selectJoin(value, tbl, parameters, outer);
+            if (value.groupBy) |groupName| return try self.selectGrouped(tbl, value, groupName, parameters);
             var anyAgg = false;
             for (value.projections) |p| {
                 if (p.expr == .function and functions.aggregate.AggKind.fromName(p.expr.function.name) != null) {
@@ -4634,16 +4800,16 @@ pub const Connection = struct {
                     }
                 }
                 var firstRow: ?[]const Value = null;
-                for (table.rows.items) |row| {
-                    const rowOuter = OuterRow{ .table = table, .alias = value.tableAlias, .values = row.values, .prev = outer };
-                    if (!try self.matchesContext(table, row.values, value.condition, parameters, &rowOuter)) continue;
+                for (tbl.rows.items) |row| {
+                    const rowOuter = OuterRow{ .table = tbl, .alias = value.tableAlias, .values = row.values, .prev = outer };
+                    if (!try self.matchesContext(tbl, row.values, value.condition, parameters, &rowOuter)) continue;
                     if (firstRow == null) firstRow = row.values;
                     for (value.projections, 0..) |p, i| {
                         if (aggStates[i]) |*agg| {
                             if (p.expr.function.argument.* == .wildcard) {
                                 agg.stepWildcard();
                             } else {
-                                const item = try self.evalContext(table, row.values, p.expr.function.argument.*, parameters, &rowOuter);
+                                const item = try self.evalContext(tbl, row.values, p.expr.function.argument.*, parameters, &rowOuter);
                                 try agg.step(item, p.expr.function.distinct);
                             }
                         }
@@ -4660,13 +4826,13 @@ pub const Connection = struct {
                                 }
                                 var havingAgg = functions.aggregate.AggState.init(self.allocator, kind, sep);
                                 defer havingAgg.deinit();
-                                for (table.rows.items) |row| {
-                                    const rowOuter = OuterRow{ .table = table, .alias = value.tableAlias, .values = row.values, .prev = outer };
-                                    if (!try self.matchesContext(table, row.values, value.condition, parameters, &rowOuter)) continue;
+                                for (tbl.rows.items) |row| {
+                                    const rowOuter = OuterRow{ .table = tbl, .alias = value.tableAlias, .values = row.values, .prev = outer };
+                                    if (!try self.matchesContext(tbl, row.values, value.condition, parameters, &rowOuter)) continue;
                                     if (function.argument.* == .wildcard) {
                                         havingAgg.stepWildcard();
                                     } else {
-                                        const item = try self.evalContext(table, row.values, function.argument.*, parameters, &rowOuter);
+                                        const item = try self.evalContext(tbl, row.values, function.argument.*, parameters, &rowOuter);
                                         try havingAgg.step(item, function.distinct);
                                     }
                                 }
@@ -4674,7 +4840,7 @@ pub const Connection = struct {
                             }
                             return error.Unsupported;
                         },
-                        else => if (firstRow) |frow| try self.materializeContext(table, frow, having.left, parameters, null) else .null,
+                        else => if (firstRow) |frow| try self.materializeContext(tbl, frow, having.left, parameters, null) else .null,
                     };
                     defer if (leftValue == .text) self.allocator.free(leftValue.text) else if (leftValue == .blob) self.allocator.free(leftValue.blob);
                     if (having.op == .isTrue and !functions.scalar.isTruthyValue(leftValue)) {
@@ -4692,8 +4858,8 @@ pub const Connection = struct {
                     if (aggStates[i]) |*agg| {
                         aggregateRow[i] = try agg.result();
                     } else if (firstRow) |frow| {
-                        const rowOuter = OuterRow{ .table = table, .alias = value.tableAlias, .values = frow, .prev = outer };
-                        aggregateRow[i] = try self.materializeContext(table, frow, p.expr, parameters, &rowOuter);
+                        const rowOuter = OuterRow{ .table = tbl, .alias = value.tableAlias, .values = frow, .prev = outer };
+                        aggregateRow[i] = try self.materializeContext(tbl, frow, p.expr, parameters, &rowOuter);
                     } else {
                         aggregateRow[i] = .null;
                     }
@@ -4705,7 +4871,7 @@ pub const Connection = struct {
             var hasWindow = false;
             for (value.projections) |projection| {
                 switch (projection.expr) {
-                    .wildcard => for (table.columns) |column| try columns.append(self.allocator, column.name),
+                    .wildcard => for (tbl.columns) |column| try columns.append(self.allocator, column.name),
                     .identifier => try columns.append(self.allocator, projection.alias orelse projection.expr.identifier),
                     .function => try columns.append(self.allocator, projection.alias orelse projection.expr.function.name),
                     .window => |w| {
@@ -4721,28 +4887,31 @@ pub const Connection = struct {
                 for (rows.items) |row| self.allocator.free(row);
                 rows.deinit(self.allocator);
             }
-            const orderedIndices = try self.plannedIndices(table, value.condition, parameters);
+            const orderedIndices = try self.plannedIndices(tbl, value.condition, parameters);
             defer self.allocator.free(orderedIndices);
-            if (value.order) |order| {
-                const orderIndex = resolveOrderColumnIndex(table, value.projections, order.column) orelse try columnIndex(table, order.column);
-                var i: usize = 0;
-                while (i < orderedIndices.len) : (i += 1) {
-                    var j = i + 1;
-                    while (j < orderedIndices.len) : (j += 1) {
-                        const left = table.rows.items[orderedIndices[i]].values[orderIndex];
-                        const right = table.rows.items[orderedIndices[j]].values[orderIndex];
-                        const swap = if (order.descending) compare(left, .less, right) else compare(left, .greater, right);
-                        if (swap) std.mem.swap(usize, &orderedIndices[i], &orderedIndices[j]);
+            if (value.orders.len != 0) {
+                // A bare rowid key orders by storage order (the engine's
+                // rowid): ascending is already storage order, descending
+                // reverses it. WITHOUT ROWID tables have no rowid at all.
+                if (value.orders.len == 1) {
+                    const sole = splitQualifier(value.orders[0].column).column;
+                    if (isRowidAlias(sole)) {
+                        if (tbl.withoutRowid) return error.UnknownColumn;
+                        if (value.orders[0].descending) std.mem.reverse(usize, orderedIndices);
+                    } else {
+                        try self.sortIndexRows(tbl, value, orderedIndices);
                     }
+                } else {
+                    try self.sortIndexRows(tbl, value, orderedIndices);
                 }
             }
             if (hasWindow) {
                 var matchingRows = std.ArrayList([]const Value).empty;
                 defer matchingRows.deinit(self.allocator);
                 for (orderedIndices) |rowIndex| {
-                    const row = table.rows.items[rowIndex];
-                    const rowOuter = OuterRow{ .table = table, .alias = value.tableAlias, .values = row.values, .prev = outer };
-                    if (!try self.matchesContext(table, row.values, value.condition, parameters, &rowOuter)) continue;
+                    const row = tbl.rows.items[rowIndex];
+                    const rowOuter = OuterRow{ .table = tbl, .alias = value.tableAlias, .values = row.values, .prev = outer };
+                    if (!try self.matchesContext(tbl, row.values, value.condition, parameters, &rowOuter)) continue;
                     try matchingRows.append(self.allocator, row.values);
                 }
                 const EvalHelper = struct {
@@ -4755,7 +4924,7 @@ pub const Connection = struct {
                         return selfCtx.conn.eval(selfCtx.tbl, row, expr, selfCtx.params);
                     }
                 };
-                const helper = EvalHelper{ .conn = self, .tbl = table, .params = parameters };
+                const helper = EvalHelper{ .conn = self, .tbl = tbl, .params = parameters };
                 const winCtx = functions.window.WindowContext{
                     .allocator = self.allocator,
                     .rows = matchingRows.items,
@@ -4795,14 +4964,14 @@ pub const Connection = struct {
                             self.allocator.free(resultRow);
                         }
                     }
-                    const rowOuter = OuterRow{ .table = table, .alias = value.tableAlias, .values = rowValues, .prev = outer };
+                    const rowOuter = OuterRow{ .table = tbl, .alias = value.tableAlias, .values = rowValues, .prev = outer };
                     for (value.projections, 0..) |projection, pIdx| {
                         if (projection.expr == .window) {
                             resultRow[outIndex] = windowCols[pIdx].?[rowIdx];
                             windowCols[pIdx].?[rowIdx] = .null;
                             outIndex += 1;
                         } else {
-                            resultRow[outIndex] = try self.materializeContext(table, rowValues, projection.expr, parameters, &rowOuter);
+                            resultRow[outIndex] = try self.materializeContext(tbl, rowValues, projection.expr, parameters, &rowOuter);
                             outIndex += 1;
                         }
                     }
@@ -4828,15 +4997,15 @@ pub const Connection = struct {
             var scanned: usize = 0;
             var count: usize = 0;
             for (orderedIndices) |rowIndex| {
-                const row = table.rows.items[rowIndex];
-                const rowOuter = OuterRow{ .table = table, .alias = value.tableAlias, .values = row.values, .prev = outer };
-                if (!try self.matchesContext(table, row.values, value.condition, parameters, &rowOuter)) continue;
+                const row = tbl.rows.items[rowIndex];
+                const rowOuter = OuterRow{ .table = tbl, .alias = value.tableAlias, .values = row.values, .prev = outer };
+                if (!try self.matchesContext(tbl, row.values, value.condition, parameters, &rowOuter)) continue;
                 if (value.offset) |offset| if (scanned < offset) {
                     scanned += 1;
                     continue;
                 };
                 scanned += 1;
-                const resultRow = try self.allocator.alloc(Value, value.projections.len + if (value.projections.len == 1 and value.projections[0].expr == .wildcard) table.columns.len - 1 else 0);
+                const resultRow = try self.allocator.alloc(Value, value.projections.len + if (value.projections.len == 1 and value.projections[0].expr == .wildcard) tbl.columns.len - 1 else 0);
                 var outIndex: usize = 0;
                 var rowOk = false;
                 defer {
@@ -4851,7 +5020,7 @@ pub const Connection = struct {
                         outIndex += 1;
                     }
                 } else {
-                    resultRow[outIndex] = try self.materializeContext(table, row.values, projection.expr, parameters, &rowOuter);
+                    resultRow[outIndex] = try self.materializeContext(tbl, row.values, projection.expr, parameters, &rowOuter);
                     outIndex += 1;
                 };
                 rowOk = true;
@@ -4897,15 +5066,15 @@ pub const Connection = struct {
         return .{ .allocator = self.allocator, .columns = try self.ownedColumns(columns.items), .rows = rows };
     }
 
-    fn plannedIndices(self: *Connection, table: *const Table, condition: ?ast.Conditions, parameters: []const Value) ![]usize {
+    fn plannedIndices(self: *Connection, tbl: *const Table, condition: ?ast.Conditions, parameters: []const Value) ![]usize {
         var indexedColumn: ?usize = null;
         var lookup: Value = .null;
         if (condition) |conditions| if (conditions.len == 1 and conditions[0].op == .equal) {
-            for (self.store.indexes.items) |index| if (index.columns.len == 1 and std.ascii.eqlIgnoreCase(index.table, table.name) and std.ascii.eqlIgnoreCase(index.columns[0], conditions[0].column)) {
+            for (self.store.indexes.items) |index| if (index.columns.len == 1 and std.ascii.eqlIgnoreCase(index.table, tbl.name) and std.ascii.eqlIgnoreCase(index.columns[0], conditions[0].column)) {
                 if (index.whereExpr) |predicate| {
                     if (!exprEvaluator.partialPredicateImpliedBy(predicate, conditions)) continue;
                 }
-                indexedColumn = try columnIndex(table, index.columns[0]);
+                indexedColumn = try columnIndex(tbl, index.columns[0]);
                 lookup = self.resolve(conditions[0].value, parameters) catch .null;
                 break;
             };
@@ -4913,10 +5082,10 @@ pub const Connection = struct {
         var indices = std.ArrayList(usize).empty;
         defer indices.deinit(self.allocator);
         if (indexedColumn) |columnIdx| {
-            for (table.rows.items, 0..) |row, rowIndex| if (compare(row.values[columnIdx], .equal, lookup)) try indices.append(self.allocator, rowIndex);
+            for (tbl.rows.items, 0..) |row, rowIndex| if (compare(row.values[columnIdx], .equal, lookup)) try indices.append(self.allocator, rowIndex);
         } else {
-            try indices.ensureTotalCapacity(self.allocator, table.rows.items.len);
-            for (table.rows.items, 0..) |_, rowIndex| try indices.append(self.allocator, rowIndex);
+            try indices.ensureTotalCapacity(self.allocator, tbl.rows.items.len);
+            for (tbl.rows.items, 0..) |_, rowIndex| try indices.append(self.allocator, rowIndex);
         }
         return indices.toOwnedSlice(self.allocator);
     }
@@ -4931,13 +5100,13 @@ pub const Connection = struct {
         rows.deinit(allocator);
     }
 
-    fn extendJoinRow(self: *Connection, prev: ?*const JoinRow, table: *const Table, alias: ?[]const u8, values: []const Value, segCount: usize, outer: ?*const OuterRow) !JoinRow {
+    fn extendJoinRow(self: *Connection, prev: ?*const JoinRow, tbl: *const Table, alias: ?[]const u8, values: []const Value, segCount: usize, outer: ?*const OuterRow) !JoinRow {
         const segments = try self.allocator.alloc(JoinSegment, segCount);
         errdefer self.allocator.free(segments);
         const frames = try self.allocator.alloc(OuterRow, segCount);
         errdefer self.allocator.free(frames);
         if (prev) |existing| std.mem.copyForwards(JoinSegment, segments[0 .. segCount - 1], existing.segments);
-        segments[segCount - 1] = .{ .table = table, .alias = alias, .values = values };
+        segments[segCount - 1] = .{ .table = tbl, .alias = alias, .values = values };
         for (frames, 0..) |*frame, index| frame.* = .{ .table = segments[index].table, .alias = segments[index].alias, .values = segments[index].values, .prev = if (index + 1 < segCount) &frames[index + 1] else outer };
         return .{ .segments = segments, .frames = frames };
     }
@@ -4945,7 +5114,14 @@ pub const Connection = struct {
     fn chainSideValue(segments: []const JoinSegment, right: *const Table, rightAlias: ?[]const u8, rightValues: []const Value, tableName: []const u8, column: []const u8, leftSide: bool) !Value {
         if (tableName.len == 0) {
             if (leftSide) {
-                for (segments) |seg| if (columnIndex(seg.table, column) catch null) |index| return seg.values[index];
+                var found: ?usize = null;
+                var foundIndex: usize = 0;
+                for (segments, 0..) |seg, si| if (columnIndex(seg.table, column) catch null) |index| {
+                    if (found != null) return error.AmbiguousColumn;
+                    found = si;
+                    foundIndex = index;
+                };
+                if (found) |si| return segments[si].values[foundIndex];
                 return error.UnknownColumn;
             }
             return rightValues[try columnIndex(right, column)];
@@ -4971,6 +5147,63 @@ pub const Connection = struct {
         return null;
     }
 
+    fn collectJoinBareIdents(self: *Connection, expr: ast.Expr, out: *std.ArrayList([]const u8)) !void {
+        switch (expr) {
+            .identifier => |name| if (std.mem.indexOfScalar(u8, name, '.') == null) try out.append(self.allocator, name),
+            .binary => |b| {
+                try self.collectJoinBareIdents(b.left.*, out);
+                try self.collectJoinBareIdents(b.right.*, out);
+            },
+            .unary => |u| try self.collectJoinBareIdents(u.expr.*, out),
+            .function => |f| {
+                try self.collectJoinBareIdents(f.argument.*, out);
+                if (f.argument2) |a| try self.collectJoinBareIdents(a.*, out);
+                if (f.argument3) |a| try self.collectJoinBareIdents(a.*, out);
+                for (f.extraArgs) |a| try self.collectJoinBareIdents(a, out);
+            },
+            .caseExpr => |c| {
+                if (c.base) |b| try self.collectJoinBareIdents(b.*, out);
+                for (c.whens) |when| {
+                    try self.collectJoinBareIdents(when.condition, out);
+                    try self.collectJoinBareIdents(when.result, out);
+                }
+                if (c.otherwise) |o| try self.collectJoinBareIdents(o.*, out);
+            },
+            .patternMatch => |m| {
+                try self.collectJoinBareIdents(m.value.*, out);
+                try self.collectJoinBareIdents(m.pattern.*, out);
+                if (m.escape) |e| try self.collectJoinBareIdents(e.*, out);
+            },
+            .collate => |node| try self.collectJoinBareIdents(node.expr.*, out),
+            .inList => |l| {
+                try self.collectJoinBareIdents(l.expr.*, out);
+                for (l.list) |item| try self.collectJoinBareIdents(item, out);
+            },
+            .inSubquery => |s| try self.collectJoinBareIdents(s.expr.*, out),
+            .window => |w| {
+                if (w.argument) |a| try self.collectJoinBareIdents(a.*, out);
+                if (w.argument2) |a| try self.collectJoinBareIdents(a.*, out);
+                for (w.extraArgs) |a| try self.collectJoinBareIdents(a, out);
+                for (w.partitionBy) |a| try self.collectJoinBareIdents(a, out);
+                for (w.orderBy) |o| try self.collectJoinBareIdents(o.expr, out);
+            },
+            else => {},
+        }
+    }
+
+    fn checkJoinAmbiguous(self: *Connection, tables: []const *const Table, groups: []const MergedGroup, names: []const []const u8) !void {
+        _ = self;
+        for (names) |name| {
+            if (name.len == 0) continue;
+            if (findMergedGroup(groups, name) != null) continue;
+            var count: usize = 0;
+            for (tables) |tbl| if (columnIndex(tbl, name) catch null) |_| {
+                count += 1;
+                if (count > 1) return error.AmbiguousColumn;
+            };
+        }
+    }
+
     fn joinRowField(row: JoinRow, groups: []const MergedGroup, qualifier: []const u8, column: []const u8) !Value {
         if (qualifier.len != 0) {
             for (row.segments) |seg| if (groupQualifierMatches(qualifier, seg.table, seg.alias)) return seg.values[try columnIndex(seg.table, column)];
@@ -4984,7 +5217,13 @@ pub const Connection = struct {
             }
             return result;
         }
-        for (row.segments) |seg| if (columnIndex(seg.table, column) catch null) |index| return seg.values[index];
+        for (row.segments, 0..) |seg, si| if (columnIndex(seg.table, column) catch null) |index| {
+            for (row.segments, 0..) |other, oi| {
+                if (oi == si) continue;
+                if (columnIndex(other.table, column) catch null) |_| return error.AmbiguousColumn;
+            }
+            return seg.values[index];
+        };
         return error.UnknownColumn;
     }
 
@@ -5013,23 +5252,77 @@ pub const Connection = struct {
         rows.deinit(self.allocator);
     }
 
-    fn sortJoinRows(rows: *std.ArrayList([]Value), columns: []const []const u8, order: ?ast.Order) !void {
-        const active = order orelse return;
-        const orderName = splitQualifier(active.column).column;
-        var orderIndex: ?usize = null;
-        for (columns, 0..) |name, position| if (std.ascii.eqlIgnoreCase(splitQualifier(name).column, orderName)) {
-            orderIndex = position;
-            break;
-        };
-        const sortIndex = orderIndex orelse return error.Unsupported;
+    const ResolvedSortKey = struct { colIdx: usize, descending: bool };
+
+    fn isRowidAlias(name: []const u8) bool {
+        return std.ascii.eqlIgnoreCase(name, "rowid") or std.ascii.eqlIgnoreCase(name, "_rowid_") or std.ascii.eqlIgnoreCase(name, "oid");
+    }
+
+    fn compareRowsByKeys(a: []const Value, b: []const Value, sortKeys: []const ResolvedSortKey) std.math.Order {
+        for (sortKeys) |key| {
+            const ord = a[key.colIdx].order(b[key.colIdx], .binary);
+            if (ord == .eq) continue;
+            return if (key.descending) ord.invert() else ord;
+        }
+        return .eq;
+    }
+
+    fn resolveSortOutputIndex(columns: []const []const u8, projections: ?[]const ast.Projection, orderColumn: []const u8) ?usize {
+        if (std.fmt.parseInt(usize, orderColumn, 10)) |pos| {
+            if (pos >= 1 and pos <= columns.len) return pos - 1;
+        } else |_| {}
+        for (columns, 0..) |name, idx| if (std.ascii.eqlIgnoreCase(name, orderColumn)) return idx;
+        const parts = splitQualifier(orderColumn);
+        if (parts.qualifier.len != 0) {
+            if (projections) |projs| {
+                for (projs, 0..) |proj, idx| {
+                    if (proj.expr == .identifier) {
+                        const exprParts = splitQualifier(proj.expr.identifier);
+                        if (exprParts.qualifier.len != 0 and std.ascii.eqlIgnoreCase(exprParts.qualifier, parts.qualifier) and std.ascii.eqlIgnoreCase(exprParts.column, parts.column)) return idx;
+                    }
+                }
+            }
+        }
+        // A qualified key never falls back to a bare-column match: qualifiers
+        // are load-bearing scope, and guessing a same-named column from another
+        // table silently sorts by the wrong key. Unresolvable qualified keys
+        // return null so callers use table-scope resolution or report the
+        // construct as unsupported.
+        if (parts.qualifier.len == 0) {
+            for (columns, 0..) |name, idx| if (std.ascii.eqlIgnoreCase(splitQualifier(name).column, parts.column)) return idx;
+        }
+        return null;
+    }
+
+    fn sortIndexRows(self: *Connection, tbl: *const Table, value: anytype, orderedIndices: []usize) !void {
+        const sortKeys = try self.allocator.alloc(ResolvedSortKey, value.orders.len);
+        defer self.allocator.free(sortKeys);
+        for (value.orders, 0..) |keyOrder, keyIndex| {
+            sortKeys[keyIndex] = .{ .colIdx = resolveOrderColumnIndex(tbl, value.projections, keyOrder.column) orelse try columnIndex(tbl, keyOrder.column), .descending = keyOrder.descending };
+        }
+        var i: usize = 0;
+        while (i < orderedIndices.len) : (i += 1) {
+            var j = i + 1;
+            while (j < orderedIndices.len) : (j += 1) {
+                if (compareRowsByKeys(tbl.rows.items[orderedIndices[i]].values, tbl.rows.items[orderedIndices[j]].values, sortKeys) == .gt)
+                    std.mem.swap(usize, &orderedIndices[i], &orderedIndices[j]);
+            }
+        }
+    }
+
+    fn sortJoinRows(self: *Connection, rows: *std.ArrayList([]Value), columns: []const []const u8, projections: ?[]const ast.Projection, orders: []const ast.Order) !void {
+        if (orders.len == 0) return;
+        const sortKeys = try self.allocator.alloc(ResolvedSortKey, orders.len);
+        defer self.allocator.free(sortKeys);
+        for (orders, 0..) |ord, keyIndex| {
+            sortKeys[keyIndex] = .{ .colIdx = resolveSortOutputIndex(columns, projections, ord.column) orelse return error.Unsupported, .descending = ord.descending };
+        }
         var i: usize = 0;
         while (i < rows.items.len) : (i += 1) {
             var j = i + 1;
             while (j < rows.items.len) : (j += 1) {
-                const leftValue = rows.items[i][sortIndex];
-                const rightValue = rows.items[j][sortIndex];
-                const swap = if (active.descending) compare(leftValue, .less, rightValue) else compare(leftValue, .greater, rightValue);
-                if (swap) std.mem.swap([]Value, &rows.items[i], &rows.items[j]);
+                if (compareRowsByKeys(rows.items[i], rows.items[j], sortKeys) == .gt)
+                    std.mem.swap([]Value, &rows.items[i], &rows.items[j]);
             }
         }
     }
@@ -5066,10 +5359,10 @@ pub const Connection = struct {
         return qualifier;
     }
 
-    fn groupQualifierMatches(qualifier: []const u8, table: *const Table, alias: ?[]const u8) bool {
+    fn groupQualifierMatches(qualifier: []const u8, tbl: *const Table, alias: ?[]const u8) bool {
         if (qualifier.len == 0) return true;
         const tablePart = qualifierTablePart(qualifier);
-        if (std.ascii.eqlIgnoreCase(tablePart, table.name)) return true;
+        if (std.ascii.eqlIgnoreCase(tablePart, tbl.name)) return true;
         if (alias) |name| if (std.ascii.eqlIgnoreCase(tablePart, name)) return true;
         return false;
     }
@@ -5087,14 +5380,19 @@ pub const Connection = struct {
 
     fn resolveJoinKey(tables: []const *const Table, aliases: []const ?[]const u8, groups: []const MergedGroup, qualifier: []const u8, column: []const u8) !KeyLoc {
         if (qualifier.len != 0) {
-            for (tables, 0..) |table, index| if (groupQualifierMatches(qualifier, table, aliases[index])) {
-                _ = try columnIndex(table, column);
+            for (tables, 0..) |tbl, index| if (groupQualifierMatches(qualifier, tbl, aliases[index])) {
+                _ = try columnIndex(tbl, column);
                 return .{ .provider = index, .group = null };
             };
             return error.UnknownColumn;
         }
         if (findMergedGroup(groups, column)) |index| return .{ .provider = groups[index].members.items[0].seg, .group = index };
-        for (tables, 0..) |table, index| if (columnIndex(table, column) catch null) |_| return .{ .provider = index, .group = null };
+        var found: ?usize = null;
+        for (tables, 0..) |tbl, index| if (columnIndex(tbl, column) catch null) |_| {
+            if (found != null) return error.AmbiguousColumn;
+            found = index;
+        };
+        if (found) |index| return .{ .provider = index, .group = null };
         return error.UnknownColumn;
     }
 
@@ -5214,13 +5512,54 @@ pub const Connection = struct {
                 .droppedRight = if (dropped.items.len == 0) &.{} else try dropped.toOwnedSlice(self.allocator),
             });
         }
+        // SQLite resolves unqualified join references against every table in
+        // scope and reports ambiguity instead of guessing. USING/NATURAL
+        // merged columns coalesce and are exempt.
+        {
+            var bare = std.ArrayList([]const u8).empty;
+            defer bare.deinit(self.allocator);
+            if (value.condition) |conds| for (conds) |cond| {
+                if (cond.column.len != 0 and std.mem.indexOfScalar(u8, cond.column, '.') == null) try bare.append(self.allocator, cond.column);
+                if (cond.leftExpr) |e| try self.collectJoinBareIdents(e, &bare);
+                try self.collectJoinBareIdents(cond.value, &bare);
+                if (cond.value2) |v| try self.collectJoinBareIdents(v, &bare);
+                for (cond.listValues) |v| try self.collectJoinBareIdents(v, &bare);
+                if (cond.escape) |e| try self.collectJoinBareIdents(e, &bare);
+            };
+            for (value.projections) |projection| try self.collectJoinBareIdents(projection.expr, &bare);
+            if (value.having) |having| {
+                try self.collectJoinBareIdents(having.left, &bare);
+                try self.collectJoinBareIdents(having.right, &bare);
+            }
+            for (value.orders) |ord| {
+                const parts = splitQualifier(ord.column);
+                if (parts.qualifier.len == 0) {
+                    var inOutput = false;
+                    for (value.projections) |projection| {
+                        if (projection.alias) |a| {
+                            if (std.ascii.eqlIgnoreCase(a, parts.column)) {
+                                inOutput = true;
+                                break;
+                            }
+                        } else if (projection.expr == .identifier) {
+                            if (std.ascii.eqlIgnoreCase(splitQualifier(projection.expr.identifier).column, parts.column)) {
+                                inOutput = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!inOutput) try bare.append(self.allocator, parts.column);
+                }
+            }
+            try self.checkJoinAmbiguous(tables.items, mergedGroups.items, bare.items);
+        }
         var slabs = std.ArrayList([]Value).empty;
         defer {
             for (slabs.items) |slab| self.allocator.free(slab);
             slabs.deinit(self.allocator);
         }
-        for (tables.items) |table| {
-            const slab = try self.allocator.alloc(Value, table.columns.len);
+        for (tables.items) |tbl| {
+            const slab = try self.allocator.alloc(Value, tbl.columns.len);
             @memset(slab, .null);
             try slabs.append(self.allocator, slab);
         }
@@ -5265,7 +5604,7 @@ pub const Connection = struct {
             var groupedColumns = std.ArrayList([]const u8).empty;
             defer groupedColumns.deinit(self.allocator);
             const sortGrouped = try self.collectJoinGrouped(pairs.items, mergedGroups.items, tables.items, aliases.items, value, groupName, parameters, &groupedRows, &groupedColumns);
-            if (sortGrouped) try sortJoinRows(&groupedRows, groupedColumns.items, value.order);
+            if (sortGrouped) try self.sortJoinRows(&groupedRows, groupedColumns.items, value.projections, value.orders);
             try self.paginateJoinRows(&groupedRows, value.limit, value.offset);
             return .{ .allocator = self.allocator, .columns = try self.ownedColumns(groupedColumns.items), .rows = try groupedRows.toOwnedSlice(self.allocator) };
         }
@@ -5282,7 +5621,7 @@ pub const Connection = struct {
             var aggColumns = std.ArrayList([]const u8).empty;
             defer aggColumns.deinit(self.allocator);
             try self.collectJoinAggregate(pairs.items, value, parameters, &aggRows, &aggColumns);
-            try sortJoinRows(&aggRows, aggColumns.items, value.order);
+            try self.sortJoinRows(&aggRows, aggColumns.items, value.projections, value.orders);
             try self.paginateJoinRows(&aggRows, value.limit, value.offset);
             return .{ .allocator = self.allocator, .columns = try self.ownedColumns(aggColumns.items), .rows = try aggRows.toOwnedSlice(self.allocator) };
         }
@@ -5313,14 +5652,15 @@ pub const Connection = struct {
         errdefer self.freeJoinResultRows(&rows);
         var pairOrder: ?[]usize = null;
         defer if (pairOrder) |indices| self.allocator.free(indices);
-        if (value.order) |ord| {
-            const orderName = splitQualifier(ord.column).column;
-            var inOutput = false;
-            for (columns.items) |name| if (std.ascii.eqlIgnoreCase(splitQualifier(name).column, orderName)) {
-                inOutput = true;
-                break;
-            };
-            if (!inOutput) {
+        if (value.orders.len != 0) {
+            var allInOutput = true;
+            for (value.orders) |keyOrder| {
+                if (resolveSortOutputIndex(columns.items, value.projections, keyOrder.column) == null) {
+                    allInOutput = false;
+                    break;
+                }
+            }
+            if (!allInOutput) {
                 if (value.distinct) return error.Unsupported;
                 const indices = try self.allocator.alloc(usize, pairs.items.len);
                 errdefer self.allocator.free(indices);
@@ -5329,10 +5669,23 @@ pub const Connection = struct {
                 while (i < indices.len) : (i += 1) {
                     var j = i + 1;
                     while (j < indices.len) : (j += 1) {
-                        const orderParts = splitQualifier(ord.column);
-                        const first = try joinRowField(pairs.items[indices[i]], mergedGroups.items, orderParts.qualifier, orderParts.column);
-                        const second = try joinRowField(pairs.items[indices[j]], mergedGroups.items, orderParts.qualifier, orderParts.column);
-                        const swap = if (ord.descending) compare(first, .less, second) else compare(first, .greater, second);
+                        // Multi-key compare over pre-projection pairs, using
+                        // the same first-non-equal-key plus per-key DESC
+                        // inversion as compareRowsByKeys. joinRowField
+                        // resolves qualifiers against the joined tables (with
+                        // ambiguity detection) and borrows values, so no
+                        // per-comparison allocation occurs.
+                        var swap = false;
+                        for (value.orders) |ord| {
+                            const orderParts = splitQualifier(ord.column);
+                            const first = try joinRowField(pairs.items[indices[i]], mergedGroups.items, orderParts.qualifier, orderParts.column);
+                            const second = try joinRowField(pairs.items[indices[j]], mergedGroups.items, orderParts.qualifier, orderParts.column);
+                            const placed = first.order(second, .binary);
+                            const resolved = if (ord.descending) placed.invert() else placed;
+                            if (resolved == .eq) continue;
+                            swap = resolved == .gt;
+                            break;
+                        }
                         if (swap) std.mem.swap(usize, &indices[i], &indices[j]);
                     }
                 }
@@ -5357,7 +5710,7 @@ pub const Connection = struct {
                     index += 1;
                 }
             }
-            try sortJoinRows(&rows, columns.items, value.order);
+            try self.sortJoinRows(&rows, columns.items, value.projections, value.orders);
         }
         try self.paginateJoinRows(&rows, value.limit, value.offset);
         return .{ .allocator = self.allocator, .columns = try self.ownedColumns(columns.items), .rows = try rows.toOwnedSlice(self.allocator) };
@@ -5514,20 +5867,25 @@ pub const Connection = struct {
             else => return error.Unsupported,
         };
         var sortAfter = false;
-        if (value.order) |ord| {
-            const orderName = splitQualifier(ord.column).column;
-            for (columns.items) |name| if (std.ascii.eqlIgnoreCase(splitQualifier(name).column, orderName)) {
-                sortAfter = true;
-                break;
-            };
+        if (value.orders.len != 0) {
+            sortAfter = true;
+            for (value.orders) |keyOrder| {
+                if (resolveSortOutputIndex(columns.items, value.projections, keyOrder.column) == null) {
+                    sortAfter = false;
+                    break;
+                }
+            }
             if (!sortAfter) {
+                if (value.orders.len != 1) return error.Unsupported;
+                const ord = value.orders[0];
                 if (!keyQualifierOk(splitQualifier(ord.column), keyName, tables, aliases, loc, groups)) return error.Unsupported;
                 var gi: usize = 0;
                 while (gi < grouped.items.len) : (gi += 1) {
                     var gj = gi + 1;
                     while (gj < grouped.items.len) : (gj += 1) {
-                        const swap = if (ord.descending) compare(grouped.items[gi].key, .less, grouped.items[gj].key) else compare(grouped.items[gi].key, .greater, grouped.items[gj].key);
-                        if (swap) std.mem.swap(Group, &grouped.items[gi], &grouped.items[gj]);
+                        const placed = grouped.items[gi].key.order(grouped.items[gj].key, .binary);
+                        if ((if (ord.descending) placed.invert() else placed) == .gt)
+                            std.mem.swap(Group, &grouped.items[gi], &grouped.items[gj]);
                     }
                 }
             }
@@ -5619,41 +5977,44 @@ pub const Connection = struct {
         if (self.cteActive(value.table)) return error.InvalidSql;
         const resolved = self.resolveTableName(value.table) orelse return error.UnknownTable;
         const store = self.storeFor(resolved.ref);
-        const table = resolved.table;
+        const tbl = resolved.table;
         for (value.columns) |name| {
-            const index = try columnIndex(table, name);
-            if (table.columns[index].generatedExpr != null) return error.ConstraintViolation;
+            const index = try columnIndex(tbl, name);
+            if (tbl.columns[index].generatedExpr != null) return error.ConstraintViolation;
         }
-        const resolvedSource = self.resolveTableName(value.from.?.table) orelse return error.UnknownTable;
+        const resolvedSource = if (value.from.?.tableSchema.len != 0)
+            self.findTableQualified(value.from.?.tableSchema, splitSchemaName(value.from.?.table).object) orelse return error.UnknownTable
+        else
+            self.resolveTableName(value.from.?.table) orelse return error.UnknownTable;
         const source = resolvedSource.table;
         const sourceSpec = value.from.?;
         const hasPair = sourceSpec.leftColumn.len != 0 and sourceSpec.rightColumn.len != 0;
-        const leftTable = if (sourceSpec.leftTable.len == 0) table else if (std.ascii.eqlIgnoreCase(sourceSpec.leftTable, table.name)) table else source;
-        const rightTable = if (sourceSpec.rightTable.len == 0) table else if (std.ascii.eqlIgnoreCase(sourceSpec.rightTable, table.name)) table else source;
+        const leftTable = if (sourceSpec.leftTable.len == 0) tbl else if (std.ascii.eqlIgnoreCase(sourceSpec.leftTable, tbl.name)) tbl else source;
+        const rightTable = if (sourceSpec.rightTable.len == 0) tbl else if (std.ascii.eqlIgnoreCase(sourceSpec.rightTable, tbl.name)) tbl else source;
         const leftColumn: usize = if (hasPair) try columnIndex(leftTable, sourceSpec.leftColumn) else 0;
         const rightColumn: usize = if (hasPair) try columnIndex(rightTable, sourceSpec.rightColumn) else 0;
         var changes: usize = 0;
         var affectedRows = std.ArrayList([]const Value).empty;
         defer affectedRows.deinit(self.allocator);
-        for (table.rows.items, 0..) |*row, rowIndex| {
+        for (tbl.rows.items, 0..) |*row, rowIndex| {
             for (source.rows.items) |sourceRow| {
                 if (hasPair) {
-                    const leftValue = if (leftTable == table) row.values[leftColumn] else sourceRow.values[leftColumn];
-                    const rightValue = if (rightTable == table) row.values[rightColumn] else sourceRow.values[rightColumn];
+                    const leftValue = if (leftTable == tbl) row.values[leftColumn] else sourceRow.values[leftColumn];
+                    const rightValue = if (rightTable == tbl) row.values[rightColumn] else sourceRow.values[rightColumn];
                     if (!compare(leftValue, .equal, rightValue)) continue;
                 }
                 if (value.condition) |conds| {
                     const sourceOuter = OuterRow{ .table = source, .alias = null, .values = sourceRow.values, .prev = null };
-                    if (!try self.matchesContext(table, row.values, conds, parameters, &sourceOuter)) continue;
+                    if (!try self.matchesContext(tbl, row.values, conds, parameters, &sourceOuter)) continue;
                 }
                 const candidate = try self.allocator.alloc(Value, row.values.len);
                 defer {
                     for (value.columns, value.values) |name, expression| {
                         if (expression != .binary and expression != .unary) continue;
-                        const index = columnIndex(table, name) catch continue;
+                        const index = columnIndex(tbl, name) catch continue;
                         self.freeConcatText(candidate[index]);
                     }
-                    for (table.columns, 0..) |column, index| {
+                    for (tbl.columns, 0..) |column, index| {
                         if (column.generatedExpr != null and !sameValue(candidate[index], row.values[index])) {
                             exprEvaluator.freeValue(self.allocator, candidate[index]);
                         }
@@ -5662,7 +6023,7 @@ pub const Connection = struct {
                 }
                 @memcpy(candidate, row.values);
                 for (value.columns, value.values) |name, expression| {
-                    const index = try columnIndex(table, name);
+                    const index = try columnIndex(tbl, name);
                     var newValue = if (expression == .identifier and std.mem.indexOfScalar(u8, expression.identifier, '.') != null) blk: {
                         const dot = std.mem.indexOfScalar(u8, expression.identifier, '.').?;
                         const qualifier = expression.identifier[0..dot];
@@ -5670,17 +6031,17 @@ pub const Connection = struct {
                         if (std.ascii.eqlIgnoreCase(qualifier, source.name)) break :blk sourceRow.values[try columnIndex(source, columnName)];
                         break :blk try self.resolve(expression, parameters);
                     } else try self.resolve(expression, parameters);
-                    if (table.strict) newValue = try Schema.coerceStrict(table.columns[index].typeName, newValue);
+                    if (tbl.strict) newValue = try Schema.coerceStrict(tbl.columns[index].typeName, newValue);
                     candidate[index] = newValue;
                 }
-                try self.recomputeGeneratedColumns(table, candidate, false);
-                try self.fireTriggers(store, table, .before, .update, candidate, row.values, value.columns);
-                store.validateUpdate(table, rowIndex, candidate) catch |err| {
+                try self.recomputeGeneratedColumns(tbl, candidate, false);
+                try self.fireTriggers(store, tbl, .before, .update, candidate, row.values, value.columns);
+                store.validateUpdate(tbl, rowIndex, candidate) catch |err| {
                     if (err != error.ConstraintViolation) return err;
                     if (value.conflict == .ignore) continue;
                     return err;
                 };
-                self.applyUpdateActions(store, table.name, row.values, candidate) catch |err| {
+                self.applyUpdateActions(store, tbl.name, row.values, candidate) catch |err| {
                     if (err != error.ConstraintViolation) return err;
                     if (value.conflict == .ignore) continue;
                     return err;
@@ -5692,25 +6053,28 @@ pub const Connection = struct {
                 }
                 for (row.values, 0..) |item, snapshotIndex| oldSnapshot[snapshotIndex] = try self.copyValue(item);
                 for (value.columns, 0..) |name, updateIndex| {
-                    const targetIndex = try columnIndex(table, name);
+                    const targetIndex = try columnIndex(tbl, name);
                     const newValue = candidate[targetIndex];
-                    if (row.values[targetIndex] == .text) self.allocator.free(row.values[targetIndex].text);
-                    if (row.values[targetIndex] == .blob) self.allocator.free(row.values[targetIndex].blob);
-                    row.values[targetIndex] = switch (newValue) {
+                    // Duplicate before freeing: newValue may borrow the storage
+                    // being replaced (e.g. SET label = label).
+                    const ownedCopy: Value = switch (newValue) {
                         .text => |text| .{ .text = try self.allocator.dupe(u8, text) },
                         .blob => |blob| .{ .blob = try self.allocator.dupe(u8, blob) },
                         else => newValue,
                     };
+                    if (row.values[targetIndex] == .text) self.allocator.free(row.values[targetIndex].text);
+                    if (row.values[targetIndex] == .blob) self.allocator.free(row.values[targetIndex].blob);
+                    row.values[targetIndex] = ownedCopy;
                     _ = updateIndex;
                 }
-                try self.recomputeGeneratedColumns(table, row.values, true);
-                try self.fireTriggers(store, table, .after, .update, candidate, oldSnapshot, value.columns);
+                try self.recomputeGeneratedColumns(tbl, row.values, true);
+                try self.fireTriggers(store, tbl, .after, .update, candidate, oldSnapshot, value.columns);
                 changes += 1;
                 try affectedRows.append(self.allocator, row.values);
                 break;
             }
         }
-        if (value.returning.len > 0) return self.evaluateReturning(table, value.returning, affectedRows.items, parameters);
+        if (value.returning.len > 0) return self.evaluateReturning(tbl, value.returning, affectedRows.items, parameters);
         return .{ .allocator = self.allocator, .columns = try self.allocator.alloc([]const u8, 0), .rows = try self.allocator.alloc([]Value, 0), .changes = changes };
     }
 
@@ -5719,29 +6083,29 @@ pub const Connection = struct {
         if (self.cteActive(value.table)) return error.InvalidSql;
         const resolved = self.resolveTableName(value.table) orelse return error.UnknownTable;
         const store = self.storeFor(resolved.ref);
-        const table = resolved.table;
-        try validateReturningColumns(table, value.returning);
+        const tbl = resolved.table;
+        try validateReturningColumns(tbl, value.returning);
         for (value.columns) |name| {
-            const index = try columnIndex(table, name);
-            if (table.columns[index].generatedExpr != null) return error.ConstraintViolation;
+            const index = try columnIndex(tbl, name);
+            if (tbl.columns[index].generatedExpr != null) return error.ConstraintViolation;
         }
         var affectedRows = std.ArrayList([]const Value).empty;
         defer affectedRows.deinit(self.allocator);
         var changes: usize = 0;
         var cursor: usize = 0;
-        outer: while (cursor < table.rows.items.len) {
+        outer: while (cursor < tbl.rows.items.len) {
             var rowIndex = cursor;
             cursor += 1;
-            var row = &table.rows.items[rowIndex];
-            if (!(try self.matches(table, row.values, value.condition, parameters))) continue :outer;
+            var row = &tbl.rows.items[rowIndex];
+            if (!(try self.matches(tbl, row.values, value.condition, parameters))) continue :outer;
             const candidate = try self.allocator.alloc(Value, row.values.len);
             defer {
                 for (value.columns, value.values) |name, expr| {
                     if (expr != .binary and expr != .unary) continue;
-                    const index = columnIndex(table, name) catch continue;
+                    const index = columnIndex(tbl, name) catch continue;
                     self.freeConcatText(candidate[index]);
                 }
-                for (table.columns, 0..) |column, index| {
+                for (tbl.columns, 0..) |column, index| {
                     if (column.generatedExpr != null and !sameValue(candidate[index], row.values[index])) {
                         exprEvaluator.freeValue(self.allocator, candidate[index]);
                     }
@@ -5750,38 +6114,38 @@ pub const Connection = struct {
             }
             @memcpy(candidate, row.values);
             for (value.columns, value.values) |name, expr| {
-                const index = try columnIndex(table, name);
-                var newValue = try self.eval(table, row.values, expr, parameters);
-                if (newValue == .null and table.columns[index].notNull) {
+                const index = try columnIndex(tbl, name);
+                var newValue = try self.eval(tbl, row.values, expr, parameters);
+                if (newValue == .null and tbl.columns[index].notNull) {
                     if (value.conflict == .ignore) continue :outer;
                     return error.ConstraintViolation;
                 }
-                if (table.strict) newValue = Schema.coerceStrict(table.columns[index].typeName, newValue) catch |err| {
+                if (tbl.strict) newValue = Schema.coerceStrict(tbl.columns[index].typeName, newValue) catch |err| {
                     if (err == error.ConstraintViolation and value.conflict == .ignore) continue :outer;
                     return err;
                 };
                 candidate[index] = newValue;
             }
-            try self.recomputeGeneratedColumns(table, candidate, false);
-            try self.fireTriggers(store, table, .before, .update, candidate, row.values, value.columns);
-            store.validateUpdate(table, rowIndex, candidate) catch |err| {
+            try self.recomputeGeneratedColumns(tbl, candidate, false);
+            try self.fireTriggers(store, tbl, .before, .update, candidate, row.values, value.columns);
+            store.validateUpdate(tbl, rowIndex, candidate) catch |err| {
                 if (err != error.ConstraintViolation) return err;
                 switch (value.conflict) {
                     .ignore => continue :outer,
                     .replace => {
-                        while (try self.conflictRow(store, table, candidate, rowIndex)) |bad| {
-                            try self.deleteRowAt(store, table, bad);
+                        while (try self.conflictRow(store, tbl, candidate, rowIndex)) |bad| {
+                            try self.deleteRowAt(store, tbl, bad);
                             if (bad < rowIndex) rowIndex -= 1;
-                            if (rowIndex >= table.rows.items.len) continue :outer;
-                            row = &table.rows.items[rowIndex];
-                            if (!(try self.matches(table, row.values, value.condition, parameters))) continue :outer;
+                            if (rowIndex >= tbl.rows.items.len) continue :outer;
+                            row = &tbl.rows.items[rowIndex];
+                            if (!(try self.matches(tbl, row.values, value.condition, parameters))) continue :outer;
                         }
-                        try store.validateUpdate(table, rowIndex, candidate);
+                        try store.validateUpdate(tbl, rowIndex, candidate);
                     },
                     else => return err,
                 }
             };
-            self.applyUpdateActions(store, table.name, row.values, candidate) catch |err| {
+            self.applyUpdateActions(store, tbl.name, row.values, candidate) catch |err| {
                 if (err != error.ConstraintViolation) return err;
                 switch (value.conflict) {
                     .ignore => continue :outer,
@@ -5795,24 +6159,36 @@ pub const Connection = struct {
             }
             for (row.values, 0..) |item, snapshotIndex| oldSnapshot[snapshotIndex] = try self.copyValue(item);
             for (value.columns, value.values) |name, expr| {
-                const index = try columnIndex(table, name);
-                var newValue = try self.eval(table, row.values, expr, parameters);
-                if (newValue == .null and candidate[index] != .null) newValue = candidate[index];
-                if (table.strict) newValue = try Schema.coerceStrict(table.columns[index].typeName, newValue);
-                if (row.values[index] == .text) self.allocator.free(row.values[index].text);
-                if (row.values[index] == .blob) self.allocator.free(row.values[index].blob);
-                row.values[index] = switch (newValue) {
+                const index = try columnIndex(tbl, name);
+                var newValue = try self.eval(tbl, row.values, expr, parameters);
+                // Tracks eval-produced ownership: complex expressions yield
+                // fresh text/blobs that must be freed; plain references borrow.
+                var ownedResult = expr == .binary or expr == .unary or expr == .function or expr == .caseExpr;
+                if (newValue == .null and candidate[index] != .null) {
+                    newValue = candidate[index];
+                    ownedResult = false;
+                }
+                if (tbl.strict) newValue = try Schema.coerceStrict(tbl.columns[index].typeName, newValue);
+                // Duplicate before freeing: newValue may borrow the storage
+                // being replaced (e.g. SET label = label).
+                const ownedCopy: Value = switch (newValue) {
                     .text => |v| .{ .text = try self.allocator.dupe(u8, v) },
                     .blob => |v| .{ .blob = try self.allocator.dupe(u8, v) },
                     else => newValue,
                 };
+                if (row.values[index] == .text) self.allocator.free(row.values[index].text);
+                if (row.values[index] == .blob) self.allocator.free(row.values[index].blob);
+                row.values[index] = ownedCopy;
+                // Free eval-owned text only when it cannot alias live storage
+                // (CASE branches may pass a borrowed column through).
+                if (ownedResult and !valueBorrowsFrom(newValue, &.{ row.values, candidate })) self.freeConcatText(newValue);
             }
-            try self.recomputeGeneratedColumns(table, row.values, true);
+            try self.recomputeGeneratedColumns(tbl, row.values, true);
             changes += 1;
             try affectedRows.append(self.allocator, row.values);
-            try self.fireTriggers(store, table, .after, .update, candidate, oldSnapshot, value.columns);
+            try self.fireTriggers(store, tbl, .after, .update, candidate, oldSnapshot, value.columns);
         }
-        if (value.returning.len > 0) return self.evaluateReturning(table, value.returning, affectedRows.items, parameters);
+        if (value.returning.len > 0) return self.evaluateReturning(tbl, value.returning, affectedRows.items, parameters);
         return .{ .allocator = self.allocator, .columns = try self.allocator.alloc([]const u8, 0), .rows = try self.allocator.alloc([]Value, 0), .changes = changes };
     }
 
@@ -5850,7 +6226,7 @@ pub const Connection = struct {
 
     fn applyCompositeUpdateActions(self: *Connection, store: *Schema, parentName: []const u8, oldValues: []const Value, newValues: []const Value) anyerror!void {
         const parent = store.findConst(parentName) orelse return error.ConstraintViolation;
-        for (store.tables.items) |*childTable| {
+        for (store.tables.items) |childTable| {
             var childRowIndex: usize = 0;
             while (childRowIndex < childTable.rows.items.len) : (childRowIndex += 1) {
                 var constraintIndex: usize = 0;
@@ -5915,7 +6291,7 @@ pub const Connection = struct {
 
     fn applyCompositeDeleteActions(self: *Connection, store: *Schema, parentName: []const u8, parentValues: []const Value) anyerror!void {
         const parent = store.findConst(parentName) orelse return error.ConstraintViolation;
-        for (store.tables.items) |*childTable| {
+        for (store.tables.items) |childTable| {
             var childRowIndex = childTable.rows.items.len;
             while (childRowIndex > 0) {
                 childRowIndex -= 1;
@@ -5969,7 +6345,7 @@ pub const Connection = struct {
         const parent = store.findConst(parentName) orelse return error.ConstraintViolation;
         var childTableIndex: usize = 0;
         while (childTableIndex < store.tables.items.len) : (childTableIndex += 1) {
-            const childTable = &store.tables.items[childTableIndex];
+            const childTable = store.tables.items[childTableIndex];
             var childColumnIndex: usize = 0;
             while (childColumnIndex < childTable.columns.len) : (childColumnIndex += 1) {
                 const childColumn = childTable.columns[childColumnIndex];
@@ -6028,7 +6404,7 @@ pub const Connection = struct {
                 var action: ?ast.ReferentialAction = null;
                 var childColumnIndex: usize = 0;
                 var parentColumnIndex: usize = 0;
-                const childTable = &store.tables.items[childTableIndex];
+                const childTable = store.tables.items[childTableIndex];
                 for (childTable.columns, 0..) |column, columnIdx| if (column.foreignTable) |foreignTable| {
                     if (std.ascii.eqlIgnoreCase(foreignTable, parentName)) {
                         const parentTable = store.findConst(parentName) orelse return error.ConstraintViolation;
@@ -6074,8 +6450,8 @@ pub const Connection = struct {
         if (self.cteActive(value.table)) return error.InvalidSql;
         const resolved = self.resolveTableName(value.table) orelse return error.UnknownTable;
         const store = self.storeFor(resolved.ref);
-        const table = resolved.table;
-        try validateReturningColumns(table, value.returning);
+        const tbl = resolved.table;
+        try validateReturningColumns(tbl, value.returning);
         var affectedRows = std.ArrayList([]Value).empty;
         defer {
             for (affectedRows.items) |r| {
@@ -6086,12 +6462,12 @@ pub const Connection = struct {
         }
         var changes: usize = 0;
         var index: usize = 0;
-        while (index < table.rows.items.len) {
-            if (try self.matches(table, table.rows.items[index].values, value.condition, parameters)) {
-                try self.fireTriggers(store, table, .before, .delete, null, table.rows.items[index].values, &.{});
-                try self.applyDeleteActions(store, table.name, table.rows.items[index].values);
-                const row = table.rows.orderedRemove(index);
-                try self.fireTriggers(store, table, .after, .delete, null, row.values, &.{});
+        while (index < tbl.rows.items.len) {
+            if (try self.matches(tbl, tbl.rows.items[index].values, value.condition, parameters)) {
+                try self.fireTriggers(store, tbl, .before, .delete, null, tbl.rows.items[index].values, &.{});
+                try self.applyDeleteActions(store, tbl.name, tbl.rows.items[index].values);
+                const row = tbl.rows.orderedRemove(index);
+                try self.fireTriggers(store, tbl, .after, .delete, null, row.values, &.{});
                 if (value.returning.len > 0) {
                     const cloned = try self.allocator.alloc(Value, row.values.len);
                     for (row.values, 0..) |item, i| cloned[i] = try self.copyValue(item);
@@ -6106,7 +6482,7 @@ pub const Connection = struct {
             const sliceOfSlices = try self.allocator.alloc([]const Value, affectedRows.items.len);
             defer self.allocator.free(sliceOfSlices);
             for (affectedRows.items, 0..) |r, i| sliceOfSlices[i] = r;
-            return self.evaluateReturning(table, value.returning, sliceOfSlices, parameters);
+            return self.evaluateReturning(tbl, value.returning, sliceOfSlices, parameters);
         }
         return .{ .allocator = self.allocator, .columns = try self.allocator.alloc([]const u8, 0), .rows = try self.allocator.alloc([]Value, 0), .changes = changes };
     }
@@ -6125,7 +6501,7 @@ test "connection executes native SQL" {
     result = try db.exec("SELECT name FROM users WHERE id = 1;");
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), result.count());
-    try std.testing.expectEqualStrings("A", result.rows[0][0].text);
+    try std.testing.expectEqualStrings("A", result.at(0)[0].text);
 }
 
 test "raw and typed indexes validate uniqueness and lifecycle" {
@@ -6145,7 +6521,7 @@ test "raw and typed indexes validate uniqueness and lifecycle" {
     defer reopened.close();
     try std.testing.expect(reopened.store.findIndexConst("index_items_label") != null);
     try std.testing.expectError(error.ConstraintViolation, reopened.from(Item).insert(.{ .id = 3, .label = "one" }));
-    try db.createIndex(Item, "index_items_id", .{Item.columns.id}, false);
+    try db.createIndex(Item, "index_items_id", .{Item.id}, false);
     try db.dropIndex("index_items_id");
     var drop = try db.exec("DROP INDEX index_items_label;");
     drop.deinit();
@@ -6169,7 +6545,7 @@ test "connection persists rows and prepared parameters" {
     var result = try db.exec("SELECT label FROM items WHERE id = 4;");
     defer result.deinit();
     defer db.close();
-    try std.testing.expectEqualStrings("saved", result.rows[0][0].text);
+    try std.testing.expectEqualStrings("saved", result.at(0)[0].text);
 }
 
 test "prepared statements query rows with bound parameters" {
@@ -6185,7 +6561,7 @@ test "prepared statements query rows with bound parameters" {
     var rows = try statement.query();
     defer rows.deinit();
     try std.testing.expectEqual(@as(usize, 1), rows.count());
-    try std.testing.expectEqualStrings("two", rows.rows[0][0].text);
+    try std.testing.expectEqualStrings("two", rows.at(0)[0].text);
     statement.reset();
     try statement.bind(1, 1);
     var again = try statement.query();
@@ -6219,8 +6595,8 @@ test "connection supports AND predicates, scalar functions, and count" {
     result = try db.exec("SELECT length(label), typeof(id) FROM numbers WHERE id > 1 AND id < 3;");
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), result.count());
-    try std.testing.expectEqual(@as(i64, 3), result.rows[0][0].integer);
-    try std.testing.expectEqualStrings("integer", result.rows[0][1].text);
+    try std.testing.expectEqual(@as(i64, 3), result.at(0)[0].integer);
+    try std.testing.expectEqualStrings("integer", result.at(0)[1].text);
     var count = try db.exec("SELECT count(*) FROM numbers;");
     defer count.deinit();
     try std.testing.expectEqual(@as(i64, 3), count.rows[0][0].integer);
@@ -6239,8 +6615,8 @@ test "connection executes order by, lower, and savepoints" {
     result = try db.exec("SELECT lower(label) AS normalized FROM items ORDER BY id DESC;");
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 2), result.count());
-    try std.testing.expectEqualStrings("beta", result.rows[0][0].text);
-    try std.testing.expectEqualStrings("alpha", result.rows[1][0].text);
+    try std.testing.expectEqualStrings("beta", result.at(0)[0].text);
+    try std.testing.expectEqualStrings("alpha", result.at(1)[0].text);
     var paged = try db.exec("SELECT id FROM items ORDER BY id ASC LIMIT 1 OFFSET 1;");
     defer paged.deinit();
     try std.testing.expectEqual(@as(i64, 2), paged.rows[0][0].integer);
@@ -6318,7 +6694,7 @@ test "createTable overWrite drops and recreates tables" {
     db = try Connection.open(std.testing.allocator, path);
     var persisted = try db.exec("SELECT label FROM ow_items WHERE id = 2;");
     defer persisted.deinit();
-    try std.testing.expectEqualStrings("v2", persisted.rows[0][0].text);
+    try std.testing.expectEqualStrings("v2", persisted.at(0)[0].text);
     try std.testing.expectError(error.TableExists, db.createTable("ow_items", .{ .columns = &.{"id"} }));
     var dyn = try db.exec("CREATE TABLE ow_dyn (id INTEGER); INSERT INTO ow_dyn VALUES (1);");
     dyn.deinit();
@@ -6336,8 +6712,8 @@ test "typed keys and foreign keys enforce relational constraints" {
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
     var db = try Connection.open(std.testing.allocator, path);
     defer db.close();
-    try db.createTable(Parent, .{ .primaryKey = Parent.columns.id, .unique = &.{Parent.columns.email} });
-    try db.createTable(Child, .{ .primaryKey = Child.columns.id, .foreignKeys = &.{.{ .column = Child.columns.parent_id, .references = Parent.columns.id }} });
+    try db.createTable(Parent, .{ .primaryKey = Parent.id, .unique = &.{Parent.email} });
+    try db.createTable(Child, .{ .primaryKey = Child.id, .foreignKeys = &.{.{ .column = Child.parent_id, .references = Parent.id }} });
     var parent = try db.from(Parent).insert(.{ .id = 1, .email = "one@example.test" });
     parent.deinit();
     try std.testing.expectError(error.ConstraintViolation, db.from(Parent).insert(.{ .id = 1, .email = "two@example.test" }));
@@ -6347,7 +6723,7 @@ test "typed keys and foreign keys enforce relational constraints" {
     var nullable = try db.exec("INSERT INTO key_dsl_parent (id, email) VALUES (2, NULL), (3, NULL);");
     nullable.deinit();
     var childUpdate = try db.from(Child).update(.{ .parent_id = 99 });
-    try std.testing.expectError(error.ConstraintViolation, childUpdate.where(Child.columns.id.eq(1)).execute());
+    try std.testing.expectError(error.ConstraintViolation, childUpdate.where(Child.id.eq(1)).execute());
 }
 
 test "raw SQL and typed DSL execute inner and left joins" {
@@ -6357,9 +6733,11 @@ test "raw SQL and typed DSL execute inner and left joins" {
     std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
     var db = try Connection.open(std.testing.allocator, path);
+    const t_db_join_dsl_orders = db.table("join_dsl_orders");
+    const t_db_join_dsl_users = db.table("join_dsl_users");
     defer db.close();
-    try db.createTable(User, .{ .primaryKey = User.columns.id });
-    try db.createTable(Order, .{ .primaryKey = Order.columns.id });
+    try db.createTable(User, .{ .primaryKey = User.id });
+    try db.createTable(Order, .{ .primaryKey = Order.id });
     var user = try db.from(User).insert(.{ .id = 1, .name = "A" });
     user.deinit();
     var order = try db.from(Order).insert(.{ .id = 10, .user_id = 1 });
@@ -6371,25 +6749,25 @@ test "raw SQL and typed DSL execute inner and left joins" {
     var raw = try db.exec("SELECT * FROM join_dsl_users JOIN join_dsl_orders ON join_dsl_users.id = join_dsl_orders.user_id;");
     defer raw.deinit();
     try std.testing.expectEqual(@as(usize, 1), raw.count());
-    try std.testing.expectEqual(@as(i64, 10), raw.rows[0][2].integer);
+    try std.testing.expectEqual(@as(i64, 10), raw.at(0)[2].integer);
     var rawDistinct = try db.exec("SELECT DISTINCT * FROM join_dsl_users JOIN join_dsl_orders ON join_dsl_users.id = join_dsl_orders.user_id;");
     defer rawDistinct.deinit();
-    var dslDistinct = try db.from(User).innerJoin(Order, User.columns.id.eq(Order.columns.user_id)).selectAll().distinct().fetch();
+    var dslDistinct = try db.from(User).innerJoin(Order, User.id.eq(Order.user_id)).selectAll().distinct().fetch();
     defer dslDistinct.deinit();
     try std.testing.expectEqual(rawDistinct.count(), dslDistinct.count());
-    var typedSum = try db.from(User).select(.{User.columns.id.sum()}).fetch();
+    var typedSum = try db.from(User).select(.{User.id.sum()}).fetch();
     defer typedSum.deinit();
     try std.testing.expectEqual(@as(i64, 3), typedSum.rows[0][0].integer);
-    var typedProjection = try db.from(User).select(.{ User.columns.id, User.columns.name }).fetch();
+    var typedProjection = try db.from(User).select(.{ User.id, User.name }).fetch();
     defer typedProjection.deinit();
     try std.testing.expectEqual(@as(usize, 2), typedProjection.count());
-    var left = try db.from(User).leftJoin(Order, User.columns.id.eq(Order.columns.user_id)).fetch();
+    var left = try db.from(User).leftJoin(Order, User.id.eq(Order.user_id)).fetch();
     defer left.deinit();
     try std.testing.expectEqual(@as(usize, 2), left.count());
-    var right = try db.from("join_dsl_users").rightJoin("join_dsl_orders", db.col("join_dsl_users.id").eq(db.col("join_dsl_orders.user_id"))).fetch();
+    var right = try t_db_join_dsl_users.rightJoin(t_db_join_dsl_orders, t_db_join_dsl_users.column("id").eq(t_db_join_dsl_orders.column("user_id"))).fetch();
     defer right.deinit();
     try std.testing.expectEqual(@as(usize, 2), right.count());
-    var full = try db.from("join_dsl_users").fullJoin("join_dsl_orders", db.col("join_dsl_users.id").eq(db.col("join_dsl_orders.user_id"))).fetch();
+    var full = try t_db_join_dsl_users.fullJoin(t_db_join_dsl_orders, t_db_join_dsl_users.column("id").eq(t_db_join_dsl_orders.column("user_id"))).fetch();
     defer full.deinit();
     try std.testing.expectEqual(@as(usize, 3), full.count());
     var cross = try db.from(User).crossJoin(Order).fetch();
@@ -6412,32 +6790,32 @@ test "raw SQL and DSL support null like and between predicates" {
     result = try db.exec("SELECT id FROM predicate_dsl_items WHERE id BETWEEN 1 AND 2 OR id = 4;");
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 3), result.count());
-    var likeResult = try db.from(Item).where(Item.columns.label.like("a%")).fetch();
+    var likeResult = try db.from(Item).where(Item.label.like("a%")).fetch();
     defer likeResult.deinit();
     try std.testing.expectEqual(@as(usize, 2), likeResult.count());
     var rawNotLike = try db.exec("SELECT id FROM predicate_dsl_items WHERE label NOT LIKE 'a%' ORDER BY id;");
     defer rawNotLike.deinit();
     try std.testing.expectEqual(@as(usize, 1), rawNotLike.count());
     try std.testing.expectEqual(@as(i64, 2), rawNotLike.rows[0][0].integer);
-    var notLikeResult = try db.from(Item).where(Item.columns.label.notLike("a%")).fetch();
+    var notLikeResult = try db.from(Item).where(Item.label.notLike("a%")).fetch();
     defer notLikeResult.deinit();
     try std.testing.expectEqual(@as(usize, 1), notLikeResult.count());
-    var nullResult = try db.from(Item).where(Item.columns.label.isNull()).fetch();
+    var nullResult = try db.from(Item).where(Item.label.isNull()).fetch();
     defer nullResult.deinit();
     try std.testing.expectEqual(@as(usize, 1), nullResult.count());
-    var distinctResult = try db.from(Item).select(.{Item.columns.label}).distinct().fetch();
+    var distinctResult = try db.from(Item).select(.{Item.label}).distinct().fetch();
     defer distinctResult.deinit();
     try std.testing.expectEqual(@as(usize, 3), distinctResult.count());
     var rawInList = try db.exec("SELECT id FROM predicate_dsl_items WHERE id IN (1, 3, 4) ORDER BY id;");
     defer rawInList.deinit();
     try std.testing.expectEqual(@as(usize, 3), rawInList.count());
-    var typedInList = try db.from(Item).whereInValues(Item.columns.id, .{ 1, 3, 4 }).fetch();
+    var typedInList = try db.from(Item).whereInValues(Item.id, .{ 1, 3, 4 }).fetch();
     defer typedInList.deinit();
     try std.testing.expectEqual(@as(usize, 3), typedInList.count());
     var rawNotInList = try db.exec("SELECT id FROM predicate_dsl_items WHERE id NOT IN (1, 3, 4) ORDER BY id;");
     defer rawNotInList.deinit();
     try std.testing.expectEqual(@as(usize, 1), rawNotInList.count());
-    var typedNotInList = try db.from(Item).whereNotInValues(Item.columns.id, .{ 1, 3, 4 }).fetch();
+    var typedNotInList = try db.from(Item).whereNotInValues(Item.id, .{ 1, 3, 4 }).fetch();
     defer typedNotInList.deinit();
     try std.testing.expectEqual(@as(usize, 1), typedNotInList.count());
     var rawIs = try db.exec("SELECT id FROM predicate_dsl_items WHERE label IS 'alpha' ORDER BY id;");
@@ -6446,16 +6824,16 @@ test "raw SQL and DSL support null like and between predicates" {
     var rawIsNotNull = try db.exec("SELECT id FROM predicate_dsl_items WHERE label IS NOT NULL ORDER BY id;");
     defer rawIsNotNull.deinit();
     try std.testing.expectEqual(@as(usize, 3), rawIsNotNull.count());
-    var typedIs = try db.from(Item).where(Item.columns.label.is("alpha")).fetch();
+    var typedIs = try db.from(Item).where(Item.label.is("alpha")).fetch();
     defer typedIs.deinit();
     try std.testing.expectEqual(@as(usize, 2), typedIs.count());
-    var typedBetween = try db.from(Item).where(Item.columns.id.between(1, 2)).fetch();
+    var typedBetween = try db.from(Item).where(Item.id.between(1, 2)).fetch();
     defer typedBetween.deinit();
     try std.testing.expectEqual(@as(usize, 2), typedBetween.count());
     var rawNotBetween = try db.exec("SELECT id FROM predicate_dsl_items WHERE id NOT BETWEEN 2 AND 3 ORDER BY id;");
     defer rawNotBetween.deinit();
     try std.testing.expectEqual(@as(usize, 2), rawNotBetween.count());
-    var typedNotBetween = try db.from(Item).where(Item.columns.id.notBetween(2, 3)).fetch();
+    var typedNotBetween = try db.from(Item).where(Item.id.notBetween(2, 3)).fetch();
     defer typedNotBetween.deinit();
     try std.testing.expectEqual(rawNotBetween.count(), typedNotBetween.count());
 }
@@ -6484,7 +6862,7 @@ test "transaction SQL modes and invalid SQL return deterministic errors" {
     var rows = try db.exec("SELECT id FROM tx_modes;");
     defer rows.deinit();
     try std.testing.expectEqual(@as(usize, 1), rows.count());
-    try std.testing.expectEqual(@as(i64, 2), rows.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 2), rows.at(0)[0].integer);
 }
 
 test "multiple dependent CTEs preserve projected column names" {
@@ -6502,7 +6880,7 @@ test "multiple dependent CTEs preserve projected column names" {
     try std.testing.expectEqualStrings("id", rows.columns[0]);
     try std.testing.expectEqualStrings("label", rows.columns[1]);
     try std.testing.expectEqual(@as(usize, 1), rows.count());
-    try std.testing.expectEqual(@as(i64, 2), rows.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 2), rows.at(0)[0].integer);
 }
 
 test "native WAL journal mode survives reopen and checkpoint" {
@@ -6526,8 +6904,8 @@ test "native WAL journal mode survives reopen and checkpoint" {
     var rows = try reopened.exec("SELECT id, value FROM wal_items;");
     defer rows.deinit();
     try std.testing.expectEqual(@as(usize, 1), rows.count());
-    try std.testing.expectEqual(@as(i64, 1), rows.rows[0][0].integer);
-    try std.testing.expectEqualStrings("wal", rows.rows[0][1].text);
+    try std.testing.expectEqual(@as(i64, 1), rows.at(0)[0].integer);
+    try std.testing.expectEqualStrings("wal", rows.at(0)[1].text);
     var checkpoint = try reopened.exec("PRAGMA journal_mode=DELETE;");
     checkpoint.deinit();
     reopened.close();
@@ -6701,7 +7079,7 @@ test "pragma cache_size and synchronous round-trip with validation" {
     db = try Connection.open(std.testing.allocator, path);
     var persisted = try db.exec("SELECT label FROM sync_items;");
     defer persisted.deinit();
-    try std.testing.expectEqualStrings("durable", persisted.rows[0][0].text);
+    try std.testing.expectEqualStrings("durable", persisted.at(0)[0].text);
     var resetCache = try db.exec("PRAGMA cache_size;");
     defer resetCache.deinit();
     try std.testing.expectEqual(@as(i64, -2000), resetCache.rows[0][0].integer);
@@ -6749,7 +7127,7 @@ test "exec accepts multiple raw SQL statements and preserves trigger bodies" {
     var result = try db.exec("CREATE TABLE multi_items (id INTEGER, label TEXT); CREATE TABLE multi_audit (label TEXT); CREATE TRIGGER multi_insert AFTER INSERT ON multi_items BEGIN INSERT INTO multi_audit VALUES (NEW.label); END; INSERT INTO multi_items VALUES (1, 'combined'); SELECT label FROM multi_audit;");
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), result.count());
-    try std.testing.expectEqualStrings("combined", result.rows[0][0].text);
+    try std.testing.expectEqualStrings("combined", result.at(0)[0].text);
 }
 
 test "insert default values materializes a NULL row" {
@@ -6765,8 +7143,8 @@ test "insert default values materializes a NULL row" {
     var rows = try db.exec("SELECT id, label FROM default_value_items;");
     defer rows.deinit();
     try std.testing.expectEqual(@as(usize, 1), rows.count());
-    try std.testing.expect(rows.rows[0][0] == .null);
-    try std.testing.expect(rows.rows[0][1] == .null);
+    try std.testing.expect(rows.at(0)[0] == .null);
+    try std.testing.expect(rows.at(0)[1] == .null);
 }
 
 test "pragma user_version persists in the SQLite header" {
@@ -6778,13 +7156,13 @@ test "pragma user_version persists in the SQLite header" {
     result.deinit();
     result = try db.exec("PRAGMA user_version;");
     defer result.deinit();
-    try std.testing.expectEqual(@as(i64, 42), result.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 42), result.at(0)[0].integer);
     db.close();
     var reopened = try Connection.open(std.testing.allocator, path);
     defer reopened.close();
     var persisted = try reopened.exec("PRAGMA user_version;");
     defer persisted.deinit();
-    try std.testing.expectEqual(@as(i64, 42), persisted.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 42), persisted.at(0)[0].integer);
 }
 
 test "pragma application_id persists in the SQLite header" {
@@ -6799,7 +7177,7 @@ test "pragma application_id persists in the SQLite header" {
     defer reopened.close();
     var persisted = try reopened.exec("PRAGMA application_id;");
     defer persisted.deinit();
-    try std.testing.expectEqual(@as(i64, 305419896), persisted.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 305419896), persisted.at(0)[0].integer);
 }
 
 test "pragma foreign_keys toggles relational enforcement and actions" {
@@ -6840,10 +7218,10 @@ test "raw SQL grouped aggregates return one row per group" {
     try std.testing.expectEqual(@as(f64, 15), grouped.rows[0][3].real);
     try std.testing.expectEqual(@as(i64, 1), grouped.rows[1][1].integer);
     const Sale = @import("../dsl/table.zig").table("grouped_sales", struct { category: []const u8, amount: i64 });
-    var typed = try db.from(Sale).select(.{Sale.columns.amount.sum()}).groupBy(Sale.columns.category).fetch();
+    var typed = try db.from(Sale).select(.{Sale.amount.sum()}).groupBy(Sale.category).fetch();
     defer typed.deinit();
     try std.testing.expectEqual(@as(usize, 2), typed.count());
-    try std.testing.expectEqual(@as(i64, 30), typed.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 30), typed.at(0)[0].integer);
 }
 
 test "grouped aggregates support HAVING predicates" {
@@ -6859,13 +7237,13 @@ test "grouped aggregates support HAVING predicates" {
     var rows = try db.exec("SELECT category, SUM(amount) FROM having_sales GROUP BY category HAVING COUNT(*) > 1;");
     defer rows.deinit();
     try std.testing.expectEqual(@as(usize, 1), rows.count());
-    try std.testing.expectEqualStrings("a", rows.rows[0][0].text);
-    try std.testing.expectEqual(@as(i64, 30), rows.rows[0][1].integer);
+    try std.testing.expectEqualStrings("a", rows.at(0)[0].text);
+    try std.testing.expectEqual(@as(i64, 30), rows.at(0)[1].integer);
     const Sale = @import("../dsl/table.zig").table("having_sales", struct { category: []const u8, amount: i64 });
-    var typed = try db.from(Sale).select(.{Sale.columns.amount.sum()}).groupBy(Sale.columns.category).havingCount(">", 1).fetch();
+    var typed = try db.from(Sale).select(.{Sale.amount.sum()}).groupBy(Sale.category).having(@import("../dsl/expr.zig").countStar().gt(1)).fetch();
     defer typed.deinit();
     try std.testing.expectEqual(@as(usize, 1), typed.count());
-    try std.testing.expectEqual(@as(i64, 30), typed.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 30), typed.at(0)[0].integer);
 }
 
 test "insert select copies query results into a destination table" {
@@ -6886,8 +7264,8 @@ test "insert select copies query results into a destination table" {
     var rows = try db.exec("SELECT id, label FROM insert_select_destination;");
     defer rows.deinit();
     try std.testing.expectEqual(@as(usize, 1), rows.count());
-    try std.testing.expectEqual(@as(i64, 2), rows.rows[0][0].integer);
-    try std.testing.expectEqualStrings("two", rows.rows[0][1].text);
+    try std.testing.expectEqual(@as(i64, 2), rows.at(0)[0].integer);
+    try std.testing.expectEqualStrings("two", rows.at(0)[1].text);
 }
 
 test "insert or ignore skips constraint conflicts" {
@@ -6906,8 +7284,8 @@ test "insert or ignore skips constraint conflicts" {
     var rows = try db.exec("SELECT id, label FROM ignore_items ORDER BY id;");
     defer rows.deinit();
     try std.testing.expectEqual(@as(usize, 2), rows.count());
-    try std.testing.expectEqualStrings("original", rows.rows[0][1].text);
-    try std.testing.expectEqualStrings("accepted", rows.rows[1][1].text);
+    try std.testing.expectEqualStrings("original", rows.at(0)[1].text);
+    try std.testing.expectEqualStrings("accepted", rows.at(1)[1].text);
     const Item = @import("../dsl/table.zig").table("ignore_items", struct { id: i64, label: []const u8 });
     var typed = try db.from(Item).insertOrIgnore(.{ .id = 1, .label = "typed duplicate" });
     defer typed.deinit();
@@ -6930,7 +7308,7 @@ test "upsert do nothing shares conflict-ignore semantics" {
     var rows = try db.exec("SELECT id, label FROM upsert_items ORDER BY id;");
     defer rows.deinit();
     try std.testing.expectEqual(@as(usize, 2), rows.count());
-    try std.testing.expectEqualStrings("original", rows.rows[0][1].text);
+    try std.testing.expectEqualStrings("original", rows.at(0)[1].text);
 }
 
 test "upsert do update changes the conflicting row" {
@@ -6948,8 +7326,8 @@ test "upsert do update changes the conflicting row" {
     try std.testing.expectEqual(@as(usize, 1), result.changes);
     var rows = try db.exec("SELECT label, amount FROM upsert_update_items;");
     defer rows.deinit();
-    try std.testing.expectEqualStrings("updated", rows.rows[0][0].text);
-    try std.testing.expectEqual(@as(i64, 100), rows.rows[0][1].integer);
+    try std.testing.expectEqualStrings("updated", rows.at(0)[0].text);
+    try std.testing.expectEqual(@as(i64, 100), rows.at(0)[1].integer);
 }
 
 test "upsert do update where can skip a conflict without changing it" {
@@ -6967,7 +7345,7 @@ test "upsert do update where can skip a conflict without changing it" {
     try std.testing.expectEqual(@as(usize, 0), result.changes);
     var rows = try db.exec("SELECT label FROM upsert_where_items;");
     defer rows.deinit();
-    try std.testing.expectEqualStrings("original", rows.rows[0][0].text);
+    try std.testing.expectEqualStrings("original", rows.at(0)[0].text);
 }
 
 test "insert or replace removes the conflicting row and inserts the replacement" {
@@ -6986,7 +7364,7 @@ test "insert or replace removes the conflicting row and inserts the replacement"
     var rows = try db.exec("SELECT label FROM replace_items;");
     defer rows.deinit();
     try std.testing.expectEqual(@as(usize, 1), rows.count());
-    try std.testing.expectEqualStrings("replacement", rows.rows[0][0].text);
+    try std.testing.expectEqualStrings("replacement", rows.at(0)[0].text);
 }
 
 test "conflict replacement detects table-level and declared unique indexes" {
@@ -7004,7 +7382,7 @@ test "conflict replacement detects table-level and declared unique indexes" {
     var rows = try db.exec("SELECT id FROM replace_unique_items;");
     defer rows.deinit();
     try std.testing.expectEqual(@as(usize, 1), rows.count());
-    try std.testing.expectEqual(@as(i64, 2), rows.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 2), rows.at(0)[0].integer);
 }
 
 test "update from applies source-column assignments through an equi-join" {
@@ -7026,8 +7404,8 @@ test "update from applies source-column assignments through an equi-join" {
     try std.testing.expectEqual(@as(usize, 1), result.changes);
     var rows = try db.exec("SELECT id, amount FROM update_from_balances ORDER BY id;");
     defer rows.deinit();
-    try std.testing.expectEqual(@as(i64, 99), rows.rows[0][1].integer);
-    try std.testing.expectEqual(@as(i64, 20), rows.rows[1][1].integer);
+    try std.testing.expectEqual(@as(i64, 99), rows.at(0)[1].integer);
+    try std.testing.expectEqual(@as(i64, 20), rows.at(1)[1].integer);
 }
 
 test "update from applies trailing filters and cartesian sources" {
@@ -7043,8 +7421,8 @@ test "update from applies trailing filters and cartesian sources" {
     try std.testing.expectEqual(@as(usize, 1), filtered.changes);
     var rows = try db.exec("SELECT id, flag FROM uf_balances ORDER BY id;");
     defer rows.deinit();
-    try std.testing.expectEqual(@as(i64, 0), rows.rows[0][1].integer);
-    try std.testing.expectEqual(@as(i64, 1), rows.rows[1][1].integer);
+    try std.testing.expectEqual(@as(i64, 0), rows.at(0)[1].integer);
+    try std.testing.expectEqual(@as(i64, 1), rows.at(1)[1].integer);
     var cartesian = try db.exec("UPDATE uf_balances SET flag = 9 FROM uf_adjustments WHERE uf_balances.id = 1;");
     defer cartesian.deinit();
     try std.testing.expectEqual(@as(usize, 1), cartesian.changes);
@@ -7070,10 +7448,10 @@ test "NOT IN subqueries work in raw SQL and typed DSL" {
     var raw = try db.exec("SELECT id FROM not_in_users WHERE id NOT IN (SELECT user_id FROM not_in_blocked) ORDER BY id;");
     defer raw.deinit();
     try std.testing.expectEqual(@as(usize, 2), raw.count());
-    var typed = try db.from(User).whereNotInQuery(User.columns.id, Blocked, Blocked.columns.user_id).fetch();
+    var typed = try db.from(User).whereNotInQuery(User.id, Blocked, Blocked.user_id).fetch();
     defer typed.deinit();
     try std.testing.expectEqual(@as(usize, 2), typed.count());
-    try std.testing.expectEqual(@as(i64, 1), typed.rows[0].id);
+    try std.testing.expectEqual(@as(i64, 1), typed.at(0).id);
 }
 
 test "EXISTS and NOT EXISTS subqueries work in raw SQL" {
@@ -7095,7 +7473,7 @@ test "EXISTS and NOT EXISTS subqueries work in raw SQL" {
     try std.testing.expectEqual(@as(i64, 1), correlated.rows[0][0].integer);
     const User = @import("../dsl/table.zig").table("exists_users", struct { id: i64 });
     const Marker = @import("../dsl/table.zig").table("exists_marker", struct { id: i64 });
-    var typed = try db.from(User).whereExists(Marker, Marker.columns.id.eq(User.columns.id)).fetch();
+    var typed = try db.from(User).whereExists(Marker, Marker.id.eq(User.id)).fetch();
     defer typed.deinit();
     try std.testing.expectEqual(@as(usize, 1), typed.count());
     result = try db.exec("DELETE FROM exists_marker;");
@@ -7148,7 +7526,7 @@ test "raw ALTER TABLE supports add rename and drop column" {
     var rows = try db.exec("SELECT id, name FROM raw_alter_records;");
     defer rows.deinit();
     try std.testing.expectEqual(@as(usize, 1), rows.count());
-    try std.testing.expectEqualStrings("one", rows.rows[0][1].text);
+    try std.testing.expectEqualStrings("one", rows.at(0)[1].text);
 }
 
 test "literal column defaults apply to omitted inserts and persist" {
@@ -7162,8 +7540,8 @@ test "literal column defaults apply to omitted inserts and persist" {
     var rows = try db.exec("SELECT id, label, enabled FROM default_items ORDER BY id;");
     defer rows.deinit();
     try std.testing.expectEqual(@as(usize, 2), rows.count());
-    try std.testing.expectEqualStrings("untitled", rows.rows[0][1].text);
-    try std.testing.expectEqual(@as(i64, 1), rows.rows[1][2].integer);
+    try std.testing.expectEqualStrings("untitled", rows.at(0)[1].text);
+    try std.testing.expectEqual(@as(i64, 1), rows.at(1)[2].integer);
     db.close();
     db = try Connection.open(std.testing.allocator, path);
     var reopened = try db.exec("INSERT INTO default_items (id) VALUES (3); SELECT label, enabled FROM default_items WHERE id = 3;");
@@ -7182,8 +7560,8 @@ test "ordinary UPDATE evaluates row expressions" {
     result.deinit();
     var rows = try db.exec("SELECT amount, label FROM update_expression_items WHERE id = 1;");
     defer rows.deinit();
-    try std.testing.expectEqual(@as(i64, 15), rows.rows[0][0].integer);
-    try std.testing.expectEqualStrings("new", rows.rows[0][1].text);
+    try std.testing.expectEqual(@as(i64, 15), rows.at(0)[0].integer);
+    try std.testing.expectEqualStrings("new", rows.at(0)[1].text);
 }
 
 test "GLOB supports wildcards, character classes, and typed DSL" {
@@ -7198,7 +7576,7 @@ test "GLOB supports wildcards, character classes, and typed DSL" {
     var raw = try db.exec("SELECT id FROM glob_items WHERE name GLOB '[BR]ob' ORDER BY id;");
     defer raw.deinit();
     try std.testing.expectEqual(@as(usize, 2), raw.count());
-    var typed = try db.from(User).where(User.columns.name.glob("A*")).fetch();
+    var typed = try db.from(User).where(User.name.glob("A*")).fetch();
     defer typed.deinit();
     try std.testing.expectEqual(@as(usize, 1), typed.count());
 }
@@ -7214,12 +7592,12 @@ test "trim family works in raw and typed projections" {
     created.deinit();
     var raw = try db.exec("SELECT TRIM(label), LTRIM(label), RTRIM(label) FROM trim_items;");
     defer raw.deinit();
-    try std.testing.expectEqualStrings("Alpha", raw.rows[0][0].text);
-    try std.testing.expectEqualStrings("Alpha  ", raw.rows[0][1].text);
-    try std.testing.expectEqualStrings("  Alpha", raw.rows[0][2].text);
-    var typed = try db.from(Item).select(.{Item.columns.label.trim()}).fetch();
+    try std.testing.expectEqualStrings("Alpha", raw.at(0)[0].text);
+    try std.testing.expectEqualStrings("Alpha  ", raw.at(0)[1].text);
+    try std.testing.expectEqualStrings("  Alpha", raw.at(0)[2].text);
+    var typed = try db.from(Item).select(.{Item.label.trim()}).fetch();
     defer typed.deinit();
-    try std.testing.expectEqualStrings("Alpha", typed.rows[0][0].text);
+    try std.testing.expectEqualStrings("Alpha", typed.at(0)[0].text);
 }
 
 test "replace and substr support multiple scalar arguments" {
@@ -7232,8 +7610,8 @@ test "replace and substr support multiple scalar arguments" {
     created.deinit();
     var rows = try db.exec("SELECT REPLACE(label, 'SQLite', 'Zig'), SUBSTR(label, 1, 5) FROM string_items;");
     defer rows.deinit();
-    try std.testing.expectEqualStrings("Alice in Zig", rows.rows[0][0].text);
-    try std.testing.expectEqualStrings("Alice", rows.rows[0][1].text);
+    try std.testing.expectEqualStrings("Alice in Zig", rows.at(0)[0].text);
+    try std.testing.expectEqualStrings("Alice", rows.at(0)[1].text);
 }
 
 test "typed replace and substr projections check columns at compile time" {
@@ -7245,10 +7623,10 @@ test "typed replace and substr projections check columns at compile time" {
     defer db.close();
     var created = try db.exec("CREATE TABLE typed_string_items (id INTEGER, label TEXT); INSERT INTO typed_string_items VALUES (1, 'Alice in SQLite');");
     created.deinit();
-    var replaced = try db.from(Item).select(.{Item.columns.label.replace("SQLite", "Zig")}).fetch();
+    var replaced = try db.from(Item).select(.{Item.label.replace("SQLite", "Zig")}).fetch();
     defer replaced.deinit();
     try std.testing.expectEqualStrings("Alice in Zig", replaced.rows[0][0].text);
-    var shortened = try db.from(Item).select(.{Item.columns.label.substr(1, 5)}).fetch();
+    var shortened = try db.from(Item).select(.{Item.label.substr(1, 5)}).fetch();
     defer shortened.deinit();
     try std.testing.expectEqualStrings("Alice", shortened.rows[0][0].text);
 }
@@ -7262,15 +7640,15 @@ test "typed fetch maps result columns into the table struct" {
     defer db.close();
     var created = try db.exec("CREATE TABLE typed_fetch_items (id INTEGER, label TEXT); INSERT INTO typed_fetch_items VALUES (7, 'mapped');");
     created.deinit();
-    var projected = try db.from(Item).select(.{ Item.columns.label, Item.columns.id }).fetch();
+    var projected = try db.from(Item).select(.{ Item.label, Item.id }).fetch();
     defer projected.deinit();
     try std.testing.expectEqual(@as(usize, 1), projected.count());
     try std.testing.expectEqualStrings("mapped", projected.rows[0][0].text);
     try std.testing.expectEqual(@as(i64, 7), projected.rows[0][1].integer);
     var typed = try db.from(Item).selectAll().fetch();
     defer typed.deinit();
-    try std.testing.expectEqual(@as(i64, 7), typed.rows[0].id);
-    try std.testing.expectEqualStrings("mapped", typed.rows[0].label);
+    try std.testing.expectEqual(@as(i64, 7), typed.at(0).id);
+    try std.testing.expectEqualStrings("mapped", typed.at(0).label);
 }
 
 test "coalesce, ifnull, and instr evaluate their arguments" {
@@ -7283,9 +7661,9 @@ test "coalesce, ifnull, and instr evaluate their arguments" {
     created.deinit();
     var rows = try db.exec("SELECT COALESCE(a, NULL, b), IFNULL(a, b), INSTR(b, 'back') FROM scalar_items;");
     defer rows.deinit();
-    try std.testing.expectEqualStrings("fallback", rows.rows[0][0].text);
-    try std.testing.expectEqualStrings("fallback", rows.rows[0][1].text);
-    try std.testing.expectEqual(@as(i64, 5), rows.rows[0][2].integer);
+    try std.testing.expectEqualStrings("fallback", rows.at(0)[0].text);
+    try std.testing.expectEqualStrings("fallback", rows.at(0)[1].text);
+    try std.testing.expectEqual(@as(i64, 5), rows.at(0)[2].integer);
 }
 
 test "NOT GLOB works in raw SQL and typed DSL" {
@@ -7300,7 +7678,7 @@ test "NOT GLOB works in raw SQL and typed DSL" {
     var raw = try db.exec("SELECT id FROM not_glob_items WHERE name NOT GLOB 'A*';");
     defer raw.deinit();
     try std.testing.expectEqual(@as(usize, 1), raw.count());
-    var typed = try db.from(Item).where(Item.columns.name.notGlob("A*")).fetch();
+    var typed = try db.from(Item).where(Item.name.notGlob("A*")).fetch();
     defer typed.deinit();
     try std.testing.expectEqual(@as(usize, 1), typed.count());
 }
@@ -7317,8 +7695,8 @@ test "typed fetch maps SQLite NULL into optional struct fields" {
     var typed = try db.from(Item).fetch();
     defer typed.deinit();
     try std.testing.expectEqual(@as(usize, 2), typed.count());
-    try std.testing.expect(typed.rows[0].label == null);
-    try std.testing.expectEqualStrings("present", typed.rows[1].label.?);
+    try std.testing.expect(typed.at(0).label == null);
+    try std.testing.expectEqualStrings("present", typed.at(1).label.?);
 }
 
 test "typed boolean fields use SQLite INTEGER affinity" {
@@ -7333,7 +7711,7 @@ test "typed boolean fields use SQLite INTEGER affinity" {
     inserted.deinit();
     var typed = try db.from(Item).fetch();
     defer typed.deinit();
-    try std.testing.expect(typed.rows[0].enabled);
+    try std.testing.expect(typed.at(0).enabled);
 }
 
 test "LIKE is ASCII case-insensitive while GLOB remains case-sensitive" {
@@ -7363,7 +7741,7 @@ test "function expressions are valid predicate left-hand sides" {
     var rows = try db.exec("SELECT name FROM function_predicate_items WHERE LOWER(name) = 'alice';");
     defer rows.deinit();
     try std.testing.expectEqual(@as(usize, 1), rows.count());
-    try std.testing.expectEqualStrings("Alice", rows.rows[0][0].text);
+    try std.testing.expectEqualStrings("Alice", rows.at(0)[0].text);
 }
 
 test "trim functions work in predicate expressions" {
@@ -7377,7 +7755,7 @@ test "trim functions work in predicate expressions" {
     var rows = try db.exec("SELECT name FROM trim_predicate_items WHERE TRIM(name) = 'Alice';");
     defer rows.deinit();
     try std.testing.expectEqual(@as(usize, 1), rows.count());
-    try std.testing.expectEqualStrings("  Alice  ", rows.rows[0][0].text);
+    try std.testing.expectEqualStrings("  Alice  ", rows.at(0)[0].text);
 }
 
 test "INSTR works in numeric predicate expressions" {
@@ -7391,7 +7769,7 @@ test "INSTR works in numeric predicate expressions" {
     var rows = try db.exec("SELECT name FROM instr_predicate_items WHERE INSTR(name, 'ite') > 0;");
     defer rows.deinit();
     try std.testing.expectEqual(@as(usize, 1), rows.count());
-    try std.testing.expectEqualStrings("SQLite", rows.rows[0][0].text);
+    try std.testing.expectEqualStrings("SQLite", rows.at(0)[0].text);
 }
 
 test "typed DSL function predicates validate columns" {
@@ -7403,10 +7781,10 @@ test "typed DSL function predicates validate columns" {
     defer db.close();
     var created = try db.exec("CREATE TABLE typed_function_items (name TEXT); INSERT INTO typed_function_items VALUES ('  Alice  '), ('Alice'), ('Bob');");
     created.deinit();
-    var lower = try db.from(Item).where(Item.columns.name.lower().eq("alice")).fetch();
+    var lower = try db.from(Item).where(Item.name.lower().eq("alice")).fetch();
     defer lower.deinit();
     try std.testing.expectEqual(@as(usize, 1), lower.count());
-    var trimmed = try db.from(Item).where(Item.columns.name.trim().eq("Alice")).fetch();
+    var trimmed = try db.from(Item).where(Item.name.trim().eq("Alice")).fetch();
     defer trimmed.deinit();
     try std.testing.expectEqual(@as(usize, 2), trimmed.count());
 }
@@ -7420,7 +7798,7 @@ test "generic typed function predicate supports scalar comparisons" {
     defer db.close();
     var created = try db.exec("CREATE TABLE generic_function_items (name TEXT); INSERT INTO generic_function_items VALUES ('long'), ('x');");
     created.deinit();
-    var rows = try db.from(Item).where(Item.columns.name.length().gt(1)).fetch();
+    var rows = try db.from(Item).where(Item.name.length().gt(1)).fetch();
     defer rows.deinit();
     try std.testing.expectEqual(@as(usize, 1), rows.count());
 }
@@ -7434,7 +7812,7 @@ test "typed two-argument function predicates support INSTR" {
     defer db.close();
     var created = try db.exec("CREATE TABLE typed_function2_items (name TEXT); INSERT INTO typed_function2_items VALUES ('SQLite'), ('Zig');");
     created.deinit();
-    var rows = try db.from(Item).where(Item.columns.name.instr("ite").gt(0)).fetch();
+    var rows = try db.from(Item).where(Item.name.instr("ite").gt(0)).fetch();
     defer rows.deinit();
     try std.testing.expectEqual(@as(usize, 1), rows.count());
 }
@@ -7451,11 +7829,11 @@ test "NULL-safe IS DISTINCT FROM works in raw SQL and typed DSL" {
     var raw = try db.exec("SELECT id FROM distinct_items WHERE label IS NOT DISTINCT FROM NULL ORDER BY id;");
     defer raw.deinit();
     try std.testing.expectEqual(@as(usize, 1), raw.count());
-    try std.testing.expectEqual(@as(i64, 1), raw.rows[0][0].integer);
-    var typed = try db.from(Item).where(Item.columns.label.isDistinctFrom(@as(Value, .null))).fetch();
+    try std.testing.expectEqual(@as(i64, 1), raw.at(0)[0].integer);
+    var typed = try db.from(Item).where(Item.label.isDistinctFrom(@as(Value, .null))).fetch();
     defer typed.deinit();
     try std.testing.expectEqual(@as(usize, 1), typed.count());
-    try std.testing.expectEqual(@as(i64, 2), typed.rows[0].id);
+    try std.testing.expectEqual(@as(i64, 2), typed.at(0).id);
 }
 
 test "NULLIF returns NULL only when its arguments are equal" {
@@ -7468,10 +7846,10 @@ test "NULLIF returns NULL only when its arguments are equal" {
     created.deinit();
     var rows = try db.exec("SELECT NULLIF(value, 0), NULLIF(value, 7) FROM nullif_items ORDER BY value;");
     defer rows.deinit();
-    try std.testing.expect(rows.rows[0][0] == .null);
-    try std.testing.expectEqual(@as(i64, 0), rows.rows[0][1].integer);
-    try std.testing.expectEqual(@as(i64, 7), rows.rows[1][0].integer);
-    try std.testing.expect(rows.rows[1][1] == .null);
+    try std.testing.expect(rows.at(0)[0] == .null);
+    try std.testing.expectEqual(@as(i64, 0), rows.at(0)[1].integer);
+    try std.testing.expectEqual(@as(i64, 7), rows.at(1)[0].integer);
+    try std.testing.expect(rows.at(1)[1] == .null);
 }
 
 test "ROUND works in raw and typed projections" {
@@ -7485,10 +7863,10 @@ test "ROUND works in raw and typed projections" {
     created.deinit();
     var raw = try db.exec("SELECT ROUND(value) FROM round_items ORDER BY value;");
     defer raw.deinit();
-    try std.testing.expectEqual(@as(f64, 2), raw.rows[0][0].real);
-    var typed = try db.from(Item).select(.{Item.columns.value.round(0)}).fetch();
+    try std.testing.expectEqual(@as(f64, 2), raw.at(0)[0].real);
+    var typed = try db.from(Item).select(.{Item.value.round(0)}).fetch();
     defer typed.deinit();
-    try std.testing.expectEqual(@as(f64, 2), typed.rows[0][0].real);
+    try std.testing.expectEqual(@as(f64, 2), typed.at(0)[0].real);
 }
 
 test "ROUND honors positive and negative precision" {
@@ -7501,8 +7879,8 @@ test "ROUND honors positive and negative precision" {
     created.deinit();
     var rows = try db.exec("SELECT ROUND(1.236, 2), ROUND(123, -1) FROM round_precision_items;");
     defer rows.deinit();
-    try std.testing.expectEqual(@as(f64, 1.24), rows.rows[0][0].real);
-    try std.testing.expectEqual(@as(f64, 120), rows.rows[0][1].real);
+    try std.testing.expectEqual(@as(f64, 1.24), rows.at(0)[0].real);
+    try std.testing.expectEqual(@as(f64, 120), rows.at(0)[1].real);
 }
 
 test "CAST supports INTEGER, REAL, and TEXT affinities" {
@@ -7516,12 +7894,12 @@ test "CAST supports INTEGER, REAL, and TEXT affinities" {
     created.deinit();
     var raw = try db.exec("SELECT CAST(value AS INTEGER), CAST(value AS REAL), CAST(value AS TEXT) FROM cast_items;");
     defer raw.deinit();
-    try std.testing.expectEqual(@as(i64, 42), raw.rows[0][0].integer);
-    try std.testing.expectEqual(@as(f64, 42), raw.rows[0][1].real);
-    try std.testing.expectEqualStrings("42", raw.rows[0][2].text);
-    var typed = try db.from(Item).select(.{Item.columns.value.cast("INTEGER")}).fetch();
+    try std.testing.expectEqual(@as(i64, 42), raw.at(0)[0].integer);
+    try std.testing.expectEqual(@as(f64, 42), raw.at(0)[1].real);
+    try std.testing.expectEqualStrings("42", raw.at(0)[2].text);
+    var typed = try db.from(Item).select(.{Item.value.cast("INTEGER")}).fetch();
     defer typed.deinit();
-    try std.testing.expectEqual(@as(i64, 42), typed.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 42), typed.at(0)[0].integer);
 }
 
 test "column type declarations accept SQLite type names with constraints" {
@@ -7539,19 +7917,19 @@ test "column type declarations accept SQLite type names with constraints" {
     var rows = try db.exec("SELECT id, tiny, big, ubi, label, code, amount, score, flag, stamp, payload, note FROM type_matrix ORDER BY id;");
     defer rows.deinit();
     try std.testing.expectEqual(@as(usize, 2), rows.rows.len);
-    try std.testing.expectEqual(@as(i64, 1), rows.rows[0][0].integer);
-    try std.testing.expectEqual(@as(i64, 2), rows.rows[0][1].integer);
-    try std.testing.expectEqual(@as(i64, 3), rows.rows[0][2].integer);
-    try std.testing.expectEqual(@as(i64, 4), rows.rows[0][3].integer);
-    try std.testing.expectEqualStrings("red", rows.rows[0][4].text);
-    try std.testing.expectEqualStrings("A", rows.rows[0][5].text);
-    try std.testing.expectEqual(@as(f64, 9.99), rows.rows[0][6].real);
-    try std.testing.expectEqual(@as(f64, 1.5), rows.rows[0][7].real);
-    try std.testing.expectEqual(@as(i64, 0), rows.rows[0][8].integer);
-    try std.testing.expectEqualStrings("2026-09-19", rows.rows[0][9].text);
-    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x01, 0x02 }, rows.rows[0][10].blob);
-    try std.testing.expectEqualStrings("hello", rows.rows[0][11].text);
-    try std.testing.expectEqual(@as(i64, 1), rows.rows[1][8].integer);
+    try std.testing.expectEqual(@as(i64, 1), rows.at(0)[0].integer);
+    try std.testing.expectEqual(@as(i64, 2), rows.at(0)[1].integer);
+    try std.testing.expectEqual(@as(i64, 3), rows.at(0)[2].integer);
+    try std.testing.expectEqual(@as(i64, 4), rows.at(0)[3].integer);
+    try std.testing.expectEqualStrings("red", rows.at(0)[4].text);
+    try std.testing.expectEqualStrings("A", rows.at(0)[5].text);
+    try std.testing.expectEqual(@as(f64, 9.99), rows.at(0)[6].real);
+    try std.testing.expectEqual(@as(f64, 1.5), rows.at(0)[7].real);
+    try std.testing.expectEqual(@as(i64, 0), rows.at(0)[8].integer);
+    try std.testing.expectEqualStrings("2026-09-19", rows.at(0)[9].text);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x01, 0x02 }, rows.at(0)[10].blob);
+    try std.testing.expectEqualStrings("hello", rows.at(0)[11].text);
+    try std.testing.expectEqual(@as(i64, 1), rows.at(1)[8].integer);
     var casted = try db.exec("SELECT CAST(big AS BIGINT), CAST(score AS DOUBLE PRECISION), CAST(label AS VARCHAR(20)), CAST(amount AS DECIMAL(10,2)), CAST(flag AS BOOLEAN) FROM type_matrix WHERE id = 1;");
     defer casted.deinit();
     try std.testing.expectEqual(@as(i64, 3), casted.rows[0][0].integer);
@@ -7585,9 +7963,9 @@ test "json_extract reads simple top-level scalar object fields" {
     created.deinit();
     var rows = try db.exec("SELECT json_extract(payload, '$.name'), json_extract(payload, '$.age'), json_extract(payload, '$.missing') FROM json_items;");
     defer rows.deinit();
-    try std.testing.expectEqualStrings("Alice", rows.rows[0][0].text);
-    try std.testing.expectEqual(@as(i64, 42), rows.rows[0][1].integer);
-    try std.testing.expect(rows.rows[0][2] == .null);
+    try std.testing.expectEqualStrings("Alice", rows.at(0)[0].text);
+    try std.testing.expectEqual(@as(i64, 42), rows.at(0)[1].integer);
+    try std.testing.expect(rows.at(0)[2] == .null);
 }
 
 test "typed json_extract validates the source column" {
@@ -7599,10 +7977,10 @@ test "typed json_extract validates the source column" {
     defer db.close();
     var created = try db.exec("CREATE TABLE typed_json_items (payload TEXT); INSERT INTO typed_json_items VALUES ('{\"name\":\"Alice\"}'), ('{\"name\":\"Bob\"}');");
     created.deinit();
-    var typed = try db.from(Item).select(.{Item.columns.payload.jsonExtract("$.name")}).fetch();
+    var typed = try db.from(Item).select(.{Item.payload.jsonExtract("$.name")}).fetch();
     defer typed.deinit();
-    try std.testing.expectEqualStrings("Alice", typed.rows[0][0].text);
-    var filtered = try db.from(Item).where(Item.columns.payload.jsonExtract("$.name").eq("Bob")).fetch();
+    try std.testing.expectEqualStrings("Alice", typed.at(0)[0].text);
+    var filtered = try db.from(Item).where(Item.payload.jsonExtract("$.name").eq("Bob")).fetch();
     defer filtered.deinit();
     try std.testing.expectEqual(@as(usize, 1), filtered.count());
 }
@@ -7616,16 +7994,16 @@ test "typed LIKE patterns match substrings, prefixes, and suffixes" {
     defer db.close();
     var created = try db.exec("CREATE TABLE text_predicate_items (name TEXT); INSERT INTO text_predicate_items VALUES ('Alice'), ('Malice'), ('Bob');");
     created.deinit();
-    var contains = try db.from(Item).where(Item.columns.name.like("%ali%")).fetch();
+    var contains = try db.from(Item).where(Item.name.like("%ali%")).fetch();
     defer contains.deinit();
     try std.testing.expectEqual(@as(usize, 2), contains.count());
-    var starts = try db.from(Item).where(Item.columns.name.like("Al%")).fetch();
+    var starts = try db.from(Item).where(Item.name.like("Al%")).fetch();
     defer starts.deinit();
     try std.testing.expectEqual(@as(usize, 1), starts.count());
-    var ends = try db.from(Item).where(Item.columns.name.like("%ob")).fetch();
+    var ends = try db.from(Item).where(Item.name.like("%ob")).fetch();
     defer ends.deinit();
     try std.testing.expectEqual(@as(usize, 1), ends.count());
-    var notContains = try db.from(Item).where(Item.columns.name.notLike("%ali%")).fetch();
+    var notContains = try db.from(Item).where(Item.name.notLike("%ali%")).fetch();
     defer notContains.deinit();
     try std.testing.expectEqual(@as(usize, 1), notContains.count());
 }
@@ -7639,13 +8017,13 @@ test "select accepts typed column arrays" {
     defer db.close();
     var created = try db.exec("CREATE TABLE typed_select_items (id INTEGER, label TEXT); INSERT INTO typed_select_items VALUES (7, 'seven');");
     created.deinit();
-    var rows = try db.from(Item).select(.{ Item.columns.label, Item.columns.id }).fetch();
+    var rows = try db.from(Item).select(.{ Item.label, Item.id }).fetch();
     defer rows.deinit();
-    try std.testing.expectEqualStrings("seven", rows.rows[0][0].text);
-    try std.testing.expectEqual(@as(i64, 7), rows.rows[0][1].integer);
+    try std.testing.expectEqualStrings("seven", rows.at(0)[0].text);
+    try std.testing.expectEqual(@as(i64, 7), rows.at(0)[1].integer);
 }
 
-test "fetchOne returns a mapped row or null" {
+test "fetchOne and fetchOptional enforce single-row cardinality" {
     const path = "sqlite_zig_fetch_one_typed_test.db";
     std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
@@ -7654,12 +8032,20 @@ test "fetchOne returns a mapped row or null" {
     defer db.close();
     var created = try db.exec("CREATE TABLE fetch_one_items (id INTEGER, label TEXT); INSERT INTO fetch_one_items VALUES (3, 'three');");
     created.deinit();
-    var row = (try db.from(Item).where(Item.columns.id.eq(3)).fetchOne()).?;
+    var row = try db.from(Item).where(Item.id.eq(3)).fetchOne();
     defer db.from(Item).freeRow(&row);
     try std.testing.expectEqual(@as(i64, 3), row.id);
     try std.testing.expectEqualStrings("three", row.label);
-    const missing = try db.from(Item).where(Item.columns.id.eq(99)).fetchOne();
+    try std.testing.expectError(error.NoRows, db.from(Item).where(Item.id.eq(99)).fetchOne());
+    const missing = try db.from(Item).where(Item.id.eq(99)).fetchOptional();
     try std.testing.expect(missing == null);
+    var present = try db.from(Item).where(Item.id.eq(3)).fetchOptional();
+    defer if (present) |*value| db.from(Item).freeRow(value);
+    try std.testing.expectEqual(@as(i64, 3), present.?.id);
+    var second = try db.from(Item).insert(.{ .id = 4, .label = "four" });
+    second.deinit();
+    try std.testing.expectError(error.TooManyRows, db.from(Item).fetchOne());
+    try std.testing.expectError(error.TooManyRows, db.from(Item).fetchOptional());
 }
 
 test "typed coalesce and ifnull projections use SQLite null semantics" {
@@ -7671,11 +8057,11 @@ test "typed coalesce and ifnull projections use SQLite null semantics" {
     defer db.close();
     var created = try db.exec("CREATE TABLE typed_null_function_items (label TEXT); INSERT INTO typed_null_function_items VALUES (NULL), ('ready');");
     created.deinit();
-    var coalesced = try db.from(Item).select(.{Item.columns.label.coalesce("fallback")}).fetch();
+    var coalesced = try db.from(Item).select(.{Item.label.coalesce("fallback")}).fetch();
     defer coalesced.deinit();
     try std.testing.expectEqualStrings("fallback", coalesced.rows[0][0].text);
     try std.testing.expectEqualStrings("ready", coalesced.rows[1][0].text);
-    var ifnulled = try db.from(Item).select(.{Item.columns.label.ifNull(7)}).fetch();
+    var ifnulled = try db.from(Item).select(.{Item.label.ifNull(7)}).fetch();
     defer ifnulled.deinit();
     try std.testing.expectEqual(@as(i64, 7), ifnulled.rows[0][0].integer);
 }
@@ -7691,10 +8077,10 @@ test "json_set updates a simple top-level scalar key" {
     created.deinit();
     var raw = try db.exec("SELECT json_set(payload, '$.city', 'Paris') FROM json_set_items;");
     defer raw.deinit();
-    try std.testing.expectEqualStrings("{\"city\":\"Paris\"}", raw.rows[0][0].text);
-    var typed = try db.from(Item).select(.{Item.columns.payload.jsonSet("$.city", "Paris")}).fetch();
+    try std.testing.expectEqualStrings("{\"city\":\"Paris\"}", raw.at(0)[0].text);
+    var typed = try db.from(Item).select(.{Item.payload.jsonSet("$.city", "Paris")}).fetch();
     defer typed.deinit();
-    try std.testing.expectEqualStrings("{\"city\":\"Paris\"}", typed.rows[0][0].text);
+    try std.testing.expectEqualStrings("{\"city\":\"Paris\"}", typed.at(0)[0].text);
     var inserted = try db.exec("SELECT json_set(payload, '$.country', 'UK') FROM json_set_items;");
     defer inserted.deinit();
     try std.testing.expectEqualStrings("{\"city\":\"London\",\"country\":\"UK\"}", inserted.rows[0][0].text);
@@ -7705,22 +8091,23 @@ test "raw DSL queries schema-less tables with runtime columns" {
     std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
     var db = try Connection.open(std.testing.allocator, path);
+    const t_db_dynamic_items = db.table("dynamic_items");
     defer db.close();
     var created = try db.exec("CREATE TABLE dynamic_items (id INTEGER, name TEXT); INSERT INTO dynamic_items VALUES (1, 'Alice'), (2, 'Bob');");
     created.deinit();
-    var rows = try db.from("dynamic_items").select(.{db.col("name")}).where(db.col("id").gte(2)).fetch();
+    var rows = try t_db_dynamic_items.select(.{t_db_dynamic_items.column("name")}).where(t_db_dynamic_items.column("id").gte(2)).fetch();
     defer rows.deinit();
     try std.testing.expectEqual(@as(usize, 1), rows.count());
-    try std.testing.expectEqualStrings("Bob", rows.rows[0][0].text);
-    var compound = try db.from("dynamic_items").where(db.col("id").gt(0)).andWhere(db.col("name").like("B%")).fetch();
+    try std.testing.expectEqualStrings("Bob", rows.at(0)[0].text);
+    var compound = try t_db_dynamic_items.selectAll().where(t_db_dynamic_items.column("id").gt(0)).andWhere(t_db_dynamic_items.column("name").like("B%")).fetch();
     defer compound.deinit();
     try std.testing.expectEqual(@as(usize, 1), compound.count());
-    var glob = try db.from("dynamic_items").where(db.col("name").glob("A*")).fetch();
+    var glob = try t_db_dynamic_items.selectAll().where(t_db_dynamic_items.column("name").glob("A*")).fetch();
     defer glob.deinit();
     try std.testing.expectEqual(@as(usize, 1), glob.count());
     var nulls = try db.exec("INSERT INTO dynamic_items VALUES (3, NULL);");
     nulls.deinit();
-    var missing = try db.from("dynamic_items").where(db.col("name").isNull()).fetch();
+    var missing = try t_db_dynamic_items.selectAll().where(t_db_dynamic_items.column("name").isNull()).fetch();
     defer missing.deinit();
     try std.testing.expectEqual(@as(usize, 1), missing.count());
 }
@@ -7735,75 +8122,249 @@ fn dropDb(db: *Connection, path: []const u8) void {
     std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
 }
 
+test "explicit values and expression assignments share native DML semantics" {
+    const Widget = @import("../dsl/table.zig").table("exp_widgets", struct {
+        id: i64,
+        label: []const u8 = "untitled",
+        stock: i64 = 0,
+        parent_id: ?i64 = null,
+    });
+    const path = "sqlite_zig_explicit_dml_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    try db.createTable(Widget, .{ .primaryKey = Widget.id });
+    // Concise and explicit inserts agree.
+    var a = try db.from(Widget).insert(.{ .id = 1, .label = "a", .stock = 5, .parent_id = null });
+    a.deinit();
+    var b = try db.from(Widget).insert(.{
+        .id = Widget.id.value(2),
+        .label = Widget.label.value("b"),
+        .stock = Widget.stock.value(7),
+        .parent_id = Widget.parent_id.nullValue(),
+    });
+    b.deinit();
+    // defaultValue() omits the column so the database DEFAULT applies.
+    var c = try db.from(Widget).insert(.{
+        .id = 3,
+        .label = Widget.label.defaultValue(),
+        .stock = Widget.stock.defaultValue(),
+        .parent_id = Widget.parent_id.nullValue(),
+    });
+    c.deinit();
+    var rows = try db.from(Widget).select(Widget.all()).orderBy(Widget.id.asc()).fetch();
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(usize, 3), rows.count());
+    try std.testing.expectEqualStrings("untitled", rows.at(2).label);
+    try std.testing.expectEqual(@as(i64, 0), rows.at(2).stock);
+    try std.testing.expect(rows.at(2).parent_id == null);
+    // Explicit update literals match concise updates.
+    var upd1 = try (try db.from(Widget).update(.{ .label = Widget.label.value("a2") })).where(Widget.id.eq(1)).execute();
+    upd1.deinit();
+    // Arithmetic assignment evaluates natively: stock = stock + 10.
+    var upd2 = try (try db.from(Widget).update(.{ .stock = Widget.stock.add(10) })).where(Widget.id.eq(1)).execute();
+    upd2.deinit();
+    // Column-to-column assignment within the same row scope.
+    var upd3 = try (try db.from(Widget).update(.{ .label = Widget.label })).where(Widget.id.eq(1)).execute();
+    upd3.deinit();
+    var check = try db.from(Widget).select(Widget.all()).where(Widget.id.eq(1)).fetchOne();
+    defer db.from(Widget).freeRow(&check);
+    try std.testing.expectEqualStrings("a2", check.label);
+    try std.testing.expectEqual(@as(i64, 15), check.stock);
+    // Dynamic explicit values behave the same.
+    const widgets = db.table("exp_widgets");
+    var d = try widgets.insert(.{
+        .id = widgets.column("id").value(4),
+        .label = widgets.column("label").value("d"),
+        .stock = widgets.column("stock").value(1),
+        .parent_id = widgets.column("parent_id").nullValue(),
+    });
+    d.deinit();
+    var du = try (try widgets.update(.{ .stock = widgets.column("stock").mul(3) })).where(widgets.column("id").eq(4)).execute();
+    du.deinit();
+    var got = try db.from(Widget).select(Widget.all()).where(Widget.id.eq(4)).fetchOne();
+    defer db.from(Widget).freeRow(&got);
+    try std.testing.expectEqual(@as(i64, 3), got.stock);
+    // Upsert DO UPDATE accepts explicit values and expressions.
+    var up = try (try db.from(Widget).onConflict(Widget.id).doUpdate(.{
+        .stock = Widget.stock.add(100),
+        .label = Widget.label.value("up"),
+    })).insert(.{ .id = 1, .label = "ignored", .stock = 0 });
+    up.deinit();
+    var after = try db.from(Widget).select(Widget.all()).where(Widget.id.eq(1)).fetchOne();
+    defer db.from(Widget).freeRow(&after);
+    try std.testing.expectEqualStrings("up", after.label);
+    try std.testing.expectEqual(@as(i64, 115), after.stock);
+}
+
+test "insertFrom maps source columns onto destination fields" {
+    const Parent = @import("../dsl/table.zig").table("map_parent", struct { id: i64, label: []const u8 });
+    const Child = @import("../dsl/table.zig").table("map_child", struct { id: i64, parent_id: i64, name: []const u8 });
+    const path = "sqlite_zig_insert_from_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    try db.createTable(Parent, .{ .primaryKey = Parent.id });
+    try db.createTable(Child, .{ .primaryKey = Child.id });
+    var seed = try db.from(Parent).insert(.{ .id = 10, .label = "root" });
+    seed.deinit();
+    var copied = try db.from(Child).insertFrom(Parent, .{
+        .id = Parent.id,
+        .parent_id = Parent.id,
+        .name = Parent.label,
+    });
+    copied.deinit();
+    var kids = try db.from(Child).select(Child.all()).fetch();
+    defer kids.deinit();
+    try std.testing.expectEqual(@as(usize, 1), kids.count());
+    try std.testing.expectEqual(@as(i64, 10), kids.at(0).id);
+    try std.testing.expectEqual(@as(i64, 10), kids.at(0).parent_id);
+    try std.testing.expectEqualStrings("root", kids.at(0).name);
+    // Dynamic mapping with differently ordered fields.
+    var raw = try db.exec("CREATE TABLE map_src (a INTEGER, b TEXT); INSERT INTO map_src VALUES (20, 'dyn'); CREATE TABLE map_dst (x INTEGER, y TEXT);");
+    raw.deinit();
+    const src = db.table("map_src");
+    const dst = db.table("map_dst");
+    var dcopied = try dst.insertFrom(src, .{
+        .y = src.column("b"),
+        .x = src.column("a"),
+    });
+    dcopied.deinit();
+    var got = try dst.selectAll().fetch();
+    defer got.deinit();
+    try std.testing.expectEqual(@as(usize, 1), got.count());
+    try std.testing.expectEqual(@as(i64, 20), got.rows[0][0].integer);
+    try std.testing.expectEqualStrings("dyn", got.rows[0][1].text);
+}
+
+test "ambiguous unqualified join references report an error" {
+    const path = "sqlite_zig_ambiguous_join_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    var setup = try db.exec("CREATE TABLE amb_a (id INTEGER, v TEXT); CREATE TABLE amb_b (id INTEGER, w TEXT); INSERT INTO amb_a VALUES (1, 'a'); INSERT INTO amb_b VALUES (1, 'b');");
+    setup.deinit();
+    // Raw SQL parity: SQLite itself rejects these.
+    try std.testing.expectError(error.AmbiguousColumn, db.exec("SELECT id FROM amb_a JOIN amb_b ON amb_a.id = amb_b.id;"));
+    try std.testing.expectError(error.AmbiguousColumn, db.exec("SELECT amb_a.v FROM amb_a JOIN amb_b ON amb_a.id = amb_b.id WHERE id = 1;"));
+    try std.testing.expectError(error.AmbiguousColumn, db.exec("SELECT amb_a.v FROM amb_a JOIN amb_b ON amb_a.id = amb_b.id GROUP BY id;"));
+    // Qualified references resolve.
+    var ok = try db.exec("SELECT amb_a.id FROM amb_a JOIN amb_b ON amb_a.id = amb_b.id;");
+    defer ok.deinit();
+    try std.testing.expectEqual(@as(usize, 1), ok.count());
+    // USING-merged columns coalesce and stay legal unqualified.
+    var merged = try db.exec("SELECT id FROM amb_a JOIN amb_b USING (id);");
+    defer merged.deinit();
+    try std.testing.expectEqual(@as(usize, 1), merged.count());
+    // Dynamic DSL: unqualified sugar errors, table-bound columns work.
+    const a = db.table("amb_a");
+    const b = db.table("amb_b");
+    try std.testing.expectError(error.AmbiguousColumn, a.innerJoin(b, a.column("id").eq(b.column("id"))).select(db.col("id")).fetch());
+    // SELECT * keeps duplicate output names legally (SQLite parity).
+    var star = try a.innerJoin(b, a.column("id").eq(b.column("id"))).selectAll().fetch();
+    defer star.deinit();
+    try std.testing.expectEqual(@as(usize, 1), star.count());
+    var dynOk = try a
+        .innerJoin(b, a.column("id").eq(b.column("id")))
+        .select(.{ a.column("id").as("aid"), b.column("id").as("bid") })
+        .fetch();
+    defer dynOk.deinit();
+    try std.testing.expectEqual(@as(usize, 1), dynOk.count());
+    // Table aliases disambiguate self-joins.
+    var setup2 = try db.exec("CREATE TABLE amb_e (id INTEGER, boss INTEGER); INSERT INTO amb_e VALUES (1, NULL), (2, 1);");
+    setup2.deinit();
+    const e1 = db.table("amb_e").as("e1");
+    const e2 = db.table("amb_e").as("e2");
+    var selfJoin = try db
+        .from(e1)
+        .innerJoin(e2, e1.column("id").eq(e2.column("boss")))
+        .select(.{ e1.column("id").as("eid"), e2.column("id").as("bid") })
+        .fetch();
+    defer selfJoin.deinit();
+    try std.testing.expectEqual(@as(usize, 1), selfJoin.count());
+    try std.testing.expectError(error.AmbiguousColumn, db.exec("SELECT id FROM amb_e e1 JOIN amb_e e2 ON e1.id = e2.boss;"));
+    // Typed aliases keep compile-time columns while rebinding qualifiers.
+    const Emp = @import("../dsl/table.zig").table("amb_e", struct { id: i64, boss: ?i64 });
+    const m1 = @import("../dsl/table.zig").aliased(Emp, "m1");
+    const m2 = @import("../dsl/table.zig").aliased(Emp, "m2");
+    var typedSelf = try db
+        .from(m1)
+        .innerJoin(m2, m1.id.eq(m2.boss))
+        .select(.{ m1.id.as("eid"), m2.id.as("bid") })
+        .fetch();
+    defer typedSelf.deinit();
+    try std.testing.expectEqual(@as(usize, 1), typedSelf.count());
+    try std.testing.expectEqualStrings("eid", typedSelf.columns[0]);
+    try std.testing.expectEqual(@as(i64, 1), (try typedSelf.get(0, "eid")).integer);
+}
+
 test "dynamic DSL covers queries without any struct" {
     const path = "sqlite_zig_final_dynamic_test.db";
     var db = try freshDb(path);
+    const t_db_dyn = db.table("dyn");
     defer dropDb(db, path);
     var setup = try db.exec("CREATE TABLE dyn (id INTEGER, name TEXT, age INTEGER); INSERT INTO dyn VALUES (1, 'Alice', 30), (2, 'Bob', 17), (3, 'Carol', 42);");
     setup.deinit();
 
-    var adults = try db.from("dyn").select(.{ db.col("id"), db.col("name") }).where(db.col("age").gte(18)).orderBy(db.col("name").asc()).fetch();
+    var adults = try t_db_dyn.select(.{ t_db_dyn.column("id"), t_db_dyn.column("name") }).where(t_db_dyn.column("age").gte(18)).orderBy(t_db_dyn.column("name").asc()).fetch();
     defer adults.deinit();
     try std.testing.expectEqual(@as(usize, 2), adults.count());
 
-    var either = try db.from("dyn").where(db.col("id").eq(2)).orWhere(db.col("id").eq(3)).fetch();
+    var either = try t_db_dyn.selectAll().where(t_db_dyn.column("id").eq(2)).orWhere(t_db_dyn.column("id").eq(3)).fetch();
     defer either.deinit();
     try std.testing.expectEqual(@as(usize, 2), either.count());
 
-    var both = try db.from("dyn").where(db.col("age").gte(18)).andWhere(db.col("name").like("C%")).fetch();
+    var both = try t_db_dyn.selectAll().where(t_db_dyn.column("age").gte(18)).andWhere(t_db_dyn.column("name").like("C%")).fetch();
     defer both.deinit();
     try std.testing.expectEqual(@as(usize, 1), both.count());
 
-    var paged = try db.from("dyn").selectAll().orderBy(db.col("id").asc()).limit(2).offset(1).fetch();
+    var paged = try t_db_dyn.selectAll().orderBy(t_db_dyn.column("id").asc()).limit(2).offset(1).fetch();
     defer paged.deinit();
     try std.testing.expectEqual(@as(usize, 2), paged.count());
     try std.testing.expectEqual(@as(i64, 2), paged.rows[0][0].integer);
 
-    var distinct = try db.from("dyn").select(.{db.col("age")}).distinct().fetch();
+    var distinct = try t_db_dyn.select(.{t_db_dyn.column("age")}).distinct().fetch();
     defer distinct.deinit();
     try std.testing.expectEqual(@as(usize, 3), distinct.count());
 
-    var sum = try db.from("dyn").select(.{db.col("age").sum()}).fetch();
+    var sum = try t_db_dyn.select(.{t_db_dyn.column("age").sum()}).fetch();
     defer sum.deinit();
     try std.testing.expectEqual(@as(i64, 89), sum.rows[0][0].integer);
-    var avg = try db.from("dyn").select(.{db.col("age").avg()}).fetch();
+    var avg = try t_db_dyn.select(.{t_db_dyn.column("age").avg()}).fetch();
     defer avg.deinit();
     try std.testing.expectEqual(@as(f64, 89.0 / 3.0), avg.rows[0][0].real);
-    var min = try db.from("dyn").select(.{db.col("age").min()}).fetch();
+    var min = try t_db_dyn.select(.{t_db_dyn.column("age").min()}).fetch();
     defer min.deinit();
     try std.testing.expectEqual(@as(i64, 17), min.rows[0][0].integer);
-    var max = try db.from("dyn").select(.{db.col("age").max()}).fetch();
+    var max = try t_db_dyn.select(.{t_db_dyn.column("age").max()}).fetch();
     defer max.deinit();
     try std.testing.expectEqual(@as(i64, 42), max.rows[0][0].integer);
-    var colCount = try db.from("dyn").select(.{db.col("age").count()}).fetch();
+    var colCount = try t_db_dyn.select(.{t_db_dyn.column("age").count()}).fetch();
     defer colCount.deinit();
     try std.testing.expectEqual(@as(i64, 3), colCount.rows[0][0].integer);
 
-    var counted = try db.from("dyn").countStar().fetch();
+    var counted = try t_db_dyn.selectAll().countStar().fetch();
     defer counted.deinit();
     try std.testing.expectEqual(@as(i64, 3), counted.rows[0][0].integer);
 
-    var ranged = try db.from("dyn").where(db.col("age").between(18, 40)).fetch();
+    var ranged = try t_db_dyn.selectAll().where(t_db_dyn.column("age").between(18, 40)).fetch();
     defer ranged.deinit();
     try std.testing.expectEqual(@as(usize, 1), ranged.count());
 
-    var notRanged = try db.from("dyn").where(db.col("age").notBetween(18, 40)).fetch();
+    var notRanged = try t_db_dyn.selectAll().where(t_db_dyn.column("age").notBetween(18, 40)).fetch();
     defer notRanged.deinit();
     try std.testing.expectEqual(@as(usize, 2), notRanged.count());
 
-    var globbed = try db.from("dyn").where(db.col("name").glob("A*")).fetch();
+    var globbed = try t_db_dyn.selectAll().where(t_db_dyn.column("name").glob("A*")).fetch();
     defer globbed.deinit();
     try std.testing.expectEqual(@as(usize, 1), globbed.count());
 
-    var notLike = try db.from("dyn").where(db.col("name").notLike("A%")).fetch();
+    var notLike = try t_db_dyn.selectAll().where(t_db_dyn.column("name").notLike("A%")).fetch();
     defer notLike.deinit();
     try std.testing.expectEqual(@as(usize, 2), notLike.count());
 
-    var lowered = try db.from("dyn").where(db.col("name").lower().eq("alice")).fetch();
+    var lowered = try t_db_dyn.selectAll().where(t_db_dyn.column("name").lower().eq("alice")).fetch();
     defer lowered.deinit();
     try std.testing.expectEqual(@as(usize, 1), lowered.count());
 
-    var inList = try db.from("dyn").whereInValues(db.col("id"), .{ 1, 3 }).fetch();
+    var inList = try t_db_dyn.selectAll().whereInValues(t_db_dyn.column("id"), .{ 1, 3 }).fetch();
     defer inList.deinit();
     try std.testing.expectEqual(@as(usize, 2), inList.count());
 
@@ -7811,42 +8372,43 @@ test "dynamic DSL covers queries without any struct" {
     city.deinit();
     var profiled = try db.exec("UPDATE dyn SET profile = '{\"city\":\"Oslo\"}' WHERE id = 1;");
     profiled.deinit();
-    var foundCity = try db.from("dyn").where(db.col("profile").jsonExtract("$.city").eq("Oslo")).fetch();
+    var foundCity = try t_db_dyn.selectAll().where(t_db_dyn.column("profile").jsonExtract("$.city").eq("Oslo")).fetch();
     defer foundCity.deinit();
     try std.testing.expectEqual(@as(usize, 1), foundCity.count());
 
-    try std.testing.expectError(error.InvalidSql, db.from("dyn").orderBy(db.col("name").lower().asc()).fetch());
-    try std.testing.expectError(error.InvalidSql, db.from("dyn").havingCount("==", 1).fetch());
+    try std.testing.expectError(error.InvalidSql, t_db_dyn.selectAll().orderBy(t_db_dyn.column("name").lower().asc()).fetch());
+    try std.testing.expectError(error.InvalidSql, t_db_dyn.selectAll().having(t_db_dyn.column("id").eq(t_db_dyn.column("name"))).fetch());
 }
 
 test "raw SQL, dynamic DSL, and typed DSL interoperate on one database" {
     const path = "sqlite_zig_final_interop_test.db";
     var db = try freshDb(path);
+    const t_db_interop_users = db.table("interop_users");
     defer dropDb(db, path);
     const User = @import("../dsl/table.zig").table("interop_users", struct { id: i64, name: []const u8, age: ?i64 });
 
     var created = try db.exec("CREATE TABLE interop_users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER); INSERT INTO interop_users VALUES (1, 'Alice', 30);");
     created.deinit();
 
-    var dyn = try db.from("interop_users").where(db.col("age").gte(18)).fetch();
+    var dyn = try t_db_interop_users.selectAll().where(t_db_interop_users.column("age").gte(18)).fetch();
     defer dyn.deinit();
     try std.testing.expectEqual(@as(usize, 1), dyn.count());
-    var dynInsert = try db.from("interop_users").insert(.{ .id = 2, .name = "Bob", .age = 17 });
+    var dynInsert = try t_db_interop_users.insert(.{ .id = 2, .name = "Bob", .age = 17 });
     dynInsert.deinit();
 
     try db.schema(User).validate();
-    var typed = try db.from(User).where(User.columns.age.gte(18)).fetch();
+    var typed = try db.from(User).where(User.age.gte(18)).fetch();
     defer typed.deinit();
     try std.testing.expectEqual(@as(usize, 1), typed.count());
-    try std.testing.expectEqualStrings("Alice", typed.rows[0].name);
+    try std.testing.expectEqualStrings("Alice", typed.at(0).name);
 
     var updated = try db.exec("UPDATE interop_users SET age = 18 WHERE id = 2;");
     updated.deinit();
-    var adults = try db.from(User).where(User.columns.age.gte(18)).fetch();
+    var adults = try db.from(User).where(User.age.gte(18)).fetch();
     defer adults.deinit();
     try std.testing.expectEqual(@as(usize, 2), adults.count());
 
-    var mutation = try db.from("interop_users").delete().where(db.col("id").eq(1)).execute();
+    var mutation = try t_db_interop_users.delete().where(t_db_interop_users.column("id").eq(1)).execute();
     mutation.deinit();
     var remaining = try db.exec("SELECT id FROM interop_users ORDER BY id;");
     defer remaining.deinit();
@@ -7920,6 +8482,8 @@ test "schema validation rejects mismatched tables" {
 test "dynamic createTable supports keys without structs" {
     const path = "sqlite_zig_final_dynamic_ddl_test.db";
     var db = try freshDb(path);
+    const t_db_d_orders = db.table("d_orders");
+    const t_db_d_users = db.table("d_users");
     defer dropDb(db, path);
     try db.createTable("d_users", .{
         .columns = &.{
@@ -7941,20 +8505,20 @@ test "dynamic createTable supports keys without structs" {
             .onDelete = .cascade,
         }},
     });
-    var user = try db.from("d_users").insert(.{ .id = 1, .email = "a@x.test" });
+    var user = try t_db_d_users.insert(.{ .id = 1, .email = "a@x.test" });
     user.deinit();
-    try std.testing.expectError(error.ConstraintViolation, db.from("d_users").insert(.{ .id = 2, .email = "a@x.test" }));
-    var order = try db.from("d_orders").insert(.{ .id = 1, .user_id = 1 });
+    try std.testing.expectError(error.ConstraintViolation, t_db_d_users.insert(.{ .id = 2, .email = "a@x.test" }));
+    var order = try t_db_d_orders.insert(.{ .id = 1, .user_id = 1 });
     order.deinit();
-    try std.testing.expectError(error.ConstraintViolation, db.from("d_orders").insert(.{ .id = 2, .user_id = 99 }));
-    var joined = try db.from("d_users").innerJoin("d_orders", db.col("d_users.id").eq(db.col("d_orders.user_id"))).fetch();
+    try std.testing.expectError(error.ConstraintViolation, t_db_d_orders.insert(.{ .id = 2, .user_id = 99 }));
+    var joined = try t_db_d_users.innerJoin("d_orders", t_db_d_users.column("id").eq(t_db_d_orders.column("user_id"))).fetch();
     defer joined.deinit();
     try std.testing.expectEqual(@as(usize, 1), joined.count());
-    try db.createIndex("d_users", "d_users_email_idx", .{db.col("email")}, true);
-    try std.testing.expectError(error.ConstraintViolation, db.from("d_users").insert(.{ .id = 3, .email = "a@x.test" }));
-    var ignored = try db.from("d_users").insertOrIgnore(.{ .id = 1, .email = "dup@x.test" });
+    try db.createIndex("d_users", "d_users_email_idx", .{t_db_d_users.column("email")}, true);
+    try std.testing.expectError(error.ConstraintViolation, t_db_d_users.insert(.{ .id = 3, .email = "a@x.test" }));
+    var ignored = try t_db_d_users.insertOrIgnore(.{ .id = 1, .email = "dup@x.test" });
     ignored.deinit();
-    var kept = try db.from("d_users").where(db.col("id").eq(1)).fetch();
+    var kept = try t_db_d_users.selectAll().where(t_db_d_users.column("id").eq(1)).fetch();
     defer kept.deinit();
     try std.testing.expectEqualStrings("a@x.test", kept.rows[0][1].text);
 }
@@ -7962,9 +8526,10 @@ test "dynamic createTable supports keys without structs" {
 test "composite primary keys work in typed and dynamic DSL" {
     const path = "sqlite_zig_final_composite_pk_test.db";
     var db = try freshDb(path);
+    const t_db_c_dyn_members = db.table("c_dyn_members");
     defer dropDb(db, path);
     const Member = @import("../dsl/table.zig").table("c_members", struct { tenant_id: i64, user_id: i64, label: []const u8 });
-    try db.createTable(Member, .{ .primaryKey = &.{ Member.columns.tenant_id, Member.columns.user_id } });
+    try db.createTable(Member, .{ .primaryKey = &.{ Member.tenant_id, Member.user_id } });
     var first = try db.from(Member).insert(.{ .tenant_id = 1, .user_id = 1, .label = "a" });
     first.deinit();
     try std.testing.expectError(error.ConstraintViolation, db.from(Member).insert(.{ .tenant_id = 1, .user_id = 1, .label = "dup" }));
@@ -7978,21 +8543,23 @@ test "composite primary keys work in typed and dynamic DSL" {
         },
         .primaryKey = &.{ "tenant_id", "user_id" },
     });
-    var dyn = try db.from("c_dyn_members").insert(.{ .tenant_id = 1, .user_id = 1 });
+    var dyn = try t_db_c_dyn_members.insert(.{ .tenant_id = 1, .user_id = 1 });
     dyn.deinit();
-    try std.testing.expectError(error.ConstraintViolation, db.from("c_dyn_members").insert(.{ .tenant_id = 1, .user_id = 1 }));
+    try std.testing.expectError(error.ConstraintViolation, t_db_c_dyn_members.insert(.{ .tenant_id = 1, .user_id = 1 }));
 }
 
 test "composite foreign keys cascade in typed and dynamic DSL" {
     const path = "sqlite_zig_final_composite_fk_test.db";
     var db = try freshDb(path);
+    const t_db_cfd_parents = db.table("cfd_parents");
+    const t_db_cfd_children = db.table("cfd_children");
     defer dropDb(db, path);
     const Parent = @import("../dsl/table.zig").table("cf_parents", struct { tenant_id: i64, id: i64 });
     const Child = @import("../dsl/table.zig").table("cf_children", struct { tenant_id: i64, parent_id: i64 });
-    try db.createTable(Parent, .{ .primaryKey = &.{ Parent.columns.tenant_id, Parent.columns.id } });
+    try db.createTable(Parent, .{ .primaryKey = &.{ Parent.tenant_id, Parent.id } });
     try db.createTable(Child, .{ .foreignKeys = &.{.{
-        .columns = &.{ Child.columns.tenant_id, Child.columns.parent_id },
-        .references = &.{ Parent.columns.tenant_id, Parent.columns.id },
+        .columns = &.{ Child.tenant_id, Child.parent_id },
+        .references = &.{ Parent.tenant_id, Parent.id },
         .onDelete = .cascade,
     }} });
     var parent = try db.from(Parent).insert(.{ .tenant_id = 1, .id = 7 });
@@ -8000,7 +8567,7 @@ test "composite foreign keys cascade in typed and dynamic DSL" {
     var child = try db.from(Child).insert(.{ .tenant_id = 1, .parent_id = 7 });
     child.deinit();
     try std.testing.expectError(error.ConstraintViolation, db.from(Child).insert(.{ .tenant_id = 1, .parent_id = 8 }));
-    var deleted = try db.from(Parent).delete().where(Parent.columns.tenant_id.eq(1)).execute();
+    var deleted = try db.from(Parent).delete().where(Parent.tenant_id.eq(1)).execute();
     deleted.deinit();
     var remaining = try db.from(Child).selectAll().fetch();
     defer remaining.deinit();
@@ -8018,13 +8585,13 @@ test "composite foreign keys cascade in typed and dynamic DSL" {
             .onDelete = .cascade,
         }},
     });
-    var dparent = try db.from("cfd_parents").insert(.{ .tenant_id = 1, .id = 7 });
+    var dparent = try t_db_cfd_parents.insert(.{ .tenant_id = 1, .id = 7 });
     dparent.deinit();
-    var dchild = try db.from("cfd_children").insert(.{ .tenant_id = 1, .parent_id = 7 });
+    var dchild = try t_db_cfd_children.insert(.{ .tenant_id = 1, .parent_id = 7 });
     dchild.deinit();
-    var ddeleted = try db.from("cfd_parents").delete().where(db.col("tenant_id").eq(1)).execute();
+    var ddeleted = try t_db_cfd_parents.delete().where(t_db_cfd_parents.column("tenant_id").eq(1)).execute();
     ddeleted.deinit();
-    var dremaining = try db.from("cfd_children").selectAll().fetch();
+    var dremaining = try t_db_cfd_children.selectAll().fetch();
     defer dremaining.deinit();
     try std.testing.expectEqual(@as(usize, 0), dremaining.count());
 }
@@ -8037,10 +8604,10 @@ test "foreign-key actions enforce restrict, cascade, and set null" {
     const Cascade = @import("../dsl/table.zig").table("fa_cascade", struct { id: i64, parent_id: i64 });
     const Nullable = @import("../dsl/table.zig").table("fa_nullable", struct { id: i64, parent_id: ?i64 });
     const Restricted = @import("../dsl/table.zig").table("fa_restricted", struct { id: i64, parent_id: i64 });
-    try db.createTable(Parent, .{ .primaryKey = Parent.columns.id });
-    try db.createTable(Cascade, .{ .foreignKeys = &.{.{ .column = Cascade.columns.parent_id, .references = Parent.columns.id, .onDelete = .cascade, .onUpdate = .cascade }} });
-    try db.createTable(Nullable, .{ .foreignKeys = &.{.{ .column = Nullable.columns.parent_id, .references = Parent.columns.id, .onDelete = .setNull, .onUpdate = .setNull }} });
-    try db.createTable(Restricted, .{ .foreignKeys = &.{.{ .column = Restricted.columns.parent_id, .references = Parent.columns.id }} });
+    try db.createTable(Parent, .{ .primaryKey = Parent.id });
+    try db.createTable(Cascade, .{ .foreignKeys = &.{.{ .column = Cascade.parent_id, .references = Parent.id, .onDelete = .cascade, .onUpdate = .cascade }} });
+    try db.createTable(Nullable, .{ .foreignKeys = &.{.{ .column = Nullable.parent_id, .references = Parent.id, .onDelete = .setNull, .onUpdate = .setNull }} });
+    try db.createTable(Restricted, .{ .foreignKeys = &.{.{ .column = Restricted.parent_id, .references = Parent.id }} });
     var parent = try db.from(Parent).insert(.{ .id = 1 });
     parent.deinit();
     var cascade = try db.from(Cascade).insert(.{ .id = 1, .parent_id = 1 });
@@ -8053,7 +8620,7 @@ test "foreign-key actions enforce restrict, cascade, and set null" {
     var wipeOne = try db.from(Restricted).delete().execute();
     wipeOne.deinit();
     var bump = try db.from(Parent).update(.{ .id = 2 });
-    var bumped = try bump.where(Parent.columns.id.eq(1)).execute();
+    var bumped = try bump.where(Parent.id.eq(1)).execute();
     bumped.deinit();
     var moved = try db.from(Cascade).selectAll().fetch();
     defer moved.deinit();
@@ -8064,7 +8631,7 @@ test "foreign-key actions enforce restrict, cascade, and set null" {
 
     var restrictedTwo = try db.from(Restricted).insert(.{ .id = 2, .parent_id = 2 });
     restrictedTwo.deinit();
-    var blocked = db.from(Parent).delete().where(Parent.columns.id.eq(2));
+    var blocked = db.from(Parent).delete().where(Parent.id.eq(2));
     try std.testing.expectError(error.ConstraintViolation, blocked.execute());
     var wipeRestricted = try db.from(Restricted).delete().execute();
     wipeRestricted.deinit();
@@ -8072,7 +8639,7 @@ test "foreign-key actions enforce restrict, cascade, and set null" {
     wipeNullable.deinit();
     var wipeCascade = try db.from(Cascade).delete().execute();
     wipeCascade.deinit();
-    var gone = try db.from(Parent).delete().where(Parent.columns.id.eq(2)).execute();
+    var gone = try db.from(Parent).delete().where(Parent.id.eq(2)).execute();
     gone.deinit();
     var left = try db.from(Parent).selectAll().fetch();
     defer left.deinit();
@@ -8082,19 +8649,20 @@ test "foreign-key actions enforce restrict, cascade, and set null" {
 test "values are bound, never interpolated" {
     const path = "sqlite_zig_final_binding_test.db";
     var db = try freshDb(path);
+    const t_db_bind_items = db.table("bind_items");
     defer dropDb(db, path);
     const Item = @import("../dsl/table.zig").table("bind_items", struct { id: i64, label: []const u8 });
     try db.createTable(Item, .{});
     const tricky = "O'Brien \"%\" _*";
     var inserted = try db.from(Item).insert(.{ .id = 1, .label = tricky });
     inserted.deinit();
-    var found = try db.from(Item).where(Item.columns.label.eq(tricky)).fetch();
+    var found = try db.from(Item).where(Item.label.eq(tricky)).fetch();
     defer found.deinit();
     try std.testing.expectEqual(@as(usize, 1), found.count());
-    var liked = try db.from(Item).where(Item.columns.label.like("O'Brien%")).fetch();
+    var liked = try db.from(Item).where(Item.label.like("O'Brien%")).fetch();
     defer liked.deinit();
     try std.testing.expectEqual(@as(usize, 1), liked.count());
-    var hostile = try db.from("bind_items").where(db.col("label").eq(tricky)).fetch();
+    var hostile = try t_db_bind_items.selectAll().where(t_db_bind_items.column("label").eq(tricky)).fetch();
     defer hostile.deinit();
     try std.testing.expectEqual(@as(usize, 1), hostile.count());
 }
@@ -8102,6 +8670,8 @@ test "values are bound, never interpolated" {
 test "joins, exists, and subqueries work in both DSL modes" {
     const path = "sqlite_zig_final_joins_test.db";
     var db = try freshDb(path);
+    const t_db_j_users = db.table("j_users");
+    const t_db_j_orders = db.table("j_orders");
     defer dropDb(db, path);
     const User = @import("../dsl/table.zig").table("j_users", struct { id: i64, name: []const u8 });
     const Order = @import("../dsl/table.zig").table("j_orders", struct { id: i64, user_id: i64 });
@@ -8110,11 +8680,11 @@ test "joins, exists, and subqueries work in both DSL modes" {
     var setup = try db.exec("INSERT INTO j_users VALUES (1, 'A'), (2, 'B'); INSERT INTO j_orders VALUES (10, 1), (11, 99);");
     setup.deinit();
 
-    var inner = try db.from(User).innerJoin(Order, User.columns.id.eq(Order.columns.user_id)).fetch();
+    var inner = try db.from(User).innerJoin(Order, User.id.eq(Order.user_id)).fetch();
     defer inner.deinit();
     try std.testing.expectEqual(@as(usize, 1), inner.count());
 
-    var left = try db.from(User).leftJoin(Order, User.columns.id.eq(Order.columns.user_id)).fetch();
+    var left = try db.from(User).leftJoin(Order, User.id.eq(Order.user_id)).fetch();
     defer left.deinit();
     try std.testing.expectEqual(@as(usize, 2), left.count());
 
@@ -8122,31 +8692,31 @@ test "joins, exists, and subqueries work in both DSL modes" {
     defer cross.deinit();
     try std.testing.expectEqual(@as(usize, 4), cross.count());
 
-    var dynInner = try db.from("j_users").innerJoin("j_orders", db.col("j_users.id").eq(db.col("j_orders.user_id"))).fetch();
+    var dynInner = try t_db_j_users.innerJoin(t_db_j_orders, t_db_j_users.column("id").eq(t_db_j_orders.column("user_id"))).fetch();
     defer dynInner.deinit();
     try std.testing.expectEqual(@as(usize, 1), dynInner.count());
 
-    var exists = try db.from(User).whereExists(Order, Order.columns.user_id.eq(User.columns.id)).fetch();
+    var exists = try db.from(User).whereExists(Order, Order.user_id.eq(User.id)).fetch();
     defer exists.deinit();
     try std.testing.expectEqual(@as(usize, 1), exists.count());
 
-    var notExists = try db.from(User).whereNotExists(Order, Order.columns.user_id.eq(User.columns.id)).fetch();
+    var notExists = try db.from(User).whereNotExists(Order, Order.user_id.eq(User.id)).fetch();
     defer notExists.deinit();
     try std.testing.expectEqual(@as(usize, 1), notExists.count());
 
-    var inQ = try db.from(User).whereInQuery(User.columns.id, Order, Order.columns.user_id).fetch();
+    var inQ = try db.from(User).whereInQuery(User.id, Order, Order.user_id).fetch();
     defer inQ.deinit();
     try std.testing.expectEqual(@as(usize, 1), inQ.count());
 
-    var notInQ = try db.from(User).whereNotInQuery(User.columns.id, Order, Order.columns.user_id).fetch();
+    var notInQ = try db.from(User).whereNotInQuery(User.id, Order, Order.user_id).fetch();
     defer notInQ.deinit();
     try std.testing.expectEqual(@as(usize, 1), notInQ.count());
 
-    var dynExists = try db.from("j_users").whereExists("j_orders", db.col("j_orders.user_id").eq(db.col("j_users.id"))).fetch();
+    var dynExists = try t_db_j_users.selectAll().whereExists(t_db_j_orders, t_db_j_orders.column("user_id").eq(t_db_j_users.column("id"))).fetch();
     defer dynExists.deinit();
     try std.testing.expectEqual(@as(usize, 1), dynExists.count());
 
-    var dynIn = try db.from("j_users").whereInQuery(db.col("id"), "j_orders", db.col("user_id")).fetch();
+    var dynIn = try t_db_j_users.selectAll().whereInQuery(t_db_j_users.column("id"), t_db_j_orders, t_db_j_orders.column("user_id")).fetch();
     defer dynIn.deinit();
     try std.testing.expectEqual(@as(usize, 1), dynIn.count());
 }
@@ -8156,7 +8726,7 @@ test "insert helpers and typed convenience insert share semantics" {
     var db = try freshDb(path);
     defer dropDb(db, path);
     const Item = @import("../dsl/table.zig").table("ins_items", struct { id: i64, label: []const u8 });
-    try db.createTable(Item, .{ .primaryKey = Item.columns.id });
+    try db.createTable(Item, .{ .primaryKey = Item.id });
     var first = try db.from(Item).insert(.{ .id = 1, .label = "one" });
     first.deinit();
     var ignored = try db.from(Item).insertOrIgnore(.{ .id = 1, .label = "dup" });
@@ -8166,32 +8736,33 @@ test "insert helpers and typed convenience insert share semantics" {
     var rows = try db.from(Item).selectAll().fetch();
     defer rows.deinit();
     try std.testing.expectEqual(@as(usize, 1), rows.count());
-    try std.testing.expectEqualStrings("two", rows.rows[0].label);
+    try std.testing.expectEqualStrings("two", rows.at(0).label);
 }
 
 test "COUNT DISTINCT deduplicates across raw SQL and both DSL modes" {
     const path = "sqlite_zig_final_distinct_agg_test.db";
     var db = try freshDb(path);
+    const t_db_daggs = db.table("daggs");
     defer dropDb(db, path);
     var setup = try db.exec("CREATE TABLE daggs (id INTEGER, label TEXT); INSERT INTO daggs VALUES (1, 'a'), (2, 'a'), (3, 'b'), (4, NULL);");
     setup.deinit();
 
     var raw = try db.exec("SELECT COUNT(DISTINCT label) FROM daggs;");
     defer raw.deinit();
-    try std.testing.expectEqual(@as(i64, 2), raw.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 2), raw.at(0)[0].integer);
 
     var rawSum = try db.exec("SELECT SUM(DISTINCT id) FROM daggs;");
     defer rawSum.deinit();
     try std.testing.expectEqual(@as(i64, 10), rawSum.rows[0][0].integer);
 
-    var dyn = try db.from("daggs").select(.{db.col("label").countDistinct()}).fetch();
+    var dyn = try t_db_daggs.select(.{t_db_daggs.column("label").countDistinct()}).fetch();
     defer dyn.deinit();
-    try std.testing.expectEqual(@as(i64, 2), dyn.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 2), dyn.at(0)[0].integer);
 
     const Agg = @import("../dsl/table.zig").table("daggs", struct { id: i64, label: ?[]const u8 });
-    var typed = try db.from(Agg).select(.{Agg.columns.label.countDistinct()}).fetch();
+    var typed = try db.from(Agg).select(.{Agg.label.countDistinct()}).fetch();
     defer typed.deinit();
-    try std.testing.expectEqual(@as(i64, 2), typed.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 2), typed.at(0)[0].integer);
 
     var grouped = try db.exec("SELECT label, COUNT(DISTINCT id) FROM daggs GROUP BY label;");
     defer grouped.deinit();
@@ -8208,6 +8779,7 @@ test "COUNT DISTINCT deduplicates across raw SQL and both DSL modes" {
 test "expression operators follow SQLite semantics" {
     const path = "sqlite_zig_final_expr_test.db";
     var db = try freshDb(path);
+    const t_db_exprs = db.table("exprs");
     defer dropDb(db, path);
     var setup = try db.exec("CREATE TABLE exprs (a INTEGER, b INTEGER, c INTEGER, name TEXT); INSERT INTO exprs VALUES (1, 0, 0, 'Alice'), (0, 1, 1, 'Bob'), (1, 1, 0, 'Al'), (2, 3, 4, NULL);");
     setup.deinit();
@@ -8245,7 +8817,7 @@ test "expression operators follow SQLite semantics" {
     try std.testing.expectEqual(@as(i64, 1), numLike.rows[0][0].integer);
     try std.testing.expectEqual(@as(i64, 1), numLike.rows[0][1].integer);
 
-    var glob = try db.from("exprs").where(db.col("name").glob("A*")).fetch();
+    var glob = try t_db_exprs.selectAll().where(t_db_exprs.column("name").glob("A*")).fetch();
     defer glob.deinit();
     try std.testing.expectEqual(@as(usize, 2), glob.count());
     var globRaw = try db.exec("SELECT name FROM exprs WHERE name IS NOT NULL AND name GLOB 'A?i*' ORDER BY name;");
@@ -8333,7 +8905,7 @@ test "expression operators follow SQLite semantics" {
     try std.testing.expectEqual(@as(usize, 2), prec.count());
     try std.testing.expectEqual(@as(i64, 1), prec.rows[0][0].integer);
     try std.testing.expectEqual(@as(i64, 1), prec.rows[1][0].integer);
-    var precOr = try db.from("exprs").where(db.col("a").eq(0)).orWhere(db.col("b").eq(1)).fetch();
+    var precOr = try t_db_exprs.selectAll().where(t_db_exprs.column("a").eq(0)).orWhere(t_db_exprs.column("b").eq(1)).fetch();
     defer precOr.deinit();
     try std.testing.expectEqual(@as(usize, 2), precOr.count());
 
@@ -8341,16 +8913,16 @@ test "expression operators follow SQLite semantics" {
     defer substrAlias.deinit();
     try std.testing.expectEqualStrings("ell", substrAlias.rows[0][0].text);
 
-    var dyn = try db.from("exprs").where(db.col("name").likeEscape("Al%", "\\")).fetch();
+    var dyn = try t_db_exprs.selectAll().where(t_db_exprs.column("name").likeEscape("Al%", "\\")).fetch();
     defer dyn.deinit();
     try std.testing.expectEqual(@as(usize, 2), dyn.count());
 
     const ExprItem = @import("../dsl/table.zig").table("exprs", struct { a: i64, b: i64, c: i64, name: ?[]const u8 });
-    var typed = try db.from(ExprItem).where(ExprItem.columns.name.likeEscape("Al%", "\\")).fetch();
+    var typed = try db.from(ExprItem).where(ExprItem.name.likeEscape("Al%", "\\")).fetch();
     defer typed.deinit();
     try std.testing.expectEqual(@as(usize, 2), typed.count());
 
-    var dynNot = try db.from("exprs").where(db.col("name").notLikeEscape("Al%", "\\")).fetch();
+    var dynNot = try t_db_exprs.selectAll().where(t_db_exprs.column("name").notLikeEscape("Al%", "\\")).fetch();
     defer dynNot.deinit();
     try std.testing.expectEqual(@as(usize, 1), dynNot.count());
 }
@@ -8358,26 +8930,29 @@ test "expression operators follow SQLite semantics" {
 test "dynamic and typed DSL build CTE queries" {
     const path = "sqlite_zig_final_cte_test.db";
     var db = try freshDb(path);
+    const t_db_nums = db.table("nums");
+    const t_db_live = db.table("live");
+    const t_db_second = db.table("second");
     defer dropDb(db, path);
     var setup = try db.exec("CREATE TABLE cte_src (id INTEGER, label TEXT, active INTEGER); INSERT INTO cte_src VALUES (1, 'alpha', 1), (2, 'beta', 0), (3, 'gamma', 1);");
     setup.deinit();
 
-    var dyn = try db.from("live").with("live", "SELECT id, label FROM cte_src WHERE active = 1").orderBy(db.col("id").asc()).fetch();
+    var dyn = try t_db_live.with("live", "SELECT id, label FROM cte_src WHERE active = 1").orderBy(t_db_live.column("id").asc()).fetch();
     defer dyn.deinit();
     try std.testing.expectEqual(@as(usize, 2), dyn.count());
-    try std.testing.expectEqual(@as(i64, 1), dyn.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 1), dyn.at(0)[0].integer);
 
     const Live = @import("../dsl/table.zig").table("live", struct { id: i64, label: []const u8 });
-    var typed = try db.from(Live).with("live", "SELECT id, label FROM cte_src WHERE active = 1").orderBy(Live.columns.id.asc()).fetch();
+    var typed = try db.from(Live).with("live", "SELECT id, label FROM cte_src WHERE active = 1").orderBy(Live.id.asc()).fetch();
     defer typed.deinit();
     try std.testing.expectEqual(@as(usize, 2), typed.count());
-    try std.testing.expectEqualStrings("gamma", typed.rows[1].label);
+    try std.testing.expectEqualStrings("gamma", typed.at(1).label);
 
-    var chained = try db.from("second").with("first", "SELECT id FROM cte_src WHERE id >= 2").with("second", "SELECT id FROM first").orderBy(db.col("id").asc()).fetch();
+    var chained = try t_db_second.with("first", "SELECT id FROM cte_src WHERE id >= 2").with("second", "SELECT id FROM first").orderBy(t_db_second.column("id").asc()).fetch();
     defer chained.deinit();
     try std.testing.expectEqual(@as(usize, 2), chained.count());
 
-    var rec = try db.from("nums").withRecursive("nums", "SELECT 1 AS n", "SELECT n + 1 AS n FROM nums WHERE n < 5").orderBy(db.col("n").asc()).fetch();
+    var rec = try t_db_nums.withRecursive("nums", "SELECT 1 AS n", "SELECT n + 1 AS n FROM nums WHERE n < 5").orderBy(t_db_nums.column("n").asc()).fetch();
     defer rec.deinit();
     try std.testing.expectEqual(@as(usize, 5), rec.count());
     try std.testing.expectEqual(@as(i64, 5), rec.rows[4][0].integer);
@@ -8386,39 +8961,40 @@ test "dynamic and typed DSL build CTE queries" {
 test "explicit zig to sql column mapping round-trips" {
     const path = "sqlite_zig_final_mapping_test.db";
     var db = try freshDb(path);
+    const t_db_map_users = db.table("map_users");
     defer dropDb(db, path);
     const col = @import("../dsl/column.zig").column;
     const User = @import("../dsl/table.zig").table("map_users", .{
         .firstName = col("first_name", []const u8),
         .ageYears = col("age_years", i64),
     });
-    try db.createTable(User, .{ .primaryKey = User.columns.firstName });
+    try db.createTable(User, .{ .primaryKey = User.firstName });
     try db.schema(User).validate();
 
     var inserted = try db.from(User).insert(.{ .firstName = "Ada", .ageYears = 36 });
     inserted.deinit();
 
-    var dyn = try db.from("map_users").where(db.col("first_name").eq("Ada")).fetch();
+    var dyn = try t_db_map_users.selectAll().where(t_db_map_users.column("first_name").eq("Ada")).fetch();
     defer dyn.deinit();
     try std.testing.expectEqual(@as(usize, 1), dyn.count());
-    try std.testing.expectEqual(@as(i64, 36), dyn.rows[0][1].integer);
+    try std.testing.expectEqual(@as(i64, 36), dyn.at(0)[1].integer);
 
-    var typed = try db.from(User).where(User.columns.ageYears.gte(18)).fetch();
+    var typed = try db.from(User).where(User.ageYears.gte(18)).fetch();
     defer typed.deinit();
     try std.testing.expectEqual(@as(usize, 1), typed.count());
-    try std.testing.expectEqualStrings("Ada", typed.rows[0].firstName);
-    try std.testing.expectEqual(@as(i64, 36), typed.rows[0].ageYears);
+    try std.testing.expectEqualStrings("Ada", typed.at(0).firstName);
+    try std.testing.expectEqual(@as(i64, 36), typed.at(0).ageYears);
 
     var pending = try db.from(User).update(.{ .ageYears = 37 });
-    var renamed = try pending.where(User.columns.firstName.eq("Ada")).execute();
+    var renamed = try pending.where(User.firstName.eq("Ada")).execute();
     renamed.deinit();
-    var one = (try db.from(User).where(User.columns.firstName.eq("Ada")).fetchOne()).?;
+    var one = try db.from(User).where(User.firstName.eq("Ada")).fetchOne();
     defer db.from(User).freeRow(&one);
     try std.testing.expectEqual(@as(i64, 37), one.ageYears);
 
     var raw = try db.exec("SELECT first_name, age_years FROM map_users;");
     defer raw.deinit();
-    try std.testing.expectEqualStrings("Ada", raw.rows[0][0].text);
+    try std.testing.expectEqualStrings("Ada", raw.at(0)[0].text);
 
     const Wrong = @import("../dsl/table.zig").table("map_users", struct { firstName: []const u8, ageYears: []const u8 });
     try std.testing.expectError(error.SchemaMismatch, db.schema(Wrong).validate());
@@ -8476,8 +9052,8 @@ test "connection executes queries through bytecode virtual machine" {
     var res2 = try db.executeBytecode("SELECT 'SQLite' || '.zig' AS name, abs(-99) AS positive;");
     defer res2.deinit();
     try std.testing.expectEqual(@as(usize, 1), res2.count());
-    try std.testing.expectEqualStrings("SQLite.zig", res2.rows[0][0].text);
-    try std.testing.expectEqual(@as(i64, 99), res2.rows[0][1].integer);
+    try std.testing.expectEqualStrings("SQLite.zig", res2.at(0)[0].text);
+    try std.testing.expectEqual(@as(i64, 99), res2.at(0)[1].integer);
 
     var initDdl = try db.exec("CREATE TABLE vm_items (id INTEGER PRIMARY KEY, title TEXT, price REAL);");
     initDdl.deinit();
@@ -8744,7 +9320,7 @@ test "Phase 7: scalar functions" {
 
     var res2 = try db.exec("SELECT trim('***hello***', '*');");
     defer res2.deinit();
-    try std.testing.expectEqualStrings("hello", res2.rows[0][0].text);
+    try std.testing.expectEqualStrings("hello", res2.at(0)[0].text);
 
     var res3 = try db.exec("SELECT substr('hello world', 1, 5), substr('hello world', 7);");
     defer res3.deinit();
@@ -8793,8 +9369,8 @@ test "Phase 7: math functions" {
 
     var res2 = try db.exec("SELECT round(sqrt(16.0), 1), round(pow(2.0, 3.0), 1);");
     defer res2.deinit();
-    try std.testing.expectEqual(@as(f64, 4.0), res2.rows[0][0].real);
-    try std.testing.expectEqual(@as(f64, 8.0), res2.rows[0][1].real);
+    try std.testing.expectEqual(@as(f64, 4.0), res2.at(0)[0].real);
+    try std.testing.expectEqual(@as(f64, 8.0), res2.at(0)[1].real);
 
     var res3 = try db.exec("SELECT round(pi(), 4);");
     defer res3.deinit();
@@ -8824,8 +9400,8 @@ test "Phase 7: date and time functions" {
 
     var res2 = try db.exec("SELECT date('2024-05-15', 'start of month'), date('2024-05-15', 'start of year');");
     defer res2.deinit();
-    try std.testing.expectEqualStrings("2024-05-01", res2.rows[0][0].text);
-    try std.testing.expectEqualStrings("2024-01-01", res2.rows[0][1].text);
+    try std.testing.expectEqualStrings("2024-05-01", res2.at(0)[0].text);
+    try std.testing.expectEqualStrings("2024-01-01", res2.at(0)[1].text);
 
     var res3 = try db.exec("SELECT time('12:34:56', '+10 minutes');");
     defer res3.deinit();
@@ -8856,10 +9432,10 @@ test "Phase 7: json functions" {
 
     var res2 = try db.exec("SELECT json_type('{\"a\":1}'), json_type('[1,2]'), json_type('123'), json_type('\"abc\"');");
     defer res2.deinit();
-    try std.testing.expectEqualStrings("object", res2.rows[0][0].text);
-    try std.testing.expectEqualStrings("array", res2.rows[0][1].text);
-    try std.testing.expectEqualStrings("integer", res2.rows[0][2].text);
-    try std.testing.expectEqualStrings("text", res2.rows[0][3].text);
+    try std.testing.expectEqualStrings("object", res2.at(0)[0].text);
+    try std.testing.expectEqualStrings("array", res2.at(0)[1].text);
+    try std.testing.expectEqualStrings("integer", res2.at(0)[2].text);
+    try std.testing.expectEqualStrings("text", res2.at(0)[3].text);
 
     var res3 = try db.exec("SELECT json_extract('{\"name\":\"Alice\",\"age\":30}', '$.name'), json_extract('{\"name\":\"Alice\",\"age\":30}', '$.age');");
     defer res3.deinit();
@@ -8911,12 +9487,12 @@ test "Phase 7: aggregate functions and distinct" {
     var res2 = try db.exec("SELECT grp, count(*), sum(val) FROM agg_tbl GROUP BY grp;");
     defer res2.deinit();
     try std.testing.expectEqual(@as(usize, 2), res2.count());
-    try std.testing.expectEqualStrings("a", res2.rows[0][0].text);
-    try std.testing.expectEqual(@as(i64, 3), res2.rows[0][1].integer);
-    try std.testing.expectEqual(@as(i64, 50), res2.rows[0][2].integer);
-    try std.testing.expectEqualStrings("b", res2.rows[1][0].text);
-    try std.testing.expectEqual(@as(i64, 2), res2.rows[1][1].integer);
-    try std.testing.expectEqual(@as(i64, 20), res2.rows[1][2].integer);
+    try std.testing.expectEqualStrings("a", res2.at(0)[0].text);
+    try std.testing.expectEqual(@as(i64, 3), res2.at(0)[1].integer);
+    try std.testing.expectEqual(@as(i64, 50), res2.at(0)[2].integer);
+    try std.testing.expectEqualStrings("b", res2.at(1)[0].text);
+    try std.testing.expectEqual(@as(i64, 2), res2.at(1)[1].integer);
+    try std.testing.expectEqual(@as(i64, 20), res2.at(1)[2].integer);
 }
 
 test "Phase 7: window functions" {
@@ -8938,8 +9514,8 @@ test "Phase 7: window functions" {
     var res2 = try db.exec("SELECT emp, salary, LAG(salary, 1, 0) OVER (ORDER BY salary) AS prev_sal, LEAD(salary, 1, 0) OVER (ORDER BY salary) AS next_sal FROM win_tbl;");
     defer res2.deinit();
     try std.testing.expectEqual(@as(usize, 5), res2.count());
-    try std.testing.expectEqual(@as(i64, 0), res2.rows[0][2].integer);
-    try std.testing.expectEqual(@as(i64, 1500), res2.rows[0][3].integer);
+    try std.testing.expectEqual(@as(i64, 0), res2.at(0)[2].integer);
+    try std.testing.expectEqual(@as(i64, 1500), res2.at(0)[3].integer);
 
     var res3 = try db.exec("SELECT emp, salary, SUM(salary) OVER (ORDER BY salary ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS moving_sum FROM win_tbl;");
     defer res3.deinit();
@@ -8951,6 +9527,8 @@ test "Phase 7: window functions" {
 test "dynamic DSL executes through direct AST without SQL round-trip" {
     const path = "sqlite_zig_direct_ast_test.db";
     var db = try freshDb(path);
+    const t_db_live = db.table("live");
+    const t_db_direct_items = db.table("direct_items");
     defer dropDb(db, path);
     const Item = @import("../dsl/table.zig").table("direct_items", struct { id: i64, label: ?[]const u8, stock: i64 });
     const Tag = @import("../dsl/table.zig").table("direct_tags", struct { id: i64, item_id: i64 });
@@ -8960,65 +9538,65 @@ test "dynamic DSL executes through direct AST without SQL round-trip" {
     setup.deinit();
 
     var mark = db.parseCount;
-    var like = try db.from("direct_items").where(db.col("label").like("al%")).orderBy(db.col("id").asc()).fetch();
+    var like = try t_db_direct_items.selectAll().where(t_db_direct_items.column("label").like("al%")).orderBy(t_db_direct_items.column("id").asc()).fetch();
     defer like.deinit();
     try std.testing.expectEqual(@as(usize, 2), like.count());
     try std.testing.expectEqual(@as(i64, 1), like.rows[0][0].integer);
     try std.testing.expectEqual(mark, db.parseCount);
 
     mark = db.parseCount;
-    var escaped = try db.from("direct_items").where(db.col("label").likeEscape("al%", "\\")).fetch();
+    var escaped = try t_db_direct_items.selectAll().where(t_db_direct_items.column("label").likeEscape("al%", "\\")).fetch();
     defer escaped.deinit();
     try std.testing.expectEqual(@as(usize, 2), escaped.count());
     try std.testing.expectEqual(mark, db.parseCount);
 
     mark = db.parseCount;
-    var between = try db.from("direct_items").where(db.col("stock").between(1, 6)).fetch();
+    var between = try t_db_direct_items.selectAll().where(t_db_direct_items.column("stock").between(1, 6)).fetch();
     defer between.deinit();
     try std.testing.expectEqual(@as(usize, 2), between.count());
     try std.testing.expectEqual(mark, db.parseCount);
 
     mark = db.parseCount;
-    var inList = try db.from("direct_items").whereInValues(Item.columns.id, .{ 1, 3, 4 }).fetch();
+    var inList = try t_db_direct_items.selectAll().whereInValues(Item.id, .{ 1, 3, 4 }).fetch();
     defer inList.deinit();
     try std.testing.expectEqual(@as(usize, 3), inList.count());
     try std.testing.expectEqual(mark, db.parseCount);
 
     mark = db.parseCount;
-    var combo = try db.from(Item).where(Item.columns.stock.gte(5)).andWhere(Item.columns.label.isNotNull()).orWhere(Item.columns.id.eq(2)).orderBy(Item.columns.id.asc()).limit(10).offset(0).fetch();
+    var combo = try db.from(Item).where(Item.stock.gte(5)).andWhere(Item.label.isNotNull()).orWhere(Item.id.eq(2)).orderBy(Item.id.asc()).limit(10).offset(0).fetch();
     defer combo.deinit();
     try std.testing.expectEqual(@as(usize, 3), combo.count());
     try std.testing.expectEqual(mark, db.parseCount);
 
     mark = db.parseCount;
-    var funcs = try db.from("direct_items").select(.{db.col("label").lower().projection()}).where(db.col("id").eq(1)).fetch();
+    var funcs = try t_db_direct_items.select(.{t_db_direct_items.column("label").lower().projection()}).where(t_db_direct_items.column("id").eq(1)).fetch();
     defer funcs.deinit();
     try std.testing.expectEqual(@as(usize, 1), funcs.count());
     try std.testing.expectEqualStrings("alpha", funcs.rows[0][0].text);
     try std.testing.expectEqual(mark, db.parseCount);
 
     mark = db.parseCount;
-    var grouped = try db.from("direct_items").select(.{db.col("stock")}).groupBy(db.col("stock")).havingCount(">", 1).fetch();
+    var grouped = try t_db_direct_items.select(.{t_db_direct_items.column("stock")}).groupBy(t_db_direct_items.column("stock")).having(t_db_direct_items.column("stock").count().gt(1)).fetch();
     defer grouped.deinit();
     try std.testing.expectEqual(@as(usize, 1), grouped.count());
     try std.testing.expectEqual(@as(i64, 5), grouped.rows[0][0].integer);
     try std.testing.expectEqual(mark, db.parseCount);
 
     mark = db.parseCount;
-    var joined = try db.from(Item).innerJoin(Tag, Item.columns.id.eq(Tag.columns.item_id)).fetch();
+    var joined = try db.from(Item).innerJoin(Tag, Item.id.eq(Tag.item_id)).fetch();
     defer joined.deinit();
     try std.testing.expectEqual(@as(usize, 2), joined.count());
     try std.testing.expectEqual(mark, db.parseCount);
 
     mark = db.parseCount;
-    var inSub = try db.from(Item).whereInQuery(Item.columns.id, Tag, Tag.columns.item_id).fetch();
+    var inSub = try db.from(Item).whereInQuery(Item.id, Tag, Tag.item_id).fetch();
     defer inSub.deinit();
     try std.testing.expectEqual(@as(usize, 1), inSub.count());
     try std.testing.expectEqual(@as(i64, 1), inSub.rows[0].id);
     try std.testing.expectEqual(mark, db.parseCount);
 
     mark = db.parseCount;
-    var exists = try db.from(Item).whereExists(Tag, Tag.columns.item_id.eq(Item.columns.id)).fetch();
+    var exists = try db.from(Item).whereExists(Tag, Tag.item_id.eq(Item.id)).fetch();
     defer exists.deinit();
     try std.testing.expectEqual(@as(usize, 1), exists.count());
     try std.testing.expectEqual(@as(i64, 1), exists.rows[0].id);
@@ -9034,7 +9612,7 @@ test "dynamic DSL executes through direct AST without SQL round-trip" {
 
     mark = db.parseCount;
     var pending = try db.from(Item).update(.{ .stock = 8 });
-    var updated = try pending.where(Item.columns.id.eq(5)).execute();
+    var updated = try pending.where(Item.id.eq(5)).execute();
     updated.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
     var rawUpdated = try db.exec("SELECT stock FROM direct_items WHERE id = 5;");
@@ -9042,14 +9620,14 @@ test "dynamic DSL executes through direct AST without SQL round-trip" {
     try std.testing.expectEqual(@as(i64, 8), rawUpdated.rows[0][0].integer);
 
     mark = db.parseCount;
-    var gone = try db.from(Item).delete().where(Item.columns.id.eq(5)).execute();
+    var gone = try db.from(Item).delete().where(Item.id.eq(5)).execute();
     gone.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
     var rawGone = try db.exec("SELECT count(*) FROM direct_items;");
     defer rawGone.deinit();
     try std.testing.expectEqual(@as(i64, 4), rawGone.rows[0][0].integer);
 
-    var cte = try db.from("live").with("live", "SELECT id, label FROM direct_items WHERE stock >= 5").orderBy(db.col("id").asc()).fetch();
+    var cte = try t_db_live.with("live", "SELECT id, label FROM direct_items WHERE stock >= 5").orderBy(t_db_live.column("id").asc()).fetch();
     defer cte.deinit();
     try std.testing.expectEqual(@as(usize, 3), cte.count());
     try std.testing.expectEqual(@as(i64, 1), cte.rows[0][0].integer);
@@ -9149,12 +9727,14 @@ test "derived table aliases never destroy real tables" {
     db = try Connection.open(std.testing.allocator, path);
     var persisted = try db.exec("SELECT count(*) FROM users;");
     defer persisted.deinit();
-    try std.testing.expectEqual(@as(i64, 2), persisted.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 2), persisted.at(0)[0].integer);
 }
 
 test "joins support order by with grouping and pagination" {
     const path = "sqlite_zig_join_order_test.db";
     var db = try freshDb(path);
+    const t_db_jo_a = db.table("jo_a");
+    const t_db_jo_b = db.table("jo_b");
     defer dropDb(db, path);
     var setup = try db.exec("CREATE TABLE jo_a (id INTEGER, name TEXT); CREATE TABLE jo_b (id INTEGER, aid INTEGER); INSERT INTO jo_a VALUES (2, 'Beta'), (1, 'Alpha'); INSERT INTO jo_b VALUES (10, 1), (11, 2);");
     setup.deinit();
@@ -9170,7 +9750,7 @@ test "joins support order by with grouping and pagination" {
     try std.testing.expectEqual(@as(i64, 2), desc.rows[0][0].integer);
     try std.testing.expectEqual(@as(i64, 1), desc.rows[1][0].integer);
 
-    var dynOrdered = try db.from("jo_a").innerJoin("jo_b", db.col("jo_a.id").eq(db.col("jo_b.aid"))).orderBy(db.col("name").asc()).fetch();
+    var dynOrdered = try t_db_jo_a.innerJoin(t_db_jo_b, t_db_jo_a.column("id").eq(t_db_jo_b.column("aid"))).orderBy(t_db_jo_a.column("name").asc()).fetch();
     defer dynOrdered.deinit();
     try std.testing.expectEqual(@as(usize, 2), dynOrdered.count());
 
@@ -9322,39 +9902,39 @@ test "multi-table joins chain across three tables" {
     var leftChain = try db.exec("SELECT u.name, o.id FROM c_users u LEFT JOIN c_orders o ON u.id = o.uid LEFT JOIN c_items i ON o.item = i.name ORDER BY o.id;");
     defer leftChain.deinit();
     try std.testing.expectEqual(@as(usize, 4), leftChain.count());
-    try std.testing.expectEqualStrings("ann", leftChain.rows[0][0].text);
-    try std.testing.expectEqual(@as(i64, 10), leftChain.rows[0][1].integer);
-    try std.testing.expectEqualStrings("cat", leftChain.rows[3][0].text);
-    try std.testing.expectEqual(@as(i64, 13), leftChain.rows[3][1].integer);
+    try std.testing.expectEqualStrings("ann", leftChain.at(0)[0].text);
+    try std.testing.expectEqual(@as(i64, 10), leftChain.at(0)[1].integer);
+    try std.testing.expectEqualStrings("cat", leftChain.at(3)[0].text);
+    try std.testing.expectEqual(@as(i64, 13), leftChain.at(3)[1].integer);
 
     var filteredChain = try db.exec("SELECT u.name, o.id, i.price FROM c_users u JOIN c_orders o ON u.id = o.uid LEFT JOIN c_items i ON o.item = i.name WHERE i.price IS NULL ORDER BY o.id;");
     defer filteredChain.deinit();
     try std.testing.expectEqual(@as(usize, 1), filteredChain.count());
-    try std.testing.expectEqualStrings("cat", filteredChain.rows[0][0].text);
-    try std.testing.expectEqual(@as(i64, 13), filteredChain.rows[0][1].integer);
-    try std.testing.expect(filteredChain.rows[0][2] == .null);
+    try std.testing.expectEqualStrings("cat", filteredChain.at(0)[0].text);
+    try std.testing.expectEqual(@as(i64, 13), filteredChain.at(0)[1].integer);
+    try std.testing.expect(filteredChain.at(0)[2] == .null);
 
     var groupedChain = try db.exec("SELECT u.name, count(*), sum(i.price) FROM c_users u JOIN c_orders o ON u.id = o.uid JOIN c_items i ON o.item = i.name GROUP BY u.name ORDER BY u.name;");
     defer groupedChain.deinit();
     try std.testing.expectEqual(@as(usize, 2), groupedChain.count());
-    try std.testing.expectEqualStrings("ann", groupedChain.rows[0][0].text);
-    try std.testing.expectEqual(@as(i64, 2), groupedChain.rows[0][1].integer);
-    try std.testing.expectEqual(@as(f64, 11.0), groupedChain.rows[0][2].real);
-    try std.testing.expectEqualStrings("bob", groupedChain.rows[1][0].text);
-    try std.testing.expectEqual(@as(f64, 50.0), groupedChain.rows[1][2].real);
+    try std.testing.expectEqualStrings("ann", groupedChain.at(0)[0].text);
+    try std.testing.expectEqual(@as(i64, 2), groupedChain.at(0)[1].integer);
+    try std.testing.expectEqual(@as(f64, 11.0), groupedChain.at(0)[2].real);
+    try std.testing.expectEqualStrings("bob", groupedChain.at(1)[0].text);
+    try std.testing.expectEqual(@as(f64, 50.0), groupedChain.at(1)[2].real);
 
     var outerGroupedChain = try db.exec("SELECT u.name, count(*) FROM c_users u LEFT JOIN c_orders o ON u.id = o.uid LEFT JOIN c_items i ON o.item = i.name GROUP BY u.name ORDER BY u.name;");
     defer outerGroupedChain.deinit();
     try std.testing.expectEqual(@as(usize, 3), outerGroupedChain.count());
-    try std.testing.expectEqual(@as(i64, 2), outerGroupedChain.rows[0][1].integer);
-    try std.testing.expectEqual(@as(i64, 1), outerGroupedChain.rows[1][1].integer);
-    try std.testing.expectEqual(@as(i64, 1), outerGroupedChain.rows[2][1].integer);
+    try std.testing.expectEqual(@as(i64, 2), outerGroupedChain.at(0)[1].integer);
+    try std.testing.expectEqual(@as(i64, 1), outerGroupedChain.at(1)[1].integer);
+    try std.testing.expectEqual(@as(i64, 1), outerGroupedChain.at(2)[1].integer);
 
     var whereChain = try db.exec("SELECT u.name FROM c_users u JOIN c_orders o ON u.id = o.uid JOIN c_items i ON o.item = i.name WHERE i.price > 5.0 ORDER BY u.name;");
     defer whereChain.deinit();
     try std.testing.expectEqual(@as(usize, 2), whereChain.count());
-    try std.testing.expectEqualStrings("ann", whereChain.rows[0][0].text);
-    try std.testing.expectEqualStrings("bob", whereChain.rows[1][0].text);
+    try std.testing.expectEqualStrings("ann", whereChain.at(0)[0].text);
+    try std.testing.expectEqualStrings("bob", whereChain.at(1)[0].text);
 
     var crossChain = try db.exec("SELECT count(*) FROM c_users CROSS JOIN c_orders CROSS JOIN c_items;");
     defer crossChain.deinit();
@@ -9379,26 +9959,26 @@ test "multi-table joins chain across three tables" {
     try std.testing.expectEqualStrings("w", mergedChain.columns[2]);
     try std.testing.expectEqualStrings("x", mergedChain.columns[3]);
     try std.testing.expectEqual(@as(usize, 1), mergedChain.count());
-    try std.testing.expectEqual(@as(i64, 1), mergedChain.rows[0][0].integer);
-    try std.testing.expectEqualStrings("e", mergedChain.rows[0][3].text);
+    try std.testing.expectEqual(@as(i64, 1), mergedChain.at(0)[0].integer);
+    try std.testing.expectEqualStrings("e", mergedChain.at(0)[3].text);
 
     var outerUsingChain = try db.exec("SELECT id, v, w, x FROM ch_a LEFT JOIN ch_b USING (id) LEFT JOIN ch_c USING (id) ORDER BY id;");
     defer outerUsingChain.deinit();
     try std.testing.expectEqual(@as(usize, 2), outerUsingChain.count());
-    try std.testing.expectEqualStrings("e", outerUsingChain.rows[0][3].text);
-    try std.testing.expect(outerUsingChain.rows[1][3] == .null);
+    try std.testing.expectEqualStrings("e", outerUsingChain.at(0)[3].text);
+    try std.testing.expect(outerUsingChain.at(1)[3] == .null);
 
     var qualifiedUsingChain = try db.exec("SELECT ch_c.id FROM ch_a LEFT JOIN ch_b USING (id) LEFT JOIN ch_c USING (id) ORDER BY ch_a.id;");
     defer qualifiedUsingChain.deinit();
     try std.testing.expectEqual(@as(usize, 2), qualifiedUsingChain.count());
-    try std.testing.expectEqual(@as(i64, 1), qualifiedUsingChain.rows[0][0].integer);
-    try std.testing.expect(qualifiedUsingChain.rows[1][0] == .null);
+    try std.testing.expectEqual(@as(i64, 1), qualifiedUsingChain.at(0)[0].integer);
+    try std.testing.expect(qualifiedUsingChain.at(1)[0] == .null);
 
     var groupedUsingChain = try db.exec("SELECT id, count(*) FROM ch_a JOIN ch_b USING (id) JOIN ch_c USING (id) GROUP BY id;");
     defer groupedUsingChain.deinit();
     try std.testing.expectEqual(@as(usize, 1), groupedUsingChain.count());
-    try std.testing.expectEqual(@as(i64, 1), groupedUsingChain.rows[0][0].integer);
-    try std.testing.expectEqual(@as(i64, 1), groupedUsingChain.rows[0][1].integer);
+    try std.testing.expectEqual(@as(i64, 1), groupedUsingChain.at(0)[0].integer);
+    try std.testing.expectEqual(@as(i64, 1), groupedUsingChain.at(0)[1].integer);
 
     try std.testing.expectError(error.UnknownTable, db.exec("SELECT * FROM c_users JOIN c_orders ON c_users.id = c_orders.uid JOIN missing ON c_orders.id = missing.id;"));
     try std.testing.expectError(error.UnknownColumn, db.exec("SELECT * FROM c_users JOIN c_orders ON c_users.id = c_orders.uid JOIN c_items ON nope = c_items.name;"));
@@ -9411,12 +9991,13 @@ test "multi-table joins chain across three tables" {
     var reopenedChain = try db.exec("SELECT u.name, i.price FROM c_users u JOIN c_orders o ON u.id = o.uid JOIN c_items i ON o.item = i.name ORDER BY o.id;");
     defer reopenedChain.deinit();
     try std.testing.expectEqual(@as(usize, 3), reopenedChain.count());
-    try std.testing.expectEqual(@as(f64, 9.5), reopenedChain.rows[0][1].real);
+    try std.testing.expectEqual(@as(f64, 9.5), reopenedChain.at(0)[1].real);
 }
 
 test "derived table errors leave state unchanged" {
     const path = "sqlite_zig_derived_error_test.db";
     var db = try freshDb(path);
+    const t_db_e_base = db.table("e_base");
     defer dropDb(db, path);
     var setup = try db.exec("CREATE TABLE e_base (id INTEGER, v INTEGER); INSERT INTO e_base VALUES (1, 10), (2, 20);");
     setup.deinit();
@@ -9428,7 +10009,7 @@ test "derived table errors leave state unchanged" {
     defer intact.deinit();
     try std.testing.expectEqual(@as(i64, 2), intact.rows[0][0].integer);
 
-    var dslInserted = try db.from("e_base").insert(.{ .id = 3, .v = 30 });
+    var dslInserted = try t_db_e_base.insert(.{ .id = 3, .v = 30 });
     dslInserted.deinit();
     var derivedSeesDsl = try db.exec("SELECT SUM(v) FROM (SELECT v FROM e_base);");
     defer derivedSeesDsl.deinit();
@@ -9438,12 +10019,13 @@ test "derived table errors leave state unchanged" {
 test "dynamic and typed DSL support returning on insert, update, and delete" {
     const path = "sqlite_zig_dsl_returning_test.db";
     var db = try freshDb(path);
+    const t_db_ret_items = db.table("ret_items");
     defer dropDb(db, path);
     const Item = @import("../dsl/table.zig").table("ret_items", struct { id: i64, label: []const u8, stock: i64 });
-    try db.createTable(Item, .{ .primaryKey = Item.columns.id });
+    try db.createTable(Item, .{ .primaryKey = Item.id });
 
     var mark = db.parseCount;
-    var inserted = try db.from(Item).returning(.{ Item.columns.id, Item.columns.label }).insert(.{ .id = 1, .label = "alpha", .stock = 5 });
+    var inserted = try db.from(Item).returning(.{ Item.id, Item.label }).insert(.{ .id = 1, .label = "alpha", .stock = 5 });
     defer inserted.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
     try std.testing.expectEqual(@as(usize, 1), inserted.count());
@@ -9451,27 +10033,27 @@ test "dynamic and typed DSL support returning on insert, update, and delete" {
     try std.testing.expectEqualStrings("alpha", inserted.rows[0][1].text);
 
     mark = db.parseCount;
-    var dynInserted = try db.from("ret_items").returning(.{db.col("id")}).insert(.{ .id = 2, .label = "beta", .stock = 7 });
+    var dynInserted = try t_db_ret_items.returning(.{t_db_ret_items.column("id")}).insert(.{ .id = 2, .label = "beta", .stock = 7 });
     defer dynInserted.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
     try std.testing.expectEqual(@as(usize, 1), dynInserted.count());
     try std.testing.expectEqual(@as(i64, 2), dynInserted.rows[0][0].integer);
 
     mark = db.parseCount;
-    var uppered = try db.from(Item).returning(.{Item.columns.label.upper().projection()}).insert(.{ .id = 3, .label = "gamma", .stock = 1 });
+    var uppered = try db.from(Item).returning(.{Item.label.upper().projection()}).insert(.{ .id = 3, .label = "gamma", .stock = 1 });
     defer uppered.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
     try std.testing.expectEqualStrings("GAMMA", uppered.rows[0][0].text);
 
     mark = db.parseCount;
-    var skipped = try db.from(Item).returning(.{Item.columns.id}).insertOrIgnore(.{ .id = 1, .label = "dup", .stock = 9 });
+    var skipped = try db.from(Item).returning(.{Item.id}).insertOrIgnore(.{ .id = 1, .label = "dup", .stock = 9 });
     defer skipped.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
     try std.testing.expectEqual(@as(usize, 0), skipped.count());
 
     mark = db.parseCount;
     var pending = try db.from(Item).update(.{ .stock = 11 });
-    var updated = try pending.where(Item.columns.id.eq(2)).returning(.{ Item.columns.id, Item.columns.stock }).execute();
+    var updated = try pending.where(Item.id.eq(2)).returning(.{ Item.id, Item.stock }).execute();
     defer updated.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
     try std.testing.expectEqual(@as(usize, 1), updated.count());
@@ -9479,15 +10061,15 @@ test "dynamic and typed DSL support returning on insert, update, and delete" {
     try std.testing.expectEqual(@as(i64, 11), updated.rows[0][1].integer);
 
     mark = db.parseCount;
-    var early = try db.from(Item).returning(.{Item.columns.id}).update(.{ .stock = 12 });
-    var earlyUpdated = try early.where(Item.columns.id.eq(3)).execute();
+    var early = try db.from(Item).returning(.{Item.id}).update(.{ .stock = 12 });
+    var earlyUpdated = try early.where(Item.id.eq(3)).execute();
     defer earlyUpdated.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
     try std.testing.expectEqual(@as(usize, 1), earlyUpdated.count());
     try std.testing.expectEqual(@as(i64, 3), earlyUpdated.rows[0][0].integer);
 
     mark = db.parseCount;
-    var deleted = try db.from(Item).delete().where(Item.columns.id.eq(1)).returning(.{Item.columns.label}).execute();
+    var deleted = try db.from(Item).delete().where(Item.id.eq(1)).returning(.{Item.label}).execute();
     defer deleted.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
     try std.testing.expectEqual(@as(usize, 1), deleted.count());
@@ -9499,7 +10081,7 @@ test "dynamic and typed DSL support returning on insert, update, and delete" {
     try std.testing.expectEqual(@as(i64, 2), remaining.rows[0][0].integer);
     try std.testing.expectEqual(@as(i64, 3), remaining.rows[1][0].integer);
 
-    if (db.from(Item).returning(.{db.col("missing")}).insert(.{ .id = 9, .label = "bad", .stock = 1 })) |r| {
+    if (db.from(Item).returning(.{t_db_ret_items.column("missing")}).insert(.{ .id = 9, .label = "bad", .stock = 1 })) |r| {
         var owned = r;
         owned.deinit();
         return error.ReturningErrorNotRaised;
@@ -9526,19 +10108,20 @@ test "dynamic and typed DSL support returning on insert, update, and delete" {
     var persisted = try db.exec("SELECT id, stock FROM ret_items ORDER BY id;");
     defer persisted.deinit();
     try std.testing.expectEqual(@as(usize, 2), persisted.count());
-    try std.testing.expectEqual(@as(i64, 11), persisted.rows[0][1].integer);
-    try std.testing.expectEqual(@as(i64, 12), persisted.rows[1][1].integer);
+    try std.testing.expectEqual(@as(i64, 11), persisted.at(0)[1].integer);
+    try std.testing.expectEqual(@as(i64, 12), persisted.at(1)[1].integer);
 }
 
 test "dynamic and typed DSL support upsert with conflict targets" {
     const path = "sqlite_zig_dsl_upsert_test.db";
     var db = try freshDb(path);
+    const t_db_up_items = db.table("up_items");
     defer dropDb(db, path);
     const Item = @import("../dsl/table.zig").table("up_items", struct { id: i64, email: []const u8, name: []const u8, stock: i64 });
-    try db.createTable(Item, .{ .primaryKey = Item.columns.id, .unique = &.{Item.columns.email} });
+    try db.createTable(Item, .{ .primaryKey = Item.id, .unique = &.{Item.email} });
 
     var mark = db.parseCount;
-    var firstUp = try db.from(Item).onConflict(Item.columns.email).doUpdate(.{ .name = db.excluded("name"), .stock = db.excluded("stock") });
+    var firstUp = try db.from(Item).onConflict(Item.email).doUpdate(.{ .name = db.excluded("name"), .stock = db.excluded("stock") });
     var first = try firstUp.insert(.{ .id = 1, .email = "a@x.test", .name = "Ann", .stock = 5 });
     first.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
@@ -9548,7 +10131,7 @@ test "dynamic and typed DSL support upsert with conflict targets" {
     try std.testing.expectEqual(@as(i64, 5), checkFirst.rows[0][1].integer);
 
     mark = db.parseCount;
-    var conflictUp = try db.from(Item).onConflict(Item.columns.email).doUpdate(.{ .name = db.excluded("name"), .stock = db.excluded("stock") });
+    var conflictUp = try db.from(Item).onConflict(Item.email).doUpdate(.{ .name = db.excluded("name"), .stock = db.excluded("stock") });
     var conflicted = try conflictUp.insert(.{ .id = 2, .email = "a@x.test", .name = "Annie", .stock = 8 });
     conflicted.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
@@ -9560,7 +10143,7 @@ test "dynamic and typed DSL support upsert with conflict targets" {
     try std.testing.expectEqual(@as(i64, 8), checkConflict.rows[0][2].integer);
 
     mark = db.parseCount;
-    var skipped = try db.from(Item).onConflict(Item.columns.email).doNothing().insert(.{ .id = 3, .email = "a@x.test", .name = "Nope", .stock = 0 });
+    var skipped = try db.from(Item).onConflict(Item.email).doNothing().insert(.{ .id = 3, .email = "a@x.test", .name = "Nope", .stock = 0 });
     skipped.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
     var checkSkipped = try db.exec("SELECT count(*) FROM up_items;");
@@ -9568,7 +10151,7 @@ test "dynamic and typed DSL support upsert with conflict targets" {
     try std.testing.expectEqual(@as(i64, 1), checkSkipped.rows[0][0].integer);
 
     mark = db.parseCount;
-    var dynUpBase = try db.from("up_items").onConflict(db.col("email")).doUpdate(.{ .stock = 42 });
+    var dynUpBase = try t_db_up_items.onConflict(t_db_up_items.column("email")).doUpdate(.{ .stock = 42 });
     var dynUp = try dynUpBase.insert(.{ .id = 4, .email = "a@x.test", .name = "Kept", .stock = 0 });
     dynUp.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
@@ -9578,7 +10161,7 @@ test "dynamic and typed DSL support upsert with conflict targets" {
     try std.testing.expectEqual(@as(i64, 42), checkDyn.rows[0][1].integer);
 
     mark = db.parseCount;
-    var filteredBase = try db.from(Item).onConflict(Item.columns.email).doUpdate(.{ .stock = 99 });
+    var filteredBase = try db.from(Item).onConflict(Item.email).doUpdate(.{ .stock = 99 });
     var filteredUp = filteredBase.where(db.excluded("stock").gt(100));
     var filtered = try filteredUp.insert(.{ .id = 5, .email = "a@x.test", .name = "Annie", .stock = 8 });
     filtered.deinit();
@@ -9588,7 +10171,7 @@ test "dynamic and typed DSL support upsert with conflict targets" {
     try std.testing.expectEqual(@as(i64, 42), checkFiltered.rows[0][0].integer);
 
     mark = db.parseCount;
-    var partialUp = try db.from(Item).onConflict(Item.columns.email).onConflictWhere(Item.columns.stock.gt(100)).doUpdate(.{ .stock = 77 });
+    var partialUp = try db.from(Item).onConflict(Item.email).onConflictWhere(Item.stock.gt(100)).doUpdate(.{ .stock = 77 });
     if (partialUp.insert(.{ .id = 6, .email = "a@x.test", .name = "Annie", .stock = 8 })) |r| {
         var owned = r;
         owned.deinit();
@@ -9602,14 +10185,14 @@ test "dynamic and typed DSL support upsert with conflict targets" {
     try std.testing.expectEqual(@as(i64, 42), checkPartial.rows[0][0].integer);
 
     const Member = @import("../dsl/table.zig").table("up_members", struct { tenant_id: i64, user_id: i64, label: []const u8 });
-    try db.createTable(Member, .{ .primaryKey = &.{ Member.columns.tenant_id, Member.columns.user_id } });
+    try db.createTable(Member, .{ .primaryKey = &.{ Member.tenant_id, Member.user_id } });
     mark = db.parseCount;
-    var memFirstUp = try db.from(Member).onConflict(.{ Member.columns.tenant_id, Member.columns.user_id }).doUpdate(.{ .label = db.excluded("label") });
+    var memFirstUp = try db.from(Member).onConflict(.{ Member.tenant_id, Member.user_id }).doUpdate(.{ .label = db.excluded("label") });
     var memFirst = try memFirstUp.insert(.{ .tenant_id = 1, .user_id = 1, .label = "a" });
     memFirst.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
     mark = db.parseCount;
-    var memConflictUp = try db.from(Member).onConflict(.{ Member.columns.tenant_id, Member.columns.user_id }).doUpdate(.{ .label = db.excluded("label") });
+    var memConflictUp = try db.from(Member).onConflict(.{ Member.tenant_id, Member.user_id }).doUpdate(.{ .label = db.excluded("label") });
     var memConflict = try memConflictUp.insert(.{ .tenant_id = 1, .user_id = 1, .label = "b" });
     memConflict.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
@@ -9636,15 +10219,15 @@ test "dynamic and typed DSL support upsert with conflict targets" {
     try std.testing.expectEqual(@as(i64, 2), checkBareUpdate.rows[0][0].integer);
 
     mark = db.parseCount;
-    var retUpDo = try db.from(Item).onConflict(Item.columns.email).doUpdate(.{ .stock = db.excluded("stock") });
-    var retUpBase = retUpDo.returning(.{Item.columns.stock});
+    var retUpDo = try db.from(Item).onConflict(Item.email).doUpdate(.{ .stock = db.excluded("stock") });
+    var retUpBase = retUpDo.returning(.{Item.stock});
     var retUp = try retUpBase.insert(.{ .id = 7, .email = "a@x.test", .name = "Annie", .stock = 55 });
     defer retUp.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
     try std.testing.expectEqual(@as(usize, 1), retUp.count());
     try std.testing.expectEqual(@as(i64, 55), retUp.rows[0][0].integer);
 
-    if (db.from(Item).onConflict(Item.columns.email).insert(.{ .id = 8, .email = "a@x.test", .name = "No", .stock = 0 })) |r| {
+    if (db.from(Item).onConflict(Item.email).insert(.{ .id = 8, .email = "a@x.test", .name = "No", .stock = 0 })) |r| {
         var owned = r;
         owned.deinit();
         return error.UpsertErrorNotRaised;
@@ -9660,7 +10243,7 @@ test "dynamic and typed DSL support upsert with conflict targets" {
     var persisted = try db.exec("SELECT email, stock FROM up_items ORDER BY email;");
     defer persisted.deinit();
     try std.testing.expectEqual(@as(usize, 1), persisted.count());
-    try std.testing.expectEqual(@as(i64, 55), persisted.rows[0][1].integer);
+    try std.testing.expectEqual(@as(i64, 55), persisted.at(0)[1].integer);
     var persistedMem = try db.exec("SELECT label FROM up_members ORDER BY user_id;");
     defer persistedMem.deinit();
     try std.testing.expectEqual(@as(usize, 2), persistedMem.count());
@@ -9820,8 +10403,8 @@ test "before and when triggers persist and work through the dsl" {
     var persisted = try db.exec("SELECT id FROM bp_audit;");
     defer persisted.deinit();
     try std.testing.expectEqual(@as(usize, 5), persisted.count());
-    try std.testing.expectEqual(@as(i64, 3), persisted.rows[3][0].integer);
-    try std.testing.expectEqual(@as(i64, -3), persisted.rows[4][0].integer);
+    try std.testing.expectEqual(@as(i64, 3), persisted.at(3)[0].integer);
+    try std.testing.expectEqual(@as(i64, -3), persisted.at(4)[0].integer);
 }
 
 test "trigger timing and when clauses parse and validate" {
@@ -9845,6 +10428,7 @@ test "trigger timing and when clauses parse and validate" {
 test "dynamic and typed DSL support case expressions in select" {
     const path = "sqlite_zig_dsl_case_test.db";
     var db = try freshDb(path);
+    const t_db_case_items = db.table("case_items");
     defer dropDb(db, path);
     const Item = @import("../dsl/table.zig").table("case_items", struct { id: i64, name: ?[]const u8, age: ?i64, score: ?i64 });
     const caseWhen = @import("../dsl/column.zig").caseWhen;
@@ -9854,7 +10438,7 @@ test "dynamic and typed DSL support case expressions in select" {
     setup.deinit();
 
     var mark = db.parseCount;
-    var searched = try db.from("case_items").select(.{ db.col("id"), caseWhen(db.col("age").gte(18), "adult").when(db.col("age").gte(13), "teen").else_("child") }).orderBy(db.col("id").asc()).fetch();
+    var searched = try t_db_case_items.select(.{ t_db_case_items.column("id"), caseWhen(t_db_case_items.column("age").gte(18), "adult").when(t_db_case_items.column("age").gte(13), "teen").else_("child") }).orderBy(t_db_case_items.column("id").asc()).fetch();
     defer searched.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
     try std.testing.expectEqual(@as(usize, 4), searched.count());
@@ -9869,13 +10453,13 @@ test "dynamic and typed DSL support case expressions in select" {
     for (searched.rows, 0..) |row, i| try std.testing.expectEqualStrings(rawSearched.rows[i][1].text, row[1].text);
 
     mark = db.parseCount;
-    var noElse = try db.from("case_items").select(.{caseWhen(db.col("age").gt(100), "old")}).orderBy(db.col("id").asc()).fetch();
+    var noElse = try t_db_case_items.select(.{caseWhen(t_db_case_items.column("age").gt(100), "old")}).orderBy(t_db_case_items.column("id").asc()).fetch();
     defer noElse.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
     for (noElse.rows) |row| try std.testing.expect(row[0] == .null);
 
     mark = db.parseCount;
-    var simple = try db.from(Item).select(.{caseValue(Item.columns.age).whenValue(30, "thirty").whenValue(17, "seventeen").else_("other")}).orderBy(Item.columns.id.asc()).fetch();
+    var simple = try db.from(Item).select(.{caseValue(Item.age).whenValue(30, "thirty").whenValue(17, "seventeen").else_("other")}).orderBy(Item.id.asc()).fetch();
     defer simple.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
     try std.testing.expectEqualStrings("thirty", simple.rows[0][0].text);
@@ -9888,7 +10472,7 @@ test "dynamic and typed DSL support case expressions in select" {
     for (simple.rows, 0..) |row, i| try std.testing.expectEqualStrings(rawSimple.rows[i][0].text, row[0].text);
 
     mark = db.parseCount;
-    var funcBase = try db.from("case_items").select(.{caseValue(db.col("name").lower()).whenValue("alice", "found").else_("missing")}).orderBy(db.col("id").asc()).fetch();
+    var funcBase = try t_db_case_items.select(.{caseValue(t_db_case_items.column("name").lower()).whenValue("alice", "found").else_("missing")}).orderBy(t_db_case_items.column("id").asc()).fetch();
     defer funcBase.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
     try std.testing.expectEqualStrings("found", funcBase.rows[0][0].text);
@@ -9896,7 +10480,7 @@ test "dynamic and typed DSL support case expressions in select" {
     try std.testing.expectEqualStrings("missing", funcBase.rows[3][0].text);
 
     mark = db.parseCount;
-    var ranged = try db.from(Item).select(.{caseWhen(Item.columns.score.between(5, 10), "mid").else_("other")}).orderBy(Item.columns.id.asc()).fetch();
+    var ranged = try db.from(Item).select(.{caseWhen(Item.score.between(5, 10), "mid").else_("other")}).orderBy(Item.id.asc()).fetch();
     defer ranged.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
     try std.testing.expectEqualStrings("mid", ranged.rows[0][0].text);
@@ -9905,7 +10489,7 @@ test "dynamic and typed DSL support case expressions in select" {
     try std.testing.expectEqualStrings("mid", ranged.rows[3][0].text);
 
     mark = db.parseCount;
-    var liked = try db.from(Item).select(.{caseWhen(Item.columns.name.like("A%"), "a-name").else_("other")}).orderBy(Item.columns.id.asc()).fetch();
+    var liked = try db.from(Item).select(.{caseWhen(Item.name.like("A%"), "a-name").else_("other")}).orderBy(Item.id.asc()).fetch();
     defer liked.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
     try std.testing.expectEqualStrings("a-name", liked.rows[0][0].text);
@@ -9913,12 +10497,12 @@ test "dynamic and typed DSL support case expressions in select" {
     try std.testing.expectEqualStrings("other", liked.rows[3][0].text);
 
     mark = db.parseCount;
-    var retCase = try db.from(Item).returning(.{caseWhen(Item.columns.score.gte(0), "new").else_("update")}).insert(.{ .id = 5, .name = "Eve", .age = 40, .score = 1 });
+    var retCase = try db.from(Item).returning(.{caseWhen(Item.score.gte(0), "new").else_("update")}).insert(.{ .id = 5, .name = "Eve", .age = 40, .score = 1 });
     defer retCase.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
     try std.testing.expectEqualStrings("new", retCase.rows[0][0].text);
 
-    if (db.from("case_items").select(.{caseWhen(db.col("age").isNull(), "x").else_("y")}).fetch()) |r| {
+    if (t_db_case_items.select(.{caseWhen(t_db_case_items.column("age").isNull(), "x").else_("y")}).fetch()) |r| {
         var owned = r;
         owned.deinit();
         return error.CaseErrorNotRaised;
@@ -9930,7 +10514,7 @@ test "dynamic and typed DSL support case expressions in select" {
     try std.testing.expectEqual(@as(i64, 5), intactRows.rows[0][0].integer);
 
     mark = db.parseCount;
-    var filtered = try db.from("case_items").whereCase(caseWhen(db.col("age").gte(18), "adult").else_("child"), "adult").orderBy(db.col("id").asc()).fetch();
+    var filtered = try t_db_case_items.selectAll().whereCase(caseWhen(t_db_case_items.column("age").gte(18), "adult").else_("child"), "adult").orderBy(t_db_case_items.column("id").asc()).fetch();
     defer filtered.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
     try std.testing.expectEqual(@as(usize, 2), filtered.count());
@@ -9943,7 +10527,7 @@ test "dynamic and typed DSL support case expressions in select" {
     for (filtered.rows, 0..) |row, i| try std.testing.expectEqual(rawFiltered.rows[i][0].integer, row[0].integer);
 
     mark = db.parseCount;
-    var orFiltered = try db.from(Item).where(Item.columns.id.eq(3)).orWhereCase(caseValue(Item.columns.age).whenValue(17, "x").else_("y"), "x").orderBy(Item.columns.id.asc()).fetch();
+    var orFiltered = try db.from(Item).where(Item.id.eq(3)).orWhereCase(caseValue(Item.age).whenValue(17, "x").else_("y"), "x").orderBy(Item.id.asc()).fetch();
     defer orFiltered.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
     try std.testing.expectEqual(@as(usize, 2), orFiltered.count());
@@ -9951,7 +10535,7 @@ test "dynamic and typed DSL support case expressions in select" {
     try std.testing.expectEqual(@as(i64, 3), orFiltered.rows[1].id);
 
     mark = db.parseCount;
-    var delPending = db.from(Item).delete().whereCase(caseWhen(Item.columns.age.lt(13), "young").else_("old"), "young");
+    var delPending = db.from(Item).delete().whereCase(caseWhen(Item.age.lt(13), "young").else_("old"), "young");
     var deleted = try delPending.execute();
     defer deleted.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
@@ -9970,7 +10554,7 @@ test "parenthesized left-hand values do not corrupt row memory" {
     var rows = try db.exec("SELECT id FROM paren_items WHERE (name) = 'alpha' ORDER BY id;");
     defer rows.deinit();
     try std.testing.expectEqual(@as(usize, 1), rows.count());
-    try std.testing.expectEqual(@as(i64, 1), rows.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 1), rows.at(0)[0].integer);
     var intact = try db.exec("SELECT name FROM paren_items ORDER BY id;");
     defer intact.deinit();
     try std.testing.expectEqualStrings("alpha", intact.rows[0][0].text);
@@ -10040,36 +10624,37 @@ test "dynamic and typed dsl using and natural joins" {
     const Right = @import("../dsl/table.zig").table("dsl_n_right", struct { id: i64, grp: []const u8, info: []const u8 });
     const path = "sqlite_zig_dsl_using_natural_test.db";
     var db = try freshDb(path);
+    const t_db_dsl_n_left = db.table("dsl_n_left");
     defer dropDb(db, path);
     var setup = try db.exec("CREATE TABLE dsl_n_left (id INTEGER, grp TEXT, val TEXT); CREATE TABLE dsl_n_right (id INTEGER, grp TEXT, info TEXT); INSERT INTO dsl_n_left VALUES (1, 'g1', 'L1'), (2, 'g2', 'L2'), (3, 'g1', 'L3'); INSERT INTO dsl_n_right VALUES (2, 'g2', 'R2'), (3, 'g9', 'R3'), (4, 'g4', 'R4');");
     setup.deinit();
     var mark = db.parseCount;
-    var dynUsing = try db.from("dsl_n_left").joinUsing("dsl_n_right", db.col("id")).orderBy(db.col("id").asc()).fetch();
+    var dynUsing = try t_db_dsl_n_left.joinUsing("dsl_n_right", t_db_dsl_n_left.column("id")).orderBy(t_db_dsl_n_left.column("id").asc()).fetch();
     defer dynUsing.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
     try std.testing.expectEqual(@as(usize, 2), dynUsing.count());
     try std.testing.expectEqual(@as(usize, 5), dynUsing.columns.len);
-    try std.testing.expectEqual(@as(i64, 2), dynUsing.rows[0][0].integer);
-    try std.testing.expectEqualStrings("L2", dynUsing.rows[0][2].text);
-    try std.testing.expectEqualStrings("R2", dynUsing.rows[0][4].text);
+    try std.testing.expectEqual(@as(i64, 2), dynUsing.at(0)[0].integer);
+    try std.testing.expectEqualStrings("L2", dynUsing.at(0)[2].text);
+    try std.testing.expectEqualStrings("R2", dynUsing.at(0)[4].text);
     var rawUsing = try db.exec("SELECT * FROM dsl_n_left JOIN dsl_n_right USING (id) ORDER BY id;");
     defer rawUsing.deinit();
     try std.testing.expectEqual(rawUsing.count(), dynUsing.count());
     try std.testing.expectEqual(rawUsing.columns.len, dynUsing.columns.len);
     for (rawUsing.rows, 0..) |row, i| for (row, 0..) |cell, j| {
-        if (cell == .integer) try std.testing.expectEqual(cell.integer, dynUsing.rows[i][j].integer);
-        if (cell == .text) try std.testing.expectEqualStrings(cell.text, dynUsing.rows[i][j].text);
+        if (cell == .integer) try std.testing.expectEqual(cell.integer, dynUsing.at(i)[j].integer);
+        if (cell == .text) try std.testing.expectEqualStrings(cell.text, dynUsing.at(i)[j].text);
     };
     mark = db.parseCount;
-    var dynNatural = try db.from("dsl_n_left").naturalJoin("dsl_n_right").fetch();
+    var dynNatural = try t_db_dsl_n_left.naturalJoin("dsl_n_right").fetch();
     defer dynNatural.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
     try std.testing.expectEqual(@as(usize, 1), dynNatural.count());
     try std.testing.expectEqual(@as(usize, 4), dynNatural.columns.len);
-    try std.testing.expectEqual(@as(i64, 2), dynNatural.rows[0][0].integer);
-    try std.testing.expectEqualStrings("R2", dynNatural.rows[0][3].text);
+    try std.testing.expectEqual(@as(i64, 2), dynNatural.at(0)[0].integer);
+    try std.testing.expectEqualStrings("R2", dynNatural.at(0)[3].text);
     mark = db.parseCount;
-    var typedUsing = try db.from(Left).joinUsing(Right, Left.columns.id).orderBy(Left.columns.id.asc()).fetch();
+    var typedUsing = try db.from(Left).joinUsing(Right, Left.id).orderBy(Left.id.asc()).fetch();
     defer typedUsing.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
     try std.testing.expectEqual(@as(usize, 2), typedUsing.count());
@@ -10080,12 +10665,12 @@ test "dynamic and typed dsl using and natural joins" {
     try std.testing.expectEqual(@as(usize, 1), typedNatural.count());
     try std.testing.expectEqual(@as(i64, 2), typedNatural.rows[0].id);
     mark = db.parseCount;
-    var leftUsing = try db.from("dsl_n_left").leftJoinUsing("dsl_n_right", db.col("id")).orderBy(db.col("id").asc()).fetch();
+    var leftUsing = try t_db_dsl_n_left.leftJoinUsing("dsl_n_right", t_db_dsl_n_left.column("id")).orderBy(t_db_dsl_n_left.column("id").asc()).fetch();
     defer leftUsing.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
     try std.testing.expectEqual(@as(usize, 3), leftUsing.count());
     mark = db.parseCount;
-    var naturalLeft = try db.from(Left).naturalLeftJoin(Right).orderBy(Left.columns.id.asc()).fetch();
+    var naturalLeft = try db.from(Left).naturalLeftJoin(Right).orderBy(Left.id.asc()).fetch();
     defer naturalLeft.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
     try std.testing.expectEqual(@as(usize, 3), naturalLeft.count());
@@ -10096,6 +10681,7 @@ test "multi-column using joins match on all columns" {
     const Right = @import("../dsl/table.zig").table("m_right", struct { id: i64, grp: []const u8, info: []const u8 });
     const path = "sqlite_zig_multi_using_test.db";
     var db = try freshDb(path);
+    const t_db_m_left = db.table("m_left");
     defer dropDb(db, path);
     var setup = try db.exec("CREATE TABLE m_left (id INTEGER, grp TEXT, val TEXT); CREATE TABLE m_right (id INTEGER, grp TEXT, info TEXT); INSERT INTO m_left VALUES (1, 'g1', 'L1'), (2, 'g2', 'L2'), (3, 'g1', 'L3'); INSERT INTO m_right VALUES (2, 'g2', 'R2'), (3, 'g9', 'R3'), (4, 'g4', 'R4');");
     setup.deinit();
@@ -10107,10 +10693,10 @@ test "multi-column using joins match on all columns" {
     try std.testing.expectEqualStrings("grp", rawStar.columns[1]);
     try std.testing.expectEqualStrings("val", rawStar.columns[2]);
     try std.testing.expectEqualStrings("info", rawStar.columns[3]);
-    try std.testing.expectEqual(@as(i64, 2), rawStar.rows[0][0].integer);
-    try std.testing.expectEqualStrings("g2", rawStar.rows[0][1].text);
-    try std.testing.expectEqualStrings("L2", rawStar.rows[0][2].text);
-    try std.testing.expectEqualStrings("R2", rawStar.rows[0][3].text);
+    try std.testing.expectEqual(@as(i64, 2), rawStar.at(0)[0].integer);
+    try std.testing.expectEqualStrings("g2", rawStar.at(0)[1].text);
+    try std.testing.expectEqualStrings("L2", rawStar.at(0)[2].text);
+    try std.testing.expectEqualStrings("R2", rawStar.at(0)[3].text);
     var rawNamed = try db.exec("SELECT id, grp, val, info FROM m_left JOIN m_right USING (id, grp);");
     defer rawNamed.deinit();
     try std.testing.expectEqual(@as(usize, 1), rawNamed.count());
@@ -10126,28 +10712,28 @@ test "multi-column using joins match on all columns" {
     defer rawCount.deinit();
     try std.testing.expectEqual(@as(i64, 1), rawCount.rows[0][0].integer);
     var mark = db.parseCount;
-    var dynMulti = try db.from("m_left").joinUsing("m_right", .{ db.col("id"), db.col("grp") }).orderBy(db.col("id").asc()).fetch();
+    var dynMulti = try t_db_m_left.joinUsing("m_right", .{ t_db_m_left.column("id"), t_db_m_left.column("grp") }).orderBy(t_db_m_left.column("id").asc()).fetch();
     defer dynMulti.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
     try std.testing.expectEqual(@as(usize, 1), dynMulti.count());
     try std.testing.expectEqual(@as(usize, 4), dynMulti.columns.len);
-    try std.testing.expectEqual(@as(i64, 2), dynMulti.rows[0][0].integer);
-    try std.testing.expectEqualStrings("g2", dynMulti.rows[0][1].text);
-    try std.testing.expectEqualStrings("L2", dynMulti.rows[0][2].text);
-    try std.testing.expectEqualStrings("R2", dynMulti.rows[0][3].text);
+    try std.testing.expectEqual(@as(i64, 2), dynMulti.at(0)[0].integer);
+    try std.testing.expectEqualStrings("g2", dynMulti.at(0)[1].text);
+    try std.testing.expectEqualStrings("L2", dynMulti.at(0)[2].text);
+    try std.testing.expectEqualStrings("R2", dynMulti.at(0)[3].text);
     for (rawStar.rows, 0..) |row, i| for (row, 0..) |cell, j| {
-        if (cell == .integer) try std.testing.expectEqual(cell.integer, dynMulti.rows[i][j].integer);
-        if (cell == .text) try std.testing.expectEqualStrings(cell.text, dynMulti.rows[i][j].text);
+        if (cell == .integer) try std.testing.expectEqual(cell.integer, dynMulti.at(i)[j].integer);
+        if (cell == .text) try std.testing.expectEqualStrings(cell.text, dynMulti.at(i)[j].text);
     };
     mark = db.parseCount;
-    var dynLeft = try db.from("m_left").leftJoinUsing("m_right", .{ db.col("id"), db.col("grp") }).orderBy(db.col("id").asc()).fetch();
+    var dynLeft = try t_db_m_left.leftJoinUsing("m_right", .{ t_db_m_left.column("id"), t_db_m_left.column("grp") }).orderBy(t_db_m_left.column("id").asc()).fetch();
     defer dynLeft.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
     try std.testing.expectEqual(@as(usize, 3), dynLeft.count());
     try std.testing.expect(dynLeft.rows[0][3] == .null);
     try std.testing.expectEqualStrings("R2", dynLeft.rows[1][3].text);
     mark = db.parseCount;
-    var typedMulti = try db.from(Left).joinUsing(Right, .{ Left.columns.id, Left.columns.grp }).orderBy(Left.columns.id.asc()).fetch();
+    var typedMulti = try db.from(Left).joinUsing(Right, .{ Left.id, Left.grp }).orderBy(Left.id.asc()).fetch();
     defer typedMulti.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
     try std.testing.expectEqual(@as(usize, 1), typedMulti.count());
@@ -10155,7 +10741,7 @@ test "multi-column using joins match on all columns" {
     try std.testing.expectEqualStrings("g2", typedMulti.rows[0].grp);
     try std.testing.expectEqualStrings("L2", typedMulti.rows[0].val);
     mark = db.parseCount;
-    var typedLeft = try db.from(Left).leftJoinUsing(Right, .{ Left.columns.id, Left.columns.grp }).orderBy(Left.columns.id.asc()).fetch();
+    var typedLeft = try db.from(Left).leftJoinUsing(Right, .{ Left.id, Left.grp }).orderBy(Left.id.asc()).fetch();
     defer typedLeft.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
     try std.testing.expectEqual(@as(usize, 3), typedLeft.count());
@@ -10169,7 +10755,7 @@ test "multi-column using joins match on all columns" {
     } else |err| {
         try std.testing.expectEqual(error.UnknownColumn, err);
     }
-    if (db.from("m_left").joinUsing("m_right", .{ db.col("id"), db.col("nope") }).fetch()) |r| {
+    if (t_db_m_left.joinUsing("m_right", .{ t_db_m_left.column("id"), t_db_m_left.column("nope") }).fetch()) |r| {
         var owned = r;
         owned.deinit();
         return error.ExpectedUnknownColumn;
@@ -10188,13 +10774,15 @@ test "multi-column using joins match on all columns" {
     defer persisted.deinit();
     try std.testing.expectEqual(@as(usize, 1), persisted.count());
     try std.testing.expectEqual(@as(usize, 4), persisted.columns.len);
-    try std.testing.expectEqual(@as(i64, 2), persisted.rows[0][0].integer);
-    try std.testing.expectEqualStrings("R2", persisted.rows[0][3].text);
+    try std.testing.expectEqual(@as(i64, 2), persisted.at(0)[0].integer);
+    try std.testing.expectEqualStrings("R2", persisted.at(0)[3].text);
 }
 
 test "compound dsl covers set operations with raw parity" {
     const path = "sqlite_zig_compound_dsl_test.db";
     var db = try freshDb(path);
+    const t_db_c_right = db.table("c_right");
+    const t_db_c_left = db.table("c_left");
     defer dropDb(db, path);
     var setup = try db.exec("CREATE TABLE c_left (id INTEGER, label TEXT); CREATE TABLE c_right (id INTEGER, label TEXT); INSERT INTO c_left VALUES (1, 'alpha'), (2, 'beta'), (2, 'beta'), (NULL, 'null'), (4, 'delta'); INSERT INTO c_right VALUES (2, 'beta'), (3, 'gamma'), (NULL, 'null'), (5, 'eps');");
     setup.deinit();
@@ -10206,7 +10794,7 @@ test "compound dsl covers set operations with raw parity" {
     try std.testing.expectEqual(@as(i64, 2), rawUnion.rows[2][0].integer);
     try std.testing.expectEqual(@as(i64, 5), rawUnion.rows[5][0].integer);
     var mark = db.parseCount;
-    var dynUnion = try db.from("c_left").select(.{db.col("id")}).unionDistinct(db.from("c_right").select(.{db.col("id")})).orderBy(db.col("id").asc()).fetch();
+    var dynUnion = try t_db_c_left.select(.{t_db_c_left.column("id")}).unionDistinct(t_db_c_right.select(.{t_db_c_right.column("id")})).orderBy(t_db_c_left.column("id").asc()).fetch();
     defer dynUnion.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
     try std.testing.expectEqual(rawUnion.count(), dynUnion.count());
@@ -10221,7 +10809,7 @@ test "compound dsl covers set operations with raw parity" {
     defer rawAll.deinit();
     try std.testing.expectEqual(@as(usize, 9), rawAll.count());
     mark = db.parseCount;
-    var dynAll = try db.from("c_left").select(.{db.col("id")}).unionAll(db.from("c_right").select(.{db.col("id")})).fetch();
+    var dynAll = try t_db_c_left.select(.{t_db_c_left.column("id")}).unionAll(t_db_c_right.select(.{t_db_c_right.column("id")})).fetch();
     defer dynAll.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
     try std.testing.expectEqual(rawAll.count(), dynAll.count());
@@ -10234,7 +10822,7 @@ test "compound dsl covers set operations with raw parity" {
     try std.testing.expectEqual(@as(i64, 2), rawIntersect.rows[0][0].integer);
     try std.testing.expect(rawIntersect.rows[1][0] == .null);
     mark = db.parseCount;
-    var dynIntersect = try db.from("c_left").select(.{db.col("id")}).intersect(db.from("c_right").select(.{db.col("id")})).fetch();
+    var dynIntersect = try t_db_c_left.select(.{t_db_c_left.column("id")}).intersect(t_db_c_right.select(.{t_db_c_right.column("id")})).fetch();
     defer dynIntersect.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
     try std.testing.expectEqual(rawIntersect.count(), dynIntersect.count());
@@ -10246,7 +10834,7 @@ test "compound dsl covers set operations with raw parity" {
     try std.testing.expectEqual(@as(i64, 1), rawExcept.rows[0][0].integer);
     try std.testing.expectEqual(@as(i64, 4), rawExcept.rows[1][0].integer);
     mark = db.parseCount;
-    var dynExcept = try db.from("c_left").select(.{db.col("id")}).except(db.from("c_right").select(.{db.col("id")})).fetch();
+    var dynExcept = try t_db_c_left.select(.{t_db_c_left.column("id")}).except(t_db_c_right.select(.{t_db_c_right.column("id")})).fetch();
     defer dynExcept.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
     try std.testing.expectEqual(rawExcept.count(), dynExcept.count());
@@ -10265,7 +10853,7 @@ test "compound dsl covers set operations with raw parity" {
     try std.testing.expectEqual(@as(i64, 1), rawPaged.rows[0][0].integer);
     try std.testing.expectEqual(@as(i64, 2), rawPaged.rows[1][0].integer);
     mark = db.parseCount;
-    var dynPaged = try db.from("c_left").select(.{db.col("id")}).unionDistinct(db.from("c_right").select(.{db.col("id")})).orderBy(db.col("id").asc()).limit(2).offset(1).fetch();
+    var dynPaged = try t_db_c_left.select(.{t_db_c_left.column("id")}).unionDistinct(t_db_c_right.select(.{t_db_c_right.column("id")})).orderBy(t_db_c_left.column("id").asc()).limit(2).offset(1).fetch();
     defer dynPaged.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
     try std.testing.expectEqual(rawPaged.count(), dynPaged.count());
@@ -10275,15 +10863,15 @@ test "compound dsl covers set operations with raw parity" {
     defer rawChain.deinit();
     try std.testing.expectEqual(@as(usize, 6), rawChain.count());
     mark = db.parseCount;
-    var dynChain = try db.from("c_left").select(.{db.col("id")}).except(db.from("c_right").select(.{db.col("id")})).unionDistinct(db.from("c_right").select(.{db.col("id")})).orderBy(db.col("id").asc()).fetch();
+    var dynChain = try t_db_c_left.select(.{t_db_c_left.column("id")}).except(t_db_c_right.select(.{t_db_c_right.column("id")})).unionDistinct(t_db_c_right.select(.{t_db_c_right.column("id")})).orderBy(t_db_c_left.column("id").asc()).fetch();
     defer dynChain.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
     try std.testing.expectEqual(rawChain.count(), dynChain.count());
     for (rawChain.rows, 0..) |row, i| {
         if (row[0] == .null) {
-            try std.testing.expect(dynChain.rows[i][0] == .null);
+            try std.testing.expect(dynChain.at(i)[0] == .null);
         } else {
-            try std.testing.expectEqual(row[0].integer, dynChain.rows[i][0].integer);
+            try std.testing.expectEqual(row[0].integer, dynChain.at(i)[0].integer);
         }
     }
     if (db.exec("SELECT id FROM c_left UNION SELECT id, label FROM c_right;")) |r| {
@@ -10293,7 +10881,7 @@ test "compound dsl covers set operations with raw parity" {
     } else |err| {
         try std.testing.expectEqual(error.SchemaMismatch, err);
     }
-    if (db.from("c_left").select(.{db.col("id")}).unionDistinct(db.from("c_right").select(.{ db.col("id"), db.col("label") })).fetch()) |r| {
+    if (t_db_c_left.select(.{t_db_c_left.column("id")}).unionDistinct(t_db_c_right.select(.{ t_db_c_right.column("id"), t_db_c_right.column("label") })).fetch()) |r| {
         var owned = r;
         owned.deinit();
         return error.ExpectedSchemaMismatch;
@@ -10308,7 +10896,7 @@ test "compound dsl covers set operations with raw parity" {
         try std.testing.expectEqual(error.UnknownColumn, err);
     }
     mark = db.parseCount;
-    if (db.from("c_left").select(.{db.col("id")}).unionDistinct(db.from("c_right").select(.{db.col("id")})).orderBy(db.col("nope").asc()).fetch()) |r| {
+    if (t_db_c_left.select(.{t_db_c_left.column("id")}).unionDistinct(t_db_c_right.select(.{t_db_c_right.column("id")})).orderBy(t_db_c_left.column("nope").asc()).fetch()) |r| {
         var owned = r;
         owned.deinit();
         return error.ExpectedUnknownColumn;
@@ -10316,7 +10904,7 @@ test "compound dsl covers set operations with raw parity" {
         try std.testing.expectEqual(error.UnknownColumn, err);
     }
     try std.testing.expectEqual(mark, db.parseCount);
-    if (db.from("c_left").select(.{db.col("id")}).orderBy(db.col("id").asc()).unionDistinct(db.from("c_right").select(.{db.col("id")})).fetch()) |r| {
+    if (t_db_c_left.select(.{t_db_c_left.column("id")}).orderBy(t_db_c_left.column("id").asc()).unionDistinct(t_db_c_right.select(.{t_db_c_right.column("id")})).fetch()) |r| {
         var owned = r;
         owned.deinit();
         return error.ExpectedArmOrderRejected;
@@ -10336,6 +10924,7 @@ test "compound dsl maps typed rows and cte arms" {
     const Right = @import("../dsl/table.zig").table("t_right", struct { id: ?i64, label: ?[]const u8 });
     const path = "sqlite_zig_compound_typed_test.db";
     var db = try freshDb(path);
+    const t_db_live_ids = db.table("live_ids");
     defer dropDb(db, path);
     var setup = try db.exec("CREATE TABLE t_left (id INTEGER, label TEXT); CREATE TABLE t_right (id INTEGER, label TEXT); INSERT INTO t_left VALUES (1, 'alpha'), (2, 'beta'), (NULL, 'null'); INSERT INTO t_right VALUES (2, 'beta'), (3, 'gamma'), (NULL, 'null');");
     setup.deinit();
@@ -10347,7 +10936,7 @@ test "compound dsl maps typed rows and cte arms" {
     try std.testing.expectEqual(@as(i64, 1), typedUnion.rows[0].id.?);
     try std.testing.expectEqualStrings("alpha", typedUnion.rows[0].label.?);
     mark = db.parseCount;
-    var typedIds = try db.from(Left).select(.{Left.columns.id}).unionDistinct(db.from(Right).select(.{Right.columns.id})).orderBy(Left.columns.id.asc()).fetch();
+    var typedIds = try db.from(Left).select(.{Left.id}).unionDistinct(db.from(Right).select(.{Right.id})).orderBy(Left.id.asc()).fetch();
     defer typedIds.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
     try std.testing.expectEqual(@as(usize, 4), typedIds.count());
@@ -10363,30 +10952,36 @@ test "compound dsl maps typed rows and cte arms" {
             try std.testing.expectEqual(row[0].integer, typedIds.rows[i][0].integer);
         }
     }
-    var cteArm = try db.from("live_ids").with("live_ids", "SELECT id FROM t_left WHERE id IS NOT NULL").select(.{db.col("id")}).unionDistinct(db.from(Right).select(.{Right.columns.id})).fetch();
+    var cteArm = try t_db_live_ids.with("live_ids", "SELECT id FROM t_left WHERE id IS NOT NULL").select(.{t_db_live_ids.column("id")}).unionDistinct(db.from(Right).select(.{Right.id})).fetch();
     defer cteArm.deinit();
     try std.testing.expectEqual(@as(usize, 4), cteArm.count());
-    var single = (try db.from(Left).unionDistinct(db.from(Right).where(Right.columns.id.gt(100))).fetchOne()).?;
+    var single = try db.from(Left).where(Left.id.eq(1)).unionDistinct(db.from(Right).where(Right.id.gt(100))).fetchOne();
     defer db.from(Left).freeRow(&single);
     try std.testing.expectEqual(@as(i64, 1), single.id.?);
     db.close();
     db = try Connection.open(std.testing.allocator, path);
-    var persisted = try db.from("t_left").select(.{db.col("id")}).unionDistinct(db.from("t_right").select(.{db.col("id")})).orderBy(db.col("id").asc()).fetch();
+    const t_db_t_left_reopened = db.table("t_left");
+    const t_db_t_right_reopened = db.table("t_right");
+    var persisted = try t_db_t_left_reopened.select(.{t_db_t_left_reopened.column("id")}).unionDistinct(t_db_t_right_reopened.select(.{t_db_t_right_reopened.column("id")})).orderBy(t_db_t_left_reopened.column("id").asc()).fetch();
     defer persisted.deinit();
     try std.testing.expectEqual(@as(usize, 4), persisted.count());
-    try std.testing.expect(persisted.rows[0][0] == .null);
+    try std.testing.expect(persisted.at(0)[0] == .null);
 }
 
 test "derived tables construct from dsl builders" {
     const Order = @import("../dsl/table.zig").table("d_orders", struct { id: i64, user_id: i64, amount: i64 });
     const path = "sqlite_zig_derived_dsl_test.db";
     var db = try freshDb(path);
+    const t_db_d_orders = db.table("d_orders");
+    const t_db_d_users = db.table("d_users");
+    const t_db_live_big = db.table("live_big");
+    const t_db_nope = db.table("nope");
     defer dropDb(db, path);
     var setup = try db.exec("CREATE TABLE d_orders (id INTEGER PRIMARY KEY, user_id INTEGER, amount INTEGER); CREATE TABLE d_users (id INTEGER PRIMARY KEY, name TEXT); INSERT INTO d_orders VALUES (1, 7, 50), (2, 7, 150), (3, 8, 200), (4, 8, 30), (5, 7, 120); INSERT INTO d_users VALUES (7, 'seven'), (8, 'eight');");
     setup.deinit();
     var mark = db.parseCount;
-    var big = try db.from("d_orders").select(.{db.col("user_id")}).where(db.col("amount").gt(100)).asSubquery("big");
-    var dynBig = try big.select(.{db.col("user_id")}).orderBy(db.col("user_id").asc()).fetch();
+    var big = try t_db_d_orders.select(.{t_db_d_orders.column("user_id")}).where(t_db_d_orders.column("amount").gt(100)).asSubquery("big");
+    var dynBig = try big.select(.{big.column("user_id")}).orderBy(big.column("user_id").asc()).fetch();
     defer dynBig.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
     try std.testing.expectEqualStrings("user_id", dynBig.columns[0]);
@@ -10399,26 +10994,26 @@ test "derived tables construct from dsl builders" {
     try std.testing.expectEqual(rawBig.count(), dynBig.count());
     for (rawBig.rows, 0..) |row, i| try std.testing.expectEqual(row[0].integer, dynBig.rows[i][0].integer);
     mark = db.parseCount;
-    var filtered = try big.select(.{db.col("user_id")}).where(db.col("user_id").eq(8)).fetch();
+    var filtered = try big.select(.{big.column("user_id")}).where(big.column("user_id").eq(8)).fetch();
     defer filtered.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
     try std.testing.expectEqual(@as(usize, 1), filtered.count());
     try std.testing.expectEqual(@as(i64, 8), filtered.rows[0][0].integer);
     mark = db.parseCount;
-    var paged = try big.select(.{db.col("user_id")}).orderBy(db.col("user_id").asc()).limit(2).offset(1).fetch();
+    var paged = try big.select(.{big.column("user_id")}).orderBy(big.column("user_id").asc()).limit(2).offset(1).fetch();
     defer paged.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
     try std.testing.expectEqual(@as(usize, 2), paged.count());
     try std.testing.expectEqual(@as(i64, 7), paged.rows[0][0].integer);
     try std.testing.expectEqual(@as(i64, 8), paged.rows[1][0].integer);
     mark = db.parseCount;
-    var distinct = try big.select(.{db.col("user_id")}).distinct().fetch();
+    var distinct = try big.select(.{big.column("user_id")}).distinct().fetch();
     defer distinct.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
     try std.testing.expectEqual(@as(usize, 2), distinct.count());
-    var allIds = try db.from("d_orders").select(.{db.col("user_id")}).asSubquery("allids");
+    var allIds = try t_db_d_orders.select(.{t_db_d_orders.column("user_id")}).asSubquery("allids");
     mark = db.parseCount;
-    var grouped = try allIds.select(.{db.col("user_id")}).groupBy(db.col("user_id")).havingCount(">", 2).fetch();
+    var grouped = try allIds.select(.{allIds.column("user_id")}).groupBy(allIds.column("user_id")).having(allIds.column("user_id").count().gt(2)).fetch();
     defer grouped.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
     try std.testing.expectEqual(@as(usize, 1), grouped.count());
@@ -10429,8 +11024,8 @@ test "derived tables construct from dsl builders" {
     try std.testing.expectEqual(mark, db.parseCount);
     try std.testing.expectEqual(@as(i64, 3), counted.rows[0][0].integer);
     mark = db.parseCount;
-    var typedSub = try db.from(Order).select(.{Order.columns.user_id}).where(Order.columns.amount.gt(100)).asSubquery("o");
-    var typedOut = try typedSub.select(.{db.col("user_id")}).fetch();
+    var typedSub = try db.from(Order).select(.{Order.user_id}).where(Order.amount.gt(100)).asSubquery("o");
+    var typedOut = try typedSub.select(.{typedSub.column("user_id")}).fetch();
     defer typedOut.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
     try std.testing.expectEqualStrings("user_id", typedOut.columns[0]);
@@ -10439,7 +11034,8 @@ test "derived tables construct from dsl builders" {
     try std.testing.expectEqual(@as(i64, 8), typedOut.rows[1][0].integer);
     try std.testing.expectEqual(@as(i64, 7), typedOut.rows[2][0].integer);
     mark = db.parseCount;
-    var joined = try big.select(.{db.col("name")}).innerJoin("d_users", db.col("big.user_id").eq(db.col("d_users.id"))).orderBy(db.col("name").asc()).fetch();
+    const bigUserId = DynamicColumn{ .name = "user_id", .table = "big" };
+    var joined = try big.select(.{big.column("name")}).innerJoin(t_db_d_users, bigUserId.eq(t_db_d_users.column("id"))).orderBy(t_db_d_users.column("name").asc()).fetch();
     defer joined.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
     try std.testing.expectEqual(@as(usize, 3), joined.count());
@@ -10450,23 +11046,24 @@ test "derived tables construct from dsl builders" {
     defer rawJoin.deinit();
     try std.testing.expectEqual(rawJoin.count(), joined.count());
     for (rawJoin.rows, 0..) |row, i| try std.testing.expectEqualStrings(row[0].text, joined.rows[i][0].text);
-    var cteSub = try db.from("live_big").with("live_big", "SELECT user_id FROM d_orders WHERE amount > 100").select(.{db.col("user_id")}).asSubquery("cbig");
-    var cteOut = try cteSub.select(.{db.col("user_id")}).orderBy(db.col("user_id").asc()).fetch();
+    var cteSub = try t_db_live_big.with("live_big", "SELECT user_id FROM d_orders WHERE amount > 100").select(.{t_db_live_big.column("user_id")}).asSubquery("cbig");
+    var cteOut = try cteSub.select(.{cteSub.column("user_id")}).orderBy(cteSub.column("user_id").asc()).fetch();
     defer cteOut.deinit();
     try std.testing.expectEqual(@as(usize, 3), cteOut.count());
     try std.testing.expectEqual(@as(i64, 7), cteOut.rows[0][0].integer);
-    try std.testing.expectError(error.InvalidSql, (try db.from("d_orders").select(.{db.col("id")}).asSubquery("a")).asSubquery("b"));
-    try std.testing.expectError(error.InvalidSql, db.from("d_orders").asSubquery(""));
-    try std.testing.expectError(error.UnknownColumn, (try db.from("d_orders").select(.{db.col("nope")}).asSubquery("s")).select(.{db.col("nope")}).fetch());
-    try std.testing.expectError(error.UnknownTable, (try db.from("nope").select(.{db.col("id")}).asSubquery("s")).fetch());
+    try std.testing.expectError(error.InvalidSql, (try t_db_d_orders.select(.{t_db_d_orders.column("id")}).asSubquery("a")).asSubquery("b"));
+    try std.testing.expectError(error.InvalidSql, t_db_d_orders.asSubquery(""));
+    try std.testing.expectError(error.UnknownColumn, (try t_db_d_orders.select(.{t_db_d_orders.column("nope")}).asSubquery("s")).select(.{t_db_d_orders.column("nope")}).fetch());
+    try std.testing.expectError(error.UnknownTable, (try t_db_nope.select(.{t_db_nope.column("id")}).asSubquery("s")).fetch());
     var intactOrders = try db.exec("SELECT count(*) FROM d_orders;");
     defer intactOrders.deinit();
     try std.testing.expectEqual(@as(i64, 5), intactOrders.rows[0][0].integer);
     db.close();
     db = try Connection.open(std.testing.allocator, path);
     const markReopened = db.parseCount;
-    var repersisted = try db.from("d_orders").select(.{db.col("user_id")}).where(db.col("amount").gt(100)).asSubquery("big");
-    var repersistedOut = try repersisted.select(.{db.col("user_id")}).orderBy(db.col("user_id").asc()).fetch();
+    const t_db_d_orders_reopened = db.table("d_orders");
+    var repersisted = try t_db_d_orders_reopened.select(.{t_db_d_orders_reopened.column("user_id")}).where(t_db_d_orders_reopened.column("amount").gt(100)).asSubquery("big");
+    var repersistedOut = try repersisted.select(.{repersisted.column("user_id")}).orderBy(repersisted.column("user_id").asc()).fetch();
     defer repersistedOut.deinit();
     try std.testing.expectEqual(markReopened, db.parseCount);
     try std.testing.expectEqual(@as(usize, 3), repersistedOut.count());
@@ -10476,6 +11073,7 @@ test "dynamic dsl covers window functions with raw parity" {
     const win = @import("../dsl/column.zig");
     const path = "sqlite_zig_window_dsl_test.db";
     var db = try freshDb(path);
+    const t_db_win_tbl = db.table("win_tbl");
     defer dropDb(db, path);
     var setup = try db.exec("CREATE TABLE win_tbl (dept TEXT, emp TEXT, salary INT); INSERT INTO win_tbl VALUES ('HR', 'Alice', 1000), ('HR', 'Bob', 1500), ('IT', 'Charlie', 2000), ('IT', 'Dave', 2000), ('IT', 'Eve', 2500);");
     setup.deinit();
@@ -10483,7 +11081,7 @@ test "dynamic dsl covers window functions with raw parity" {
     defer rawRanks.deinit();
     try std.testing.expectEqual(@as(usize, 5), rawRanks.count());
     var mark = db.parseCount;
-    var dynRanks = try db.from("win_tbl").select(.{ db.col("emp"), win.rowNumber().partitionBy(db.col("dept")).orderBy(db.col("salary").asc()), win.rank().partitionBy(db.col("dept")).orderBy(db.col("salary").asc()), win.denseRank().partitionBy(db.col("dept")).orderBy(db.col("salary").asc()) }).orderBy(db.col("dept").asc()).fetch();
+    var dynRanks = try t_db_win_tbl.select(.{ t_db_win_tbl.column("emp"), win.rowNumber().partitionBy(t_db_win_tbl.column("dept")).orderBy(t_db_win_tbl.column("salary").asc()), win.rank().partitionBy(t_db_win_tbl.column("dept")).orderBy(t_db_win_tbl.column("salary").asc()), win.denseRank().partitionBy(t_db_win_tbl.column("dept")).orderBy(t_db_win_tbl.column("salary").asc()) }).orderBy(t_db_win_tbl.column("dept").asc()).fetch();
     defer dynRanks.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
     try std.testing.expectEqual(rawRanks.count(), dynRanks.count());
@@ -10502,7 +11100,7 @@ test "dynamic dsl covers window functions with raw parity" {
     var rawLag = try db.exec("SELECT emp, LAG(emp, 2, 'none') OVER (ORDER BY salary), LEAD(salary, 1, 0) OVER (ORDER BY salary) FROM win_tbl ORDER BY salary;");
     defer rawLag.deinit();
     mark = db.parseCount;
-    var dynLag = try db.from("win_tbl").select(.{ db.col("emp"), win.lag(db.col("emp")).offset(2).defaultValue("none").orderBy(db.col("salary").asc()), win.lead(db.col("salary")).offset(1).defaultValue(0).orderBy(db.col("salary").asc()) }).orderBy(db.col("salary").asc()).fetch();
+    var dynLag = try t_db_win_tbl.select(.{ t_db_win_tbl.column("emp"), win.lag(t_db_win_tbl.column("emp")).offset(2).defaultValue("none").orderBy(t_db_win_tbl.column("salary").asc()), win.lead(t_db_win_tbl.column("salary")).offset(1).defaultValue(0).orderBy(t_db_win_tbl.column("salary").asc()) }).orderBy(t_db_win_tbl.column("salary").asc()).fetch();
     defer dynLag.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
     try std.testing.expectEqual(rawLag.count(), dynLag.count());
@@ -10520,7 +11118,7 @@ test "dynamic dsl covers window functions with raw parity" {
     var rawDist = try db.exec("SELECT emp, PERCENT_RANK() OVER (ORDER BY salary), CUME_DIST() OVER (ORDER BY salary), NTILE(2) OVER (ORDER BY salary) FROM win_tbl ORDER BY salary;");
     defer rawDist.deinit();
     mark = db.parseCount;
-    var dynDist = try db.from("win_tbl").select(.{ db.col("emp"), win.percentRank().orderBy(db.col("salary").asc()), win.cumeDist().orderBy(db.col("salary").asc()), win.ntile(2).orderBy(db.col("salary").asc()) }).orderBy(db.col("salary").asc()).fetch();
+    var dynDist = try t_db_win_tbl.select(.{ t_db_win_tbl.column("emp"), win.percentRank().orderBy(t_db_win_tbl.column("salary").asc()), win.cumeDist().orderBy(t_db_win_tbl.column("salary").asc()), win.ntile(2).orderBy(t_db_win_tbl.column("salary").asc()) }).orderBy(t_db_win_tbl.column("salary").asc()).fetch();
     defer dynDist.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
     try std.testing.expectEqual(rawDist.count(), dynDist.count());
@@ -10533,7 +11131,7 @@ test "dynamic dsl covers window functions with raw parity" {
     var rawFramed = try db.exec("SELECT emp, FIRST_VALUE(emp) OVER (ORDER BY salary ROWS BETWEEN 1 PRECEDING AND CURRENT ROW), LAST_VALUE(emp) OVER (ORDER BY salary ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING), NTH_VALUE(emp, 2) OVER (PARTITION BY dept ORDER BY salary) FROM win_tbl ORDER BY salary;");
     defer rawFramed.deinit();
     mark = db.parseCount;
-    var dynFramed = try db.from("win_tbl").select(.{ db.col("emp"), win.firstValue(db.col("emp")).orderBy(db.col("salary").asc()).rowsBetween(win.preceding(1), win.currentRow()), win.lastValue(db.col("emp")).orderBy(db.col("salary").asc()).rowsBetween(win.currentRow(), win.following(1)), win.nthValue(db.col("emp"), 2).partitionBy(db.col("dept")).orderBy(db.col("salary").asc()) }).orderBy(db.col("salary").asc()).fetch();
+    var dynFramed = try t_db_win_tbl.select(.{ t_db_win_tbl.column("emp"), win.firstValue(t_db_win_tbl.column("emp")).orderBy(t_db_win_tbl.column("salary").asc()).rowsBetween(win.preceding(1), win.currentRow()), win.lastValue(t_db_win_tbl.column("emp")).orderBy(t_db_win_tbl.column("salary").asc()).rowsBetween(win.currentRow(), win.following(1)), win.nthValue(t_db_win_tbl.column("emp"), 2).partitionBy(t_db_win_tbl.column("dept")).orderBy(t_db_win_tbl.column("salary").asc()) }).orderBy(t_db_win_tbl.column("salary").asc()).fetch();
     defer dynFramed.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
     try std.testing.expectEqual(rawFramed.count(), dynFramed.count());
@@ -10553,7 +11151,7 @@ test "dynamic dsl covers window functions with raw parity" {
     var rawRangeGroups = try db.exec("SELECT emp, FIRST_VALUE(emp) OVER (ORDER BY salary RANGE BETWEEN 100 PRECEDING AND CURRENT ROW), FIRST_VALUE(emp) OVER (ORDER BY salary GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM win_tbl ORDER BY salary;");
     defer rawRangeGroups.deinit();
     mark = db.parseCount;
-    var dynRangeGroups = try db.from("win_tbl").select(.{ db.col("emp"), win.firstValue(db.col("emp")).orderBy(db.col("salary").asc()).rangeBetween(win.preceding(100), win.currentRow()), win.firstValue(db.col("emp")).orderBy(db.col("salary").asc()).groupsBetween(win.preceding(1), win.currentRow()) }).orderBy(db.col("salary").asc()).fetch();
+    var dynRangeGroups = try t_db_win_tbl.select(.{ t_db_win_tbl.column("emp"), win.firstValue(t_db_win_tbl.column("emp")).orderBy(t_db_win_tbl.column("salary").asc()).rangeBetween(win.preceding(100), win.currentRow()), win.firstValue(t_db_win_tbl.column("emp")).orderBy(t_db_win_tbl.column("salary").asc()).groupsBetween(win.preceding(1), win.currentRow()) }).orderBy(t_db_win_tbl.column("salary").asc()).fetch();
     defer dynRangeGroups.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
     try std.testing.expectEqual(rawRangeGroups.count(), dynRangeGroups.count());
@@ -10564,7 +11162,7 @@ test "dynamic dsl covers window functions with raw parity" {
     var rawUnbounded = try db.exec("SELECT emp, FIRST_VALUE(emp) OVER (ORDER BY salary RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW), FIRST_VALUE(emp) OVER (ORDER BY salary GROUPS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM win_tbl ORDER BY salary;");
     defer rawUnbounded.deinit();
     mark = db.parseCount;
-    var dynUnbounded = try db.from("win_tbl").select(.{ db.col("emp"), win.firstValue(db.col("emp")).orderBy(db.col("salary").asc()).rangeBetween(win.unboundedPreceding(), win.currentRow()), win.firstValue(db.col("emp")).orderBy(db.col("salary").asc()).groupsBetween(win.unboundedPreceding(), win.currentRow()) }).orderBy(db.col("salary").asc()).fetch();
+    var dynUnbounded = try t_db_win_tbl.select(.{ t_db_win_tbl.column("emp"), win.firstValue(t_db_win_tbl.column("emp")).orderBy(t_db_win_tbl.column("salary").asc()).rangeBetween(win.unboundedPreceding(), win.currentRow()), win.firstValue(t_db_win_tbl.column("emp")).orderBy(t_db_win_tbl.column("salary").asc()).groupsBetween(win.unboundedPreceding(), win.currentRow()) }).orderBy(t_db_win_tbl.column("salary").asc()).fetch();
     defer dynUnbounded.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
     try std.testing.expectEqual(rawUnbounded.count(), dynUnbounded.count());
@@ -10577,7 +11175,7 @@ test "dynamic dsl covers window functions with raw parity" {
     var rawBare = try db.exec("SELECT RANK() OVER (), NTILE(2) OVER () FROM win_tbl;");
     defer rawBare.deinit();
     mark = db.parseCount;
-    var dynBare = try db.from("win_tbl").select(.{ win.rank(), win.ntile(2) }).fetch();
+    var dynBare = try t_db_win_tbl.select(.{ win.rank(), win.ntile(2) }).fetch();
     defer dynBare.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
     try std.testing.expectEqual(rawBare.count(), dynBare.count());
@@ -10591,7 +11189,7 @@ test "dynamic dsl covers window functions with raw parity" {
         try std.testing.expectEqual(error.UnknownColumn, err);
     }
     mark = db.parseCount;
-    if (db.from("win_tbl").select(.{win.rank().orderBy(db.col("nope").asc())}).fetch()) |r| {
+    if (t_db_win_tbl.select(.{win.rank().orderBy(t_db_win_tbl.column("nope").asc())}).fetch()) |r| {
         var owned = r;
         owned.deinit();
         return error.ExpectedUnknownColumn;
@@ -10613,7 +11211,7 @@ test "typed dsl covers window functions" {
     var setup = try db.exec("CREATE TABLE t_win (dept TEXT, emp TEXT, salary INT); INSERT INTO t_win VALUES ('HR', 'Alice', 1000), ('HR', 'Bob', 1500), ('IT', 'Charlie', 2000), ('IT', 'Dave', 2000), ('IT', 'Eve', 2500);");
     setup.deinit();
     var mark = db.parseCount;
-    var typedRanks = try db.from(Win).select(.{ Win.columns.emp, win.rowNumber().partitionBy(Win.columns.dept).orderBy(Win.columns.salary.asc()), win.rank().partitionBy(Win.columns.dept).orderBy(Win.columns.salary.asc()) }).orderBy(Win.columns.dept.asc()).fetch();
+    var typedRanks = try db.from(Win).select(.{ Win.emp, win.rowNumber().partitionBy(Win.dept).orderBy(Win.salary.asc()), win.rank().partitionBy(Win.dept).orderBy(Win.salary.asc()) }).orderBy(Win.dept.asc()).fetch();
     defer typedRanks.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
     try std.testing.expectEqual(@as(usize, 5), typedRanks.count());
@@ -10628,7 +11226,7 @@ test "typed dsl covers window functions" {
         try std.testing.expectEqual(row[2].integer, typedRanks.rows[i][2].integer);
     }
     mark = db.parseCount;
-    var typedLag = try db.from(Win).select(.{ Win.columns.emp, win.lag(Win.columns.salary).offset(1).defaultValue(0).orderBy(Win.columns.salary.asc()), win.ntile(2).orderBy(Win.columns.salary.asc()) }).orderBy(Win.columns.salary.asc()).fetch();
+    var typedLag = try db.from(Win).select(.{ Win.emp, win.lag(Win.salary).offset(1).defaultValue(0).orderBy(Win.salary.asc()), win.ntile(2).orderBy(Win.salary.asc()) }).orderBy(Win.salary.asc()).fetch();
     defer typedLag.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
     try std.testing.expectEqual(@as(i64, 0), typedLag.rows[0][1].integer);
@@ -10643,7 +11241,7 @@ test "typed dsl covers window functions" {
     defer afterInsert.deinit();
     try std.testing.expectEqual(@as(i64, 6), afterInsert.rows[0][0].integer);
     mark = db.parseCount;
-    var typedFirst = try db.from(Win).select(.{win.firstValue(Win.columns.emp).partitionBy(Win.columns.dept).orderBy(Win.columns.salary.asc()).rowsFrom(win.unboundedPreceding())}).fetch();
+    var typedFirst = try db.from(Win).select(.{win.firstValue(Win.emp).partitionBy(Win.dept).orderBy(Win.salary.asc()).rowsFrom(win.unboundedPreceding())}).fetch();
     defer typedFirst.deinit();
     try std.testing.expectEqual(mark, db.parseCount);
     try std.testing.expectEqual(@as(usize, 6), typedFirst.count());
@@ -10652,7 +11250,8 @@ test "typed dsl covers window functions" {
     try std.testing.expectEqualStrings("Zed", typedFirst.rows[5][0].text);
     db.close();
     db = try Connection.open(std.testing.allocator, path);
-    var repersisted = try db.from("t_win").select(.{win.rowNumber().partitionBy(db.col("dept")).orderBy(db.col("salary").asc())}).fetch();
+    const t_db_t_win_reopened = db.table("t_win");
+    var repersisted = try t_db_t_win_reopened.select(.{win.rowNumber().partitionBy(t_db_t_win_reopened.column("dept")).orderBy(t_db_t_win_reopened.column("salary").asc())}).fetch();
     defer repersisted.deinit();
     try std.testing.expectEqual(@as(usize, 6), repersisted.count());
     const repersistedWant = [_]i64{ 2, 3, 1, 2, 3, 1 };
@@ -10693,8 +11292,8 @@ test "vacuum rebuilds storage and preserves schema objects" {
     var rows = try db.exec("SELECT label FROM vac_items ORDER BY id;");
     defer rows.deinit();
     try std.testing.expectEqual(@as(usize, 2), rows.count());
-    try std.testing.expectEqualStrings("one", rows.rows[0][0].text);
-    try std.testing.expectEqualStrings("two", rows.rows[1][0].text);
+    try std.testing.expectEqualStrings("one", rows.at(0)[0].text);
+    try std.testing.expectEqualStrings("two", rows.at(1)[0].text);
     try std.testing.expect(db.store.findIndexConst("vac_items_label_idx") != null);
     try std.testing.expect(db.store.findViewConst("vac_view") != null);
     try std.testing.expect(db.store.findTriggerConst("vac_log") != null);
@@ -10772,7 +11371,7 @@ test "pragma page_size validates and preserves data across rebuilds" {
     var rows = try db.exec("SELECT label FROM sized ORDER BY id;");
     defer rows.deinit();
     try std.testing.expectEqual(@as(usize, 2), rows.count());
-    try std.testing.expectEqualStrings("b", rows.rows[1][0].text);
+    try std.testing.expectEqualStrings("b", rows.at(1)[0].text);
     db.close();
     db = try Connection.open(std.testing.allocator, path);
     try std.testing.expectEqual(@as(usize, 8192), db.file.pageSize);
@@ -10856,9 +11455,9 @@ test "partial unique index constrains only matching rows" {
     var rows = try db.exec("SELECT id FROM members ORDER BY id;");
     defer rows.deinit();
     try std.testing.expectEqual(@as(usize, 3), rows.count());
-    try std.testing.expectEqual(@as(i64, 1), rows.rows[0][0].integer);
-    try std.testing.expectEqual(@as(i64, 3), rows.rows[1][0].integer);
-    try std.testing.expectEqual(@as(i64, 4), rows.rows[2][0].integer);
+    try std.testing.expectEqual(@as(i64, 1), rows.at(0)[0].integer);
+    try std.testing.expectEqual(@as(i64, 3), rows.at(1)[0].integer);
+    try std.testing.expectEqual(@as(i64, 4), rows.at(2)[0].integer);
 }
 
 test "partial unique index follows updates across the predicate boundary" {
@@ -10874,8 +11473,8 @@ test "partial unique index follows updates across the predicate boundary" {
     nowAllowed.deinit();
     var rows = try db.exec("SELECT id, active FROM flags ORDER BY id;");
     defer rows.deinit();
-    try std.testing.expectEqual(@as(i64, 0), rows.rows[0][1].integer);
-    try std.testing.expectEqual(@as(i64, 1), rows.rows[1][1].integer);
+    try std.testing.expectEqual(@as(i64, 0), rows.at(0)[1].integer);
+    try std.testing.expectEqual(@as(i64, 1), rows.at(1)[1].integer);
 }
 
 test "partial unique index interacts with conflict handling" {
@@ -10893,10 +11492,10 @@ test "partial unique index interacts with conflict handling" {
     var rows = try db.exec("SELECT id, active FROM subs ORDER BY id;");
     defer rows.deinit();
     try std.testing.expectEqual(@as(usize, 2), rows.count());
-    try std.testing.expectEqual(@as(i64, 3), rows.rows[0][0].integer);
-    try std.testing.expectEqual(@as(i64, 0), rows.rows[0][1].integer);
-    try std.testing.expectEqual(@as(i64, 4), rows.rows[1][0].integer);
-    try std.testing.expectEqual(@as(i64, 1), rows.rows[1][1].integer);
+    try std.testing.expectEqual(@as(i64, 3), rows.at(0)[0].integer);
+    try std.testing.expectEqual(@as(i64, 0), rows.at(0)[1].integer);
+    try std.testing.expectEqual(@as(i64, 4), rows.at(1)[0].integer);
+    try std.testing.expectEqual(@as(i64, 1), rows.at(1)[1].integer);
 }
 
 test "planner uses partial indexes only when implied" {
@@ -10942,7 +11541,7 @@ test "partial indexes persist across reopen" {
     try std.testing.expect(std.mem.indexOf(u8, check.rows[0][0].text, "keep_active_code") != null);
     var rows = try db.exec("SELECT count(*) FROM keep;");
     defer rows.deinit();
-    try std.testing.expectEqual(@as(i64, 3), rows.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 3), rows.at(0)[0].integer);
 }
 
 test "expression index creation validates keys" {
@@ -10986,8 +11585,8 @@ test "expression unique index constrains computed values" {
     var rows = try db.exec("SELECT id, email FROM accounts ORDER BY id;");
     defer rows.deinit();
     try std.testing.expectEqual(@as(usize, 2), rows.count());
-    try std.testing.expectEqualStrings("A@Test", rows.rows[0][1].text);
-    try std.testing.expectEqualStrings("b@test", rows.rows[1][1].text);
+    try std.testing.expectEqualStrings("A@Test", rows.at(0)[1].text);
+    try std.testing.expectEqualStrings("b@test", rows.at(1)[1].text);
     try std.testing.expectError(error.ConstraintViolation, db.exec("UPDATE accounts SET email = 'B@TEST' WHERE id = 1;"));
     var moved = try db.exec("UPDATE accounts SET email = 'c@test' WHERE id = 1;");
     moved.deinit();
@@ -11033,7 +11632,7 @@ test "expression and partial index combine correctly" {
     inactive.deinit();
     var rows = try db.exec("SELECT count(*) FROM staff;");
     defer rows.deinit();
-    try std.testing.expectEqual(@as(i64, 2), rows.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 2), rows.at(0)[0].integer);
     var planned = try db.exec("EXPLAIN QUERY PLAN SELECT email FROM staff WHERE lower(email) = 'a@test' AND active = 1;");
     defer planned.deinit();
     try std.testing.expect(planned.count() > 0);
@@ -11059,7 +11658,7 @@ test "expression indexes persist across reopen" {
     try std.testing.expect(std.mem.indexOf(u8, check.rows[0][0].text, "persist_lower_email") != null);
     var rows = try db.exec("SELECT count(*) FROM persist;");
     defer rows.deinit();
-    try std.testing.expectEqual(@as(i64, 2), rows.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 2), rows.at(0)[0].integer);
 }
 
 test "dynamic and typed DSL support insert-select" {
@@ -11067,6 +11666,8 @@ test "dynamic and typed DSL support insert-select" {
     const Dst = @import("../dsl/table.zig").table("dsl_dst_items", struct { id: i64, label: []const u8 });
     const path = "sqlite_zig_dsl_insert_select_test.db";
     var db = try freshDb(path);
+    const t_db_dsl_dst_items = db.table("dsl_dst_items");
+    const t_db_dsl_src_items = db.table("dsl_src_items");
     defer dropDb(db, path);
     try db.createTable(Src, .{});
     try db.createTable(Dst, .{});
@@ -11074,22 +11675,22 @@ test "dynamic and typed DSL support insert-select" {
     seed.deinit();
     var seed2 = try db.exec("INSERT INTO dsl_src_items VALUES (2, 'two'), (3, 'three');");
     seed2.deinit();
-    var copied = try db.from(Dst).insertSelect(db.from(Src).select(.{ Src.columns.id, Src.columns.label }));
+    var copied = try db.from(Dst).insertSelect(db.from(Src).select(.{ Src.id, Src.label }));
     defer copied.deinit();
     try std.testing.expectEqual(@as(usize, 3), copied.changes);
-    var rows = try db.from(Dst).select(.{Dst.columns.id}).fetch();
+    var rows = try db.from(Dst).select(.{Dst.id}).fetch();
     defer rows.deinit();
     try std.testing.expectEqual(@as(usize, 3), rows.count());
-    var filtered = try db.from("dsl_dst_items").insertSelect(
-        db.from("dsl_src_items").select(.{ db.col("id"), db.col("label") }).where(db.col("id").gt(10)),
+    var filtered = try t_db_dsl_dst_items.insertSelect(
+        t_db_dsl_src_items.select(.{ t_db_dsl_src_items.column("id"), t_db_dsl_src_items.column("label") }).where(t_db_dsl_src_items.column("id").gt(10)),
     );
     defer filtered.deinit();
     try std.testing.expectEqual(@as(usize, 0), filtered.changes);
     var resized = try db.exec("SELECT count(*) FROM dsl_dst_items;");
     defer resized.deinit();
     try std.testing.expectEqual(@as(i64, 3), resized.rows[0][0].integer);
-    var returning = try db.from(Dst).returning(.{Dst.columns.id}).insertSelect(
-        db.from(Src).select(.{ Src.columns.id, Src.columns.label }).where(Src.columns.id.eq(1)),
+    var returning = try db.from(Dst).returning(.{Dst.id}).insertSelect(
+        db.from(Src).select(.{ Src.id, Src.label }).where(Src.id.eq(1)),
     );
     defer returning.deinit();
     try std.testing.expectEqual(@as(usize, 1), returning.count());
@@ -11101,21 +11702,23 @@ test "dynamic and typed DSL support update-from" {
     const Adj = @import("../dsl/table.zig").table("dsl_adjustments", struct { id: i64, bal_id: i64 });
     const path = "sqlite_zig_dsl_update_from_test.db";
     var db = try freshDb(path);
+    const t_db_dsl_balances = db.table("dsl_balances");
+    const t_db_dsl_adjustments = db.table("dsl_adjustments");
     defer dropDb(db, path);
     try db.createTable(Bal, .{});
     try db.createTable(Adj, .{});
     var seed = try db.exec("INSERT INTO dsl_balances VALUES (1, 100, 0), (2, 200, 0); INSERT INTO dsl_adjustments VALUES (10, 1);");
     seed.deinit();
     var mutation = try db.from(Bal).update(.{ .flag = 1 });
-    var updated = try mutation.updateFrom(Adj, Bal.columns.id.eq(Adj.columns.bal_id)).execute();
+    var updated = try mutation.updateFrom(Adj, Bal.id.eq(Adj.bal_id)).execute();
     defer updated.deinit();
     try std.testing.expectEqual(@as(usize, 1), updated.changes);
     var rows = try db.exec("SELECT id, flag FROM dsl_balances ORDER BY id;");
     defer rows.deinit();
-    try std.testing.expectEqual(@as(i64, 1), rows.rows[0][1].integer);
-    try std.testing.expectEqual(@as(i64, 0), rows.rows[1][1].integer);
-    var dynMutation = try db.from("dsl_balances").update(.{ .flag = 7 });
-    var dynUpdated = try dynMutation.updateFrom("dsl_adjustments", db.col("dsl_balances.id").eq(db.col("dsl_adjustments.bal_id"))).where(db.col("id").eq(2)).execute();
+    try std.testing.expectEqual(@as(i64, 1), rows.at(0)[1].integer);
+    try std.testing.expectEqual(@as(i64, 0), rows.at(1)[1].integer);
+    var dynMutation = try t_db_dsl_balances.update(.{ .flag = 7 });
+    var dynUpdated = try dynMutation.updateFrom("dsl_adjustments", t_db_dsl_balances.column("id").eq(t_db_dsl_adjustments.column("bal_id"))).where(t_db_dsl_balances.column("id").eq(2)).execute();
     defer dynUpdated.deinit();
     try std.testing.expectEqual(@as(usize, 0), dynUpdated.changes);
     var again = try db.exec("SELECT flag FROM dsl_balances WHERE id = 2;");
@@ -11123,7 +11726,7 @@ test "dynamic and typed DSL support update-from" {
     try std.testing.expectEqual(@as(usize, 1), again.count());
     try std.testing.expectEqual(@as(i64, 0), again.rows[0][0].integer);
     var doomed = db.from(Bal).delete();
-    try std.testing.expectError(error.InvalidSql, doomed.updateFrom(Adj, Bal.columns.id.eq(Adj.columns.bal_id)).execute());
+    try std.testing.expectError(error.InvalidSql, doomed.updateFrom(Adj, Bal.id.eq(Adj.bal_id)).execute());
 }
 
 test "DSL creates partial and expression indexes" {
@@ -11132,13 +11735,13 @@ test "DSL creates partial and expression indexes" {
     var db = try freshDb(path);
     defer dropDb(db, path);
     try db.createTable(Item, .{});
-    try db.createIndexWhere(Item, "dsl_idx_active", .{Item.columns.id}, false, "active = 1");
+    try db.createIndexWhere(Item, "dsl_idx_active", .{Item.id}, false, "active = 1");
     try std.testing.expect(db.store.findIndexConst("dsl_idx_active") != null);
     try db.createIndexExpr("dsl_idx_items", "dsl_idx_lower", &.{"lower(email)"}, false, null);
     try std.testing.expect(db.store.findIndexConst("dsl_idx_lower") != null);
     try db.createIndexExpr(Item, "dsl_idx_combined", &.{"lower(email)"}, true, "active = 1");
     try std.testing.expect(db.store.findIndexConst("dsl_idx_combined") != null);
-    try std.testing.expectError(error.UnknownColumn, db.createIndexWhere(Item, "dsl_idx_bad", .{Item.columns.id}, false, "missing = 1"));
+    try std.testing.expectError(error.UnknownColumn, db.createIndexWhere(Item, "dsl_idx_bad", .{Item.id}, false, "missing = 1"));
     try std.testing.expect(db.store.findIndexConst("dsl_idx_bad") == null);
     var first = try db.from(Item).insert(.{ .id = 1, .email = "A@Test", .active = 1 });
     first.deinit();
@@ -11199,7 +11802,7 @@ test "insert DSL conflict policies match raw SQL" {
     const path = "sqlite_zig_dsl_conflict_test.db";
     var db = try freshDb(path);
     defer dropDb(db, path);
-    try db.createTable(Item, .{ .unique = &.{Item.columns.code} });
+    try db.createTable(Item, .{ .unique = &.{Item.code} });
     var first = try db.from(Item).insertOrFail(.{ .id = 1, .code = "a" });
     first.deinit();
     try std.testing.expectError(error.ConstraintViolation, db.from(Item).insertOrFail(.{ .id = 2, .code = "a" }));
@@ -11260,8 +11863,8 @@ test "update or rollback discards the enclosing transaction" {
     try std.testing.expectError(error.NotInTransaction, db.exec("COMMIT;"));
     var rows = try db.exec("SELECT code FROM rb ORDER BY id;");
     defer rows.deinit();
-    try std.testing.expectEqualStrings("a", rows.rows[0][0].text);
-    try std.testing.expectEqualStrings("b", rows.rows[1][0].text);
+    try std.testing.expectEqualStrings("a", rows.at(0)[0].text);
+    try std.testing.expectEqualStrings("b", rows.at(1)[0].text);
 }
 
 test "delete failures roll back the statement" {
@@ -11303,7 +11906,7 @@ test "statement errors preserve enclosing savepoints" {
     var rows = try db.exec("SELECT id FROM sps ORDER BY id;");
     defer rows.deinit();
     try std.testing.expectEqual(@as(usize, 1), rows.count());
-    try std.testing.expectEqual(@as(i64, 1), rows.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 1), rows.at(0)[0].integer);
 }
 
 test "with clause backs insert, update, and delete" {
@@ -11346,7 +11949,7 @@ test "with recursive backs insert with returning" {
     try std.testing.expectEqual(@as(i64, 4), inserted.rows[3][0].integer);
     var rows = try db.exec("SELECT sum(n) FROM fib;");
     defer rows.deinit();
-    try std.testing.expectEqual(@as(i64, 10), rows.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 10), rows.at(0)[0].integer);
 }
 
 test "writing to a cte name fails without changing state" {
@@ -11360,7 +11963,7 @@ test "writing to a cte name fails without changing state" {
     try std.testing.expectError(error.InvalidSql, db.exec("WITH tmp AS (SELECT id FROM real_items) DELETE FROM tmp;"));
     var rows = try db.exec("SELECT count(*) FROM real_items;");
     defer rows.deinit();
-    try std.testing.expectEqual(@as(i64, 1), rows.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 1), rows.at(0)[0].integer);
     try std.testing.expectError(error.UnknownTable, db.exec("SELECT count(*) FROM tmp;"));
 }
 
@@ -11375,8 +11978,8 @@ test "with clause combines with upsert and constraints" {
     var rows = try db.exec("SELECT id, label FROM upsert_items ORDER BY id;");
     defer rows.deinit();
     try std.testing.expectEqual(@as(usize, 2), rows.count());
-    try std.testing.expectEqualStrings("new", rows.rows[0][1].text);
-    try std.testing.expectEqualStrings("two", rows.rows[1][1].text);
+    try std.testing.expectEqualStrings("new", rows.at(0)[1].text);
+    try std.testing.expectEqualStrings("two", rows.at(1)[1].text);
     try std.testing.expectError(error.ConstraintViolation, db.exec("WITH bad AS (SELECT 1 AS id) INSERT INTO upsert_items (id) VALUES (1);"));
     var intact = try db.exec("SELECT count(*) FROM upsert_items;");
     defer intact.deinit();
@@ -11437,7 +12040,7 @@ test "update of rejects unknown columns and non-update events" {
     try std.testing.expect(db.store.findTriggerConst("bad_event") == null);
     var rows = try db.exec("SELECT count(*) FROM t;");
     defer rows.deinit();
-    try std.testing.expectEqual(@as(i64, 0), rows.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 0), rows.at(0)[0].integer);
 }
 
 test "update of triggers persist and interact with upsert" {
@@ -11568,7 +12171,7 @@ test "analyze persists and rolls back with transactions" {
     errdefer db.close();
     var rows = try db.exec("SELECT stat FROM sqlite_stat1 WHERE tbl = 'txn_items' AND idx IS NULL;");
     defer rows.deinit();
-    try std.testing.expectEqualStrings("1", rows.rows[0][0].text);
+    try std.testing.expectEqualStrings("1", rows.at(0)[0].text);
 }
 
 test "cte column lists rename projected columns" {
@@ -11629,7 +12232,7 @@ test "end commits like commit" {
     ended.deinit();
     var rows = try db.exec("SELECT id FROM ends;");
     defer rows.deinit();
-    try std.testing.expectEqual(@as(i64, 1), rows.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 1), rows.at(0)[0].integer);
     try std.testing.expectError(error.NotInTransaction, db.exec("END;"));
     db.close();
     db = try Connection.open(std.testing.allocator, path);
@@ -11695,7 +12298,7 @@ test "schema version persists and bumps on schema changes" {
     defer dropDb(db, path);
     var persisted = try db.exec("PRAGMA schema_version;");
     defer persisted.deinit();
-    try std.testing.expectEqual(@as(i64, 42), persisted.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 42), persisted.at(0)[0].integer);
 }
 
 test "wal checkpoint merges frames and reports counts" {
@@ -11730,7 +12333,7 @@ test "wal checkpoint merges frames and reports counts" {
     try std.testing.expectEqual(@as(u64, 0), stat.size);
     var rows = try db.exec("SELECT count(*) FROM chk;");
     defer rows.deinit();
-    try std.testing.expectEqual(@as(i64, 2), rows.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 2), rows.at(0)[0].integer);
     db.close();
     db = try Connection.open(std.testing.allocator, path);
     errdefer db.close();
@@ -11960,7 +12563,7 @@ test "dsl schema version bumps and strict flags persist" {
     var v1 = try db.exec("PRAGMA schema_version;");
     defer v1.deinit();
     const DslT = @import("../dsl/table.zig").table("probe_dsl", struct { id: i64 });
-    try db.createTable(DslT, .{ .primaryKey = DslT.columns.id });
+    try db.createTable(DslT, .{ .primaryKey = DslT.id });
     var v2 = try db.exec("PRAGMA schema_version;");
     defer v2.deinit();
     try std.testing.expectEqual(v1.rows[0][0].integer + 1, v2.rows[0][0].integer);
@@ -11979,6 +12582,7 @@ test "dsl schema version bumps and strict flags persist" {
 test "autoincrement never reuses keys across raw and dsl" {
     const path = "sqlite_zig_autoincrement_test.db";
     var db = try freshDb(path);
+    const t_db_dyn_ai = db.table("dyn_ai");
     defer dropDb(db, path);
     var setup = try db.exec("CREATE TABLE ai (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT); INSERT INTO ai VALUES (NULL, 'a'), (NULL, 'b'), (10, 'j');");
     setup.deinit();
@@ -12016,12 +12620,12 @@ test "autoincrement never reuses keys across raw and dsl" {
     defer dropped.deinit();
     try std.testing.expectEqual(@as(i64, 0), dropped.rows[0][0].integer);
     const DslAi = @import("../dsl/table.zig").table("dsl_ai", struct { id: ?i64, v: []const u8 });
-    try db.createTable(DslAi, .{ .primaryKey = DslAi.columns.id, .autoincrement = DslAi.columns.id });
+    try db.createTable(DslAi, .{ .primaryKey = DslAi.id, .autoincrement = DslAi.id });
     var d1 = try db.from(DslAi).insert(.{ .id = null, .v = "a" });
     d1.deinit();
     var d2 = try db.from(DslAi).insert(.{ .id = null, .v = "b" });
     d2.deinit();
-    var dwipe = try db.from(DslAi).delete().where(DslAi.columns.id.eq(2)).execute();
+    var dwipe = try db.from(DslAi).delete().where(DslAi.id.eq(2)).execute();
     dwipe.deinit();
     var d3 = try db.from(DslAi).insert(.{ .id = null, .v = "c" });
     d3.deinit();
@@ -12032,7 +12636,7 @@ test "autoincrement never reuses keys across raw and dsl" {
     try db.createTable("dyn_ai", .{
         .columns = &.{ .{ .name = "id", .type = "INTEGER", .primaryKey = true, .autoincrement = true }, .{ .name = "v", .type = "TEXT" } },
     });
-    var y1 = try db.from("dyn_ai").insert(.{ .v = "a" });
+    var y1 = try t_db_dyn_ai.insert(.{ .v = "a" });
     y1.deinit();
     var yrows = try db.exec("SELECT id FROM dyn_ai;");
     defer yrows.deinit();
@@ -12095,8 +12699,8 @@ test "renames follow check generated index and trigger expressions" {
     errdefer db.close();
     var persisted = try db.exec("SELECT gamma, obeta FROM mm_view;");
     defer persisted.deinit();
-    try std.testing.expectEqual(@as(i64, 7), persisted.rows[0][0].integer);
-    try std.testing.expectEqualStrings("keep", persisted.rows[0][1].text);
+    try std.testing.expectEqual(@as(i64, 7), persisted.at(0)[0].integer);
+    try std.testing.expectEqualStrings("keep", persisted.at(0)[1].text);
     var genPersisted = try db.exec("SELECT g FROM people;");
     defer genPersisted.deinit();
     try std.testing.expectEqual(@as(i64, 70), genPersisted.rows[0][0].integer);
@@ -12110,7 +12714,7 @@ test "temporary keyword aliases temp objects" {
     setup.deinit();
     var rows = try db.exec("SELECT x FROM tv;");
     defer rows.deinit();
-    try std.testing.expectEqual(@as(i64, 1), rows.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 1), rows.at(0)[0].integer);
     var fired = try db.exec("INSERT INTO tt VALUES (2); SELECT x FROM tt ORDER BY x;");
     defer fired.deinit();
     try std.testing.expectEqual(@as(i64, 102), fired.rows[1][0].integer);
@@ -12397,9 +13001,9 @@ test "where truthiness follows numeric conversion" {
     var rows = try db.exec("SELECT id FROM w WHERE v ORDER BY id;");
     defer rows.deinit();
     try std.testing.expectEqual(@as(usize, 3), rows.count());
-    try std.testing.expectEqual(@as(i64, 1), rows.rows[0][0].integer);
-    try std.testing.expectEqual(@as(i64, 5), rows.rows[1][0].integer);
-    try std.testing.expectEqual(@as(i64, 6), rows.rows[2][0].integer);
+    try std.testing.expectEqual(@as(i64, 1), rows.at(0)[0].integer);
+    try std.testing.expectEqual(@as(i64, 5), rows.at(1)[0].integer);
+    try std.testing.expectEqual(@as(i64, 6), rows.at(2)[0].integer);
     var notRows = try db.exec("SELECT ALL id FROM w WHERE NOT v ORDER BY id;");
     defer notRows.deinit();
     try std.testing.expectEqual(@as(usize, 4), notRows.count());
@@ -12425,6 +13029,61 @@ test "open failure reports an error instead of crashing" {
     try partial.writePositionalAll(std.testing.io, &tiny, 0);
     partial.close(std.testing.io);
     try std.testing.expectError(error.InvalidHeader, Connection.open(std.testing.allocator, path));
+}
+
+test "corrupted bytes report controlled errors instead of crashing" {
+    const path = "sqlite_zig_corruption_test.db";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    {
+        var db = try Connection.open(std.testing.allocator, path);
+        defer db.close();
+        var setup = try db.exec("CREATE TABLE c (id INTEGER PRIMARY KEY, v TEXT); INSERT INTO c VALUES (1, 'one'), (2, 'two');");
+        setup.deinit();
+        var ok = try db.exec("PRAGMA integrity_check;");
+        defer ok.deinit();
+        try std.testing.expectEqualStrings("ok", ok.rows[0][0].text);
+    }
+    var valid = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+    const fstat = try valid.stat(std.testing.io);
+    var rawImage = try std.testing.allocator.alloc(u8, @intCast(fstat.size));
+    const got = try valid.readPositional(std.testing.io, &.{rawImage}, 0);
+    valid.close(std.testing.io);
+    defer std.testing.allocator.free(rawImage);
+    try std.testing.expectEqual(rawImage.len, got);
+    try std.testing.expect(rawImage.len > 100);
+    // Corrupted magic: not a database, never a panic or an empty result.
+    {
+        var f = try std.Io.Dir.cwd().createFile(std.testing.io, path, .{ .read = true, .truncate = true });
+        var bad = try std.testing.allocator.dupe(u8, rawImage);
+        defer std.testing.allocator.free(bad);
+        bad[0] = 'X';
+        try f.writePositionalAll(std.testing.io, bad, 0);
+        f.close(std.testing.io);
+        try std.testing.expectError(error.InvalidHeader, Connection.open(std.testing.allocator, path));
+    }
+    // Truncated file: short read, never a partial page presented as data.
+    {
+        var f = try std.Io.Dir.cwd().createFile(std.testing.io, path, .{ .read = true, .truncate = true });
+        try f.writePositionalAll(std.testing.io, rawImage[0..50], 0);
+        f.close(std.testing.io);
+        try std.testing.expectError(error.InvalidHeader, Connection.open(std.testing.allocator, path));
+    }
+    // Restored image reopens with schema and data intact.
+    {
+        var f = try std.Io.Dir.cwd().createFile(std.testing.io, path, .{ .read = true, .truncate = true });
+        try f.writePositionalAll(std.testing.io, rawImage, 0);
+        f.close(std.testing.io);
+        var db = try Connection.open(std.testing.allocator, path);
+        defer db.close();
+        var rows = try db.exec("SELECT v FROM c ORDER BY id;");
+        defer rows.deinit();
+        try std.testing.expectEqual(@as(usize, 2), rows.count());
+        try std.testing.expectEqualStrings("one", rows.rows[0][0].text);
+        var check = try db.exec("PRAGMA integrity_check;");
+        defer check.deinit();
+        try std.testing.expectEqualStrings("ok", check.rows[0][0].text);
+    }
 }
 
 test "integer primary key null auto assigns rowid alias" {
@@ -12479,6 +13138,7 @@ test "integer primary key null auto assigns rowid alias" {
 test "unique nulls and actions hold across raw and dsl" {
     const path = "sqlite_zig_key_matrix_test.db";
     var db = try freshDb(path);
+    const t_db_matrix_dyn = db.table("matrix_dyn");
     defer dropDb(db, path);
     var setup = try db.exec("CREATE TABLE p (id INTEGER PRIMARY KEY, v TEXT); INSERT INTO p VALUES (1, 'a'), (2, 'b'); CREATE TABLE uq (id INTEGER PRIMARY KEY, email TEXT UNIQUE, a INTEGER, b INTEGER, UNIQUE(a, b)); INSERT INTO uq VALUES (1, NULL, 1, 1), (2, NULL, 1, 2), (3, 'x@y.test', NULL, 1), (4, NULL, NULL, NULL);");
     setup.deinit();
@@ -12512,9 +13172,9 @@ test "unique nulls and actions hold across raw and dsl" {
     try std.testing.expectEqual(@as(i64, 0), casGone.rows[0][0].integer);
     const Emp = @import("../dsl/table.zig").table("matrix_emp", struct { id: i64, mgr: ?i64, email: ?[]const u8 });
     try db.createTable(Emp, .{
-        .primaryKey = Emp.columns.id,
-        .unique = &.{Emp.columns.email},
-        .foreignKeys = &.{.{ .column = Emp.columns.mgr, .references = Emp.columns.id, .onDelete = .cascade }},
+        .primaryKey = Emp.id,
+        .unique = &.{Emp.email},
+        .foreignKeys = &.{.{ .column = Emp.mgr, .references = Emp.id, .onDelete = .cascade }},
     });
     var ceo = try db.from(Emp).insert(.{ .id = 1, .mgr = null, .email = null });
     ceo.deinit();
@@ -12524,7 +13184,7 @@ test "unique nulls and actions hold across raw and dsl" {
     var dupeMail = try db.from(Emp).insert(.{ .id = 4, .mgr = 1, .email = "boss@x.test" });
     dupeMail.deinit();
     try std.testing.expectError(error.ConstraintViolation, db.from(Emp).insert(.{ .id = 5, .mgr = 1, .email = "boss@x.test" }));
-    var dropCeo = try db.from(Emp).delete().where(Emp.columns.id.eq(1)).execute();
+    var dropCeo = try db.from(Emp).delete().where(Emp.id.eq(1)).execute();
     dropCeo.deinit();
     var reports = try db.from(Emp).selectAll().fetch();
     defer reports.deinit();
@@ -12539,14 +13199,14 @@ test "unique nulls and actions hold across raw and dsl" {
             .onDelete = .cascade,
         }},
     });
-    var d1 = try db.from("matrix_dyn").insert(.{ .id = 1, .email = null, .mgr = null });
+    var d1 = try t_db_matrix_dyn.insert(.{ .id = 1, .email = null, .mgr = null });
     d1.deinit();
-    var d2 = try db.from("matrix_dyn").insert(.{ .id = 2, .email = null, .mgr = 1 });
+    var d2 = try t_db_matrix_dyn.insert(.{ .id = 2, .email = null, .mgr = 1 });
     d2.deinit();
-    try std.testing.expectError(error.ConstraintViolation, db.from("matrix_dyn").insert(.{ .id = 3, .email = null, .mgr = 42 }));
-    var dwipe = try db.from("matrix_dyn").delete().where(db.col("id").eq(1)).execute();
+    try std.testing.expectError(error.ConstraintViolation, t_db_matrix_dyn.insert(.{ .id = 3, .email = null, .mgr = 42 }));
+    var dwipe = try t_db_matrix_dyn.delete().where(t_db_matrix_dyn.column("id").eq(1)).execute();
     dwipe.deinit();
-    var dleft = try db.from("matrix_dyn").selectAll().fetch();
+    var dleft = try t_db_matrix_dyn.selectAll().fetch();
     defer dleft.deinit();
     try std.testing.expectEqual(@as(usize, 0), dleft.count());
     var off = try db.exec("PRAGMA foreign_keys = OFF;");
@@ -12564,6 +13224,7 @@ test "unique nulls and actions hold across raw and dsl" {
 test "table operations hold across raw and dsl" {
     const path = "sqlite_zig_table_ops_test.db";
     var db = try freshDb(path);
+    const t_db_ops_widget = db.table("ops_widget");
     defer dropDb(db, path);
     var setup = try db.exec("CREATE TABLE ops (id INTEGER PRIMARY KEY, name TEXT UNIQUE, age INTEGER); INSERT INTO ops VALUES (1, 'a', 10), (2, 'b', 20); CREATE INDEX ops_age_idx ON ops(age); CREATE TABLE ops_child (id INTEGER PRIMARY KEY, oid INTEGER REFERENCES ops(id)); INSERT INTO ops_child VALUES (1, 1);");
     setup.deinit();
@@ -12621,25 +13282,25 @@ test "table operations hold across raw and dsl" {
     ifExists.deinit();
     try std.testing.expectError(error.InvalidSql, db.exec("TRUNCATE TABLE ops_child;"));
     const Widget = @import("../dsl/table.zig").table("ops_widget", struct { id: i64, label: []const u8 });
-    try db.createTable(Widget, .{ .primaryKey = Widget.columns.id });
+    try db.createTable(Widget, .{ .primaryKey = Widget.id });
     var w1 = try db.from(Widget).insert(.{ .id = 1, .label = "a" });
     w1.deinit();
     try db.addColumn(Widget, "stock", i64);
     try db.renameTable(Widget, "ops_gadget");
     try db.renameTable("ops_gadget", "ops_widget");
     try db.addColumn("ops_widget", "price", f64);
-    var w2 = try db.from("ops_widget").insert(.{ .id = 2, .label = "b" });
+    var w2 = try t_db_ops_widget.insert(.{ .id = 2, .label = "b" });
     w2.deinit();
     try db.truncate("ops_widget");
-    var empty = try db.from("ops_widget").selectAll().fetch();
+    var empty = try t_db_ops_widget.selectAll().fetch();
     defer empty.deinit();
     try std.testing.expectEqual(@as(usize, 0), empty.count());
-    var w3 = try db.from("ops_widget").insert(.{ .id = 3, .label = "c" });
+    var w3 = try t_db_ops_widget.insert(.{ .id = 3, .label = "c" });
     w3.deinit();
     try db.createView("ops_view", "SELECT id FROM ops_widget");
     try db.dropView("ops_view");
     try std.testing.expectError(error.UnknownView, db.dropView("ops_view"));
-    try db.createIndex("ops_widget", "ops_widget_label_idx", .{db.col("label")}, false);
+    try db.createIndex("ops_widget", "ops_widget_label_idx", .{t_db_ops_widget.column("label")}, false);
     try db.dropIndex("ops_widget_label_idx");
     try std.testing.expectError(error.UnknownIndex, db.dropIndex("ops_widget_label_idx"));
     try db.truncate(Widget);
@@ -12838,4 +13499,713 @@ test "version accessors roundtrip through the public api" {
     try std.testing.expectEqual(@as(u32, 41), db.userVersion());
     try std.testing.expectEqual(@as(u32, 99), db.applicationId());
     try std.testing.expectEqual(@as(u32, 7), db.schemaVersion());
+}
+
+test "typed parent child nullable foreign keys roundtrip" {
+    const Parent = @import("../dsl/table.zig").table("pg_parent", struct {
+        id: i64,
+        label: []const u8,
+    });
+    const Child = @import("../dsl/table.zig").table("pg_child", struct {
+        id: i64,
+        parent_id: ?i64,
+        label: []const u8,
+    });
+    const path = "sqlite_zig_pg_parent_child_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    try db.createTable(Parent, .{ .primaryKey = Parent.id });
+    try db.createTable(Child, .{
+        .primaryKey = Child.id,
+        .foreignKeys = &.{.{ .column = Child.parent_id, .references = Parent.id }},
+    });
+    try db.schema(Parent).validate();
+    try db.schema(Child).validate();
+    var p1 = try db.from(Parent).insert(.{ .id = 10, .label = "root" });
+    p1.deinit();
+    var c1 = try db.from(Child).insert(.{ .id = 1, .parent_id = 10, .label = "child" });
+    c1.deinit();
+    var orphan = try db.from(Child).insert(.{ .id = 2, .parent_id = null, .label = "orphan" });
+    orphan.deinit();
+    try std.testing.expectError(error.ConstraintViolation, db.from(Child).insert(.{ .id = 3, .parent_id = 99, .label = "bad" }));
+    var kids = try db.from(Child).select(Child.all()).orderBy(Child.id.asc()).fetch();
+    defer kids.deinit();
+    try std.testing.expectEqual(@as(usize, 2), kids.count());
+    try std.testing.expectEqual(@as(i64, 10), kids.at(0).parent_id.?);
+    try std.testing.expectEqualStrings("child", kids.at(0).label);
+    try std.testing.expect(kids.at(1).parent_id == null);
+    var orphans = try db.from(Child).select(Child.all()).where(Child.parent_id.isNull()).fetch();
+    defer orphans.deinit();
+    try std.testing.expectEqual(@as(usize, 1), orphans.count());
+    var linked = try db.from(Child).innerJoin(Parent, Child.parent_id.eq(Parent.id)).select(Child.all()).fetch();
+    defer linked.deinit();
+    try std.testing.expectEqual(@as(usize, 1), linked.count());
+    try std.testing.expectEqualStrings("child", linked.at(0).label);
+    var joined = try db.from(Child).innerJoin(Parent, Child.parent_id.eq(Parent.id)).select(.{ Child.id, Parent.label }).fetch();
+    defer joined.deinit();
+    try std.testing.expectEqual(@as(usize, 1), joined.count());
+    var leftovers = try db.from(Child).leftJoin(Parent, Child.parent_id.eq(Parent.id)).select(Child.all()).orderBy(Child.id.asc()).fetch();
+    defer leftovers.deinit();
+    try std.testing.expectEqual(@as(usize, 2), leftovers.count());
+    try std.testing.expectError(error.ConstraintViolation, db.from(Parent).delete().where(Parent.id.eq(10)).execute());
+    var renamed = try (try db.from(Parent).update(.{ .label = "root2" })).where(Parent.id.eq(10)).execute();
+    renamed.deinit();
+    const rootName = try db.from(Parent).select(Parent.label).where(Parent.id.eq(10)).fetchOne();
+    defer std.testing.allocator.free(rootName.text);
+    try std.testing.expectEqualStrings("root2", rootName.text);
+    try db.begin();
+    var doomed = try db.from(Child).delete().where(Child.id.eq(1)).execute();
+    doomed.deinit();
+    try db.rollback();
+    var kept = try db.from(Child).select(Child.all()).where(Child.id.eq(1)).fetchOne();
+    defer db.from(Child).freeRow(&kept);
+    try std.testing.expectEqual(@as(i64, 1), kept.id);
+    db.close();
+    db = try Connection.open(std.testing.allocator, path);
+    errdefer db.close();
+    var reopened = try db.from(Child).select(Child.all()).orderBy(Child.id.asc()).fetch();
+    defer reopened.deinit();
+    try std.testing.expectEqual(@as(usize, 2), reopened.count());
+    try std.testing.expect(reopened.at(1).parent_id == null);
+}
+
+test "dynamic schema tables keep attached identity" {
+    const path = "sqlite_zig_dyn_schema_main_test.db";
+    const auxPath = "sqlite_zig_dyn_schema_aux_test.db";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, auxPath) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, auxPath) catch {};
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    var setup = try db.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT); INSERT INTO users VALUES (1, 'ann');");
+    setup.deinit();
+    var attach = try db.exec("ATTACH 'sqlite_zig_dyn_schema_aux_test.db' AS aux;");
+    attach.deinit();
+    var auxSetup = try db.exec("CREATE TABLE aux.orders (id INTEGER PRIMARY KEY, user_id INTEGER, amount INTEGER); INSERT INTO aux.orders VALUES (1, 1, 100);");
+    auxSetup.deinit();
+    const users = db.table("users");
+    const orders = db.schema("aux").table("orders");
+    try std.testing.expectEqualStrings("", users.schema);
+    try std.testing.expectEqualStrings("users", users.name);
+    try std.testing.expectEqualStrings("aux", orders.schema);
+    try std.testing.expectEqualStrings("orders", orders.name);
+    const uid = users.column("id");
+    const uname = users.column("name");
+    const oid = orders.column("id");
+    const oamount = orders.column("amount");
+    try std.testing.expectEqualStrings("users", @import("../dsl/column.zig").dynRef(uid).table);
+    try std.testing.expectEqualStrings("", @import("../dsl/column.zig").dynRef(uid).schema);
+    try std.testing.expectEqualStrings("orders", @import("../dsl/column.zig").dynRef(oid).table);
+    try std.testing.expectEqualStrings("aux", @import("../dsl/column.zig").dynRef(oid).schema);
+    var one = try orders.selectAll().where(oid.eq(1)).fetch();
+    defer one.deinit();
+    try std.testing.expectEqual(@as(usize, 1), one.count());
+    try std.testing.expectEqual(@as(i64, 100), (try one.get(0, "amount")).integer);
+    var both = try users
+        .innerJoin(orders, uid.eq(orders.column("user_id")))
+        .select(.{ uid.as("userId"), uname, oid.as("orderId"), oamount })
+        .fetch();
+    defer both.deinit();
+    try std.testing.expectEqual(@as(usize, 1), both.count());
+    try std.testing.expectEqualStrings("userId", both.columns[0]);
+    try std.testing.expectEqualStrings("orderId", both.columns[2]);
+    var it = both.iter();
+    const first = it.next().?;
+    try std.testing.expectEqual(@as(i64, 1), (try first.get("userId")).integer);
+    try std.testing.expectEqualStrings("ann", (try first.get("name")).text);
+    try std.testing.expectEqual(@as(i64, 1), (try first.get("orderId")).integer);
+    try std.testing.expect(it.next() == null);
+    var detached = try db.exec("DETACH aux;");
+    detached.deinit();
+    try std.testing.expectError(error.UnknownTable, orders.selectAll().fetch());
+}
+
+test "column aliases disambiguate duplicate join projections" {
+    const User = @import("../dsl/table.zig").table("alias_users", struct { id: i64, name: []const u8 });
+    const Order = @import("../dsl/table.zig").table("alias_orders", struct { id: i64, user_id: i64, amount: i64 });
+    const path = "sqlite_zig_alias_join_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    try db.createTable(User, .{ .primaryKey = User.id });
+    try db.createTable(Order, .{ .primaryKey = Order.id });
+    var u = try db.from(User).insert(.{ .id = 1, .name = "ann" });
+    u.deinit();
+    var o = try db.from(Order).insert(.{ .id = 7, .user_id = 1, .amount = 100 });
+    o.deinit();
+    var rows = try db
+        .from(User)
+        .innerJoin(Order, User.id.eq(Order.user_id))
+        .select(.{ User.id.as("userId"), User.name, Order.id.as("orderId"), Order.amount })
+        .fetch();
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(usize, 1), rows.count());
+    try std.testing.expectEqualStrings("userId", rows.columns[0]);
+    try std.testing.expectEqualStrings("name", rows.columns[1]);
+    try std.testing.expectEqualStrings("orderId", rows.columns[2]);
+    try std.testing.expectEqualStrings("amount", rows.columns[3]);
+    try std.testing.expectEqual(@as(i64, 1), (try rows.get(0, "userId")).integer);
+    try std.testing.expectEqual(@as(i64, 7), (try rows.get(0, "orderId")).integer);
+    try std.testing.expectEqualStrings("ann", (try rows.get(0, "name")).text);
+    const users = db.table("alias_users");
+    const orders = db.table("alias_orders");
+    var dyn = try users
+        .innerJoin(orders, users.column("id").eq(orders.column("user_id")))
+        .select(.{
+            users.column("id").as("userId"),
+            users.column("name"),
+            orders.column("id").as("orderId"),
+        })
+        .fetch();
+    defer dyn.deinit();
+    try std.testing.expectEqual(@as(i64, 1), (try dyn.get(0, "userId")).integer);
+    try std.testing.expectEqual(@as(i64, 7), (try dyn.get(0, "orderId")).integer);
+}
+
+test "having filters groups through the common expression system" {
+    const path = "sqlite_zig_having_expr_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    var setup = try db.exec("CREATE TABLE hsales (grp TEXT, amount INTEGER); INSERT INTO hsales VALUES ('a', 10), ('a', 20), ('b', 7);");
+    setup.deinit();
+    var raw = try db.exec("SELECT grp, SUM(amount) FROM hsales GROUP BY grp HAVING COUNT(*) > 1;");
+    defer raw.deinit();
+    try std.testing.expectEqual(@as(usize, 1), raw.count());
+    try std.testing.expectEqualStrings("a", raw.rows[0][0].text);
+    const Sale = @import("../dsl/table.zig").table("hsales", struct { grp: []const u8, amount: i64 });
+    const sales = db.table("hsales");
+    var dynAgg = try sales
+        .select(.{sales.column("grp")})
+        .groupBy(sales.column("grp"))
+        .having(sales.column("grp").count().gt(1))
+        .fetch();
+    defer dynAgg.deinit();
+    try std.testing.expectEqual(@as(usize, 1), dynAgg.count());
+    try std.testing.expectEqualStrings("a", dynAgg.rows[0][0].text);
+    var typedAgg = try db
+        .from(Sale)
+        .select(.{Sale.grp})
+        .groupBy(Sale.grp)
+        .having(Sale.grp.count().gt(1))
+        .fetch();
+    defer typedAgg.deinit();
+    try std.testing.expectEqual(@as(usize, 1), typedAgg.count());
+    var dynAvg = try sales
+        .select(.{sales.column("grp")})
+        .groupBy(sales.column("grp"))
+        .having(sales.column("amount").avg().gte(15))
+        .fetch();
+    defer dynAvg.deinit();
+    try std.testing.expectEqual(@as(usize, 1), dynAvg.count());
+    var plain = try sales
+        .select(.{sales.column("grp")})
+        .groupBy(sales.column("grp"))
+        .having(sales.column("grp").eq("b"))
+        .fetch();
+    defer plain.deinit();
+    try std.testing.expectEqual(@as(usize, 1), plain.count());
+    try std.testing.expectEqualStrings("b", plain.rows[0][0].text);
+    var typedPlain = try db
+        .from(Sale)
+        .select(.{Sale.grp})
+        .groupBy(Sale.grp)
+        .having(Sale.grp.eq("b"))
+        .fetch();
+    defer typedPlain.deinit();
+    try std.testing.expectEqual(@as(usize, 1), typedPlain.count());
+}
+
+test "scalar fetchOne and fetchOptional return single projection values" {
+    const Item = @import("../dsl/table.zig").table("scalar_one_items", struct { id: i64, label: []const u8 });
+    const path = "sqlite_zig_scalar_one_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    try db.createTable(Item, .{ .primaryKey = Item.id });
+    var first = try db.from(Item).insert(.{ .id = 1, .label = "one" });
+    first.deinit();
+    var second = try db.from(Item).insert(.{ .id = 2, .label = "two" });
+    second.deinit();
+    const items = db.table("scalar_one_items");
+    const id = items.column("id");
+    const label = items.column("label");
+    try std.testing.expectEqual(@as(i64, 2), (try items.select(id).where(id.eq(2)).fetchOne()).integer);
+    try std.testing.expectEqual(@as(i64, 1), (try db.from(Item).select(Item.id).where(Item.id.eq(1)).fetchOne()).integer);
+    const missing = try items.select(label).where(id.eq(99)).fetchOptional();
+    try std.testing.expect(missing == null);
+    const present = try items.select(label).where(id.eq(1)).fetchOptional();
+    try std.testing.expect(present != null);
+    defer std.testing.allocator.free(present.?.text);
+    try std.testing.expectEqualStrings("one", present.?.text);
+    try std.testing.expectError(error.NoRows, items.select(id).where(id.eq(99)).fetchOne());
+    try std.testing.expectError(error.TooManyRows, items.select(id).fetchOne());
+    try std.testing.expectError(error.TooManyRows, items.select(id).fetchOptional());
+}
+
+test "raw dynamic and typed queries agree on values and errors" {
+    const User = @import("../dsl/table.zig").table("equiv_users", struct { id: i64, name: []const u8, age: i64 });
+    const path = "sqlite_zig_equiv_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    try db.createTable(User, .{ .primaryKey = User.id });
+    var seed = try db.exec("INSERT INTO equiv_users VALUES (1, 'ann', 30), (2, 'bob', 17), (3, 'cid', 44);");
+    seed.deinit();
+    var raw = try db.exec("SELECT id, name FROM equiv_users WHERE age >= 18 ORDER BY name;");
+    defer raw.deinit();
+    const users = db.table("equiv_users");
+    var dyn = try users
+        .select(.{ users.column("id"), users.column("name") })
+        .where(users.column("age").gte(18))
+        .orderBy(users.column("name").asc())
+        .fetch();
+    defer dyn.deinit();
+    var typed = try db
+        .from(User)
+        .select(.{ User.id, User.name })
+        .where(User.age.gte(18))
+        .orderBy(User.name.asc())
+        .fetch();
+    defer typed.deinit();
+    try std.testing.expectEqual(raw.count(), dyn.count());
+    try std.testing.expectEqual(raw.count(), typed.count());
+    try std.testing.expectEqual(@as(usize, 2), raw.count());
+    for (0..raw.count()) |i| {
+        try std.testing.expectEqual(raw.rows[i][0].integer, dyn.rows[i][0].integer);
+        try std.testing.expectEqualStrings(raw.rows[i][1].text, dyn.rows[i][1].text);
+        try std.testing.expectEqual(raw.rows[i][0].integer, typed.rows[i][0].integer);
+        try std.testing.expectEqualStrings(raw.rows[i][1].text, typed.rows[i][1].text);
+    }
+    try std.testing.expectEqualStrings("id", dyn.columns[0]);
+    try std.testing.expectEqualStrings("name", dyn.columns[1]);
+    try std.testing.expectError(error.UnknownColumn, users.select(users.column("nope")).fetch());
+    try std.testing.expectError(error.UnknownColumn, db.exec("SELECT nope FROM equiv_users;"));
+    try std.testing.expectError(error.UnknownTable, db.table("missing").selectAll().fetch());
+    try std.testing.expectError(error.UnknownTable, db.exec("SELECT * FROM missing;"));
+}
+
+test "multi-key order by sorts raw dynamic typed identically" {
+    const Mk = @import("../dsl/table.zig").table("mk_sort", struct { grp: ?[]const u8, val: i64, tag: ?[]const u8 });
+    const path = "sqlite_zig_multi_key_order_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    const t_db_mk = db.table("mk_sort");
+    var setup = try db.exec("CREATE TABLE mk_sort (grp TEXT, val INTEGER, tag TEXT); INSERT INTO mk_sort VALUES ('b', 2, 'x'), ('a', 1, 'y'), ('b', 1, 'z'), ('a', 2, NULL), ('a', 1, 'w'), (NULL, 0, 'n');");
+    setup.deinit();
+    // NULLs sort first under ASC (SQLite total order) on every key.
+    var raw = try db.exec("SELECT grp, val, tag FROM mk_sort ORDER BY grp, val, tag;");
+    defer raw.deinit();
+    try std.testing.expectEqual(@as(usize, 6), raw.count());
+    try std.testing.expect(raw.rows[0][0] == .null);
+    try std.testing.expectEqualStrings("n", raw.rows[0][2].text);
+    try std.testing.expectEqualStrings("a", raw.rows[1][0].text);
+    try std.testing.expectEqual(@as(i64, 1), raw.rows[1][1].integer);
+    try std.testing.expectEqualStrings("w", raw.rows[1][2].text);
+    try std.testing.expectEqualStrings("y", raw.rows[2][2].text);
+    try std.testing.expect(raw.rows[3][2] == .null);
+    try std.testing.expectEqualStrings("b", raw.rows[4][0].text);
+    try std.testing.expectEqual(@as(i64, 1), raw.rows[4][1].integer);
+    try std.testing.expectEqualStrings("x", raw.rows[5][2].text);
+    // Per-key DESC inverts placement (NULLs last under DESC), like OP_Compare.
+    var rawDesc = try db.exec("SELECT grp, val, tag FROM mk_sort ORDER BY grp DESC, val ASC;");
+    defer rawDesc.deinit();
+    try std.testing.expectEqual(@as(usize, 6), rawDesc.count());
+    try std.testing.expectEqualStrings("b", rawDesc.rows[0][0].text);
+    try std.testing.expectEqual(@as(i64, 1), rawDesc.rows[0][1].integer);
+    try std.testing.expectEqualStrings("b", rawDesc.rows[1][0].text);
+    try std.testing.expectEqual(@as(i64, 2), rawDesc.rows[1][1].integer);
+    try std.testing.expectEqualStrings("a", rawDesc.rows[2][0].text);
+    try std.testing.expect(rawDesc.rows[5][0] == .null);
+    // Ordinal positions and aliases resolve per key.
+    var rawOrd = try db.exec("SELECT grp, val, tag FROM mk_sort ORDER BY 1, 3;");
+    defer rawOrd.deinit();
+    try std.testing.expectEqual(@as(usize, 6), rawOrd.count());
+    try std.testing.expect(rawOrd.rows[0][0] == .null);
+    try std.testing.expect(rawOrd.rows[1][2] == .null);
+    try std.testing.expectEqualStrings("w", rawOrd.rows[2][2].text);
+    var rawAlias = try db.exec("SELECT grp AS g, val AS v, tag AS t FROM mk_sort ORDER BY g DESC, v ASC;");
+    defer rawAlias.deinit();
+    try std.testing.expectEqual(@as(usize, 6), rawAlias.count());
+    try std.testing.expectEqualStrings("b", rawAlias.rows[0][0].text);
+    try std.testing.expect(rawAlias.rows[5][0] == .null);
+    // LIMIT/OFFSET apply after the full multi-key sort.
+    var rawPage = try db.exec("SELECT grp, val, tag FROM mk_sort ORDER BY grp, val, tag LIMIT 2 OFFSET 1;");
+    defer rawPage.deinit();
+    try std.testing.expectEqual(@as(usize, 2), rawPage.count());
+    try std.testing.expectEqualStrings("w", rawPage.rows[0][2].text);
+    try std.testing.expectEqualStrings("y", rawPage.rows[1][2].text);
+    // Dynamic and Typed tuples build the same key list: grp ASC, val DESC.
+    var rawMixed = try db.exec("SELECT grp, val, tag FROM mk_sort ORDER BY grp ASC, val DESC;");
+    defer rawMixed.deinit();
+    var dyn = try t_db_mk.select(.{ t_db_mk.column("grp"), t_db_mk.column("val"), t_db_mk.column("tag") }).orderBy(.{ t_db_mk.column("grp").asc(), t_db_mk.column("val").desc() }).fetch();
+    defer dyn.deinit();
+    var typed = try db.from(Mk).select(.{ Mk.grp, Mk.val, Mk.tag }).orderBy(.{ Mk.grp.asc(), Mk.val.desc() }).fetch();
+    defer typed.deinit();
+    try std.testing.expectEqual(rawMixed.count(), dyn.count());
+    try std.testing.expectEqual(rawMixed.count(), typed.count());
+    try std.testing.expectEqual(@as(usize, 6), rawMixed.count());
+    try std.testing.expect(rawMixed.rows[0][0] == .null);
+    try std.testing.expectEqual(@as(i64, 2), rawMixed.rows[1][1].integer);
+    for (0..rawMixed.count()) |i| {
+        try expectSameSortCell(rawMixed.rows[i][0], dyn.rows[i][0]);
+        try expectSameSortCell(rawMixed.rows[i][1], dyn.rows[i][1]);
+        try expectSameSortCell(rawMixed.rows[i][2], dyn.rows[i][2]);
+        try expectSameSortCell(rawMixed.rows[i][0], typed.rows[i][0]);
+        try expectSameSortCell(rawMixed.rows[i][1], typed.rows[i][1]);
+        try expectSameSortCell(rawMixed.rows[i][2], typed.rows[i][2]);
+    }
+    // Unknown keys stay errors, never silent picks.
+    try std.testing.expectError(error.UnknownColumn, db.exec("SELECT grp FROM mk_sort ORDER BY nope;"));
+    // Compound trailing ORDER BY takes multiple keys over ordinals.
+    var compound = try db.exec("SELECT grp, val FROM mk_sort WHERE grp = 'a' UNION ALL SELECT grp, val FROM mk_sort WHERE grp = 'b' ORDER BY 1 DESC, 2 ASC;");
+    defer compound.deinit();
+    try std.testing.expectEqual(@as(usize, 5), compound.count());
+    try std.testing.expectEqualStrings("b", compound.rows[0][0].text);
+    try std.testing.expectEqual(@as(i64, 1), compound.rows[0][1].integer);
+    try std.testing.expectEqual(@as(i64, 2), compound.rows[1][1].integer);
+    try std.testing.expectEqualStrings("a", compound.rows[2][0].text);
+    // Qualified keys resolve against their own table, not a same-named column.
+    var qualSetup = try db.exec("CREATE TABLE q_a (id INTEGER, v TEXT); CREATE TABLE q_b (id INTEGER, w TEXT); INSERT INTO q_a VALUES (1, 'a1'), (2, 'a2'), (3, 'a3'); INSERT INTO q_b VALUES (2, 'b2'), (3, 'b3'), (4, 'b4');");
+    qualSetup.deinit();
+    var qualRight = try db.exec("SELECT q_a.id, q_a.v, q_b.id, q_b.w FROM q_a RIGHT JOIN q_b ON q_a.id = q_b.id ORDER BY q_b.id DESC, q_a.id ASC;");
+    defer qualRight.deinit();
+    try std.testing.expectEqual(@as(usize, 3), qualRight.count());
+    try std.testing.expectEqual(@as(i64, 4), qualRight.rows[0][2].integer);
+    try std.testing.expectEqual(@as(i64, 3), qualRight.rows[1][2].integer);
+    try std.testing.expectEqual(@as(i64, 2), qualRight.rows[2][2].integer);
+    var qualFull = try db.exec("SELECT q_a.id, q_b.id FROM q_a FULL JOIN q_b ON q_a.id = q_b.id ORDER BY q_a.id DESC, q_b.id ASC;");
+    defer qualFull.deinit();
+    try std.testing.expectEqual(@as(usize, 4), qualFull.count());
+    try std.testing.expectEqual(@as(i64, 3), qualFull.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 2), qualFull.rows[1][0].integer);
+    try std.testing.expectEqual(@as(i64, 1), qualFull.rows[2][0].integer);
+    try std.testing.expect(qualFull.rows[3][0] == .null);
+    try std.testing.expectEqual(@as(i64, 4), qualFull.rows[3][1].integer);
+    // Qualified keys outside the projection sort pre-projection pairs.
+    var qualOuter = try db.exec("SELECT q_a.v, q_b.w FROM q_a RIGHT JOIN q_b ON q_a.id = q_b.id ORDER BY q_b.id DESC, q_a.id ASC;");
+    defer qualOuter.deinit();
+    try std.testing.expectEqual(@as(usize, 3), qualOuter.count());
+    try std.testing.expectEqualStrings("b4", qualOuter.rows[0][1].text);
+    try std.testing.expectEqualStrings("b3", qualOuter.rows[1][1].text);
+    try std.testing.expectEqualStrings("b2", qualOuter.rows[2][1].text);
+}
+
+fn expectSameSortCell(a: Value, b: Value) !void {
+    if (a == .null or b == .null) {
+        try std.testing.expect(a == .null and b == .null);
+        return;
+    }
+    try std.testing.expectEqual(a.order(b, .binary), .eq);
+}
+
+test "database files carry the sqlite magic and reopen intact" {
+    const path = "sqlite_zig_file_format_test.db";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    {
+        var db = try Connection.open(std.testing.allocator, path);
+        defer db.close();
+        var setup = try db.exec("CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER, data BLOB); INSERT INTO users VALUES (1,'alice',30,x'00ff'),(2,'cara',NULL,NULL),(3,'bob',-9223372036854775808,NULL); CREATE INDEX users_name_idx ON users(name); CREATE TABLE orders(id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id), amount REAL); INSERT INTO orders VALUES (1,1,9.5),(2,1,NULL); CREATE VIEW adult_users AS SELECT id, name FROM users WHERE age >= 18;");
+        setup.deinit();
+    }
+    var raw = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_only });
+    const stat = try raw.stat(std.testing.io);
+    var fileImage = try std.testing.allocator.alloc(u8, @intCast(stat.size));
+    defer std.testing.allocator.free(fileImage);
+    const got = try raw.readPositional(std.testing.io, &.{fileImage}, 0);
+    raw.close(std.testing.io);
+    try std.testing.expectEqual(fileImage.len, got);
+    try std.testing.expectEqualStrings("SQLite format 3\x00", fileImage[0..16]);
+    var db = try Connection.open(std.testing.allocator, path);
+    defer db.close();
+    var users = try db.exec("SELECT id, name, age FROM users ORDER BY id;");
+    defer users.deinit();
+    try std.testing.expectEqual(@as(usize, 3), users.count());
+    try std.testing.expectEqual(@as(i64, 1), users.rows[0][0].integer);
+    try std.testing.expectEqualStrings("alice", users.rows[0][1].text);
+    try std.testing.expectEqual(@as(i64, 30), users.rows[0][2].integer);
+    try std.testing.expectEqualStrings("cara", users.rows[1][1].text);
+    try std.testing.expect(users.rows[1][2] == .null);
+    try std.testing.expectEqual(@as(i64, std.math.minInt(i64)), users.rows[2][2].integer);
+    var blob = try db.exec("SELECT hex(data) FROM users ORDER BY id;");
+    defer blob.deinit();
+    try std.testing.expectEqualStrings("00FF", blob.rows[0][0].text);
+    try std.testing.expect(blob.rows[1][0] == .null);
+    var orders = try db.exec("SELECT amount FROM orders ORDER BY id;");
+    defer orders.deinit();
+    try std.testing.expectEqual(@as(f64, 9.5), orders.rows[0][0].real);
+    try std.testing.expect(orders.rows[1][0] == .null);
+    var adults = try db.exec("SELECT id, name FROM adult_users;");
+    defer adults.deinit();
+    try std.testing.expectEqual(@as(usize, 1), adults.count());
+    try std.testing.expectEqualStrings("alice", adults.rows[0][1].text);
+    var check = try db.exec("PRAGMA integrity_check;");
+    defer check.deinit();
+    try std.testing.expectEqualStrings("ok", check.rows[0][0].text);
+}
+
+test "null three-valued logic matches sqlite" {
+    const path = "sqlite_zig_null_matrix_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    // NULL never equals, orders, or ranges: only IS (NOT) NULL sees it.
+    var cmp = try db.exec("SELECT NULL = NULL, NULL <> NULL, NULL < NULL, NULL > NULL, NULL IS NULL, NULL IS NOT NULL;");
+    defer cmp.deinit();
+    try std.testing.expect(cmp.rows[0][0] == .null);
+    try std.testing.expect(cmp.rows[0][1] == .null);
+    try std.testing.expect(cmp.rows[0][2] == .null);
+    try std.testing.expect(cmp.rows[0][3] == .null);
+    try std.testing.expectEqual(@as(i64, 1), cmp.rows[0][4].integer);
+    try std.testing.expectEqual(@as(i64, 0), cmp.rows[0][5].integer);
+    // AND/OR/NOT truth tables with NULL.
+    var logic = try db.exec("SELECT (NULL AND 1), (NULL AND 0), (NULL OR 1), (NULL OR 0), (NOT NULL);");
+    defer logic.deinit();
+    try std.testing.expect(logic.rows[0][0] == .null);
+    try std.testing.expectEqual(@as(i64, 0), logic.rows[0][1].integer);
+    try std.testing.expectEqual(@as(i64, 1), logic.rows[0][2].integer);
+    try std.testing.expect(logic.rows[0][3] == .null);
+    try std.testing.expect(logic.rows[0][4] == .null);
+    // IN/NOT IN with NULL operand, NULL list members, and empty subqueries.
+    var membership = try db.exec("SELECT 1 IN (NULL), 1 NOT IN (NULL), NULL IN (1, 2), NULL NOT IN (1, 2);");
+    defer membership.deinit();
+    for (membership.rows[0]) |cell| try std.testing.expect(cell == .null);
+    var emptySub = try db.exec("CREATE TABLE empty_in (x INTEGER); SELECT 1 IN (SELECT x FROM empty_in), 1 NOT IN (SELECT x FROM empty_in);");
+    defer emptySub.deinit();
+    try std.testing.expectEqual(@as(i64, 0), emptySub.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 1), emptySub.rows[0][1].integer);
+    // A NULL row with no match makes IN/NOT IN unknown, never false/true.
+    var nullSub = try db.exec("SELECT 1 IN (SELECT NULL), 1 NOT IN (SELECT NULL), 2 IN (SELECT NULL UNION ALL SELECT 1), 1 IN (SELECT NULL UNION ALL SELECT 1);");
+    defer nullSub.deinit();
+    try std.testing.expect(nullSub.rows[0][0] == .null);
+    try std.testing.expect(nullSub.rows[0][1] == .null);
+    try std.testing.expect(nullSub.rows[0][2] == .null);
+    try std.testing.expectEqual(@as(i64, 1), nullSub.rows[0][3].integer);
+    // Aggregates over empty and all-NULL inputs.
+    var agg = try db.exec("SELECT SUM(x), TOTAL(x), AVG(x), COUNT(x), COUNT(*), GROUP_CONCAT(x) FROM empty_in;");
+    defer agg.deinit();
+    try std.testing.expect(agg.rows[0][0] == .null);
+    try std.testing.expectEqual(@as(f64, 0.0), agg.rows[0][1].real);
+    try std.testing.expect(agg.rows[0][2] == .null);
+    try std.testing.expectEqual(@as(i64, 0), agg.rows[0][3].integer);
+    try std.testing.expectEqual(@as(i64, 0), agg.rows[0][4].integer);
+    try std.testing.expect(agg.rows[0][5] == .null);
+    var allNull = try db.exec("SELECT SUM(x), TOTAL(x), COUNT(x), COUNT(*), GROUP_CONCAT(x, '|') FROM (SELECT NULL AS x UNION ALL SELECT NULL);");
+    defer allNull.deinit();
+    try std.testing.expect(allNull.rows[0][0] == .null);
+    try std.testing.expectEqual(@as(f64, 0.0), allNull.rows[0][1].real);
+    try std.testing.expectEqual(@as(i64, 0), allNull.rows[0][2].integer);
+    try std.testing.expectEqual(@as(i64, 2), allNull.rows[0][3].integer);
+    try std.testing.expect(allNull.rows[0][4] == .null);
+}
+
+test "integer and real edge cases match sqlite" {
+    const path = "sqlite_zig_numeric_edge_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    // Boundary storage round-trips through a table.
+    var setup = try db.exec("CREATE TABLE nums (v INTEGER); INSERT INTO nums VALUES (9223372036854775807), (-9223372036854775808), (0), (-1), (1);");
+    setup.deinit();
+    var bounds = try db.exec("SELECT v FROM nums ORDER BY v;");
+    defer bounds.deinit();
+    try std.testing.expectEqual(@as(i64, std.math.minInt(i64)), bounds.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, -1), bounds.rows[1][0].integer);
+    try std.testing.expectEqual(@as(i64, 0), bounds.rows[2][0].integer);
+    try std.testing.expectEqual(@as(i64, 1), bounds.rows[3][0].integer);
+    try std.testing.expectEqual(@as(i64, std.math.maxInt(i64)), bounds.rows[4][0].integer);
+    // Overflow promotes to REAL, exactly like the reference implementation.
+    var overflow = try db.exec("SELECT 9223372036854775807 + 1, -9223372036854775808 - 1, 3037000500 * 3037000500;");
+    defer overflow.deinit();
+    try std.testing.expectEqual(@as(f64, 9223372036854775808.0), overflow.rows[0][0].real);
+    try std.testing.expect(overflow.rows[0][1].real < -9.2233720368547e18);
+    try std.testing.expect(overflow.rows[0][2].real > 9.223372036e18);
+    // Division and remainder by zero yield NULL, never an error or panic.
+    var divZero = try db.exec("SELECT 1/0, 1%0, -9223372036854775808 / -1, -9223372036854775808 % -1;");
+    defer divZero.deinit();
+    try std.testing.expect(divZero.rows[0][0] == .null);
+    try std.testing.expect(divZero.rows[0][1] == .null);
+    try std.testing.expectEqual(@as(f64, 9223372036854775808.0), divZero.rows[0][2].real);
+    try std.testing.expectEqual(@as(i64, 0), divZero.rows[0][3].integer);
+    // Integer division truncates; bit operations and shifts match.
+    var intOps = try db.exec("SELECT 7/2, 7%3, -7%3, 7%-3, 12 & 10, 12 | 10, 1 << 70, 1 >> 70, 1 << 3, 256 >> 2;");
+    defer intOps.deinit();
+    const expectedInts = [_]i64{ 3, 1, -1, 1, 8, 14, 0, 0, 8, 64 };
+    for (expectedInts, 0..) |expected, i| try std.testing.expectEqual(expected, intOps.rows[0][i].integer);
+    // Real edges: signed zero equality, infinities, real division by zero.
+    var realEdges = try db.exec("SELECT 0.0 = -0.0, 1e999, -1e999, 1.0/0.0;");
+    defer realEdges.deinit();
+    try std.testing.expectEqual(@as(i64, 1), realEdges.rows[0][0].integer);
+    try std.testing.expect(std.math.isInf(realEdges.rows[0][1].real) and realEdges.rows[0][1].real > 0);
+    try std.testing.expect(std.math.isInf(realEdges.rows[0][2].real) and realEdges.rows[0][2].real < 0);
+    try std.testing.expect(realEdges.rows[0][3] == .null);
+    // Concatenation with NULL is NULL.
+    var concatNull = try db.exec("SELECT 'a' || NULL, NULL || 'b', 'foo' || 'bar';");
+    defer concatNull.deinit();
+    try std.testing.expect(concatNull.rows[0][0] == .null);
+    try std.testing.expect(concatNull.rows[0][1] == .null);
+    try std.testing.expectEqualStrings("foobar", concatNull.rows[0][2].text);
+}
+
+test "text blob and scalar edges match sqlite" {
+    const path = "sqlite_zig_text_blob_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    // Empty values round-trip and compare correctly.
+    var setup = try db.exec("CREATE TABLE blobs (t TEXT, b BLOB); INSERT INTO blobs VALUES ('', x''), ('hello', x'00ff'), (NULL, NULL);");
+    setup.deinit();
+    var empties = try db.exec("SELECT length(t), length(b) FROM blobs ORDER BY rowid;");
+    defer empties.deinit();
+    try std.testing.expectEqual(@as(usize, 3), empties.count());
+    try std.testing.expectEqual(@as(i64, 0), empties.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 0), empties.rows[0][1].integer);
+    try std.testing.expectEqual(@as(i64, 5), empties.rows[1][0].integer);
+    try std.testing.expectEqual(@as(i64, 2), empties.rows[1][1].integer);
+    try std.testing.expect(empties.rows[2][0] == .null);
+    // Blob bytes (including zero) survive storage and order by memcmp,
+    // with the empty blob smallest.
+    var blobOrder = try db.exec("SELECT hex(b) FROM blobs WHERE b IS NOT NULL ORDER BY b;");
+    defer blobOrder.deinit();
+    try std.testing.expectEqualStrings("", blobOrder.rows[0][0].text);
+    try std.testing.expectEqualStrings("00FF", blobOrder.rows[1][0].text);
+    // LIKE is case-insensitive, GLOB is case-sensitive, length counts UTF-8 characters.
+    var pattern = try db.exec("SELECT 'AbC' LIKE 'abc', 'AbC' GLOB 'abc', 'AbC' LIKE 'a_c', length(char(104,233,108,108,111)), substr('hello', -2), substr('hello', 2, 2);");
+    defer pattern.deinit();
+    try std.testing.expectEqual(@as(i64, 1), pattern.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 0), pattern.rows[0][1].integer);
+    try std.testing.expectEqual(@as(i64, 1), pattern.rows[0][2].integer);
+    try std.testing.expectEqual(@as(i64, 5), pattern.rows[0][3].integer);
+    try std.testing.expectEqualStrings("lo", pattern.rows[0][4].text);
+    try std.testing.expectEqualStrings("el", pattern.rows[0][5].text);
+    // Scalar aggregates over values.
+    var scalars = try db.exec("SELECT TOTAL(x), AVG(x), GROUP_CONCAT(x), GROUP_CONCAT(x, '|') FROM (SELECT 1 AS x UNION ALL SELECT 2 UNION ALL SELECT 3);");
+    defer scalars.deinit();
+    try std.testing.expectEqual(@as(f64, 6.0), scalars.rows[0][0].real);
+    try std.testing.expectEqual(@as(f64, 2.0), scalars.rows[0][1].real);
+    try std.testing.expectEqualStrings("1,2,3", scalars.rows[0][2].text);
+    try std.testing.expectEqualStrings("1|2|3", scalars.rows[0][3].text);
+}
+
+test "rowid order by follows storage order" {
+    const path = "sqlite_zig_rowid_order_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    var setup = try db.exec("CREATE TABLE r (v TEXT); INSERT INTO r VALUES ('a'), ('b'), ('c'); CREATE TABLE w (k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID; INSERT INTO w VALUES ('x', 1);");
+    setup.deinit();
+    var asc = try db.exec("SELECT v FROM r ORDER BY rowid;");
+    defer asc.deinit();
+    try std.testing.expectEqualStrings("a", asc.rows[0][0].text);
+    try std.testing.expectEqualStrings("c", asc.rows[2][0].text);
+    var desc = try db.exec("SELECT v FROM r ORDER BY rowid DESC;");
+    defer desc.deinit();
+    try std.testing.expectEqualStrings("c", desc.rows[0][0].text);
+    try std.testing.expectEqualStrings("a", desc.rows[2][0].text);
+    var oid = try db.exec("SELECT v FROM r ORDER BY oid;");
+    defer oid.deinit();
+    try std.testing.expectEqualStrings("a", oid.rows[0][0].text);
+    // WITHOUT ROWID tables have no rowid to order by.
+    try std.testing.expectError(error.UnknownColumn, db.exec("SELECT v FROM w ORDER BY rowid;"));
+}
+
+test "subquery nesting correlation and emptiness match sqlite" {
+    const path = "sqlite_zig_subquery_edge_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    var setup = try db.exec("CREATE TABLE sq_a (id INTEGER, grp TEXT); CREATE TABLE sq_b (aid INTEGER, val INTEGER); INSERT INTO sq_a VALUES (1, 'x'), (2, 'y'), (3, 'x'); INSERT INTO sq_b VALUES (1, 10), (1, 20), (2, 30);");
+    setup.deinit();
+    // Scalar subquery, three nesting levels, correlated EXISTS.
+    var scalar = try db.exec("SELECT (SELECT max(v) FROM (SELECT val AS v FROM sq_b WHERE aid = sq_a.id)) FROM sq_a ORDER BY id;");
+    defer scalar.deinit();
+    try std.testing.expectEqual(@as(i64, 20), scalar.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 30), scalar.rows[1][0].integer);
+    try std.testing.expect(scalar.rows[2][0] == .null);
+    var correlated = try db.exec("SELECT id FROM sq_a WHERE EXISTS (SELECT 1 FROM sq_b WHERE aid = sq_a.id AND val > 15) ORDER BY id;");
+    defer correlated.deinit();
+    try std.testing.expectEqual(@as(usize, 2), correlated.count());
+    try std.testing.expectEqual(@as(i64, 1), correlated.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 2), correlated.rows[1][0].integer);
+    // NULL never matches IN, even against itself; empty results decide cleanly.
+    var nullIn = try db.exec("SELECT NULL IN (SELECT id FROM sq_a), NULL IN (1, 2);");
+    defer nullIn.deinit();
+    try std.testing.expect(nullIn.rows[0][0] == .null);
+    try std.testing.expect(nullIn.rows[0][1] == .null);
+    // Correlated NOT EXISTS finds the childless row.
+    var childless = try db.exec("SELECT grp FROM sq_a WHERE NOT EXISTS (SELECT 1 FROM sq_b WHERE aid = sq_a.id) ORDER BY id;");
+    defer childless.deinit();
+    try std.testing.expectEqual(@as(usize, 1), childless.count());
+    try std.testing.expectEqualStrings("x", childless.rows[0][0].text);
+    // Subquery in a DML statement.
+    var promoted = try db.exec("UPDATE sq_b SET val = val + (SELECT count(*) FROM sq_a WHERE grp = 'x') WHERE aid = 2;");
+    defer promoted.deinit();
+    var check = try db.exec("SELECT val FROM sq_b WHERE aid = 2;");
+    defer check.deinit();
+    try std.testing.expectEqual(@as(i64, 32), check.rows[0][0].integer);
+}
+
+test "dsl-looking column names stay usable end to end" {
+    const WeirdRow = struct {
+        id: i64,
+        all: []const u8,
+        count: i64,
+        select: []const u8,
+        where: []const u8,
+        join: []const u8,
+        limit: i64,
+    };
+    const Weird = @import("../dsl/table.zig").table("cf_weird", WeirdRow);
+    const path = "sqlite_zig_collision_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    try db.createTable(Weird, .{ .primaryKey = Weird.id });
+    try db.schema(Weird).validate();
+    var inserted = try db.from(Weird).insert(.{ .id = 1, .all = "a", .count = 7, .select = "s", .where = "w", .join = "j", .limit = 50 });
+    inserted.deinit();
+    var second = try db.from(Weird).insert(.{ .id = 2, .all = "b", .count = 3, .select = "t", .where = "x", .join = "k", .limit = 10 });
+    second.deinit();
+    // Each colliding name filters, orders, and updates as a plain column.
+    var filtered = try db.from(Weird).select(Weird.all).where(Weird.where.eq("w")).fetch();
+    defer filtered.deinit();
+    try std.testing.expectEqual(@as(usize, 1), filtered.count());
+    try std.testing.expectEqualStrings("a", filtered.rows[0][0].text);
+    // Raw SQL spells reserved-word columns quoted, exactly as SQLite requires.
+    var rawQuoted = try db.exec("SELECT \"all\", \"count\" FROM cf_weird WHERE \"where\" = 'w' ORDER BY \"limit\";");
+    defer rawQuoted.deinit();
+    try std.testing.expectEqual(@as(usize, 1), rawQuoted.count());
+    try std.testing.expectEqualStrings("a", rawQuoted.rows[0][0].text);
+    try std.testing.expectEqual(@as(i64, 7), rawQuoted.rows[0][1].integer);
+    var ordered = try db.from(Weird).select(Weird.all).orderBy(Weird.limit.asc()).fetch();
+    defer ordered.deinit();
+    try std.testing.expectEqual(@as(usize, 2), ordered.count());
+    try std.testing.expectEqualStrings("b", ordered.rows[0][0].text);
+    try std.testing.expectEqualStrings("a", ordered.rows[1][0].text);
+    var renamed = try (try db.from(Weird).update(.{ .limit = 99 })).where(Weird.id.eq(2)).execute();
+    renamed.deinit();
+    const checkLimit = try db.from(Weird).select(Weird.limit).where(Weird.id.eq(2)).fetchOne();
+    try std.testing.expectEqual(@as(i64, 99), checkLimit.integer);
+    var summed = try db.from(Weird).select(.{Weird.count.sum()}).fetch();
+    defer summed.deinit();
+    try std.testing.expectEqual(@as(i64, 10), summed.rows[0][0].integer);
+    // `selectAll()` is the all-columns operation; raw SELECT * agrees.
+    var everything = try db.from(Weird).selectAll().orderBy(Weird.id.asc()).fetch();
+    defer everything.deinit();
+    var rawStar = try db.exec("SELECT * FROM cf_weird ORDER BY id;");
+    defer rawStar.deinit();
+    try std.testing.expectEqual(rawStar.count(), everything.count());
+    try std.testing.expectEqual(@as(usize, 7), rawStar.columns.len);
+    for (0..everything.count()) |i| {
+        try std.testing.expectEqual(rawStar.rows[i][0].integer, everything.at(i).id);
+        try std.testing.expectEqualStrings(rawStar.rows[i][1].text, everything.at(i).all);
+        try std.testing.expectEqual(rawStar.rows[i][2].integer, everything.at(i).count);
+    }
+    // Dynamic DSL sees the same columns under the same names.
+    const dynWeird = db.table("cf_weird");
+    var dynFiltered = try dynWeird.select(.{dynWeird.column("all")}).where(dynWeird.column("where").eq("x")).fetch();
+    defer dynFiltered.deinit();
+    try std.testing.expectEqual(@as(usize, 1), dynFiltered.count());
+    try std.testing.expectEqualStrings("b", dynFiltered.rows[0][0].text);
+    // Aliases keep colliding columns working.
+    const w = @import("../dsl/table.zig").aliased(Weird, "w");
+    var aliasedRows = try db.from(w).select(w.all).where(w.id.eq(1)).fetch();
+    defer aliasedRows.deinit();
+    try std.testing.expectEqual(@as(usize, 1), aliasedRows.count());
+    try std.testing.expectEqualStrings("a", aliasedRows.rows[0][0].text);
+    var gone = try db.from(Weird).delete().where(Weird.join.eq("k")).execute();
+    gone.deinit();
+    var remaining = try db.exec("SELECT count(*) FROM cf_weird;");
+    defer remaining.deinit();
+    try std.testing.expectEqual(@as(i64, 1), remaining.rows[0][0].integer);
 }

@@ -68,17 +68,17 @@ indexes). Use `db.createIndex(Table, name, cols, unique)`.
 
 ```zig
 // Primary key
-.primaryKey = User.columns.id,
+.primaryKey = User.id,
 
 // Composite primary key
-.primaryKey = &.{ User.columns.tenant_id, User.columns.user_id },
+.primaryKey = &.{ User.tenant_id, User.user_id },
 
 // Unique
-.unique = &.{User.columns.email},
+.unique = &.{User.email},
 
 // Foreign key
 .foreignKeys = &.{
-    .{ .column = Order.columns.user_id, .references = User.columns.id },
+    .{ .column = Order.user_id, .references = User.id },
 },
 ```
 

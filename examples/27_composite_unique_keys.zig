@@ -7,10 +7,10 @@ const Membership = sqlite.table("composite_memberships", MembershipRow);
 pub fn main() !void {
     var db = try sqlite.open(std.heap.page_allocator, "example_27.db");
     defer db.close();
-    try db.createTable(Membership, .{ .overWrite = true, .primaryKey = Membership.columns.id });
+    try db.createTable(Membership, .{ .overWrite = true, .primaryKey = Membership.id });
     try db.truncate(Membership);
     db.dropIndex("membership_user_group") catch {};
-    try db.createIndex(Membership, "membership_user_group", &.{ Membership.columns.user_id, Membership.columns.group_id }, true);
+    try db.createIndex(Membership, "membership_user_group", &.{ Membership.user_id, Membership.group_id }, true);
 
     var first = try db.from(Membership).insert(.{ .id = 1, .user_id = 10, .group_id = 20 });
     first.deinit();

@@ -262,8 +262,21 @@ fn saturatingTrunc(real: f64) i64 {
 }
 
 fn absUnsigned(value: i64) usize {
-    if (value == std.math.minInt(i64)) return @as(usize, @intCast(std.math.maxInt(i64))) + 1;
-    return @as(usize, @intCast(if (value < 0) -value else value));
+    // Saturate: magnitudes are only compared against string lengths, which
+    // can never reach 2^63, so saturation is exact on 32-bit and 64-bit.
+    if (value == std.math.minInt(i64)) return std.math.maxInt(usize);
+    return saturatingIntCast(if (value < 0) -value else value);
+}
+
+// Saturating i64 -> usize for user-supplied sizes. A plain @intCast traps
+// on 32-bit targets once values exceed 2^32; saturation keeps behavior
+// identical on 64-bit while turning the 32-bit case into a clamped value
+// (callers bound it further against real buffer lengths) instead of a trap.
+fn saturatingIntCast(value: i64) usize {
+    if (value <= 0) return 0;
+    const magnitude: u64 = @as(u64, @intCast(value));
+    if (magnitude > std.math.maxInt(usize)) return std.math.maxInt(usize);
+    return @as(usize, @intCast(magnitude));
 }
 
 fn substrArgInt(val: Value) ?i64 {
@@ -308,7 +321,7 @@ pub fn evalSubstr(allocator: std.mem.Allocator, strVal: Value, startVal: Value, 
     const startNum = substrArgInt(startVal) orelse return .null;
     var startChar: usize = 0;
     if (startNum > 0) {
-        startChar = @min(@as(usize, @intCast(startNum - 1)), charCount);
+        startChar = @min(saturatingIntCast(startNum - 1), charCount);
     } else if (startNum < 0) {
         const fromEnd = absUnsigned(startNum);
         startChar = if (fromEnd > charCount) 0 else charCount - fromEnd;
@@ -322,7 +335,7 @@ pub fn evalSubstr(allocator: std.mem.Allocator, strVal: Value, startVal: Value, 
             endChar = startChar;
             startChar = actualStart;
         } else {
-            endChar = @min(charCount, startChar +% @as(usize, @intCast(lenNum)));
+            endChar = @min(charCount, startChar +% saturatingIntCast(lenNum));
         }
     }
     if (startChar > endChar) startChar = endChar;
@@ -730,7 +743,8 @@ pub fn evalZeroblob(allocator: std.mem.Allocator, arg: Value) !Value {
         .blob => |b| parseIntPrefix(b),
     };
     if (count <= 0) return .{ .blob = try allocator.alloc(u8, 0) };
-    const out = try allocator.alloc(u8, @intCast(count));
+    const size: usize = std.math.cast(usize, count) orelse return error.OutOfMemory;
+    const out = try allocator.alloc(u8, size);
     @memset(out, 0);
     return .{ .blob = out };
 }
@@ -797,7 +811,8 @@ pub fn evalRandomblob(allocator: std.mem.Allocator, arg: Value) !Value {
         .blob => |b| parseIntPrefix(b),
     };
     if (count < 1) count = 1;
-    const out = try allocator.alloc(u8, @intCast(count));
+    const size: usize = std.math.cast(usize, count) orelse return error.OutOfMemory;
+    const out = try allocator.alloc(u8, size);
     RandomState.random().bytes(out);
     return .{ .blob = out };
 }

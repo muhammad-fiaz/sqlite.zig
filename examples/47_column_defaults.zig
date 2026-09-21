@@ -8,6 +8,6 @@ pub fn main() !void {
     result.deinit();
     var rows = try db.exec("SELECT label, enabled FROM default_demo ORDER BY id;");
     defer rows.deinit();
-    if (rows.count() != 2 or !std.mem.eql(u8, rows.rows[0][0].text, "untitled") or rows.rows[1][1].integer != 1) return error.DefaultVerificationFailed;
+    if (rows.count() != 2 or !std.mem.eql(u8, rows.at(0)[0].text, "untitled") or rows.at(1)[1].integer != 1) return error.DefaultVerificationFailed;
     std.debug.print("47 column defaults: omitted columns and DEFAULT VALUES verified\n", .{});
 }

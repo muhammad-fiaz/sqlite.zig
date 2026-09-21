@@ -16,14 +16,14 @@ const User = sqlite.table("users", struct { id: i64, name: []const u8 });
 const Order = sqlite.table("orders", struct { id: i64, user_id: i64, amount: i64 });
 
 try db.createTable(User, .{
-    .primaryKey = User.columns.id,
+    .primaryKey = User.id,
 });
 
 try db.createTable(Order, .{
-    .primaryKey = Order.columns.id,
+    .primaryKey = Order.id,
     .foreignKeys = &.{.{
-        .column = Order.columns.user_id,
-        .references = User.columns.id,
+        .column = Order.user_id,
+        .references = User.id,
         .onDelete = .cascade,
         .onUpdate = .cascade,
     }},
@@ -60,10 +60,10 @@ try db.createTable("orders", .{
 
 ```zig
 try db.createTable(Child, .{
-    .primaryKey = Child.columns.id,
+    .primaryKey = Child.id,
     .foreignKeys = &.{.{
-        .columns = &.{ Child.columns.parent_a, Child.columns.parent_b },
-        .references = &.{ Parent.columns.a, Parent.columns.b },
+        .columns = &.{ Child.parent_a, Child.parent_b },
+        .references = &.{ Parent.a, Parent.b },
         .onDelete = .cascade,
         .onUpdate = .cascade,
     }},
@@ -84,12 +84,12 @@ try db.commit();
 
 // Delete the user; orders are cascade-deleted
 try db.begin();
-var deleted = try db.from(User).delete().where(User.columns.id.eq(1)).execute();
+var deleted = try db.from(User).delete().where(User.id.eq(1)).execute();
 deleted.deinit();
 try db.commit();
 
 // Order count is now 0
-var count = try db.from(Order).select(.{Order.columns.id.count()}).fetch();
+var count = try db.from(Order).select(.{Order.id.count()}).fetch();
 defer count.deinit();
 ```
 

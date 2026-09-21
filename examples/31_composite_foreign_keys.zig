@@ -24,10 +24,10 @@ pub fn main() !void {
     updated.deinit();
     var rawChild = try db.exec("SELECT parent_a, parent_b FROM raw_fk_children;");
     defer rawChild.deinit();
-    if (rawChild.rows[0][0].integer != 2 or rawChild.rows[0][1].integer != 20) return error.CompositeForeignKeyUpdateFailed;
+    if (rawChild.at(0)[0].integer != 2 or rawChild.at(0)[1].integer != 20) return error.CompositeForeignKeyUpdateFailed;
 
-    try db.createTable(TypedParent, .{ .overWrite = true, .primaryKey = &.{ TypedParent.columns.part_a, TypedParent.columns.part_b } });
-    try db.createTable(TypedChild, .{ .overWrite = true, .foreignKeys = &.{.{ .columns = &.{ TypedChild.columns.parent_a, TypedChild.columns.parent_b }, .references = &.{ TypedParent.columns.part_a, TypedParent.columns.part_b }, .onDelete = .cascade, .onUpdate = .cascade }} });
+    try db.createTable(TypedParent, .{ .overWrite = true, .primaryKey = &.{ TypedParent.part_a, TypedParent.part_b } });
+    try db.createTable(TypedChild, .{ .overWrite = true, .foreignKeys = &.{.{ .columns = &.{ TypedChild.parent_a, TypedChild.parent_b }, .references = &.{ TypedParent.part_a, TypedParent.part_b }, .onDelete = .cascade, .onUpdate = .cascade }} });
     try db.truncate(TypedChild);
     try db.truncate(TypedParent);
     var parent = try db.from(TypedParent).insert(.{ .part_a = 1, .part_b = 10, .label = "typed" });
@@ -35,10 +35,10 @@ pub fn main() !void {
     var child = try db.from(TypedChild).insert(.{ .id = 1, .parent_a = 1, .parent_b = 10 });
     child.deinit();
     var parentUpdate = try db.from(TypedParent).update(.{ .part_a = 2, .part_b = 20 });
-    var result = try parentUpdate.where(TypedParent.columns.part_a.eq(1)).execute();
+    var result = try parentUpdate.where(TypedParent.part_a.eq(1)).execute();
     result.deinit();
     var typedChild = try db.from(TypedChild).selectAll().fetch();
     defer typedChild.deinit();
-    if (typedChild.rows[0].parent_a != 2 or typedChild.rows[0].parent_b != 20) return error.TypedCompositeForeignKeyUpdateFailed;
+    if (typedChild.at(0).parent_a != 2 or typedChild.at(0).parent_b != 20) return error.TypedCompositeForeignKeyUpdateFailed;
     std.debug.print("31 composite foreign keys: raw and typed cascading relationships verified\n", .{});
 }

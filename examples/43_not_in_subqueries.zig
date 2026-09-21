@@ -17,8 +17,8 @@ pub fn main() !void {
     b.deinit();
     var blocked = try db.from(Blocked).insert(.{ .user_id = 2 });
     blocked.deinit();
-    var rows = try db.from(User).whereNotInQuery(User.columns.id, Blocked, Blocked.columns.user_id).fetch();
+    var rows = try db.from(User).whereNotInQuery(User.id, Blocked, Blocked.user_id).fetch();
     defer rows.deinit();
-    if (rows.count() != 1 or rows.rows[0].id != 1) return error.NotInVerificationFailed;
+    if (rows.count() != 1 or rows.at(0).id != 1) return error.NotInVerificationFailed;
     std.debug.print("43 NOT IN: raw-compatible anti-subquery DSL verified\n", .{});
 }

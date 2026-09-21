@@ -116,6 +116,12 @@ pub fn build(b: *std.Build) void {
         "62_pragma_checks",
         "63_derived_dsl",
         "64_window_dsl",
+        "65_generated_columns",
+        "66_strict_tables",
+        "67_without_rowid",
+        "68_partial_expression_indexes",
+        "69_multi_key_order_by",
+        "70_collision_free_dsl",
     };
 
     inline for (examples) |name| {

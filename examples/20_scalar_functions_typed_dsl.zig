@@ -7,7 +7,7 @@ const Metric = sqlite.table("scalar_metrics", MetricRow);
 pub fn main() !void {
     var db = try sqlite.open(std.heap.page_allocator, "example_20.db");
     defer db.close();
-    try db.createTable(Metric, .{ .overWrite = true, .primaryKey = Metric.columns.id });
+    try db.createTable(Metric, .{ .overWrite = true, .primaryKey = Metric.id });
     try db.truncate(Metric);
     var inserted = try db.from(Metric).insert(.{ .id = 1, .label = "Alpha", .value = 12 });
     inserted.deinit();
@@ -16,10 +16,10 @@ pub fn main() !void {
     defer raw.deinit();
     if (raw.count() != 1) return error.RawScalarVerificationFailed;
 
-    var lower = try db.from(Metric).select(.{Metric.columns.label.lower()}).fetch();
+    var lower = try db.from(Metric).select(.{Metric.label.lower()}).fetch();
     defer lower.deinit();
-    var absolute = try db.from(Metric).select(.{Metric.columns.value.abs()}).fetch();
+    var absolute = try db.from(Metric).select(.{Metric.value.abs()}).fetch();
     defer absolute.deinit();
-    if (lower.count() != 1 or absolute.rows[0][0].integer != 12) return error.TypedScalarVerificationFailed;
+    if (lower.count() != 1 or absolute.at(0)[0].integer != 12) return error.TypedScalarVerificationFailed;
     std.debug.print("20 scalar functions: raw and typed projections verified\n", .{});
 }

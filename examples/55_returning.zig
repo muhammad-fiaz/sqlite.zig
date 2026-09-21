@@ -5,6 +5,7 @@ const Item = sqlite.table("returning_items", struct { id: i64, label: []const u8
 
 pub fn main() !void {
     var db = try sqlite.open(std.heap.page_allocator, "example_55.db");
+    const t_db_returning_items = db.table("returning_items");
     errdefer db.close();
     var setup = try db.exec("DROP TABLE IF EXISTS returning_items; CREATE TABLE returning_items (id INTEGER PRIMARY KEY, label TEXT NOT NULL, stock INTEGER NOT NULL);");
     setup.deinit();
@@ -13,50 +14,50 @@ pub fn main() !void {
     var rawInsert = try db.exec("INSERT INTO returning_items VALUES (1, 'alpha', 5) RETURNING id, label;");
     defer rawInsert.deinit();
     if (rawInsert.count() != 1) return error.VerificationFailed;
-    if (rawInsert.rows[0][0].integer != 1) return error.VerificationFailed;
-    if (!std.mem.eql(u8, rawInsert.rows[0][1].text, "alpha")) return error.VerificationFailed;
+    if (rawInsert.at(0)[0].integer != 1) return error.VerificationFailed;
+    if (!std.mem.eql(u8, rawInsert.at(0)[1].text, "alpha")) return error.VerificationFailed;
 
-    var typedInsert = try db.from(Item).returning(.{ Item.columns.id, Item.columns.stock }).insert(.{ .id = 2, .label = "beta", .stock = 7 });
+    var typedInsert = try db.from(Item).returning(.{ Item.id, Item.stock }).insert(.{ .id = 2, .label = "beta", .stock = 7 });
     defer typedInsert.deinit();
     if (typedInsert.count() != 1) return error.VerificationFailed;
-    if (typedInsert.rows[0][0].integer != 2) return error.VerificationFailed;
-    if (typedInsert.rows[0][1].integer != 7) return error.VerificationFailed;
+    if (typedInsert.at(0)[0].integer != 2) return error.VerificationFailed;
+    if (typedInsert.at(0)[1].integer != 7) return error.VerificationFailed;
 
-    var dynInsert = try db.from("returning_items").returning(.{db.col("label").upper().projection()}).insert(.{ .id = 3, .label = "gamma", .stock = 1 });
+    var dynInsert = try t_db_returning_items.returning(.{t_db_returning_items.column("label").upper().projection()}).insert(.{ .id = 3, .label = "gamma", .stock = 1 });
     defer dynInsert.deinit();
     if (dynInsert.count() != 1) return error.VerificationFailed;
-    if (!std.mem.eql(u8, dynInsert.rows[0][0].text, "GAMMA")) return error.VerificationFailed;
+    if (!std.mem.eql(u8, dynInsert.at(0)[0].text, "GAMMA")) return error.VerificationFailed;
 
     var rawSeen = try db.exec("SELECT count(*) FROM returning_items;");
     defer rawSeen.deinit();
-    if (rawSeen.rows[0][0].integer != 3) return error.VerificationFailed;
+    if (rawSeen.at(0)[0].integer != 3) return error.VerificationFailed;
 
-    var ignored = try db.from(Item).returning(.{Item.columns.id}).insertOrIgnore(.{ .id = 2, .label = "dup", .stock = 9 });
+    var ignored = try db.from(Item).returning(.{Item.id}).insertOrIgnore(.{ .id = 2, .label = "dup", .stock = 9 });
     defer ignored.deinit();
     if (ignored.count() != 0) return error.VerificationFailed;
 
     var typedUpdate = try db.from(Item).update(.{ .stock = 11 });
-    var updated = try typedUpdate.where(Item.columns.id.eq(2)).returning(.{ Item.columns.id, Item.columns.stock }).execute();
+    var updated = try typedUpdate.where(Item.id.eq(2)).returning(.{ Item.id, Item.stock }).execute();
     defer updated.deinit();
     if (updated.count() != 1) return error.VerificationFailed;
-    if (updated.rows[0][0].integer != 2) return error.VerificationFailed;
-    if (updated.rows[0][1].integer != 11) return error.VerificationFailed;
+    if (updated.at(0)[0].integer != 2) return error.VerificationFailed;
+    if (updated.at(0)[1].integer != 11) return error.VerificationFailed;
 
     var rawUpdated = try db.exec("SELECT stock FROM returning_items WHERE id = 2;");
     defer rawUpdated.deinit();
-    if (rawUpdated.rows[0][0].integer != 11) return error.VerificationFailed;
+    if (rawUpdated.at(0)[0].integer != 11) return error.VerificationFailed;
 
-    var dynDelete = try db.from("returning_items").delete().where(db.col("id").eq(1)).returning(.{db.col("label")}).execute();
+    var dynDelete = try t_db_returning_items.delete().where(t_db_returning_items.column("id").eq(1)).returning(.{t_db_returning_items.column("label")}).execute();
     defer dynDelete.deinit();
     if (dynDelete.count() != 1) return error.VerificationFailed;
-    if (!std.mem.eql(u8, dynDelete.rows[0][0].text, "alpha")) return error.VerificationFailed;
+    if (!std.mem.eql(u8, dynDelete.at(0)[0].text, "alpha")) return error.VerificationFailed;
 
     var rawRemaining = try db.exec("SELECT id FROM returning_items ORDER BY id;");
     defer rawRemaining.deinit();
     if (rawRemaining.count() != 2) return error.VerificationFailed;
-    if (rawRemaining.rows[0][0].integer != 2) return error.VerificationFailed;
+    if (rawRemaining.at(0)[0].integer != 2) return error.VerificationFailed;
 
-    if (db.from(Item).returning(.{db.col("missing")}).insert(.{ .id = 9, .label = "bad", .stock = 1 })) |r| {
+    if (db.from(Item).returning(.{t_db_returning_items.column("missing")}).insert(.{ .id = 9, .label = "bad", .stock = 1 })) |r| {
         var owned = r;
         owned.deinit();
         return error.VerificationFailed;
@@ -65,13 +66,13 @@ pub fn main() !void {
     }
     var afterBad = try db.exec("SELECT count(*) FROM returning_items;");
     defer afterBad.deinit();
-    if (afterBad.rows[0][0].integer != 2) return error.VerificationFailed;
+    if (afterBad.at(0)[0].integer != 2) return error.VerificationFailed;
 
     {
         var check = try db.exec("SELECT id, stock FROM returning_items ORDER BY id;");
         defer check.deinit();
-        if (check.rows[0][1].integer != 11) return error.VerificationFailed;
-        if (check.rows[1][1].integer != 1) return error.VerificationFailed;
+        if (check.at(0)[1].integer != 11) return error.VerificationFailed;
+        if (check.at(1)[1].integer != 1) return error.VerificationFailed;
     }
     db.close();
     var reopened = try sqlite.open(std.heap.page_allocator, "example_55.db");
@@ -79,7 +80,7 @@ pub fn main() !void {
     var persisted = try reopened.exec("SELECT id, stock FROM returning_items ORDER BY id;");
     defer persisted.deinit();
     if (persisted.count() != 2) return error.VerificationFailed;
-    if (persisted.rows[0][1].integer != 11) return error.VerificationFailed;
-    if (persisted.rows[1][1].integer != 1) return error.VerificationFailed;
+    if (persisted.at(0)[1].integer != 11) return error.VerificationFailed;
+    if (persisted.at(1)[1].integer != 1) return error.VerificationFailed;
     std.debug.print("55 returning: insert, update, and delete returning verified with persistence\n", .{});
 }

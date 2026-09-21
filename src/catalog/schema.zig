@@ -44,7 +44,7 @@ pub const Trigger = struct {
 
 pub const Schema = struct {
     allocator: std.mem.Allocator,
-    tables: std.ArrayList(Table),
+    tables: std.ArrayList(*Table),
     indexes: std.ArrayList(Index),
     views: std.ArrayList(View),
     triggers: std.ArrayList(Trigger),
@@ -55,35 +55,9 @@ pub const Schema = struct {
     }
 
     pub fn deinit(self: *Schema) void {
-        for (self.tables.items) |*table| {
-            for (table.rows.items) |row| {
-                for (row.values) |value| freeValue(self.allocator, value);
-                self.allocator.free(row.values);
-            }
-            table.rows.deinit(self.allocator);
-            for (table.columns) |column| {
-                self.allocator.free(column.name);
-                self.allocator.free(column.typeName);
-                if (column.defaultValue) |value| freeValue(self.allocator, value);
-                if (column.foreignTable) |value| self.allocator.free(value);
-                if (column.foreignColumn) |value| self.allocator.free(value);
-                if (column.checkExpr) |chk| ast.freeOwnedExpr(self.allocator, chk);
-                if (column.generatedExpr) |gen| ast.freeOwnedExpr(self.allocator, gen);
-            }
-            self.allocator.free(table.columns);
-            for (table.constraints) |constraint| {
-                for (constraint.columns) |column| self.allocator.free(column);
-                self.allocator.free(constraint.columns);
-                if (constraint.foreignTable) |foreignTable| self.allocator.free(foreignTable);
-                for (constraint.referencedColumns) |column| self.allocator.free(column);
-                self.allocator.free(constraint.referencedColumns);
-                if (constraint.checkExpr) |chk| ast.freeOwnedExpr(self.allocator, chk);
-            }
-            self.allocator.free(table.constraints);
-            if (table.virtualModule) |module| self.allocator.free(module);
-            for (table.virtualArguments) |argument| self.allocator.free(argument);
-            self.allocator.free(table.virtualArguments);
-            self.allocator.free(table.name);
+        for (self.tables.items) |table| {
+            self.deinitTable(table);
+            self.allocator.destroy(table);
         }
         self.tables.deinit(self.allocator);
         for (self.indexes.items) |index| {
@@ -129,11 +103,11 @@ pub const Schema = struct {
     }
 
     pub fn find(self: *Schema, name: []const u8) ?*Table {
-        for (self.tables.items) |*table| if (std.ascii.eqlIgnoreCase(table.name, name)) return table;
+        for (self.tables.items) |table| if (std.ascii.eqlIgnoreCase(table.name, name)) return table;
         return null;
     }
     pub fn findConst(self: *const Schema, name: []const u8) ?*const Table {
-        for (self.tables.items) |*table| if (std.ascii.eqlIgnoreCase(table.name, name)) return table;
+        for (self.tables.items) |table| if (std.ascii.eqlIgnoreCase(table.name, name)) return table;
         return null;
     }
 
@@ -563,14 +537,17 @@ pub const Schema = struct {
             if (!std.ascii.eqlIgnoreCase(declared, "integer")) return error.InvalidSql;
             if (!columns[index].primaryKey) return error.InvalidSql;
         }
-        try self.tables.append(self.allocator, .{
+        const table = try self.allocator.create(Table);
+        errdefer self.allocator.destroy(table);
+        table.* = .{
             .name = ownedName,
             .columns = columns,
             .constraints = constraints,
             .rows = .empty,
             .strict = options.strict,
             .withoutRowid = options.withoutRowid,
-        });
+        };
+        try self.tables.append(self.allocator, table);
         for (columns) |column| {
             if (!column.autoincrement) continue;
             try self.ensureSequenceTable();
@@ -645,7 +622,7 @@ pub const Schema = struct {
     }
 
     pub fn dropTable(self: *Schema, name: []const u8) !void {
-        for (self.tables.items, 0..) |*table, index| {
+        for (self.tables.items, 0..) |table, index| {
             if (std.ascii.eqlIgnoreCase(table.name, name)) {
                 var indexPosition: usize = 0;
                 while (indexPosition < self.indexes.items.len) {
@@ -901,7 +878,7 @@ pub const Schema = struct {
     }
 
     fn renameStoredExprs(self: *Schema, tableName: []const u8, oldName: []const u8, newName: []const u8, isTableRename: bool) !void {
-        for (self.tables.items) |*other| {
+        for (self.tables.items) |other| {
             if (!std.ascii.eqlIgnoreCase(other.name, tableName)) continue;
             for (other.columns) |*column| {
                 if (column.checkExpr) |*check| try self.renameExprIdentifier(check, other.name, oldName, newName, isTableRename);
@@ -936,7 +913,7 @@ pub const Schema = struct {
                 trg.table = try self.allocator.dupe(u8, newName);
             }
         }
-        for (self.tables.items) |*other| {
+        for (self.tables.items) |other| {
             for (other.columns) |*column| {
                 if (column.foreignTable) |foreignTable| {
                     if (std.ascii.eqlIgnoreCase(foreignTable, oldName)) {
@@ -1078,7 +1055,7 @@ pub const Schema = struct {
                 }
             }
         }
-        for (self.tables.items) |*other| {
+        for (self.tables.items) |other| {
             for (other.columns) |*column| {
                 if (column.foreignTable) |foreignTable| {
                     if (std.ascii.eqlIgnoreCase(foreignTable, tableName)) {
@@ -1199,7 +1176,12 @@ pub const Schema = struct {
     }
 
     fn removeTable(self: *Schema, index: usize) void {
-        var table = self.tables.orderedRemove(index);
+        const table = self.tables.orderedRemove(index);
+        self.deinitTable(table);
+        self.allocator.destroy(table);
+    }
+
+    fn deinitTable(self: *Schema, table: *Table) void {
         for (table.rows.items) |row| {
             for (row.values) |value| freeValue(self.allocator, value);
             self.allocator.free(row.values);

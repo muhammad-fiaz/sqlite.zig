@@ -6,9 +6,9 @@ const Item = sqlite.table("planner_items", struct { id: i64, code: []const u8, v
 pub fn main() !void {
     var db = try sqlite.open(std.heap.page_allocator, "example_33.db");
     defer db.close();
-    try db.createTable(Item, .{ .overWrite = true, .primaryKey = Item.columns.id });
+    try db.createTable(Item, .{ .overWrite = true, .primaryKey = Item.id });
     db.dropIndex("planner_items_code_idx") catch {};
-    try db.createIndex(Item, "planner_items_code_idx", &.{Item.columns.code}, false);
+    try db.createIndex(Item, "planner_items_code_idx", &.{Item.code}, false);
     try db.truncate(Item);
     var inserted = try db.from(Item).insert(.{ .id = 1, .code = "A", .value = 10 });
     inserted.deinit();
@@ -17,9 +17,9 @@ pub fn main() !void {
 
     var plan = try db.exec("EXPLAIN QUERY PLAN SELECT id FROM planner_items WHERE code = 'B';");
     defer plan.deinit();
-    if (plan.count() != 1 or std.mem.indexOf(u8, plan.rows[0][0].text, "USING INDEX planner_items_code_idx") == null) return error.IndexPlanVerificationFailed;
-    var rows = try db.from(Item).select(&.{ Item.columns.id, Item.columns.value }).where(Item.columns.code.eq("B")).fetch();
+    if (plan.count() != 1 or std.mem.indexOf(u8, plan.at(0)[0].text, "USING INDEX planner_items_code_idx") == null) return error.IndexPlanVerificationFailed;
+    var rows = try db.from(Item).select(&.{ Item.id, Item.value }).where(Item.code.eq("B")).fetch();
     defer rows.deinit();
-    if (rows.count() != 1 or rows.rows[0][0].integer != 2) return error.IndexLookupVerificationFailed;
+    if (rows.count() != 1 or rows.at(0)[0].integer != 2) return error.IndexLookupVerificationFailed;
     std.debug.print("33 planner: EXPLAIN QUERY PLAN and indexed equality verified\n", .{});
 }

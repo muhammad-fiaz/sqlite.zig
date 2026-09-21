@@ -7,7 +7,7 @@ description: "Raw SQL, the dynamic DSL, and the typed DSL over one shared query 
 
 Three interfaces share one engine: unrestricted raw SQL, a dynamic DSL for
 runtime table/column names (no struct required), and a typed DSL where
-`User.columns.<field>` gives compile-time columns and typed rows.
+`User.<field>` gives compile-time columns and typed rows.
 
 ## Defining tables
 
@@ -33,18 +33,22 @@ field defaults become `DEFAULT` clauses.
 ## Dynamic queries without structs
 
 ```zig
-var rows = try db
-    .from("users")
-    .select(.{ db.col("id"), db.col("name") })
-    .where(db.col("age").gte(18))
-    .orderBy(db.col("name").asc())
+const users = db.table("users");
+var rows = try db.from(users)
+    .select(.{ users.column("id"), users.column("name") })
+    .where(users.column("age").gte(18))
+    .orderBy(users.column("name").asc())
     .fetch();
 defer rows.deinit();
 ```
 
 This is the mode for existing databases, legacy schemas, runtime table
-names, and ad-hoc queries: `db.from("users")` plus `db.col("age")` never
-require a Zig struct.
+names, and ad-hoc queries: `db.table("users")` plus `users.column("age")`
+never require a Zig struct. The canonical explicit form is
+`users.column("id")`, which carries table identity; `db.col("id")` is
+optional sugar for an unqualified reference resolved with SQLite
+name-resolution rules (ambiguous references are an error, never a silent
+pick).
 
 ## Typed queries
 
@@ -55,12 +59,12 @@ defer all.deinit();
 
 // With WHERE clause
 var filtered = try db.from(User)
-    .where(User.columns.name.eq("Alice"))
+    .where(User.name.eq("Alice"))
     .fetch();
 defer filtered.deinit();
 
 // With specific columns (projections return raw rows)
-var projected = try db.from(User).select(.{ User.columns.id, User.columns.name }).fetch();
+var projected = try db.from(User).select(.{ User.id, User.name }).fetch();
 defer projected.deinit();
 
 // Full-row queries map back into the table struct.
@@ -90,7 +94,7 @@ Conflict handling: `insertOrIgnore` / `insertOrReplace`, plus full
 
 ```zig
 var upserted = try db.from(User)
-    .onConflict(User.columns.id)
+    .onConflict(User.id)
     .doUpdate(.{ .name = "Alice" })
     .insert(.{ .id = 1, .name = "Alice", .email = "alice@example.com" });
 upserted.deinit();
@@ -100,7 +104,7 @@ upserted.deinit();
 
 ```zig
 var copied = try db.from(Archive)
-    .insertSelect(db.from(Active).select(.{ Active.columns.id, Active.columns.name }));
+    .insertSelect(db.from(Active).select(.{ Active.id, Active.name }));
 defer copied.deinit();
 ```
 
@@ -112,7 +116,7 @@ so every value maps positionally, exactly like raw `INSERT ... SELECT`.
 
 ```zig
 var mutation = try db.from(User).update(.{ .name = "Bob" });
-var result = try mutation.where(User.columns.id.eq(1)).execute();
+var result = try mutation.where(User.id.eq(1)).execute();
 defer result.deinit();
 ```
 
@@ -121,7 +125,7 @@ Updates can read a source table with `updateFrom` and an equi-join predicate
 
 ```zig
 var joined = try db.from(Bal).update(.{ .flag = 1 })
-    .updateFrom(Adj, Bal.columns.id.eq(Adj.columns.bal_id))
+    .updateFrom(Adj, Bal.id.eq(Adj.bal_id))
     .execute();
 defer joined.deinit();
 ```
@@ -129,7 +133,7 @@ defer joined.deinit();
 ### Delete
 
 ```zig
-var result = try db.from(User).delete().where(User.columns.id.eq(1)).execute();
+var result = try db.from(User).delete().where(User.id.eq(1)).execute();
 defer result.deinit();
 ```
 
@@ -140,13 +144,13 @@ Joins take the other table plus one column-comparison expression:
 ```zig
 // Inner join
 var result = try db.from(User)
-    .innerJoin(Order, User.columns.id.eq(Order.columns.user_id))
+    .innerJoin(Order, User.id.eq(Order.user_id))
     .fetch();
 defer result.deinit();
 
 // Left join
 var left = try db.from(User)
-    .leftJoin(Order, User.columns.id.eq(Order.columns.user_id))
+    .leftJoin(Order, User.id.eq(Order.user_id))
     .fetch();
 defer left.deinit();
 ```
@@ -154,8 +158,10 @@ defer left.deinit();
 Dynamic equivalent:
 
 ```zig
-var dyn = try db.from("users")
-    .innerJoin("orders", db.col("users.id").eq(db.col("orders.user_id")))
+const users = db.table("users");
+const orders = db.table("orders");
+var dyn = try db.from(users)
+    .innerJoin(orders, users.column("id").eq(orders.column("user_id")))
     .fetch();
 defer dyn.deinit();
 ```
@@ -164,7 +170,7 @@ defer dyn.deinit();
 
 ```zig
 var result = try db.from(User)
-    .innerJoin(Order, User.columns.id.eq(Order.columns.user_id))
+    .innerJoin(Order, User.id.eq(Order.user_id))
     .selectAll()
     .distinct()
     .fetch();
@@ -177,13 +183,13 @@ Aggregates are column projections used with `select`, freely combined in
 one statement:
 
 ```zig
-var total = try db.from(Order).select(.{Order.columns.amount.sum()}).fetch();
+var total = try db.from(Order).select(.{Order.amount.sum()}).fetch();
 defer total.deinit();
 
-var avg = try db.from(Order).select(.{Order.columns.amount.avg()}).fetch();
+var avg = try db.from(Order).select(.{Order.amount.avg()}).fetch();
 defer avg.deinit();
 
-var count = try db.from(Order).select(.{Order.columns.id.count()}).fetch();
+var count = try db.from(Order).select(.{Order.id.count()}).fetch();
 defer count.deinit();
 
 var all = try db.from(Order).countStar().fetch(); // COUNT(*)
@@ -197,42 +203,42 @@ predicates and projections:
 
 ```zig
 var changed = try db.from(User)
-    .select(.{User.columns.name.replace("Alice", "A.")})
+    .select(.{User.name.replace("Alice", "A.")})
     .fetch();
 defer changed.deinit();
 
 var prefix = try db.from(User)
-    .select(.{User.columns.name.substr(1, 3)})
+    .select(.{User.name.substr(1, 3)})
     .fetch();
 defer prefix.deinit();
 
 var labels = try db.from(User)
-    .select(.{User.columns.name.coalesce("anonymous")})
+    .select(.{User.name.coalesce("anonymous")})
     .fetch();
 defer labels.deinit();
 
 var normalized = try db.from(User)
-    .where(User.columns.name.lower().eq("alice"))
+    .where(User.name.lower().eq("alice"))
     .fetch();
 defer normalized.deinit();
 
 var longNames = try db.from(User)
-    .where(User.columns.name.length().gt(3))
+    .where(User.name.length().gt(3))
     .fetch();
 defer longNames.deinit();
 
 var contains = try db.from(User)
-    .where(User.columns.name.instr("ali").gt(0))
+    .where(User.name.instr("ali").gt(0))
     .fetch();
 defer contains.deinit();
 
 var names = try db.from(User)
-    .select(.{User.columns.email.jsonExtract("$.name")})
+    .select(.{User.email.jsonExtract("$.name")})
     .fetch();
 defer names.deinit();
 
 var matching = try db.from(User)
-    .where(User.columns.email.jsonExtract("$.city").eq("London"))
+    .where(User.email.jsonExtract("$.city").eq("London"))
     .fetch();
 defer matching.deinit();
 ```
@@ -241,7 +247,7 @@ Text search uses `LIKE`/`GLOB` patterns directly:
 
 ```zig
 var matches = try db.from(User)
-    .where(User.columns.name.like("%ali%"))
+    .where(User.name.like("%ali%"))
     .fetch();
 defer matches.deinit();
 ```
@@ -249,16 +255,17 @@ defer matches.deinit();
 ## Single-row typed lookups
 
 ```zig
-if (try db.from(User)
-    .where(User.columns.id.eq(1))
-    .fetchOne()) |*user| {
-    defer db.from(User).freeRow(user);
-    std.debug.print("{d} {s}\n", .{ user.id, user.name });
-}
+var user = try db.from(User)
+    .where(User.id.eq(1))
+    .fetchOne();
+defer db.from(User).freeRow(&user);
+std.debug.print("{d} {s}\n", .{ user.id, user.name });
 ```
 
-It returns `null` when no row matches. Typed text fields are allocator-owned;
-release them with `freeRow`.
+`fetchOne()` returns `error.NoRows` when nothing matches (and
+`error.TooManyRows` when more than one row matches); `fetchOptional()`
+returns `null` instead for the zero-row case. Typed text fields are
+allocator-owned; release them with `freeRow`.
 
 ## Pagination
 
@@ -271,6 +278,21 @@ var page = try db.from(User)
 defer page.deinit();
 ```
 
+## Multi-key ordering
+
+`orderBy` takes one order or a tuple of orders, matching SQLite's
+comma-separated `ORDER BY`. Each key carries its own direction, NULLs sort
+first under `ASC` and last under `DESC`, and qualified keys resolve against
+their own table rather than a same-named column elsewhere:
+
+```zig
+var rows = try db.from(User)
+    .selectAll()
+    .orderBy(.{ User.name.asc(), User.age.desc() })
+    .fetch();
+defer rows.deinit();
+```
+
 ## CTEs
 
 `.with` / `.withRecursive` prefix raw-SQL CTE bodies; the typed table names
@@ -279,7 +301,7 @@ the CTE being read, like a view:
 ```zig
 var rows = try db.from(Live)
     .with("live", "SELECT id, name FROM users WHERE active = 1")
-    .orderBy(Live.columns.id.asc())
+    .orderBy(Live.id.asc())
     .fetch();
 defer rows.deinit();
 ```

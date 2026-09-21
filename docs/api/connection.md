@@ -117,7 +117,7 @@ defer rows.deinit();
 
 // With WHERE
 var filtered = try db.from(User)
-    .where(User.columns.id.eq(1))
+    .where(User.id.eq(1))
     .fetch();
 defer filtered.deinit();
 ```
@@ -149,12 +149,12 @@ try db.commit();
 ```zig
 // Create table
 try db.createTable(User, .{
-    .primaryKey = User.columns.id,
+    .primaryKey = User.id,
 });
 
 // Replace an existing table (drops and recreates it, discarding its rows)
 try db.createTable(User, .{
-    .primaryKey = User.columns.id,
+    .primaryKey = User.id,
     .overWrite = true,
 });
 

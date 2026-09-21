@@ -9,7 +9,7 @@ Raw SQL and the typed DSL support anti-subqueries:
 
 ```zig
 var rows = try db.from(User)
-    .whereNotInQuery(User.columns.id, Blocked, Blocked.columns.user_id)
+    .whereNotInQuery(User.id, Blocked, Blocked.user_id)
     .fetch();
 defer rows.deinit();
 ```
@@ -39,11 +39,11 @@ The typed DSL provides the corresponding checked APIs:
 
 ```zig
 const matching = try db.from(User)
-    .whereExists(Order, Order.columns.user_id.eq(User.columns.id))
+    .whereExists(Order, Order.user_id.eq(User.id))
     .fetch();
 ```
 
-Use `whereNotExists(Order, Order.columns.user_id.eq(User.columns.id))` for the
+Use `whereNotExists(Order, Order.user_id.eq(User.id))` for the
 anti-join form, or `whereExists(Order, null)` when only the presence of any row
 in the other table matters. Table and column names are validated at compile
 time; the dynamic equivalents take table-name strings and `db.col(...)`

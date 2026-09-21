@@ -16,7 +16,7 @@ pub fn main() !void {
     rawInsert.deinit();
     try std.testing.expectError(error.ConstraintViolation, db.exec("INSERT INTO raw_composite_items VALUES (1, 10, 'duplicate');"));
 
-    try db.createTable(Membership, .{ .overWrite = true, .primaryKey = &.{ Membership.columns.user_id, Membership.columns.group_id }, .unique = &.{&.{ Membership.columns.group_id, Membership.columns.label }} });
+    try db.createTable(Membership, .{ .overWrite = true, .primaryKey = &.{ Membership.user_id, Membership.group_id }, .unique = &.{&.{ Membership.group_id, Membership.label }} });
     try db.truncate(Membership);
     var typed = try db.from(Membership).insert(.{ .user_id = 1, .group_id = 10, .label = "alpha" });
     typed.deinit();

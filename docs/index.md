@@ -1,5 +1,5 @@
 ---
-title: "Native SQLite-Compatible Database Engine in Zig"
+title: "Native SQLite Database Engine in Zig"
 description: "A fully native, zero-dependency SQLite-compatible database engine written entirely in Zig. Pure Zig storage engine, SQL parser, bytecode VM, typed DSL query builder, WAL journaling, and cross-platform support."
 layout: home
 

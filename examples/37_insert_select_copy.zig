@@ -19,6 +19,6 @@ pub fn main() !void {
     copied.deinit();
     var rows = try db.from(Destination).selectAll().fetch();
     defer rows.deinit();
-    if (rows.count() != 1 or rows.rows[0].id != 2) return error.InsertSelectVerificationFailed;
+    if (rows.count() != 1 or rows.at(0).id != 2) return error.InsertSelectVerificationFailed;
     std.debug.print("37 INSERT SELECT: filtered query results copied and verified\n", .{});
 }

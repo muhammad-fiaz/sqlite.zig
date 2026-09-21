@@ -9,6 +9,10 @@ pub const Value = @import("vm/value.zig").Value;
 pub const errors = @import("errors/errors.zig");
 pub const table = @import("dsl/table.zig").table;
 pub const tableWith = @import("dsl/table.zig").tableWith;
+pub const aliased = @import("dsl/table.zig").aliased;
+pub const DynamicTable = @import("dsl/dynamic.zig").DynamicTable;
+pub const DynamicColumn = @import("dsl/column.zig").DynamicColumn;
+pub const SchemaHandle = @import("dsl/dynamic.zig").SchemaHandle;
 pub const column = @import("dsl/column.zig").column;
 pub const caseWhen = @import("dsl/column.zig").caseWhen;
 pub const caseValue = @import("dsl/column.zig").caseValue;
@@ -65,6 +69,7 @@ test {
     _ = @import("dsl/table.zig");
     _ = @import("dsl/query_builder.zig");
     _ = @import("dsl/ast_builder.zig");
+    _ = @import("dsl/dynamic.zig");
     _ = @import("migration/migration.zig");
     _ = @import("migration/runner.zig");
     _ = @import("catalog/schema.zig");
@@ -92,6 +97,9 @@ test "public surface exposes only client concepts" {
     try std.testing.expect(@hasDecl(@This(), "errors"));
     try std.testing.expect(@hasDecl(@This(), "table"));
     try std.testing.expect(@hasDecl(@This(), "tableWith"));
+    try std.testing.expect(@hasDecl(@This(), "DynamicTable"));
+    try std.testing.expect(@hasDecl(@This(), "DynamicColumn"));
+    try std.testing.expect(@hasDecl(@This(), "SchemaHandle"));
     try std.testing.expect(@hasDecl(@This(), "column"));
     try std.testing.expect(@hasDecl(@This(), "caseWhen"));
     try std.testing.expect(@hasDecl(@This(), "caseValue"));

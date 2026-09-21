@@ -10,7 +10,7 @@ pub fn main() !void {
     setup.deinit();
     var insert = try db.exec("INSERT INTO users VALUES (1, 'Fiaz');");
     insert.deinit();
-    var rows = try db.from(User).where(User.columns.id.gt(0)).fetch();
+    var rows = try db.from(User).where(User.id.gt(0)).fetch();
     defer rows.deinit();
     std.debug.print("04 dsl query builder: {d} row(s) fetched\n", .{rows.count()});
 }
