@@ -1,42 +1,109 @@
+//! Public client facade: the only module downstream code needs to import.
+//!
+//! Purpose: re-export exactly the client concepts — connections, results,
+//! statements, values, errors, typed/dynamic table handles, scalar/window
+//! helpers, migrations, and version — while keeping every engine subsystem
+//! (`format`, `storage`, `sql`, `catalog`, `btree`, `plan`, `vm`, `txn`, `dsl`
+//! internals) private. The `public surface exposes only client concepts` test
+//! below pins this boundary.
+//!
+//! Responsibilities: none beyond curation. No logic, no state, no allocation.
+//! All pipelines (Raw SQL via `Connection.exec`/`prepare`, dynamic DSL via
+//! `DynamicTable`, typed DSL via `table()`) converge downstream on native
+//! AST/IR — never via a DSL->SQL-string round trip.
+//!
+//! Ownership/lifetime: each re-export keeps its home module's contract.
+//! `Connection` owns the database image and must outlive every `Result`,
+//! `Statement`, table handle, and builder derived from it. `Result` is owned
+//! (caller `deinit`s); `Statement` is owned (caller `finalize`s, idempotent);
+//! table/column descriptors and builders are borrowed values; migration defs
+//! are borrowed slices. Closing the connection first dangles everything.
+//!
+//! Error behavior: none here; see `errors`, `Connection`, and `migration`.
+//!
+//! SQLite compatibility: the facade exposes the full SQLite-compatible
+//! surface (SQL + DSL + migrations) without leaking engine internals.
+//!
+//! Column/operation collision rule: `table()` fields are always columns;
+//! operations are calls (`User.all()`), so operation-named columns stay valid.
+//!
+//! AllColumns note: `User.all()` (call) yields the native star marker;
+//! `selectAll()` on a query builder is the explicit-star spelling.
+
 const std = @import("std");
 const connection = @import("connection/connection.zig");
 
-pub const Connection = connection.Connection;
+/// Open a database at `path` (borrowed). Returns an owned `Connection` that
+/// must be `close`d; it must outlive every result/statement/handle from it.
 pub const open = Connection.open;
+/// Owned live database connection; see `connection/connection.zig`.
+pub const Connection = connection.Connection;
+/// Owned eagerly materialized result; caller `deinit`s (idempotent).
 pub const Result = @import("connection/result.zig").Result;
+/// Owned prepared statement; caller `finalize`s (idempotent).
 pub const Statement = @import("connection/statement.zig").Statement;
+/// Runtime value; text/blob payloads follow the owner (Result borrows in).
 pub const Value = @import("vm/value.zig").Value;
+/// Engine error sets.
 pub const errors = @import("errors/errors.zig");
+/// Define a typed table value from a row struct or descriptor struct.
 pub const table = @import("dsl/table.zig").table;
+/// Define a typed table value with options (strict/without-rowid flags).
 pub const tableWith = @import("dsl/table.zig").tableWith;
+/// Rebind a table value's columns to an alias (for self-joins).
 pub const aliased = @import("dsl/table.zig").aliased;
+/// Borrowed runtime table handle; connection must outlive it.
 pub const DynamicTable = @import("dsl/dynamic.zig").DynamicTable;
+/// Runtime column descriptor; same predicate family as typed columns.
 pub const DynamicColumn = @import("dsl/column.zig").DynamicColumn;
+/// Borrowed handle to one attached schema; connection must outlive it.
 pub const SchemaHandle = @import("dsl/dynamic.zig").SchemaHandle;
+/// Build a typed column value for descriptor-form table specs.
 pub const column = @import("dsl/column.zig").column;
+/// Start a searched CASE builder (`caseWhen(cond, result)`).
 pub const caseWhen = @import("dsl/column.zig").caseWhen;
+/// Start a simple CASE builder dispatching on a column (`caseValue(col)`).
 pub const caseValue = @import("dsl/column.zig").caseValue;
+/// `row_number()` window handle.
 pub const rowNumber = @import("dsl/column.zig").rowNumber;
+/// `rank()` window handle.
 pub const rank = @import("dsl/column.zig").rank;
+/// `dense_rank()` window handle.
 pub const denseRank = @import("dsl/column.zig").denseRank;
+/// `percent_rank()` window handle.
 pub const percentRank = @import("dsl/column.zig").percentRank;
+/// `cume_dist()` window handle.
 pub const cumeDist = @import("dsl/column.zig").cumeDist;
+/// `ntile(n)` window handle.
 pub const ntile = @import("dsl/column.zig").ntile;
+/// `lag(col)` window handle.
 pub const lag = @import("dsl/column.zig").lag;
+/// `lead(col)` window handle.
 pub const lead = @import("dsl/column.zig").lead;
+/// `first_value(col)` window handle.
 pub const firstValue = @import("dsl/column.zig").firstValue;
+/// `last_value(col)` window handle.
 pub const lastValue = @import("dsl/column.zig").lastValue;
+/// `nth_value(col, n)` window handle.
 pub const nthValue = @import("dsl/column.zig").nthValue;
+/// `UNBOUNDED PRECEDING` frame bound.
 pub const unboundedPreceding = @import("dsl/column.zig").unboundedPreceding;
+/// `<offset> PRECEDING` frame bound.
 pub const preceding = @import("dsl/column.zig").preceding;
+/// `CURRENT ROW` frame bound.
 pub const currentRow = @import("dsl/column.zig").currentRow;
+/// `<offset> FOLLOWING` frame bound.
 pub const following = @import("dsl/column.zig").following;
+/// `UNBOUNDED FOLLOWING` frame bound.
 pub const unboundedFollowing = @import("dsl/column.zig").unboundedFollowing;
+/// Migration namespace: `Migration` (borrowed def), `Set` (borrowed list),
+/// `Runner` (borrowed applier). Connection must outlive runner calls.
 pub const migration = struct {
     pub const Migration = @import("migration/migration.zig").Migration;
     pub const Set = @import("migration/migration.zig").Set;
     pub const Runner = @import("migration/runner.zig").Runner;
 };
+/// Library version info.
 pub const version = @import("version.zig");
 
 test {
@@ -74,8 +141,6 @@ test {
     _ = @import("migration/runner.zig");
     _ = @import("catalog/schema.zig");
     _ = @import("catalog/type_affinity.zig");
-    _ = @import("catalog/table_def.zig");
-    _ = @import("catalog/index_def.zig");
     _ = @import("btree/btree.zig");
     _ = @import("btree/cursor.zig");
     _ = @import("btree/index_btree.zig");
@@ -85,6 +150,8 @@ test {
     _ = @import("plan/optimizer.zig");
     _ = @import("txn/transaction.zig");
     _ = @import("txn/locking.zig");
+    _ = @import("connection/pattern.zig");
+    _ = @import("connection/compare.zig");
     _ = @import("version.zig");
 }
 

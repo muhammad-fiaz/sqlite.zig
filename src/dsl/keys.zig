@@ -1,3 +1,43 @@
+//! Key and constraint normalization for typed/dynamic table definitions.
+//!
+//! Purpose: funnel every user-facing key shape — a single typed column, a
+//! `DynamicColumn`, a bare name string, a tuple, an array, or a slice — into
+//! canonical borrowed name lists (`normalizeKey`), foreign-key specs
+//! (`parseFkSpec`), and expected-key sets (`ExpectedKeys`) validated against a
+//! live `catalog/schema.zig` table (`validateKeys`).
+//!
+//! Responsibilities: key-shape normalization, FK reference parsing, Zig-type
+//! to SQL-type mapping (`dslTypeName`), default-value extraction
+//! (`zigDefault`), affinity compatibility (`affinitiesCompatible`), and
+//! PK/UNIQUE/FK drift checks.
+//!
+//! Dependencies: `sql/ast.zig` (referential actions), `catalog/schema.zig`
+//! (read-only validation target), `dsl/column.zig` (column descriptors).
+//!
+//! Ownership/lifetime: all outputs borrow the inputs. `normalizeKey` writes
+//! borrowed `[]const u8` slices into the caller's `out` buffer; `parseFkSpec`
+//! and `ExpectedKeys` likewise retain no memory. The caller must keep the
+//! underlying column descriptors / name strings alive while the spec is used.
+//! Validation borrows both the schema table and the expected set.
+//!
+//! Error behavior: wrong-table columns yield `error.UnknownColumn`; empty or
+//! oversized key lists yield `error.InvalidSql`; drift yields
+//! `error.SchemaMismatch`. Shape misuse that can be detected at comptime
+//! (e.g. FK struct without `.references`) is a `@compileError`.
+//!
+//! SQLite compatibility: name comparison is ASCII case-insensitive throughout
+//! (SQLite identifiers are case-insensitive). Affinity compatibility treats
+//! NUMERIC as interchangeable with INTEGER/REAL, matching SQLite's flexible
+//! typing; TEXT/BLOB never coerce.
+//!
+//! Unified pipeline note: keys describe catalog state, not queries. Raw SQL,
+//! dynamic DSL, and typed DSL all converge on the same native AST/IR; key
+//! specs never render SQL strings.
+//!
+//! Column/operation collision rule: key inputs accept column descriptors as
+//! values (`User.where`) or bare strings; operations remain calls
+//! (`User.all()`), so columns named `all`/`count`/`where` stay addressable.
+
 const std = @import("std");
 const ast = @import("../sql/ast.zig");
 const Value = @import("../vm/value.zig").Value;
@@ -5,13 +45,17 @@ const schemaMod = @import("../catalog/schema.zig");
 const dslColumn = @import("column.zig");
 const DynamicColumn = dslColumn.DynamicColumn;
 
+/// Re-exported referential action so table definitions need only import keys.
 pub const Action = ast.ReferentialAction;
 
+/// Comptime check for a typed column descriptor (`Column(...)` instance).
 pub fn isDslColumn(comptime T: type) bool {
     if (@typeInfo(T) != .@"struct") return false;
     return @hasDecl(T, "isDslColumn") and T.isDslColumn;
 }
 
+/// Dereference a `*[_][]const u8`-style single-pointer key list; otherwise
+/// return the value unchanged. Used so callers may pass `&pair` or `pair`.
 pub fn derefItems(list: anytype) Derefed(@TypeOf(list)) {
     const one = comptime isOnePointer(@TypeOf(list));
     if (one) return list.*;
@@ -29,6 +73,8 @@ fn isOnePointer(comptime T: type) bool {
     return info == .pointer and info.pointer.size == .one;
 }
 
+/// True for `[]const u8`, `[]u8`, `*[N]u8`-style string-likes (slices and
+/// single pointers to u8 arrays). Used to recognize bare name key items.
 pub fn isStringLike(comptime T: type) bool {
     if (T == []const u8 or T == []u8) return true;
     const info = @typeInfo(T);
@@ -42,6 +88,8 @@ pub fn isStringLike(comptime T: type) bool {
     return false;
 }
 
+/// Borrow the caller's string as a column name. Accepts slices and
+/// `*const [N]u8`; anything else is a comptime error. Never allocates.
 pub fn coerceName(value: anytype) []const u8 {
     const T = @TypeOf(value);
     if (T == []const u8 or T == []u8) return value;
@@ -57,6 +105,7 @@ pub fn coerceName(value: anytype) []const u8 {
     @compileError("expected a column-name string");
 }
 
+/// Borrowed SQL column name of a key item (typed/dynamic column or string).
 pub fn colNameOf(c: anytype) []const u8 {
     const T = @TypeOf(c);
     if (T == DynamicColumn) return dslColumn.dynRef(c).name;
@@ -64,6 +113,7 @@ pub fn colNameOf(c: anytype) []const u8 {
     return coerceName(c);
 }
 
+/// Borrowed owning-table qualifier of a key item, or `""` for bare strings.
 pub fn colTableOf(c: anytype) []const u8 {
     const T = @TypeOf(c);
     if (T == DynamicColumn) return dslColumn.dynRef(c).table;
@@ -76,6 +126,10 @@ fn checkKeyTable(c: anytype, expectedTable: []const u8) !void {
     if (t.len != 0 and !std.ascii.eqlIgnoreCase(t, expectedTable)) return error.UnknownColumn;
 }
 
+/// Normalize one key (single or composite) into borrowed names in `out`.
+/// Returns the count written (max 16). `expectedTable` guards cross-table
+/// mixing; bare strings skip the check. Errors: `UnknownColumn` on table
+/// mismatch, `InvalidSql` on empty/oversized lists.
 pub fn normalizeKey(key: anytype, expectedTable: []const u8, out: *[16][]const u8) !usize {
     const T = @TypeOf(key);
     const isSingle = comptime (T == DynamicColumn or isDslColumn(T) or isStringLike(T));
@@ -106,6 +160,8 @@ pub fn normalizeKey(key: anytype, expectedTable: []const u8, out: *[16][]const u
     return count;
 }
 
+/// Normalized foreign-key spec. All name/table slices are borrowed from the
+/// caller's descriptors; `localCount`/`refCount` must agree.
 pub const ForeignKeySpec = struct {
     local: [16][]const u8 = undefined,
     localCount: usize = 0,
@@ -116,6 +172,8 @@ pub const ForeignKeySpec = struct {
     onUpdate: ast.ReferentialAction = .noAction,
 };
 
+/// Normalize `.{ .table, .column/.columns }`-style reference inputs plus
+/// tuple/array/slice reference lists into `(table, cols)`. Borrowed.
 fn normalizeRefList(ref: anytype, outTable: *[]const u8, outCols: *[16][]const u8) !usize {
     const R = @TypeOf(ref);
     if (R == DynamicColumn) {
@@ -170,6 +228,10 @@ fn normalizeRefList(ref: anytype, outTable: *[]const u8, outCols: *[16][]const u
     return count;
 }
 
+/// Parse `.{ .column/.columns, .references, .onDelete?, .onUpdate? }` into a
+/// `ForeignKeySpec`. `references` may be a typed column, a `DynamicColumn`
+/// with `table` set, a `.{ .table, .column/.columns }` struct, or a tuple of
+/// same-table typed columns. Borrowed; fails `InvalidSql` on count mismatch.
 pub fn parseFkSpec(fk: anytype, expectedTable: []const u8) !ForeignKeySpec {
     const F = @TypeOf(fk);
     const info = @typeInfo(F);
@@ -188,6 +250,8 @@ pub fn parseFkSpec(fk: anytype, expectedTable: []const u8) !ForeignKeySpec {
     return spec;
 }
 
+/// Map a Zig field type to its declared SQL type name (static literal).
+/// ints/bools -> INTEGER, floats -> REAL, u8 slices/arrays -> TEXT, else BLOB.
 pub fn dslTypeName(comptime T: type) []const u8 {
     const info = @typeInfo(T);
     if (info == .optional) return dslTypeName(info.optional.child);
@@ -216,12 +280,17 @@ fn defaultScalar(value: anytype) ?Value {
     };
 }
 
+/// Read a struct field's comptime default as a `Value` (borrowed text).
+/// Returns `null` when the field has no default or the type is unsupported.
+/// `ptr` must point at an `F`; null means "no default known".
 pub fn zigDefault(comptime F: type, ptr: ?*const anyopaque) ?Value {
     const p = ptr orelse return null;
     const v: *const F = @ptrCast(@alignCast(p));
     return defaultScalar(v.*);
 }
 
+/// Declared type name -> storage class (`INTEGER`/`TEXT`/`BLOB`/`REAL`/
+/// `NUMERIC`). Case-insensitive substring match mirroring `type_affinity`.
 pub fn affinityOf(typeName: []const u8) []const u8 {
     if (typeName.len == 0) return "BLOB";
     if (containsIgnoreCase(typeName, "INT")) return "INTEGER";
@@ -247,6 +316,8 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     return false;
 }
 
+/// NUMERIC is compatible with INTEGER/REAL in either direction; otherwise
+/// classes must match exactly (case-insensitive). TEXT never matches numbers.
 pub fn affinitiesCompatible(expected: []const u8, actual: []const u8) bool {
     const a = affinityOf(expected);
     const b = affinityOf(actual);
@@ -258,6 +329,8 @@ pub fn affinitiesCompatible(expected: []const u8, actual: []const u8) bool {
     return (aNum and bIntReal) or (bNum and aIntReal);
 }
 
+/// Compare optional default `Value`s: two missing/nulls match, int/real mix
+/// by numeric equality, texts by bytes. Anything else is unequal.
 pub fn sameDefault(expected: ?Value, actual: ?Value) bool {
     const eNull = expected == null or expected.? == .null;
     const aNull = actual == null or actual.? == .null;
@@ -277,8 +350,11 @@ pub fn sameDefault(expected: ?Value, actual: ?Value) bool {
     return false;
 }
 
+/// One composite UNIQUE group: borrowed names plus count.
 pub const UniqueGroup = struct { names: [16][]const u8 = undefined, count: usize = 0 };
 
+/// Expected key set accumulated by `parsePkInto`/`parseUniqueInto`/
+/// `parseFksInto` and checked by `validateKeys`. All slices borrowed.
 pub const ExpectedKeys = struct {
     hasPk: bool = false,
     pk: [16][]const u8 = undefined,
@@ -293,11 +369,14 @@ pub const ExpectedKeys = struct {
     fkCount: usize = 0,
 };
 
+/// Record the expected primary key. Overwrites any previous expectation.
 pub fn parsePkInto(src: anytype, tableName: []const u8, expected: *ExpectedKeys) !void {
     expected.hasPk = true;
     expected.pkCount = try normalizeKey(src, tableName, &expected.pk);
 }
 
+/// Record expected UNIQUEs: singles go to `uniqueSingles`, composites to
+/// `uniqueGroups`. Accumulates across calls; sets `hasUnique`.
 pub fn parseUniqueInto(src: anytype, tableName: []const u8, expected: *ExpectedKeys) !void {
     const items = derefItems(src);
     const info = @typeInfo(@TypeOf(items));
@@ -328,6 +407,8 @@ fn addUniqueItem(item: anytype, tableName: []const u8, expected: *ExpectedKeys) 
     expected.uniqueGroupCount += 1;
 }
 
+/// Record expected foreign keys (tuple/slice/array of FK structs).
+/// Accumulates into `fks`; sets `hasFks`.
 pub fn parseFksInto(src: anytype, tableName: []const u8, expected: *ExpectedKeys) !void {
     const items = derefItems(src);
     const info = @typeInfo(@TypeOf(items));
@@ -362,6 +443,8 @@ fn namesEqual(a: []const []const u8, b: []const []const u8) bool {
     return true;
 }
 
+/// Canonical primary-key column names of a live table (borrowed), from the
+/// table constraint first, else from column `primaryKey` flags.
 pub fn actualPk(table: *const schemaMod.Table, out: *[16][]const u8) usize {
     for (table.constraints) |*c| {
         if (c.kind != .primaryKey) continue;
@@ -383,6 +466,9 @@ pub fn actualPk(table: *const schemaMod.Table, out: *[16][]const u8) usize {
     return n;
 }
 
+/// Check the expected PK/UNIQUE/FK set against a live catalog table.
+/// Only declared aspects are checked (unset `has*` flags are skipped).
+/// Returns `error.SchemaMismatch` on any drift; borrows both inputs.
 pub fn validateKeys(table: *const schemaMod.Table, expected: *const ExpectedKeys) !void {
     if (expected.hasPk) {
         var actual: [16][]const u8 = undefined;
@@ -433,6 +519,8 @@ pub fn validateKeys(table: *const schemaMod.Table, expected: *const ExpectedKeys
     }
 }
 
+/// One-shot bipartite match of an actual FK against unmatched expectations.
+/// Marks the slot on success so each expectation matches at most once.
 fn matchFk(expected: *const ExpectedKeys, matched: *[8]bool, local: []const []const u8, refTable: []const u8, refCols: []const []const u8, onDelete: ast.ReferentialAction, onUpdate: ast.ReferentialAction) bool {
     for (expected.fks[0..expected.fkCount], 0..) |*fk, i| {
         if (matched[i]) continue;
@@ -530,4 +618,26 @@ test "zig type mapping documents the storage contract" {
         if (std.mem.eql(u8, field.name, "o")) try std.testing.expect(got == null);
         if (std.mem.eql(u8, field.name, "b")) try std.testing.expect(got.?.integer == 1);
     }
+}
+
+test "collision-free key items accept operation-named columns" {
+    const All = dslColumn.Column("t", "all", []const u8);
+    const Count = dslColumn.Column("t", "count", i64);
+    const Where = dslColumn.Column("t", "where", []const u8);
+    var buf: [16][]const u8 = undefined;
+    // Schema fields stay valid key inputs even when named like operations.
+    try std.testing.expectEqual(@as(usize, 1), try normalizeKey(All{}, "t", &buf));
+    try std.testing.expectEqualStrings("all", buf[0]);
+    const pair = .{ Count{}, Where{} };
+    try std.testing.expectEqual(@as(usize, 2), try normalizeKey(&pair, "t", &buf));
+    try std.testing.expectEqualStrings("where", buf[1]);
+    var expected = ExpectedKeys{};
+    try parsePkInto(All{}, "t", &expected);
+    try std.testing.expect(expected.hasPk and expected.pkCount == 1);
+    try parseUniqueInto(.{All{}}, "t", &expected);
+    try std.testing.expectEqual(@as(usize, 1), expected.uniqueSingleCount);
+    // Overflow is a hard error, not silent truncation.
+    var big: [17][]const u8 = undefined;
+    for (&big) |*s| s.* = "x";
+    try std.testing.expectError(error.InvalidSql, normalizeKey(big[0..], "t", &buf));
 }

@@ -1,3 +1,37 @@
+//! JSON1 SQL functions (`json`, `json_extract`, `json_object`, ...).
+//!
+//! Purpose: authoritative JSON implementations behind `functions.evalScalar`.
+//! Paths follow the `$.a.b[0]`Subset (`$"quoted"`, `[N]`, negative-from-end,
+//! `[#N]` legacy form); values convert between `std.json.Value` and SQL
+//! `Value` (bool <-> 1/0, array/object <-> canonical text).
+//!
+//! Responsibilities: path parsing, pointed lookup, `set`/`insert`/`replace`
+//! modification, `remove`, and constructors (`json_array`, `json_object`).
+//!
+//! Dependencies: `std.json`, `../../vm/value.zig` only.
+//!
+//! Ownership/lifetime: inputs borrowed; text outputs heap-owned by the caller.
+//! Internal `std.json` trees live in a function-local arena freed on return;
+//! `PathStep.key` slices borrow the path text, `steps` arrays are freed by
+//! the caller of `parsePath`.
+//!
+//! Error behavior: malformed JSON or path mismatches yield `.null` (never an
+//! error) except `json_object` with odd arity (`InvalidArgumentCount`) or
+//! non-text keys (`InvalidArgument`). OOM propagates.
+//!
+//! Invariants: `getPath` never mutates; `setPath`/`removePath` silently ignore
+//! type mismatches (SQLite-compatible no-op); negative indexes count from end.
+//!
+//! SQLite compatibility: subset — `->`/`->>` operators are parser-level,
+//! JSON5 extensions unsupported, `[#N]` maps toward end-anchored indexes.
+// TODO(sql/json): nested-document recursion (`cloneJson`, `std.json` parse)
+// has no explicit depth cap; hostile 10k-deep `[..]` can stack-overflow.
+// Expected: depth-limited parse/clone failing closed to NULL; tests: deep
+// nesting returns NULL instead of crashing. Subsystem: sql/functions.
+// TODO(sql/json): no document-size cap; a multi-MB hostile JSON arg can OOM
+// the arena. Expected: shared input-size budget with lexer/parser; tests:
+// over-limit JSON arg yields NULL. Subsystem: sql/functions.
+
 const std = @import("std");
 const Value = @import("../../vm/value.zig").Value;
 
@@ -154,6 +188,7 @@ fn getPath(root: std.json.Value, steps: []const PathStep) ?std.json.Value {
     return cur;
 }
 
+/// `json_set`/`json_insert`/`json_replace` write modes.
 pub const ModifyMode = enum { set, insert, replace };
 
 fn setPath(arena: std.mem.Allocator, root: *std.json.Value, steps: []const PathStep, newVal: std.json.Value, mode: ModifyMode) !void {
@@ -260,6 +295,7 @@ fn removePath(root: *std.json.Value, steps: []const PathStep) void {
     }
 }
 
+/// `json(X)`: canonical minified JSON text, or NULL for non-text/NULL/bad JSON.
 pub fn evalJson(allocator: std.mem.Allocator, arg: Value) !Value {
     if (arg == .null or arg != .text) return .null;
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, arg.text, .{}) catch return .null;
@@ -268,6 +304,7 @@ pub fn evalJson(allocator: std.mem.Allocator, arg: Value) !Value {
     return .{ .text = str };
 }
 
+/// `json_valid(X)`: 1 when X is well-formed JSON text, else 0 (never NULL).
 pub fn evalJsonValid(allocator: std.mem.Allocator, arg: Value) Value {
     if (arg == .null or arg != .text) return .{ .integer = 0 };
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, arg.text, .{}) catch return .{ .integer = 0 };
@@ -275,6 +312,7 @@ pub fn evalJsonValid(allocator: std.mem.Allocator, arg: Value) Value {
     return .{ .integer = 1 };
 }
 
+/// `json_type(X[,path])`: `null|true|false|integer|real|text|array|object` or NULL.
 pub fn evalJsonType(allocator: std.mem.Allocator, args: []const Value) !Value {
     if (args.len == 0 or args[0] == .null or args[0] != .text) return .null;
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, args[0].text, .{}) catch return .null;
@@ -288,6 +326,8 @@ pub fn evalJsonType(allocator: std.mem.Allocator, args: []const Value) !Value {
     return .{ .text = try allocator.dupe(u8, jsonTypeString(parsed.value)) };
 }
 
+/// `json_extract(X,paths...)`: scalar SQL value for one path, JSON array text for N paths.
+/// Missing paths yield NULL (single) or JSON null elements (multi).
 pub fn evalJsonExtract(allocator: std.mem.Allocator, args: []const Value) !Value {
     if (args.len < 2 or args[0] == .null or args[0] != .text) return .null;
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, args[0].text, .{}) catch return .null;
@@ -320,6 +360,7 @@ pub fn evalJsonExtract(allocator: std.mem.Allocator, args: []const Value) !Value
     return .{ .text = resStr };
 }
 
+/// `json_array(v...)`: JSON array text; SQL values convert (text tries JSON parse first).
 pub fn evalJsonArray(allocator: std.mem.Allocator, args: []const Value) !Value {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -333,6 +374,7 @@ pub fn evalJsonArray(allocator: std.mem.Allocator, args: []const Value) !Value {
     return .{ .text = resStr };
 }
 
+/// `json_object(k,v...)`: JSON object text; odd arity errors, non-text keys error.
 pub fn evalJsonObject(allocator: std.mem.Allocator, args: []const Value) !Value {
     if (args.len % 2 != 0) return error.InvalidArgumentCount;
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -351,6 +393,8 @@ pub fn evalJsonObject(allocator: std.mem.Allocator, args: []const Value) !Value 
     return .{ .text = resStr };
 }
 
+/// `json_set/insert/replace(X,path,val...)`: modified JSON text; bad pairs skipped.
+/// NULL/non-text base or bad JSON yields NULL.
 pub fn evalJsonModify(allocator: std.mem.Allocator, args: []const Value, mode: ModifyMode) !Value {
     if (args.len < 3 or args[0] == .null or args[0] != .text) return .null;
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -373,6 +417,8 @@ pub fn evalJsonModify(allocator: std.mem.Allocator, args: []const Value, mode: M
     return .{ .text = resStr };
 }
 
+/// `json_remove(X,paths...)`: JSON text with pointed values deleted.
+/// NULL/non-text base or bad JSON yields NULL; bad paths skipped.
 pub fn evalJsonRemove(allocator: std.mem.Allocator, args: []const Value) !Value {
     if (args.len < 2 or args[0] == .null or args[0] != .text) return .null;
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -389,4 +435,59 @@ pub fn evalJsonRemove(allocator: std.mem.Allocator, args: []const Value) !Value 
     }
     const resStr = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(root, .{})});
     return .{ .text = resStr };
+}
+
+test "json normal behavior" {
+    const alloc = std.testing.allocator;
+    const ok = try evalJson(alloc, .{ .text = "{\"a\":1}" });
+    defer ok.free(alloc);
+    try std.testing.expect(ok == .text);
+    try std.testing.expectEqual(@as(i64, 1), evalJsonValid(alloc, .{ .text = "[1,2]" }).integer);
+    try std.testing.expectEqual(@as(i64, 0), evalJsonValid(alloc, .{ .text = "{bad" }).integer);
+    const ty = try evalJsonType(alloc, &.{ .{ .text = "{\"a\":[1,2]}" }, .{ .text = "$.a" } });
+    defer ty.free(alloc);
+    try std.testing.expectEqualStrings("array", ty.text);
+    const ex = try evalJsonExtract(alloc, &.{ .{ .text = "{\"a\":{\"b\":42}}" }, .{ .text = "$.a.b" } });
+    defer ex.free(alloc);
+    try std.testing.expectEqual(@as(i64, 42), ex.integer);
+    const arr = try evalJsonArray(alloc, &.{ .{ .integer = 1 }, .{ .text = "x" } });
+    defer arr.free(alloc);
+    try std.testing.expectEqualStrings("[1,\"x\"]", arr.text);
+    const obj = try evalJsonObject(alloc, &.{ .{ .text = "k" }, .{ .integer = 1 } });
+    defer obj.free(alloc);
+    try std.testing.expectEqualStrings("{\"k\":1}", obj.text);
+}
+
+test "json null empty and boundary" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect((try evalJson(alloc, .null)) == .null);
+    try std.testing.expect((try evalJson(alloc, .{ .integer = 1 })) == .null);
+    try std.testing.expect((try evalJson(alloc, .{ .text = "" })) == .null);
+    try std.testing.expect((try evalJsonExtract(alloc, &.{ .{ .text = "{\"a\":1}" }, .{ .text = "$.missing" } })) == .null);
+    // Negative index counts from end.
+    const last = try evalJsonExtract(alloc, &.{ .{ .text = "[1,2,3]" }, .{ .text = "$[-1]" } });
+    defer last.free(alloc);
+    try std.testing.expectEqual(@as(i64, 3), last.integer);
+    const empty_arr = try evalJsonArray(alloc, &.{});
+    defer empty_arr.free(alloc);
+    try std.testing.expectEqualStrings("[]", empty_arr.text);
+    // set/insert/replace modes differ on existing keys.
+    const base = Value{ .text = "{\"a\":1}" };
+    const set = try evalJsonModify(alloc, &.{ base, .{ .text = "$.a" }, .{ .integer = 2 } }, .set);
+    defer set.free(alloc);
+    try std.testing.expectEqualStrings("{\"a\":2}", set.text);
+    const ins = try evalJsonModify(alloc, &.{ base, .{ .text = "$.a" }, .{ .integer = 2 } }, .insert);
+    defer ins.free(alloc);
+    try std.testing.expectEqualStrings("{\"a\":1}", ins.text);
+    const rem = try evalJsonRemove(alloc, &.{ base, .{ .text = "$.a" } });
+    defer rem.free(alloc);
+    try std.testing.expectEqualStrings("{}", rem.text);
+}
+
+test "json error behavior" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.InvalidArgumentCount, evalJsonObject(alloc, &.{.{ .text = "k" }}));
+    try std.testing.expectError(error.InvalidArgument, evalJsonObject(alloc, &.{ .{ .integer = 1 }, .{ .integer = 2 } }));
+    try std.testing.expect((try evalJsonModify(alloc, &.{ .{ .text = "{bad" }, .{ .text = "$.a" }, .{ .integer = 1 } }, .set)) == .null);
+    try std.testing.expect((try evalJsonRemove(alloc, &.{.null})) == .null);
 }

@@ -1,3 +1,45 @@
+//! SQL parser: tokens -> owned `ast.zig` statements (pipeline stage 2).
+//!
+//! Purpose: recursive-descent frontend accepting the SQLite surface used by
+//! `connection.zig` (DDL/DML/queries, pragmas, CTEs, compound selects, window
+//! specs, RETURNING, upserts). This is the only SQL-string entry point; DSL
+//! builders in `src/dsl/` construct native AST directly and never format SQL.
+//!
+//! Responsibilities: single-statement parse with fail-closed errors,
+//! source-slice retention for lazily re-parsed bodies (views, CTEs,
+//! subqueries, trigger bodies), and arena tracking of owned copies.
+//!
+//! Dependencies: `token.zig`, `lexer.zig`, `ast.zig`, `../vm/value.zig`.
+//! Callers own the returned `Statement` and free it with `ast.deinit`, then
+//! free the parser itself with `Parser.deinit` (which releases the token
+//! slice and all `copy()` allocations).
+//!
+//! Ownership/lifetime: string slices in the AST borrow `source` or the
+//! parser's `allocations` list; expression nodes are heap-owned. `parse()`
+//! consumes exactly one statement plus an optional `;` and rejects trailing
+//! tokens. On error, partially built state is freed via `errdefer` paths.
+//!
+//! Error behavior: `InvalidSql` for grammatically invalid input,
+//! `UnexpectedToken` for a wrong token at a valid position, `Unsupported`
+//! for recognized-but-unimplemented syntax. Lexer/alloc/parse-int/float
+//! errors are unioned into `Error`. Malformed input never yields a partial AST.
+//!
+//! Invariants: `tokens` always ends in `.eof`; `index <= tokens.len`;
+//! `nextParameter` counts anonymous `?` placeholders; nesting depth is capped
+//! by `max_parse_depth` so hostile `((((...))))` fails closed with
+//! `InvalidSql` instead of overflowing the stack.
+//!
+//! SQLite compatibility: quoted keywords are identifiers; `==`/`<>` accepted;
+//! multi-word type names, `CAST(x AS DOUBLE PRECISION)`, rowid aliases,
+//! `INSERT OR ...`, `UPDATE OR ...`, `ON CONFLICT`, `RETURNING`, `STRICT` and
+//! `WITHOUT ROWID` accepted; branch `ORDER BY` allowed only on the final
+//! compound arm.
+// TODO(sql/parser): allocation is O(input) but uncapped (VALUES lists, CTE
+// chains, IN lists); add a shared SQLITE_LIMIT_* budget (variables, columns,
+// compound arms) with `connection.zig`. Expected: one limits unit + error;
+// tests: hostile 100k-element IN list rejected, boundary accepted.
+// Subsystem: sql/frontend.
+
 const std = @import("std");
 const Token = @import("token.zig").Token;
 const Tag = @import("token.zig").Tag;
@@ -93,20 +135,37 @@ fn freeParserExpr(allocator: std.mem.Allocator, expr: ast.Expr) void {
         else => {},
     }
 }
+/// Parser failure modes: grammar errors plus unioned lexer/allocator errors.
 pub const Error = error{ InvalidSql, UnexpectedToken, OutOfMemory, Unsupported } || std.mem.Allocator.Error || lexer.Error || std.fmt.ParseIntError || std.fmt.ParseFloatError;
 
-pub const Parser = struct {
-    allocator: std.mem.Allocator,
-    source: []const u8,
-    tokens: []Token,
-    index: usize = 0,
-    nextParameter: usize = 1,
-    allocations: std.ArrayList([]const u8),
+/// Maximum nesting depth for expressions/subqueries; hostile input fails closed.
+pub const max_parse_depth: usize = 200;
 
+/// Single-statement recursive-descent parser over a token slice.
+pub const Parser = struct {
+    /// Allocator for tokens, AST nodes, and retained string copies.
+    allocator: std.mem.Allocator,
+    /// Original SQL text; AST slices borrow it (must outlive parse+use).
+    source: []const u8,
+    /// Token stream ending in `.eof`, owned by the parser.
+    tokens: []Token,
+    /// Cursor into `tokens`.
+    index: usize = 0,
+    /// Next anonymous `?` parameter number (1-based).
+    nextParameter: usize = 1,
+    /// Owned string copies + blobs retained until `deinit`.
+    allocations: std.ArrayList([]const u8),
+    /// Current expression nesting depth (guarded by `max_parse_depth`).
+    depth: usize = 0,
+
+    /// Tokenize `sql` and return a parser; caller must call `deinit`.
+    /// Fails closed on lexer errors with no parser to clean up.
     pub fn init(allocator: std.mem.Allocator, sql: []const u8) !Parser {
         return .{ .allocator = allocator, .source = sql, .tokens = try lexer.tokenize(allocator, sql), .allocations = .empty };
     }
 
+    /// Release the token slice and every retained `copy()` allocation.
+    /// Must be called after the AST has been freed with `ast.deinit`.
     pub fn deinit(self: *Parser) void {
         self.allocator.free(self.tokens);
         for (self.allocations.items) |allocation| self.allocator.free(allocation);
@@ -180,6 +239,25 @@ pub const Parser = struct {
         return result;
     }
 
+    /// Copy a `'...'` string literal, collapsing SQLite `''` escapes to `'`.
+    /// The lexer preserves the raw interior (e.g. `A''B`); the AST must hold
+    /// the unescaped value (`A'B`) so stored data round-trips correctly.
+    fn copyStringLiteral(self: *Parser, raw: []const u8) ![]const u8 {
+        if (std.mem.indexOf(u8, raw, "''") == null) return self.copy(raw);
+        var out = try self.allocator.alloc(u8, raw.len);
+        errdefer self.allocator.free(out);
+        var w: usize = 0;
+        var i: usize = 0;
+        while (i < raw.len) : (i += 1) {
+            out[w] = raw[i];
+            w += 1;
+            if (raw[i] == '\'' and i + 1 < raw.len and raw[i + 1] == '\'') i += 1;
+        }
+        const shrunk = try self.allocator.realloc(out, w);
+        try self.allocations.append(self.allocator, shrunk);
+        return shrunk;
+    }
+
     fn signedPragmaValue(self: *Parser, sign: []const u8, text: []const u8) ![]const u8 {
         const combined = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ sign, text });
         defer self.allocator.free(combined);
@@ -194,6 +272,8 @@ pub const Parser = struct {
         };
     }
 
+    /// Parse exactly one statement plus optional `;`; reject trailing tokens.
+    /// Returns an AST the caller owns (`ast.deinit`); on error nothing leaks.
     pub fn parse(self: *Parser) !ast.Statement {
         var statement: ast.Statement = undefined;
         if (self.acceptWord("pragma")) {
@@ -215,7 +295,7 @@ pub const Parser = struct {
                     defer self.allocator.free(combined);
                     pragmaArgument = try self.copy(combined);
                 } else {
-                    pragmaArgument = token.text;
+                    pragmaArgument = if (token.tag == .string) try self.copyStringLiteral(token.text) else token.text;
                 }
                 try self.requireTag(.rparen);
             } else if (self.acceptTag(.equal)) {
@@ -229,7 +309,7 @@ pub const Parser = struct {
                 } else {
                     if (token.tag != .word and token.tag != .number and token.tag != .string) return Error.UnexpectedToken;
                     _ = self.advance();
-                    pragmaValue = token.text;
+                    pragmaValue = if (token.tag == .string) try self.copyStringLiteral(token.text) else token.text;
                 }
             }
             statement = .{ .pragma = .{ .name = pragmaName, .value = pragmaValue, .argument = pragmaArgument, .schema = pragmaSchema } };
@@ -922,7 +1002,7 @@ pub const Parser = struct {
         }
         if (token.tag == .string) {
             _ = self.advance();
-            return .{ .literal = .{ .text = token.text } };
+            return .{ .literal = .{ .text = try self.copyStringLiteral(token.text) } };
         }
         if (self.acceptWord("null")) return .{ .literal = .null };
         if (self.acceptWord("true")) return .{ .literal = .{ .integer = 1 } };
@@ -1052,6 +1132,9 @@ pub const Parser = struct {
     }
 
     fn parseExpr(self: *Parser) Error!ast.Expr {
+        if (self.depth >= max_parse_depth) return Error.InvalidSql;
+        self.depth += 1;
+        defer self.depth -= 1;
         return self.parseOr();
     }
 
@@ -2526,4 +2609,76 @@ test "parser treats quoted keywords as identifiers" {
     defer ast.deinit(std.testing.allocator, &quotedAliasStmt);
     try std.testing.expectEqualStrings("where", quotedAliasStmt.select.projections[0].alias.?);
     try std.testing.expectEqualStrings("limit", quotedAliasStmt.select.projections[1].alias.?);
+}
+
+test "parser fails closed on malformed input" {
+    const bad = [_][]const u8{
+        "SELECT;",
+        "SELECT * FROM;",
+        "SELECT * FROM t WHERE;",
+        "INSERT INTO t VALUES;",
+        "CREATE TABLE t (",
+        "SELECT 1 UNION;",
+        "SELECT (1;",
+        "SELECT CASE WHEN 1 THEN;",
+    };
+    for (bad) |sql| {
+        var p = try Parser.init(std.testing.allocator, sql);
+        defer p.deinit();
+        if (p.parse()) |stale| {
+            var owned = stale;
+            ast.deinit(std.testing.allocator, &owned);
+            return error.ExpectedParseFailure;
+        } else |_| {}
+    }
+    // Empty input is not a statement.
+    var empty = try Parser.init(std.testing.allocator, "");
+    defer empty.deinit();
+    if (empty.parse()) |stale| {
+        var owned = stale;
+        ast.deinit(std.testing.allocator, &owned);
+        return error.ExpectedParseFailure;
+    } else |_| {}
+    // Trailing garbage after a valid statement is rejected.
+    var extra = try Parser.init(std.testing.allocator, "SELECT 1; SELECT 2;");
+    defer extra.deinit();
+    try std.testing.expectError(Error.UnexpectedToken, extra.parse());
+    // Unterminated string surfaces the lexer error, not a partial AST.
+    // Note: the lexer rejects it inside Parser.init, so either stage may
+    // report UnterminatedString depending on where tokenization fails.
+    var unterminated = Parser.init(std.testing.allocator, "SELECT 'abc;") catch |err| {
+        try std.testing.expectEqual(Error.UnterminatedString, err);
+        return;
+    };
+    defer unterminated.deinit();
+    try std.testing.expectError(Error.UnterminatedString, unterminated.parse());
+}
+
+test "parser depth cap rejects hostile nesting fail-closed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const depth = max_parse_depth + 50;
+    var sql = std.ArrayList(u8).empty;
+    defer sql.deinit(alloc);
+    for (0..depth) |_| try sql.appendSlice(alloc, "(");
+    try sql.appendSlice(alloc, "1");
+    for (0..depth) |_| try sql.appendSlice(alloc, ")");
+    try sql.appendSlice(alloc, ";");
+    var p = try Parser.init(std.testing.allocator, sql.items);
+    defer p.deinit();
+    try std.testing.expectError(Error.InvalidSql, p.parse());
+}
+
+test "parser unescapes doubled single quotes in string literals" {
+    // Regression: the lexer preserves raw interiors (o''brien); the AST must
+    // hold the SQLite-unescaped value (o'brien) so stored data round-trips.
+    var p = try Parser.init(std.testing.allocator, "SELECT 'o''brien';");
+    defer p.deinit();
+    var stmt = try p.parse();
+    defer ast.deinit(std.testing.allocator, &stmt);
+    try std.testing.expect(stmt == .select);
+    const proj = stmt.select.projections[0];
+    try std.testing.expect(proj.expr == .literal);
+    try std.testing.expectEqualStrings("o'brien", proj.expr.literal.text);
 }

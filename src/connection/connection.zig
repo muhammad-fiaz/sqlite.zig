@@ -1,3 +1,44 @@
+//! Engine facade: `Connection` — SQL execution over file-backed schema state.
+//!
+//! Purpose: own the database handle and implement the full statement lifecycle:
+//! parse (`sql/parser`) -> resolve against `catalog/schema` -> plan
+//! (`plan/planner`) -> execute (interpreter here + `vm` for compiled
+//! expressions) -> materialize owned `Result`s -> persist via `storage/*`.
+//! Responsibilities: DDL/DML/SELECT, transactions and savepoints, PRAGMAs,
+//! ATTACH/DETACH, VACUUM/ANALYZE, views/triggers/CTEs/compounds, constraints
+//! and foreign-key actions, and the Raw/Dynamic/Typed entry points which all
+//! converge on native AST/IR (never a DSL->SQL-string round trip).
+//!
+//! Dependencies: `storage/file` + `storage/sqlite_image` (persistence),
+//! `catalog/schema`, `sql/*`, `plan/*`, `vm/*`, `dsl/*`. Pure string-matching
+//! lives in `connection/pattern`; ordering bridges live in
+//! `connection/compare` (wiring in progress — see TODO).
+//!
+//! Ownership/lifetime (critical): the `Connection` owns the file handle, the
+//! main/temp/attached schemas, and transaction snapshots. `exec`/`query`
+//! return OWNED `Result`s (caller `deinit`s). `prepare` returns a `Statement`
+//! bound to this connection (finalize before close). `table`/`col` DSL handles
+//! borrow the connection. Cursors/pages borrowed during execution dangle after
+//! the statement completes. Close rolls back an open transaction, persists,
+//! and frees snapshots — never use the handle afterwards.
+//!
+//! Error behavior: structured `errors.Error` (syntax, schema, constraint,
+//! transaction, storage, corruption, I/O, Unsupported). Corrupt file bytes
+//! fail closed via `storage` validation; panics are reserved for caller bugs
+//! (use-after-close, out-of-range access), never for disk content.
+//!
+//! SQLite compatibility: file format, affinity, three-valued logic, FK
+//! actions, and transaction/savepoint semantics track SQLite; known deltas
+//! are documented at the owning helper with source-local TODOs.
+// TODO: Finish wiring connection execution through connection/pattern.zig and
+// connection/compare.zig so GLOB/REGEXP/MATCH and key-based row ordering have
+// one authoritative implementation. Current status: LIKE (like/likeWithEscape)
+// and ordering bridges (isNocase/compare/compareCollated/sameValue/rowsEqual)
+// already delegate to the new modules; GLOB/REGEXP/MATCH still call local
+// copies and compareRowsByKeys uses a local ResolvedSortKey while the module
+// exposes SortKey. Expected: unify the sort-key type and delegate the rest.
+// Required tests: GLOB/REGEXP/MATCH matrices through raw SQL and both DSLs
+// plus ORDER BY stability tests.
 const std = @import("std");
 const DatabaseFile = @import("../storage/file.zig").DatabaseFile;
 const image = @import("../storage/image.zig");
@@ -23,6 +64,8 @@ const keys = @import("../dsl/keys.zig");
 const planner = @import("../plan/planner.zig");
 const exprEvaluator = @import("../sql/expr.zig");
 const functions = @import("../sql/functions.zig");
+const patternLib = @import("pattern.zig");
+const compareBridge = @import("compare.zig");
 
 const maxTriggerDepth: usize = 64;
 
@@ -38,27 +81,46 @@ const ChainMerge = struct { pairs: []ChainMergePair, droppedRight: []bool };
 const MergeMember = struct { seg: usize, col: usize };
 const MergedGroup = struct { name: []const u8, members: std.ArrayList(MergeMember) };
 
+/// Open database handle owning the file, schemas, and transaction state.
+/// See module docs for the full ownership contract. Sections below group the
+/// implementation: lifecycle/persistence, schema resolution, raw execution,
+/// DSL bridges, DDL/DML, transactions/savepoints, PRAGMAs, and query
+/// evaluation (expression, SELECT/JOIN, compounds, triggers, FK actions).
+/// Private helpers document their own invariants; public entry points carry
+/// `///` docs stating ownership, errors, and SQLite notes.
 pub const Connection = struct {
+    /// Allocator for schemas, snapshots, AST copies, and owned results.
+    /// Must outlive the connection; results cloned from it dangle after close.
     allocator: std.mem.Allocator,
+    /// Backing database file (main schema). Closed by `close`.
     file: DatabaseFile,
+    /// Main-schema catalog (tables/indexes/views/triggers + rows).
     store: Schema,
+    /// TEMP-schema catalog, invisible to file persistence and ATTACH peers.
     tempStore: Schema,
+    /// ATTACHed databases in order; each owns its file + catalog.
     attached: std.ArrayList(AttachedDb) = .empty,
+    /// Transaction-level schema snapshots (rollback restores them).
     backup: ?Schema = null,
     tempBackup: ?Schema = null,
     attachedBackup: std.ArrayList(AttachedBackup) = .empty,
+    /// Per-statement atomic snapshots for constraint-rollback paths.
     statementBackup: ?Schema = null,
     tempStatementBackup: ?Schema = null,
     attachedStatementBackup: std.ArrayList(AttachedBackup) = .empty,
     inAtomicStatement: bool = false,
+    /// Active CTE names (recursion guard); trigger recursion state follows.
     activeCtes: std.ArrayList([]const u8) = .empty,
     recursiveTriggers: bool = false,
     triggerStack: std.ArrayList([]const u8) = .empty,
+    /// True inside BEGIN..COMMIT; savepoints nest inside it.
     transactionActive: bool = false,
     savepoints: std.ArrayList(Savepoint),
+    /// SQLite-compatible status: last rowid / changes / total changes.
     lastRowid: i64 = 0,
     lastChanges: i64 = 0,
     totalChanges: i64 = 0,
+    /// Diagnostics + PRAGMA-backed settings (cache_size, synchronous, ...).
     parseCount: usize = 0,
     cacheSize: i32 = -2000,
     synchronousLevel: u8 = 2,
@@ -66,6 +128,11 @@ pub const Connection = struct {
     lockingModeExclusive: bool = false,
     autoVacuum: u8 = 0,
 
+    /// Opens a database at `path`, creating it when absent.
+    ///
+    /// The returned handle owns the file and all schema state; call `close`
+    /// exactly once. Reopens persisted images (native payload or SQLite file
+    /// bytes); invalid images fail with `InvalidHeader`/decode errors.
     pub fn open(allocator: std.mem.Allocator, path: []const u8) !*Connection {
         const connection = try allocator.create(Connection);
         const file = DatabaseFile.open(allocator, path) catch |err| {
@@ -93,6 +160,9 @@ pub const Connection = struct {
         return connection;
     }
 
+    /// Closes the handle: rolls back an open transaction, persists schemas,
+    /// frees snapshots, temp/attached state, and the file, then destroys the
+    /// handle. Never use the connection afterwards; owned `Result`s dangle.
     pub fn close(self: *Connection) void {
         if (self.transactionActive) {
             self.rollback() catch {};
@@ -361,6 +431,9 @@ pub const Connection = struct {
         return null;
     }
 
+    /// Executes one raw-SQL statement and returns an OWNED `Result` (caller
+    /// `deinit`s). Unrestricted entry point — no struct needed. Errors are
+    /// structured (`InvalidSql`, `ConstraintViolation`, ...).
     pub fn exec(self: *Connection, sql: []const u8) !Result {
         var last: ?Result = null;
         errdefer if (last) |*result| result.deinit();
@@ -410,6 +483,8 @@ pub const Connection = struct {
         return last orelse error.InvalidSql;
     }
 
+    /// Prepares a parameterized statement bound to this connection. Caller must
+    /// `finalize` it before `close`; bindings are typed and owned copies.
     pub fn prepare(self: *Connection, sql: []const u8) !Prepared {
         return .{ .connection = self, .sql = try self.allocator.dupe(u8, sql), .allocator = self.allocator, .parameters = .empty, .executeFn = executePrepared, .queryFn = queryPrepared };
     }
@@ -427,6 +502,8 @@ pub const Connection = struct {
         return virtualMachine.execute(&compiled.program, compiled.columnNames);
     }
 
+    /// Typed/Dynamic query root: `db.from(User)` or `db.from(dynamicTable)`.
+    /// Returns a builder converging on native AST/IR (never SQL strings).
     pub fn from(self: *Connection, source: anytype) FromOut(@TypeOf(source)) {
         const T = @TypeOf(source);
         if (comptime T != type and @typeInfo(T) == .@"struct" and @hasDecl(T, "isDynamicTable")) {
@@ -446,18 +523,26 @@ pub const Connection = struct {
     }
 
     // The returned handle borrows this connection; do not use it after close.
+    /// Dynamic table handle for runtime table names (legacy/ad-hoc schemas).
+    /// Borrowed — resolves against this connection at execution time.
     pub fn table(self: *Connection, name: []const u8) DynamicTable {
         return DynamicTable.init(self.allocator, self, executeForDsl, executeCompoundForDsl, executeDerivedForDsl, "", name);
     }
 
+    /// Unqualified dynamic column sugar; resolved with SQLite name-resolution
+    /// rules. Ambiguous references are errors, never silent picks.
     pub fn col(_: *Connection, name: []const u8) DynamicColumn {
         return .{ .name = name };
     }
 
+    /// `excluded.<col>` reference for UPSERT DO UPDATE right-hand sides.
+    /// Valid only inside an upsert clause; otherwise `InvalidSql`.
     pub fn excluded(_: *Connection, name: []const u8) ExcludedColumn {
         return .{ .name = name };
     }
 
+    /// Schema API root: `db.schema(User).validate()` checks columns, types,
+    /// affinity, PK/UNIQUE/NOT NULL/defaults, FKs, indexes, STRICT/WITHOUT ROWID.
     pub fn schema(self: *Connection, source: anytype) SchemaTarget(@TypeOf(source)) {
         const T = @TypeOf(source);
         if (comptime keys.isStringLike(T)) {
@@ -478,6 +563,7 @@ pub const Connection = struct {
         return SchemaValidator(T);
     }
 
+    /// True when the typed or named table exists in the visible schemas.
     pub fn tableExists(self: *Connection, source: anytype) bool {
         const T = @TypeOf(source);
         if (comptime @import("../dsl/table.zig").isTableValue(T)) {
@@ -489,33 +575,41 @@ pub const Connection = struct {
         return self.store.find(source) != null;
     }
 
+    /// PRAGMA user_version getter (persisted in the file header).
     pub fn userVersion(self: *Connection) u32 {
         return self.file.getUserVersion();
     }
 
+    /// PRAGMA user_version setter; persisted on next write/sync.
     pub fn setUserVersion(self: *Connection, version: u32) !void {
         self.file.setUserVersion(version);
         try self.persistSchema(&self.file, &self.store);
     }
 
+    /// PRAGMA schema_version getter (schema cookie).
     pub fn schemaVersion(self: *Connection) u32 {
         return self.file.getSchemaVersion();
     }
 
+    /// PRAGMA schema_version setter; bumped automatically on DDL.
     pub fn setSchemaVersion(self: *Connection, version: u32) !void {
         self.file.setSchemaVersion(version);
         try self.persistSchema(&self.file, &self.store);
     }
 
+    /// PRAGMA application_id getter.
     pub fn applicationId(self: *Connection) u32 {
         return self.file.getApplicationId();
     }
 
+    /// PRAGMA application_id setter; persisted on next write/sync.
     pub fn setApplicationId(self: *Connection, id: u32) !void {
         self.file.setApplicationId(id);
         try self.persistSchema(&self.file, &self.store);
     }
 
+    /// Creates a table from a typed struct or dynamic spec (`IF NOT EXISTS` /
+    /// STRICT / WITHOUT ROWID / TEMP via options). Persists and bumps cookie.
     pub fn createTable(self: *Connection, target: anytype, options: anytype) !void {
         const T = @TypeOf(target);
         if (comptime @import("../dsl/table.zig").isTableValue(T)) {
@@ -768,6 +862,7 @@ pub const Connection = struct {
         return target;
     }
 
+    /// Drops a typed or named table plus its indexes/triggers; persists.
     pub fn dropTable(self: *Connection, target: anytype) !void {
         const tableName: []const u8 = targetTableName(target);
         try self.store.dropTable(tableName);
@@ -775,6 +870,7 @@ pub const Connection = struct {
         if (!self.transactionActive) try self.persist();
     }
 
+    /// Creates a (unique) index over listed columns; planned by `plan/planner`.
     pub fn createIndex(self: *Connection, target: anytype, name: []const u8, cols: anytype, unique: bool) !void {
         const tableName: []const u8 = targetTableName(target);
         var names: [16][]const u8 = undefined;
@@ -784,12 +880,14 @@ pub const Connection = struct {
         if (!self.transactionActive) try self.persist();
     }
 
+    /// Drops a named index; unknown names fail with `UnknownIndex`.
     pub fn dropIndex(self: *Connection, name: []const u8) !void {
         try self.store.dropIndex(name);
         self.bumpSchemaVersion();
         if (!self.transactionActive) try self.persist();
     }
 
+    /// Creates a partial index with a WHERE predicate (stored + planned).
     pub fn createIndexWhere(self: *Connection, target: anytype, name: []const u8, cols: anytype, unique: bool, whereSql: []const u8) !void {
         if (whereSql.len == 0) return error.InvalidSql;
         const tableName: []const u8 = targetTableName(target);
@@ -814,6 +912,7 @@ pub const Connection = struct {
         result.deinit();
     }
 
+    /// Creates an expression/partial index from key expressions + predicate.
     pub fn createIndexExpr(self: *Connection, target: anytype, name: []const u8, indexKeys: []const []const u8, unique: bool, whereSql: ?[]const u8) !void {
         if (indexKeys.len == 0) return error.InvalidSql;
         if (whereSql) |predicate| if (predicate.len == 0) return error.InvalidSql;
@@ -840,24 +939,30 @@ pub const Connection = struct {
         result.deinit();
     }
 
+    /// Creates a persistent view over stored SELECT text with dependency
+    /// tracking; nested/TEMP/aggregate/CTE views supported.
     pub fn createView(self: *Connection, name: []const u8, sql: []const u8) !void {
         try self.store.createView(name, sql);
         self.bumpSchemaVersion();
         if (!self.transactionActive) try self.persist();
     }
 
+    /// Drops a named view; unknown names fail with `UnknownView`.
     pub fn dropView(self: *Connection, name: []const u8) !void {
         try self.store.dropView(name);
         self.bumpSchemaVersion();
         if (!self.transactionActive) try self.persist();
     }
 
+    /// Drops a named trigger; unknown names fail with `UnknownTrigger`.
     pub fn dropTrigger(self: *Connection, name: []const u8) !void {
         try self.store.dropTrigger(name);
         self.bumpSchemaVersion();
         if (!self.transactionActive) try self.persist();
     }
 
+    /// Renames a table, keeping rows/indexes/triggers; visible under the new
+    /// name only. Persists and invalidates cached plans.
     pub fn renameTable(self: *Connection, target: anytype, newName: []const u8) !void {
         const tableName: []const u8 = targetTableName(target);
         try self.store.renameTable(tableName, newName);
@@ -865,12 +970,15 @@ pub const Connection = struct {
         if (!self.transactionActive) try self.persist();
     }
 
+    /// Deletes all rows quickly while keeping the schema object and indexes.
     pub fn truncate(self: *Connection, target: anytype) !void {
         const tableName: []const u8 = targetTableName(target);
         try self.store.truncateTable(tableName);
         if (!self.transactionActive) try self.persist();
     }
 
+    /// ALTER TABLE ADD COLUMN with backfill of defaults/NULLs; STRICT and
+    /// generated-column rules enforced.
     pub fn addColumn(self: *Connection, target: anytype, field: []const u8, FieldType: type) !void {
         const tableName: []const u8 = targetTableName(target);
         try self.store.addColumn(tableName, .{ .name = field, .typeName = keys.dslTypeName(FieldType) });
@@ -878,11 +986,13 @@ pub const Connection = struct {
         if (!self.transactionActive) try self.persist();
     }
 
+    /// Renames a column and rewrites dependent index/trigger metadata.
     pub fn renameColumn(self: *Connection, source: anytype, comptime oldName: []const u8, comptime newName: []const u8) !void {
         try self.store.renameColumn(targetTableName(source), oldName, newName);
         if (!self.transactionActive) try self.persist();
     }
 
+    /// Drops a column and rebuilds rows/indexes; PK/FK members are refused.
     pub fn dropColumn(self: *Connection, source: anytype, comptime field: []const u8) !void {
         try self.store.dropColumn(targetTableName(source), field);
         if (!self.transactionActive) try self.persist();
@@ -905,6 +1015,8 @@ pub const Connection = struct {
         return result;
     }
 
+    /// Comptime validator type returned by `schema()`; call `validate()` to
+    /// compare the declared struct against the stored catalog.
     pub fn SchemaValidator(comptime TableValueType: type) type {
         const tableMod = @import("../dsl/table.zig");
         const Row = if (comptime tableMod.isTableValue(TableValueType)) tableMod.rowTypeOfValue(TableValueType) else TableValueType.rowType;
@@ -963,18 +1075,23 @@ pub const Connection = struct {
         return self.execute(sql, parameters);
     }
 
+    /// BEGIN DEFERRED; fails `TransactionActive` when already in a transaction.
     pub fn begin(self: *Connection) !void {
         if (self.transactionActive) return error.TransactionActive;
         try self.snapshotSchemas();
         self.transactionActive = true;
     }
 
+    /// BEGIN IMMEDIATE (reserved write intent); see `begin` for errors.
     pub fn beginImmediate(self: *Connection) !void {
         try self.begin();
     }
+    /// BEGIN EXCLUSIVE; see `begin` for errors.
     pub fn beginExclusive(self: *Connection) !void {
         try self.begin();
     }
+    /// COMMITs the transaction (validates deferred FKs); `NotInTransaction`
+    /// outside one. Persists the image.
     pub fn commit(self: *Connection) !void {
         if (!self.transactionActive) return error.NotInTransaction;
         try self.persist();
@@ -982,6 +1099,7 @@ pub const Connection = struct {
         self.clearSavepoints();
         self.transactionActive = false;
     }
+    /// ROLLBACKs to the pre-transaction snapshot; `NotInTransaction` outside one.
     pub fn rollback(self: *Connection) !void {
         if (!self.transactionActive) return error.NotInTransaction;
         self.restoreSchemas();
@@ -1054,6 +1172,8 @@ pub const Connection = struct {
         return result;
     }
 
+    /// Runs `callback` in a transaction, committing on success and rolling back
+    /// on any error (savepoint-safe nesting included).
     pub fn transaction(self: *Connection, callback: anytype) !void {
         try self.begin();
         errdefer self.rollback() catch {};
@@ -1061,16 +1181,19 @@ pub const Connection = struct {
         try self.commit();
     }
 
+    /// SAVEPOINT checkpoint with schema snapshots for partial rollback.
     pub fn savepoint(self: *Connection, name: []const u8) !void {
         var result = try self.savepointCommand(name);
         result.deinit();
     }
 
+    /// RELEASEs (merges) a savepoint; unknown names fail.
     pub fn releaseSavepoint(self: *Connection, name: []const u8) !void {
         var result = try self.releaseCommand(name);
         result.deinit();
     }
 
+    /// ROLLBACK TO a savepoint, restoring its snapshots; unknown names fail.
     pub fn rollbackToSavepoint(self: *Connection, name: []const u8) !void {
         var result = try self.rollbackToCommand(name);
         result.deinit();
@@ -2990,84 +3113,15 @@ pub const Connection = struct {
     }
 
     fn isNocase(collate: ?[]const u8) bool {
-        if (collate) |name| return std.ascii.eqlIgnoreCase(name, "nocase");
-        return false;
+        return compareBridge.isNocase(collate);
     }
 
     fn compare(left: Value, op: ast.CompareOp, right: Value) bool {
-        return compareCollated(left, op, right, null);
+        return compareBridge.compare(left, op, right);
     }
 
     fn compareCollated(left: Value, op: ast.CompareOp, right: Value, collate: ?[]const u8) bool {
-        if (left == .null or right == .null) return false;
-        if (isNocase(collate)) {
-            if (left == .text and right == .text) {
-                var li: usize = 0;
-                var ri: usize = 0;
-                const l = left.text;
-                const r = right.text;
-                while (li < l.len and ri < r.len) : ({
-                    li += 1;
-                    ri += 1;
-                }) {
-                    const a = std.ascii.toLower(l[li]);
-                    const b = std.ascii.toLower(r[ri]);
-                    if (a != b) {
-                        const less = a < b;
-                        return switch (op) {
-                            .equal => false,
-                            .notEqual => true,
-                            .less => less,
-                            .lessEqual => less,
-                            .greater => !less,
-                            .greaterEqual => !less,
-                            else => false,
-                        };
-                    }
-                }
-                const result: i8 = if (l.len < r.len) -1 else if (l.len > r.len) 1 else 0;
-                return switch (op) {
-                    .equal => result == 0,
-                    .notEqual => result != 0,
-                    .less => result < 0,
-                    .lessEqual => result <= 0,
-                    .greater => result > 0,
-                    .greaterEqual => result >= 0,
-                    else => false,
-                };
-            }
-        }
-        if (left == .null or right == .null) return false;
-        const result: i8 = switch (left) {
-            .integer => |l| switch (right) {
-                .integer => |r| if (l < r) -1 else if (l > r) 1 else 0,
-                .real => |r| if (@as(f64, @floatFromInt(l)) < r) -1 else if (@as(f64, @floatFromInt(l)) > r) 1 else 0,
-                else => -1,
-            },
-            .real => |l| switch (right) {
-                .integer => |r| if (l < @as(f64, @floatFromInt(r))) -1 else if (l > @as(f64, @floatFromInt(r))) 1 else 0,
-                .real => |r| if (l < r) -1 else if (l > r) 1 else 0,
-                else => -1,
-            },
-            .text => |l| switch (right) {
-                .text => |r| if (std.mem.order(u8, l, r) == .lt) -1 else if (std.mem.order(u8, l, r) == .gt) 1 else 0,
-                else => -1,
-            },
-            .blob => |l| switch (right) {
-                .blob => |r| if (std.mem.order(u8, l, r) == .lt) -1 else if (std.mem.order(u8, l, r) == .gt) 1 else 0,
-                else => -1,
-            },
-            .null => 0,
-        };
-        return switch (op) {
-            .equal => result == 0,
-            .notEqual => result != 0,
-            .less => result < 0,
-            .lessEqual => result <= 0,
-            .greater => result > 0,
-            .greaterEqual => result >= 0,
-            .like, .notLike, .glob, .notGlob, .regexp, .notRegexp, .match, .notMatch, .isNull, .isNotNull, .isValue, .isNotValue, .isDistinct, .isNotDistinct, .between, .notBetween, .in, .notIn, .exists, .notExists, .isTrue => false,
-        };
+        return compareBridge.compareCollated(left, op, right, collate);
     }
 
     fn matches(self: *Connection, tbl: *const Table, row: []const Value, condition: ?ast.Conditions, parameters: []const Value) anyerror!bool {
@@ -3231,35 +3285,16 @@ pub const Connection = struct {
         return true;
     }
 
-    fn likeMatch(text: []const u8, pattern: []const u8) bool {
-        return likeMatchEscape(text, pattern, null);
+    fn likeMatch(text: []const u8, patternText: []const u8) bool {
+        return patternLib.like(text, patternText);
     }
 
-    fn likeMatchEscape(text: []const u8, pattern: []const u8, escape: ?u8) bool {
-        if (pattern.len == 0) return text.len == 0;
-        if (escape) |esc| if (pattern[0] == esc) {
-            if (pattern.len == 1) return false;
-            return text.len != 0 and std.ascii.toLower(pattern[1]) == std.ascii.toLower(text[0]) and likeMatchEscape(text[1..], pattern[2..], escape);
-        };
-        if (pattern[0] == '%') {
-            var index: usize = 0;
-            while (index <= text.len) : (index += 1) if (likeMatchEscape(text[index..], pattern[1..], escape)) return true;
-            return false;
-        }
-        if (pattern[0] == '_') return text.len != 0 and likeMatchEscape(text[1..], pattern[1..], escape);
-        return text.len != 0 and std.ascii.toLower(pattern[0]) == std.ascii.toLower(text[0]) and likeMatchEscape(text[1..], pattern[1..], escape);
+    fn likeMatchEscape(text: []const u8, patternText: []const u8, escape: ?u8) bool {
+        return patternLib.likeWithEscape(text, patternText, escape);
     }
 
     fn rowsEqual(left: []const Value, right: []const Value) bool {
-        if (left.len != right.len) return false;
-        for (left, right) |a, b| switch (a) {
-            .null => if (b != .null) return false,
-            .integer => |value| if (b != .integer or b.integer != value) return false,
-            .real => |value| if (b != .real or b.real != value) return false,
-            .text => |value| if (b != .text or !std.mem.eql(u8, value, b.text)) return false,
-            .blob => |value| if (b != .blob or !std.mem.eql(u8, value, b.blob)) return false,
-        };
-        return true;
+        return compareBridge.rowsEqual(left, right);
     }
 
     const RegexEngine = struct {
@@ -4463,9 +4498,9 @@ pub const Connection = struct {
                             for (tbl.columns, 0..) |tableColumn, idx| names[idx] = tableColumn.name;
                             colNames = names;
                         }
-                        const leftVal = try exprEvaluator.evalTemp(self.allocator, colNames.?, existing.values, index.keyExpr(position).?);
+                        const leftVal = try exprEvaluator.eval(self.allocator, colNames.?, existing.values, index.keyExpr(position).?);
                         defer exprEvaluator.freeValue(self.allocator, leftVal);
-                        const rightVal = try exprEvaluator.evalTemp(self.allocator, colNames.?, values, index.keyExpr(position).?);
+                        const rightVal = try exprEvaluator.eval(self.allocator, colNames.?, values, index.keyExpr(position).?);
                         defer exprEvaluator.freeValue(self.allocator, rightVal);
                         if (leftVal == .null or rightVal == .null) {
                             valid = false;
@@ -6193,25 +6228,7 @@ pub const Connection = struct {
     }
 
     fn sameValue(left: Value, right: Value) bool {
-        return switch (left) {
-            .null => right == .null,
-            .integer => |value| switch (right) {
-                .integer => |other| value == other,
-                else => false,
-            },
-            .real => |value| switch (right) {
-                .real => |other| value == other,
-                else => false,
-            },
-            .text => |value| switch (right) {
-                .text => |other| std.mem.eql(u8, value, other),
-                else => false,
-            },
-            .blob => |value| switch (right) {
-                .blob => |other| std.mem.eql(u8, value, other),
-                else => false,
-            },
-        };
+        return compareBridge.sameValue(left, right);
     }
 
     fn compositeMatches(self: *Connection, child: *const Table, childValues: []const Value, parent: *const Table, parentValues: []const Value, constraint: anytype) !bool {

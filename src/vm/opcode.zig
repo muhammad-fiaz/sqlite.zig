@@ -1,6 +1,30 @@
+//! VM instruction set: opcodes, operands, and programs.
+//!
+//! Purpose: define the bytecode vocabulary (`OpCode`), the operand-carrying
+//! `Instruction`, and the append-only `Program` built by `vm/compiler.zig`
+//! and executed by `vm/vm.zig` (modeled on SQLite's VDBE architecture).
+//! Responsibilities: stable opcode enumeration, register addressing (`p2`/
+//! `register`), jump fixups for control flow, and program lifetime.
+//!
+//! Dependencies: `vm/value.zig` for `p4`/`value` payloads. No storage, catalog,
+//! or SQL dependencies — the compiler lowers those away before emitting.
+//!
+//! Ownership/lifetime: `Program` owns its instruction list; `p4`/`value`
+//! payloads borrow or are cloned per the compiler's contract and are freed
+//! with the `CompiledQuery`. Instructions are plain data — no finalization.
+//!
+//! Error behavior: `append`/`emit` fail only on OOM; `fixupJump` is infallible
+//! but panics on an out-of-range address (compiler bug, never corrupt input).
+//!
+//! SQLite compatibility: opcode names track VDBE concepts (cursors, seeks,
+//! `makeRecord`, aggregates); every opcode's runtime semantics and NULL
+//! behavior are implemented and tested in `vm/vm.zig`.
 const std = @import("std");
 const Value = @import("value.zig").Value;
 
+/// Bytecode operation. Cursor, comparison, arithmetic, and aggregation
+/// operations; see `vm.zig` for per-opcode semantics, NULL behavior, and
+/// cursor/transaction interaction.
 pub const OpCode = enum {
     halt,
     gotoOp,
@@ -59,6 +83,10 @@ pub const OpCode = enum {
     aggFinal,
 };
 
+/// Single instruction: opcode plus VDBE-style operands. `p1`/`p2`/`p3` are
+/// integer operands (registers, jump targets, cursor ids); `p4`/`value`
+/// carry an optional scalar payload; `p5` holds flags. `register` mirrors
+/// the destination register when `p2 >= 0`.
 pub const Instruction = struct {
     opcode: OpCode,
     p1: i32 = 0,
@@ -70,23 +98,29 @@ pub const Instruction = struct {
     value: Value = .null,
 };
 
+/// Append-only instruction sequence. Owned by the compiler output; freed by
+/// `CompiledQuery.deinit`. `maxRegisters` sizes the VM register file.
 pub const Program = struct {
     allocator: std.mem.Allocator,
     instructions: std.ArrayList(Instruction),
     maxRegisters: usize = 0,
 
+    /// Empty program; caller `deinit`s. Register high-water starts at 0.
     pub fn init(allocator: std.mem.Allocator) Program {
         return .{ .allocator = allocator, .instructions = .empty, .maxRegisters = 0 };
     }
 
+    /// Frees the instruction list (payloads follow the CompiledQuery contract).
     pub fn deinit(self: *Program) void {
         self.instructions.deinit(self.allocator);
     }
 
+    /// Pushes one instruction (OOM propagates).
     pub fn append(self: *Program, instruction: Instruction) !void {
         try self.instructions.append(self.allocator, instruction);
     }
 
+    /// Emits an operand-only instruction, returning its address for fixups.
     pub fn emit(self: *Program, opcode: OpCode, p1: i32, p2: i32, p3: i32) !usize {
         const addr = self.instructions.items.len;
         try self.append(.{
@@ -99,6 +133,7 @@ pub const Program = struct {
         return addr;
     }
 
+    /// Emits an instruction with a scalar payload, returning its address.
     pub fn emitValue(self: *Program, opcode: OpCode, p1: i32, p2: i32, p3: i32, val: Value) !usize {
         const addr = self.instructions.items.len;
         try self.append(.{
@@ -113,10 +148,13 @@ pub const Program = struct {
         return addr;
     }
 
+    /// Next instruction address (i.e. current length).
     pub fn currentAddress(self: *const Program) usize {
         return self.instructions.items.len;
     }
 
+    /// Patches a previously emitted jump's `p2` target. Panics on a bad
+    /// address (compiler bug, never runtime input).
     pub fn fixupJump(self: *Program, address: usize, target: i32) void {
         self.instructions.items[address].p2 = target;
     }

@@ -1,7 +1,48 @@
+//! SQL lexer: bytes -> `token.zig` tokens (pipeline stage 1).
+//!
+//! Purpose: single-pass scanner producing the token stream `Parser` consumes.
+//! Handles whitespace, `--`/`/* */` comments, quoted identifiers and string
+//! literals (`'it''s'`, `"ident"`, `` `ident` ``), numbers (decimal, float,
+//! exponent, `0x` hex, leading-dot floats), bind parameters (`?`, `?NNN`,
+//! `:name`, `@name`, `$name`), and all single/double-char operators
+//! (`||`, `<<`, `>>`, `<=`, `>=`, `==`, `!=`, `<>`).
+//!
+//! Responsibilities: tokenize only; no keyword classification (that stays in
+//! the parser so quoted keywords remain identifiers) and no semantic checks.
+//! DSL builders bypass this stage by constructing `ast.zig` nodes directly.
+//!
+//! Dependencies: `token.zig` (`Token`, `Tag`) and `std` only.
+//!
+//! Ownership/lifetime: returned `[]Token` is heap-owned by the caller; each
+//! `Token.text` borrows the input `sql` slice. Caller frees the slice with
+//! `allocator.free(tokens)`; no per-token frees.
+//!
+//! Error behavior: fails closed on hostile input — `InvalidCharacter` for
+//! stray bytes/`!` without `=`, `UnterminatedString` for a missing close
+//! quote, `UnterminatedComment` for a missing `*/`. No partial token stream
+//! is returned on error (`errdefer` cleans up).
+//!
+//! Invariants: output always ends with exactly one `.eof` token whose
+//! `position == sql.len`; every other token satisfies
+//! `text.len > 0` and `position + text.len <= sql.len` (modulo quote stripping).
+//!
+//! SQLite compatibility: `==` accepted as `=`; `<>` and `!=` both map to
+//! `.notEqual`; `--` runs to newline; `/* */` is non-nesting, as in SQLite.
+//!
+//! Hostile-input notes: token count is O(sql.len) (each token consumes >= 1
+//! byte), so allocation is linear in input the caller already holds.
+//! No recursion is used; the scanner loop itself cannot stack-overflow.
+// TODO(sql/lexer): enforce a SQLITE_LIMIT_SQL_LENGTH-style cap (SQLite
+// defaults to 1_000_000 bytes) and surface `error.SqlTooBig` so a
+// multi-megabyte hostile string fails fast instead of allocating O(n) tokens.
+// Expected: lexer + parser + connection agree on one constant and one error;
+// tests: over-limit SQL rejected, boundary length accepted, limit documented.
+
 const std = @import("std");
 const Token = @import("token.zig").Token;
 const Tag = @import("token.zig").Tag;
 
+/// Lexer failure modes; all fail closed with no partial output.
 pub const Error = error{ InvalidCharacter, UnterminatedString, UnterminatedComment };
 
 fn isWordStart(byte: u8) bool {
@@ -11,6 +52,9 @@ fn isWordPart(byte: u8) bool {
     return isWordStart(byte) or std.ascii.isDigit(byte) or byte == '$';
 }
 
+/// Scan `sql` into a heap-owned token slice ending in `.eof`.
+/// Caller owns the returned slice (`allocator.free`) while token texts borrow `sql`.
+/// Fails closed with `Error` on bad bytes, unterminated strings, or comments.
 pub fn tokenize(allocator: std.mem.Allocator, sql: []const u8) ![]Token {
     var tokens = std.ArrayList(Token).empty;
     errdefer tokens.deinit(allocator);
@@ -202,4 +246,37 @@ test "lexer handles SQL primitives" {
     try std.testing.expectEqual(Tag.word, tokens[0].tag);
     try std.testing.expectEqual(Tag.greaterEqual, tokens[6].tag);
     try std.testing.expectEqualStrings("A''B", tokens[11].text);
+}
+
+test "lexer rejects hostile inputs fail-closed" {
+    // Stray `!` without `=`.
+    try std.testing.expectError(Error.InvalidCharacter, tokenize(std.testing.allocator, "SELECT 1 ! 2"));
+    // Unterminated string and block comment.
+    try std.testing.expectError(Error.UnterminatedString, tokenize(std.testing.allocator, "SELECT 'abc"));
+    try std.testing.expectError(Error.UnterminatedComment, tokenize(std.testing.allocator, "SELECT 1 /* nope"));
+}
+
+test "lexer tokenizes operators, numbers, and parameters matrix" {
+    const tokens = try tokenize(std.testing.allocator, "SELECT 0xFF, 1.5e-3, .25, a || b << 1 >> 2, ?1, :name;");
+    defer std.testing.allocator.free(tokens);
+    var saw_hex = false;
+    var saw_concat = false;
+    var saw_param = false;
+    for (tokens) |t| {
+        if (t.tag == .number and std.mem.eql(u8, t.text, "0xFF")) saw_hex = true;
+        if (t.tag == .concat) saw_concat = true;
+        if (t.tag == .parameter) saw_param = true;
+    }
+    try std.testing.expect(saw_hex and saw_concat and saw_param);
+    try std.testing.expectEqual(Tag.eof, tokens[tokens.len - 1].tag);
+}
+
+test "lexer handles empty input and comments only" {
+    const empty = try tokenize(std.testing.allocator, "");
+    defer std.testing.allocator.free(empty);
+    try std.testing.expectEqual(@as(usize, 1), empty.len);
+    try std.testing.expectEqual(Tag.eof, empty[0].tag);
+    const comments = try tokenize(std.testing.allocator, "-- hi\n/* x */");
+    defer std.testing.allocator.free(comments);
+    try std.testing.expectEqual(@as(usize, 1), comments.len);
 }

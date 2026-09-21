@@ -1,3 +1,38 @@
+//! Scalar SQL functions: strings, casts, blobs, misc (single dispatch leaf).
+//!
+//! Purpose: authoritative implementations for every scalar function routed by
+//! `functions.zig` (`lower`, `substr`, `cast`, `hex`, `char`, `printf`, ...).
+//! Called from `expr.zig` and the VM `function` opcode via `evalScalar`.
+//!
+//! Responsibilities: SQLite-compatible NULL propagation (most functions
+//! return NULL when any required input is NULL), prefix-number parsing,
+//! UTF-8-aware `length`/`substr`, saturating float->int conversion, and
+//! caller-owned text/blob results.
+//!
+//! Dependencies: `../../vm/value.zig` (`Value`),
+//! `../../catalog/type_affinity.zig` (CAST affinity). No planner/VM imports.
+//!
+//! Ownership/lifetime: inputs borrowed; text/blob outputs heap-owned by the
+//! caller (same allocator). Integer/real/null outputs need no freeing.
+//!
+//! Error behavior: `InvalidArgumentCount` is validated by the dispatcher, not
+//! here; these helpers return `InvalidSql` for malformed escapes/hex,
+//! `IntegerOverflow` for `abs(minInt)`, `OutOfMemory` for allocations.
+//! Domain errors that SQLite maps to NULL (e.g. bad `unhex`) return `.null`.
+//!
+//! Invariants: `parseIntPrefix` saturates (never traps); `saturatingTrunc`
+//! maps NaN->0 and clamps infinities; `substr` indices are 1-based with
+//! negative-from-end semantics; `trim` defaults to `" \t\r\n"`.
+//!
+//! SQLite compatibility: `substring` is an alias of `substr`; `if` aliases
+//! `iif`; `likely`/`unlikely`/`likelihood` are identity hints; `random()`
+//! yields any i64; `randomblob(n)` clamps `n < 1` to 1.
+// TODO(sql/scalar): numeric-text coercion helpers (`parseIntPrefix`,
+// `parseFloatPrefix`, `formatReal`, `saturatingTrunc`) are duplicated in
+// spirit across scalar/math/vm/expr. Expected: one shared `coerce.zig` unit;
+// tests: cross-module matrix proving identical `' 12x'`, `NaN`, `Inf`,
+// overflow behavior. Subsystem: sql/functions.
+
 const std = @import("std");
 const Value = @import("../../vm/value.zig").Value;
 const affinityOf = @import("../../catalog/type_affinity.zig").fromDeclaration;
@@ -6,6 +41,8 @@ fn trimSpaces(text: []const u8) []const u8 {
     return std.mem.trim(u8, text, " \t\n\x0B\x0C\r");
 }
 
+/// Parse a leading integer with SQLite prefix rules; saturates on overflow, 0 if no digits.
+/// Leading/trailing spaces and a sign are allowed; parsing stops at first non-digit.
 pub fn parseIntPrefix(text: []const u8) i64 {
     var rest = trimSpaces(text);
     var negative = false;
@@ -32,6 +69,8 @@ pub fn parseIntPrefix(text: []const u8) i64 {
     return value;
 }
 
+/// Parse a leading float with SQLite prefix rules; 0.0 if no digits.
+/// Handles optional fraction and exponent; trailing junk is ignored.
 pub fn parseFloatPrefix(text: []const u8) f64 {
     var rest = trimSpaces(text);
     var negative = false;
@@ -58,6 +97,8 @@ pub fn parseFloatPrefix(text: []const u8) f64 {
     return if (negative) -magnitude else magnitude;
 }
 
+/// Render a REAL in SQLite `%!.15G`-ish form: `{d}` plus trailing `.0` for whole numbers.
+/// Returns caller-owned memory.
 pub fn formatReal(allocator: std.mem.Allocator, number: f64) ![]u8 {
     const rendered = try std.fmt.allocPrint(allocator, "{d}", .{number});
     errdefer allocator.free(rendered);
@@ -67,6 +108,7 @@ pub fn formatReal(allocator: std.mem.Allocator, number: f64) ![]u8 {
     return withDot;
 }
 
+/// Truth test used by `iif`; text/blob coerce via numeric prefix (NULL -> false).
 pub fn isTruthyValue(value: Value) bool {
     return switch (value) {
         .null => false,
@@ -77,6 +119,8 @@ pub fn isTruthyValue(value: Value) bool {
     };
 }
 
+/// `abs(X)`: NULL->NULL; minInt errors `IntegerOverflow` (SQLite would widen).
+/// Text/blob coerce through `parseFloatPrefix` and return REAL.
 pub fn evalAbs(arg: Value) anyerror!Value {
     return switch (arg) {
         .null => .null,
@@ -87,6 +131,7 @@ pub fn evalAbs(arg: Value) anyerror!Value {
     };
 }
 
+/// `lower(X)`: ASCII-lowercase text; non-text values cloned unchanged (NULL stays NULL).
 pub fn evalLower(allocator: std.mem.Allocator, arg: Value) !Value {
     switch (arg) {
         .text => |t| {
@@ -98,6 +143,7 @@ pub fn evalLower(allocator: std.mem.Allocator, arg: Value) !Value {
     }
 }
 
+/// `upper(X)`: ASCII-uppercase text; non-text values cloned unchanged.
 pub fn evalUpper(allocator: std.mem.Allocator, arg: Value) !Value {
     switch (arg) {
         .text => |t| {
@@ -109,6 +155,8 @@ pub fn evalUpper(allocator: std.mem.Allocator, arg: Value) !Value {
     }
 }
 
+/// `length(X)`: UTF-8 code points for text, bytes for blob, decimal width for ints.
+/// NULL->NULL. REAL length uses `formatReal` rendering.
 pub fn evalLength(allocator: std.mem.Allocator, arg: Value) !Value {
     return switch (arg) {
         .null => .null,
@@ -151,6 +199,8 @@ fn utf8CharAt(text: []const u8, charIndex: usize) ?[]const u8 {
     return null;
 }
 
+/// `round(X[,Y])`: banker's ` @round` scaled by 10^clamp(Y,-30,30). NULL->NULL.
+/// Non-numeric precision handling: NULL precision->NULL; text/blob via int prefix.
 pub fn evalRound(arg: Value, precisionArg: ?Value) Value {
     if (arg == .null) return .null;
     const num: f64 = switch (arg) {
@@ -183,10 +233,12 @@ pub fn evalRound(arg: Value, precisionArg: ?Value) Value {
     }
 }
 
+/// `typeof(X)`: lowercase storage class name as owned text (never NULL).
 pub fn evalTypeof(allocator: std.mem.Allocator, arg: Value) !Value {
     return .{ .text = try allocator.dupe(u8, arg.typeName()) };
 }
 
+/// `coalesce(...)`: first non-NULL clone, or NULL when empty/all-NULL.
 pub fn evalCoalesce(allocator: std.mem.Allocator, args: []const Value) !Value {
     for (args) |a| {
         if (a != .null) return try a.clone(allocator);
@@ -194,11 +246,13 @@ pub fn evalCoalesce(allocator: std.mem.Allocator, args: []const Value) !Value {
     return .null;
 }
 
+/// `ifnull(A,B)`: clone of A unless NULL, else clone of B.
 pub fn evalIfnull(allocator: std.mem.Allocator, a: Value, b: Value) !Value {
     if (a != .null) return try a.clone(allocator);
     return try b.clone(allocator);
 }
 
+/// `nullif(A,B)`: NULL when `sameValue`, else clone of A.
 pub fn evalNullif(allocator: std.mem.Allocator, a: Value, b: Value) !Value {
     if (a.sameValue(b)) return .null;
     return try a.clone(allocator);
@@ -214,6 +268,8 @@ fn coerceText(allocator: std.mem.Allocator, val: Value) !?[]const u8 {
     };
 }
 
+/// `instr(H,N)`: 1-based byte index of N in H, 1 for empty N, 0 when absent.
+/// Any NULL->NULL. Numbers/blobs coerce via decimal rendering.
 pub fn evalInstr(allocator: std.mem.Allocator, haystack: Value, needle: Value) !Value {
     if (haystack == .null or needle == .null) return .null;
     const hBytes = try coerceText(allocator, haystack) orelse return .null;
@@ -227,6 +283,8 @@ pub fn evalInstr(allocator: std.mem.Allocator, haystack: Value, needle: Value) !
     return .{ .integer = 0 };
 }
 
+/// `replace(X,Y,Z)`: every non-overlapping Y replaced by Z. Any NULL->NULL.
+/// Empty Y returns a copy of X.
 pub fn evalReplace(allocator: std.mem.Allocator, orig: Value, from: Value, to: Value) !Value {
     if (orig == .null or from == .null or to == .null) return .null;
     const origText = try coerceText(allocator, orig) orelse return .null;
@@ -289,6 +347,8 @@ fn substrArgInt(val: Value) ?i64 {
     };
 }
 
+/// `substr(X,Y[,Z])`: 1-based chars (bytes for blob); negative Y counts from end.
+/// Negative Z reaches backwards. NULL start/len->NULL. Returns text (or blob).
 pub fn evalSubstr(allocator: std.mem.Allocator, strVal: Value, startVal: Value, lenVal: ?Value) !Value {
     if (strVal == .null or startVal == .null) return .null;
     const isBlob = strVal == .blob;
@@ -346,6 +406,8 @@ pub fn evalSubstr(allocator: std.mem.Allocator, strVal: Value, startVal: Value, 
     return .{ .text = sliced };
 }
 
+/// `trim/ltrim/rtrim(X[,C])`: strip C (default spaces) from both/left/right.
+/// X NULL or C NULL->NULL. Always returns text, even for blob input.
 pub fn evalTrim(allocator: std.mem.Allocator, strVal: Value, charsVal: ?Value, mode: enum { both, left, right }) !Value {
     if (strVal == .null) return .null;
     const ownedText: ?[]u8 = switch (strVal) {
@@ -385,6 +447,8 @@ pub fn evalTrim(allocator: std.mem.Allocator, strVal: Value, charsVal: ?Value, m
     return .{ .text = try allocator.dupe(u8, source[start..end]) };
 }
 
+/// `cast(X AS T)`: affinity conversion (`targetType` is the raw `AS` identifier text).
+/// INTEGER/REAL saturate; TEXT/BLOB re-encode; NUMERIC tries int then float.
 pub fn evalCast(allocator: std.mem.Allocator, val: Value, targetType: []const u8) !Value {
     return switch (affinityOf(targetType)) {
         .integer => switch (val) {
@@ -434,6 +498,7 @@ pub fn evalCast(allocator: std.mem.Allocator, val: Value, targetType: []const u8
     };
 }
 
+/// `hex(X)`: uppercase hex of the UTF-8/byte rendering. NULL->NULL.
 pub fn evalHex(allocator: std.mem.Allocator, val: Value) !Value {
     if (val == .null) return .null;
     var owned: ?[]u8 = null;
@@ -460,6 +525,8 @@ pub fn evalHex(allocator: std.mem.Allocator, val: Value) !Value {
     return .{ .text = hexStr };
 }
 
+/// `unhex(X[,ignore])`: hex pairs to blob, skipping `ignore` chars.
+/// Odd length or bad digits->NULL. Non-text X->NULL.
 pub fn evalUnhex(allocator: std.mem.Allocator, val: Value, ignoreVal: ?Value) !Value {
     if (val == .null) return .null;
     if (val != .text) return .null;
@@ -482,6 +549,7 @@ pub fn evalUnhex(allocator: std.mem.Allocator, val: Value, ignoreVal: ?Value) !V
     return .{ .blob = out };
 }
 
+/// `quote(X)`: SQL literal rendering (`NULL`, digits, `'it''s'`, `X'ABCD'`).
 pub fn evalQuote(allocator: std.mem.Allocator, val: Value) !Value {
     switch (val) {
         .null => return .{ .text = try allocator.dupe(u8, "NULL") },
@@ -513,6 +581,8 @@ pub fn evalQuote(allocator: std.mem.Allocator, val: Value) !Value {
     }
 }
 
+/// `char(N...)`: Unicode code points to UTF-8 text; out-of-range->U+FFFD.
+/// NULL args count as 0 (NUL is skipped by the encoder).
 pub fn evalChar(allocator: std.mem.Allocator, args: []const Value) !Value {
     var out = std.ArrayList(u8).empty;
     defer out.deinit(allocator);
@@ -532,6 +602,7 @@ pub fn evalChar(allocator: std.mem.Allocator, args: []const Value) !Value {
     return .{ .text = try out.toOwnedSlice(allocator) };
 }
 
+/// `unicode(X)`: code point of the first character; empty->NULL, NULL->NULL.
 pub fn evalUnicode(allocator: std.mem.Allocator, arg: Value) !Value {
     const str = switch (arg) {
         .null => return .null,
@@ -553,6 +624,8 @@ pub fn evalUnicode(allocator: std.mem.Allocator, arg: Value) !Value {
     return .{ .integer = @intCast(cp) };
 }
 
+/// `printf(fmt,...)`/`format`: `%d %u %f %g %s %x %X %q %%` subset.
+/// Missing args leave the specifier partially consumed; NULL fmt->NULL.
 pub fn evalPrintf(allocator: std.mem.Allocator, args: []const Value) !Value {
     if (args.len == 0 or args[0] == .null) return .null;
     const fmt = switch (args[0]) {
@@ -662,6 +735,7 @@ pub fn evalPrintf(allocator: std.mem.Allocator, args: []const Value) !Value {
     return .{ .text = try out.toOwnedSlice(allocator) };
 }
 
+/// `concat(...)`: all args stringified and joined; NULLs skipped (never NULL).
 pub fn evalConcat(allocator: std.mem.Allocator, args: []const Value) !Value {
     var out = std.ArrayList(u8).empty;
     defer out.deinit(allocator);
@@ -685,6 +759,7 @@ pub fn evalConcat(allocator: std.mem.Allocator, args: []const Value) !Value {
     return .{ .text = try out.toOwnedSlice(allocator) };
 }
 
+/// `concat_ws(sep,...)`: non-NULL args joined with `sep`. NULL sep->NULL.
 pub fn evalConcatWs(allocator: std.mem.Allocator, args: []const Value) !Value {
     if (args.len == 0) return error.InvalidArgumentCount;
     if (args[0] == .null) return .null;
@@ -716,6 +791,7 @@ pub fn evalConcatWs(allocator: std.mem.Allocator, args: []const Value) !Value {
     return .{ .text = try out.toOwnedSlice(allocator) };
 }
 
+/// `octet_length(X)`: byte length of the rendered value. NULL->NULL.
 pub fn evalOctetLength(allocator: std.mem.Allocator, arg: Value) !Value {
     return switch (arg) {
         .null => .null,
@@ -734,6 +810,7 @@ pub fn evalOctetLength(allocator: std.mem.Allocator, arg: Value) !Value {
     };
 }
 
+/// `zeroblob(N)`: N zero bytes; N<=0 yields empty blob. Uncastable sizes->OOM.
 pub fn evalZeroblob(allocator: std.mem.Allocator, arg: Value) !Value {
     const count: i64 = switch (arg) {
         .null => 0,
@@ -749,6 +826,7 @@ pub fn evalZeroblob(allocator: std.mem.Allocator, arg: Value) !Value {
     return .{ .blob = out };
 }
 
+/// `sign(X)`: -1/0/1 by numeric sign. NULL->NULL; blob->NULL; NaN text->NULL.
 pub fn evalSign(arg: Value) Value {
     switch (arg) {
         .null => return .null,
@@ -770,11 +848,13 @@ pub fn evalSign(arg: Value) Value {
     }
 }
 
+/// `iif(C,A,B)`/`if`: clone of A when C truthy, else clone of B.
 pub fn evalIif(allocator: std.mem.Allocator, cond: Value, whenTrue: Value, whenFalse: Value) !Value {
     if (isTruthyValue(cond)) return try whenTrue.clone(allocator);
     return try whenFalse.clone(allocator);
 }
 
+/// `likely/unlikely/likelihood`: optimizer hints; identity clone.
 pub fn evalUnlikely(allocator: std.mem.Allocator, arg: Value) !Value {
     return try arg.clone(allocator);
 }
@@ -797,11 +877,13 @@ const RandomState = struct {
     }
 };
 
+/// `random()`: any i64 from a process-seeded PRNG (SQLite-compatible range).
 pub fn evalRandom(allocator: std.mem.Allocator) !Value {
     _ = allocator;
     return .{ .integer = RandomState.random().int(i64) };
 }
 
+/// `randomblob(N)`: N random bytes; N<1 clamped to 1. Uncastable sizes->OOM.
 pub fn evalRandomblob(allocator: std.mem.Allocator, arg: Value) !Value {
     var count: i64 = switch (arg) {
         .null => 0,
@@ -817,14 +899,17 @@ pub fn evalRandomblob(allocator: std.mem.Allocator, arg: Value) !Value {
     return .{ .blob = out };
 }
 
+/// `sqlite_version()`: engine version text from `version.zig` (owned).
 pub fn evalSqliteVersion(allocator: std.mem.Allocator) !Value {
     return .{ .text = try allocator.dupe(u8, @import("../../version.zig").sqliteEngineVersion) };
 }
 
+/// `sqlite_source_id()`: version plus build tag (owned text).
 pub fn evalSqliteSourceId(allocator: std.mem.Allocator) !Value {
     return .{ .text = try std.fmt.allocPrint(allocator, "{s}|sqlite.zig-native", .{@import("../../version.zig").sqliteEngineVersion}) };
 }
 
+/// `json_quote(X)`: JSON literal rendering; blob errors `InvalidSql`.
 pub fn evalJsonQuote(allocator: std.mem.Allocator, val: Value) !Value {
     switch (val) {
         .null => return .{ .text = try allocator.dupe(u8, "null") },
@@ -881,6 +966,8 @@ fn parseHexDigits(text: []const u8, count: usize) ?u32 {
     return value;
 }
 
+/// `unistr(X)`: `\uXXXX`/`\UXXXXXXXX`/`\+XXXXXX`/bare-hex escapes to text.
+/// Trailing lone backslash or bad digits error `InvalidSql`.
 pub fn evalUnistr(allocator: std.mem.Allocator, arg: Value) !Value {
     const owned: ?[]u8 = switch (arg) {
         .null => return .null,
@@ -930,4 +1017,104 @@ pub fn evalUnistr(allocator: std.mem.Allocator, arg: Value) !Value {
         }
     }
     return .{ .text = try out.toOwnedSlice(allocator) };
+}
+
+test "scalar normal behavior matrix" {
+    const alloc = std.testing.allocator;
+    const lower = try evalLower(alloc, .{ .text = "AbC" });
+    defer lower.free(alloc);
+    try std.testing.expectEqualStrings("abc", lower.text);
+    const upper = try evalUpper(alloc, .{ .text = "AbC" });
+    defer upper.free(alloc);
+    try std.testing.expectEqualStrings("ABC", upper.text);
+    const len = try evalLength(alloc, .{ .text = "héllo" });
+    defer len.free(alloc);
+    try std.testing.expectEqual(@as(i64, 5), len.integer);
+    const sub = try evalSubstr(alloc, .{ .text = "hello" }, .{ .integer = 2 }, .{ .integer = 3 });
+    defer sub.free(alloc);
+    try std.testing.expectEqualStrings("ell", sub.text);
+    const rep = try evalReplace(alloc, .{ .text = "aaa" }, .{ .text = "a" }, .{ .text = "b" });
+    defer rep.free(alloc);
+    try std.testing.expectEqualStrings("bbb", rep.text);
+    const ins = try evalInstr(alloc, .{ .text = "hello" }, .{ .text = "ll" });
+    defer ins.free(alloc);
+    try std.testing.expectEqual(@as(i64, 3), ins.integer);
+    const t = try evalTypeof(alloc, .{ .integer = 1 });
+    defer t.free(alloc);
+    try std.testing.expectEqualStrings("integer", t.text);
+    try std.testing.expectEqual(@as(i64, 7), (try evalCoalesce(alloc, &.{ .null, .{ .integer = 7 } })).integer);
+    const casted = try evalCast(alloc, .{ .text = "42" }, "INTEGER");
+    defer casted.free(alloc);
+    try std.testing.expectEqual(@as(i64, 42), casted.integer);
+    const hex = try evalHex(alloc, .{ .text = "Hi" });
+    defer hex.free(alloc);
+    try std.testing.expectEqualStrings("4869", hex.text);
+    const q = try evalQuote(alloc, .{ .text = "o'clock" });
+    defer q.free(alloc);
+    try std.testing.expectEqualStrings("'o''clock'", q.text);
+    const ch = try evalChar(alloc, &.{ .{ .integer = 65 }, .{ .integer = 66 } });
+    defer ch.free(alloc);
+    try std.testing.expectEqualStrings("AB", ch.text);
+    const pf = try evalPrintf(alloc, &.{ .{ .text = "%d-%s" }, .{ .integer = 7 }, .{ .text = "x" } });
+    defer pf.free(alloc);
+    try std.testing.expectEqualStrings("7-x", pf.text);
+    const cc = try evalConcat(alloc, &.{ .{ .text = "a" }, .null, .{ .integer = 1 } });
+    defer cc.free(alloc);
+    try std.testing.expectEqualStrings("a1", cc.text);
+}
+
+test "scalar null empty and edge boundaries" {
+    const alloc = std.testing.allocator;
+    const n1 = try evalLower(alloc, .null);
+    defer n1.free(alloc);
+    try std.testing.expect(n1 == .null);
+    const n2 = try evalSubstr(alloc, .null, .{ .integer = 1 }, null);
+    defer n2.free(alloc);
+    try std.testing.expect(n2 == .null);
+    const n3 = try evalInstr(alloc, .{ .text = "abc" }, .null);
+    defer n3.free(alloc);
+    try std.testing.expect(n3 == .null);
+    const empty_sub = try evalSubstr(alloc, .{ .text = "" }, .{ .integer = 1 }, .{ .integer = 5 });
+    defer empty_sub.free(alloc);
+    try std.testing.expectEqualStrings("", empty_sub.text);
+    const empty_rep = try evalReplace(alloc, .{ .text = "abc" }, .{ .text = "" }, .{ .text = "z" });
+    defer empty_rep.free(alloc);
+    try std.testing.expectEqualStrings("abc", empty_rep.text);
+    const neg_sub = try evalSubstr(alloc, .{ .text = "hello" }, .{ .integer = -2 }, null);
+    defer neg_sub.free(alloc);
+    try std.testing.expectEqualStrings("lo", neg_sub.text);
+    const trim = try evalTrim(alloc, .{ .text = "  hi  " }, null, .both);
+    defer trim.free(alloc);
+    try std.testing.expectEqualStrings("hi", trim.text);
+    const uni_empty = try evalUnicode(alloc, .{ .text = "" });
+    defer uni_empty.free(alloc);
+    try std.testing.expect(uni_empty == .null);
+    const zero = try evalZeroblob(alloc, .{ .integer = 0 });
+    defer zero.free(alloc);
+    try std.testing.expectEqual(@as(usize, 0), zero.blob.len);
+    const uni = try evalUnicode(alloc, .{ .text = "A" });
+    defer uni.free(alloc);
+    try std.testing.expectEqual(@as(i64, 65), uni.integer);
+    try std.testing.expectEqual(@as(i64, 0), evalSign(.{ .integer = 0 }).integer);
+    try std.testing.expect((try evalAbs(.null)) == .null);
+    const ulen = try evalLength(alloc, .{ .text = "é" });
+    defer ulen.free(alloc);
+    const olen = try evalOctetLength(alloc, .{ .text = "é" });
+    defer olen.free(alloc);
+    try std.testing.expectEqual(@as(i64, 1), ulen.integer);
+    try std.testing.expectEqual(@as(i64, 2), olen.integer);
+}
+
+test "scalar error behavior" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.IntegerOverflow, evalAbs(.{ .integer = std.math.minInt(i64) }));
+    try std.testing.expectError(error.InvalidSql, evalUnistr(alloc, .{ .text = "\\x" }));
+    try std.testing.expectError(error.InvalidSql, evalUnistr(alloc, .{ .text = "abc\\" }));
+    try std.testing.expectError(error.InvalidSql, evalJsonQuote(alloc, .{ .blob = "x" }));
+    const bad_hex = try evalUnhex(alloc, .{ .text = "zz" }, null);
+    defer bad_hex.free(alloc);
+    try std.testing.expect(bad_hex == .null);
+    const odd_hex = try evalUnhex(alloc, .{ .text = "abc" }, null);
+    defer odd_hex.free(alloc);
+    try std.testing.expect(odd_hex == .null);
 }

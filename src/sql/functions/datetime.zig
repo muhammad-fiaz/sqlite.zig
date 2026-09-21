@@ -1,3 +1,40 @@
+//! Date/time SQL functions (`date`, `time`, `datetime`, `julianday`, ...).
+//!
+//! Purpose: authoritative SQLite-compatible date/time evaluation behind
+//! `functions.evalScalar`. Parses `YYYY-MM-DD[ HH:MM:SS[.SSS]]`, `HH:MM[:SS]`,
+//! Julian-day numbers, `now`, and `unixepoch`-tagged integers, then applies
+//! modifier chains (`N days/months/years/hours/minutes/seconds`,
+//! `start of day/month/year`, `weekday N`, `utc`/`localtime` no-ops).
+//!
+//! Responsibilities: proleptic-Gregorian Julian-day conversion, modifier
+//! application, and `strftime` formatting for the `%Y %m %d %H %M %S %f %s
+//! %j %J %w %W %%` subset.
+//!
+//! Dependencies: `std`, `../../vm/value.zig` only (plus libc `gettimeofday`
+//! on Apple/BSD targets for `now`).
+//!
+//! Ownership/lifetime: inputs borrowed; text outputs heap-owned by the caller.
+//! No state is retained between calls.
+//!
+//! Error behavior: unparseable input yields `.null` (never an error), matching
+//! SQLite; `strftime` with < 2 args or non-text format yields `.null`.
+//! `getCurrentTimestamp` failure makes `now` unparseable (NULL).
+//!
+//! Invariants: `DateTime` fields are calendar components (month 1-12 for
+//! well-formed input); `fromJulianDay(toJulianDay(dt))` round-trips.
+//!
+//! SQLite compatibility: `date`/`time`/`datetime` return UTC text;
+//! `julianday` returns REAL, `unixepoch` INTEGER seconds; unknown modifiers
+//! are ignored; `localtime`/`utc` are accepted no-ops in this build.
+// TODO(sql/datetime): `utc`/`localtime` are no-ops and sub-second/timezone
+// parsing is a subset (`Z` suffix, `±HH:MM` offsets ignored). Expected:
+// real offset handling or explicit Unsupported-tz docs; tests: `Z`/offset
+// matrices, fractional-second preservation through modifiers.
+// Subsystem: sql/functions.
+// TODO(sql/datetime): `now` uses wall-clock syscalls, making tests
+// time-dependent. Expected: injectable clock for deterministic tests;
+// tests: frozen-clock `now`/`date('now')` golden values. Subsystem: sql/functions.
+
 const std = @import("std");
 const Value = @import("../../vm/value.zig").Value;
 
@@ -13,16 +50,26 @@ const CTimeval = extern struct {
 
 extern "c" fn gettimeofday(tp: *CTimeval, tzp: ?*anyopaque) c_int;
 
+/// Broken-down calendar timestamp; `valid` is always true for produced values.
 pub const DateTime = struct {
+    /// Proleptic year (may be <= 0 for ancient Julian days; formatted clamped).
     year: i32,
+    /// Month 1-12 for well-formed input.
     month: i32,
+    /// Day of month 1-31.
     day: i32,
+    /// Hour 0-23.
     hour: i32,
+    /// Minute 0-59.
     minute: i32,
+    /// Second 0-59.
     second: i32,
+    /// Fractional second in [0,1).
     fraction: f64 = 0.0,
+    /// Always true; reserved for future validation failures.
     valid: bool = true,
 
+    /// Convert to Julian day number (fractional).
     pub fn toJulianDay(self: DateTime) f64 {
         var y = self.year;
         var m = self.month;
@@ -41,6 +88,7 @@ pub const DateTime = struct {
         return jdInt + timeFrac;
     }
 
+    /// Inverse of `toJulianDay`; clamps negative day fractions to zero.
     pub fn fromJulianDay(jd: f64) DateTime {
         const z = @as(i64, @intFromFloat(jd + 0.5));
         const f = (jd + 0.5) - @as(f64, @floatFromInt(z));
@@ -75,11 +123,16 @@ pub const DateTime = struct {
         };
     }
 
+    /// Seconds since 1970-01-01 UTC, truncated toward zero.
     pub fn toUnixEpoch(self: DateTime) i64 {
         const jd = self.toJulianDay();
-        return @intFromFloat((jd - 2440587.5) * 86400.0);
+        // Julian-day math is floating point; round to the nearest second so
+        // exact timestamps (e.g. 1970-01-01 00:00:01 -> 1) do not truncate
+        // to one less on rounding error.
+        return @as(i64, @intFromFloat(@round((jd - 2440587.5) * 86400.0)));
     }
 
+    /// Inverse of `toUnixEpoch` via Julian-day arithmetic.
     pub fn fromUnixEpoch(sec: i64) DateTime {
         const jd = (@as(f64, @floatFromInt(sec)) / 86400.0) + 2440587.5;
         return fromJulianDay(jd);
@@ -308,6 +361,7 @@ fn parseDateTimeWithModifiers(args: []const Value) ?DateTime {
     return dt;
 }
 
+/// `date(...)`: `YYYY-MM-DD` text or NULL when unparseable/empty.
 pub fn evalDate(allocator: std.mem.Allocator, args: []const Value) !Value {
     const dt = parseDateTimeWithModifiers(args) orelse return .null;
     const y: u32 = if (dt.year >= 0) @intCast(dt.year) else 0;
@@ -317,6 +371,7 @@ pub fn evalDate(allocator: std.mem.Allocator, args: []const Value) !Value {
     return .{ .text = res };
 }
 
+/// `time(...)`: `HH:MM:SS` text or NULL when unparseable/empty.
 pub fn evalTime(allocator: std.mem.Allocator, args: []const Value) !Value {
     const dt = parseDateTimeWithModifiers(args) orelse return .null;
     const h: u32 = if (dt.hour >= 0) @intCast(dt.hour) else 0;
@@ -326,6 +381,7 @@ pub fn evalTime(allocator: std.mem.Allocator, args: []const Value) !Value {
     return .{ .text = res };
 }
 
+/// `datetime(...)`: `YYYY-MM-DD HH:MM:SS` text or NULL when unparseable/empty.
 pub fn evalDatetime(allocator: std.mem.Allocator, args: []const Value) !Value {
     const dt = parseDateTimeWithModifiers(args) orelse return .null;
     const y: u32 = if (dt.year >= 0) @intCast(dt.year) else 0;
@@ -338,16 +394,20 @@ pub fn evalDatetime(allocator: std.mem.Allocator, args: []const Value) !Value {
     return .{ .text = res };
 }
 
+/// `julianday(...)`: REAL Julian day or NULL when unparseable/empty.
 pub fn evalJulianday(args: []const Value) Value {
     const dt = parseDateTimeWithModifiers(args) orelse return .null;
     return .{ .real = dt.toJulianDay() };
 }
 
+/// `unixepoch(...)`: INTEGER seconds since epoch or NULL when unparseable/empty.
 pub fn evalUnixepoch(args: []const Value) Value {
     const dt = parseDateTimeWithModifiers(args) orelse return .null;
     return .{ .integer = dt.toUnixEpoch() };
 }
 
+/// `strftime(fmt,...)`: format subset (`%Y %m %d %H %M %S %f %s %j %J %w %W %%`).
+/// NULL when fmt is not text, args < 2, or the timestamp is unparseable.
 pub fn evalStrftime(allocator: std.mem.Allocator, args: []const Value) !Value {
     if (args.len < 2) return .null;
     const fmtVal = args[0];
@@ -463,4 +523,57 @@ pub fn evalStrftime(allocator: std.mem.Allocator, args: []const Value) !Value {
         try out.append(allocator, fmt[i]);
     }
     return .{ .text = try out.toOwnedSlice(allocator) };
+}
+
+test "datetime normal behavior" {
+    const alloc = std.testing.allocator;
+    const d = try evalDate(alloc, &.{.{ .text = "2024-02-29" }});
+    defer d.free(alloc);
+    try std.testing.expectEqualStrings("2024-02-29", d.text);
+    const t = try evalTime(alloc, &.{.{ .text = "2024-01-02 03:04:05" }});
+    defer t.free(alloc);
+    try std.testing.expectEqualStrings("03:04:05", t.text);
+    const dt = try evalDatetime(alloc, &.{.{ .text = "2024-01-02" }});
+    defer dt.free(alloc);
+    try std.testing.expectEqualStrings("2024-01-02 00:00:00", dt.text);
+    const jd = evalJulianday(&.{.{ .text = "2000-01-01 12:00:00" }});
+    try std.testing.expect(jd == .real);
+    const ux = evalUnixepoch(&.{.{ .text = "1970-01-01 00:00:01" }});
+    try std.testing.expectEqual(@as(i64, 1), ux.integer);
+    const sf = try evalStrftime(alloc, &.{ .{ .text = "%Y-%m-%d" }, .{ .text = "2024-03-04 05:06:07" } });
+    defer sf.free(alloc);
+    try std.testing.expectEqualStrings("2024-03-04", sf.text);
+}
+
+test "datetime null empty and boundary" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect((try evalDate(alloc, &.{})) == .null);
+    try std.testing.expect((try evalDate(alloc, &.{.null})) == .null);
+    try std.testing.expect((try evalDate(alloc, &.{.{ .text = "" }})) == .null);
+    try std.testing.expect((try evalDate(alloc, &.{.{ .text = "not-a-date" }})) == .null);
+    try std.testing.expect((try evalStrftime(alloc, &.{.{ .text = "%Y" }})) == .null);
+    try std.testing.expect((try evalStrftime(alloc, &.{ .{ .integer = 1 }, .{ .text = "2024-01-01" } })) == .null);
+    // Modifiers: start-of-month truncates, +1 day advances.
+    const som = try evalDate(alloc, &.{ .{ .text = "2024-03-15" }, .{ .text = "start of month" } });
+    defer som.free(alloc);
+    try std.testing.expectEqualStrings("2024-03-01", som.text);
+    const nxt = try evalDate(alloc, &.{ .{ .text = "2024-03-01" }, .{ .text = "1 day" } });
+    defer nxt.free(alloc);
+    try std.testing.expectEqualStrings("2024-03-02", nxt.text);
+    // Julian round-trip through DateTime helpers.
+    const rt = DateTime.fromJulianDay((DateTime{ .year = 2024, .month = 5, .day = 6, .hour = 7, .minute = 8, .second = 9 }).toJulianDay());
+    try std.testing.expectEqual(@as(i32, 2024), rt.year);
+    try std.testing.expectEqual(@as(i32, 5), rt.month);
+    try std.testing.expectEqual(@as(i32, 6), rt.day);
+}
+
+test "datetime invalid modifiers fail soft to null or ignored" {
+    const alloc = std.testing.allocator;
+    // Unknown modifier text is ignored, base date still formats.
+    const kept = try evalDate(alloc, &.{ .{ .text = "2024-01-02" }, .{ .text = "frobnicate" } });
+    defer kept.free(alloc);
+    try std.testing.expectEqualStrings("2024-01-02", kept.text);
+    // Non-text modifier skipped; unixepoch modifier path with bad int is NULL.
+    try std.testing.expect(evalUnixepoch(&.{ .{ .text = "abc" }, .{ .text = "unixepoch" } }) == .null);
+    try std.testing.expect(evalJulianday(&.{.null}) == .null);
 }

@@ -1,10 +1,38 @@
+//! Runtime scalar values: the single authoritative `Value` representation.
+//!
+//! Purpose: own the NULL/INTEGER/REAL/TEXT/BLOB universe used by the SQL
+//! evaluator, the VM registers, the catalog defaults, and result materialization.
+//! Responsibilities: total ordering (NULL < numeric < TEXT < BLOB), SQLite
+//! three-valued comparison (`compare` returns false on any NULL input),
+//! `IS DISTINCT FROM` null-aware identity, collations (BINARY/NOCASE/RTRIM),
+//! numeric int<->real equivalence, truthiness, and owned cloning.
+//!
+//! Dependencies: `std` only. Consumers (`sql/expr`, `connection`, `vm`,
+//! `catalog/type_affinity`, `connection/compare`) borrow or clone values;
+//! see `type_affinity.apply` for the canonical storage coercion that sits
+//! above this type.
+//!
+//! Ownership/lifetime: `text`/`blob` payloads are borrowed slices by default.
+//! `clone` duplicates them into owned memory; `free` releases exactly what
+//! `clone` (or an equivalent `dupe`) allocated. Never `free` a borrowed slice.
+//!
+//! Error behavior: infallible except `clone` (OOM). Corrupt or hostile data
+//! cannot reach this layer as raw bytes — decoding/validation happens in
+//! `format/*` and `storage/*`, so no bounds checks are needed here.
+//!
+//! SQLite compatibility: ordering, cross-type numeric equality, NaN placement,
+//! and NOCASE/RTRIM text rules mirror SQLite semantics; see source-local tests.
 const std = @import("std");
 
+/// Text comparison collation. BINARY is memcmp; NOCASE folds ASCII case;
+/// RTRIM ignores trailing spaces. Resolved from `COLLATE` by `fromName`.
 pub const Collation = enum {
     binary,
     nocase,
     rtrim,
 
+    /// Resolves a COLLATE name (null -> binary; nocase/rtrim folds case).
+    /// Unknown names fall back to binary.
     pub fn fromName(name: ?[]const u8) Collation {
         const n = name orelse return .binary;
         if (std.ascii.eqlIgnoreCase(n, "nocase")) return .nocase;
@@ -13,6 +41,7 @@ pub const Collation = enum {
     }
 };
 
+/// Ordered comparison operator used by `Value.compare`.
 pub const Comparison = enum {
     equal,
     notEqual,
@@ -22,6 +51,9 @@ pub const Comparison = enum {
     greaterEqual,
 };
 
+/// Canonical runtime scalar. Borrowed `text`/`blob` slices unless produced by
+/// `clone`; see module docs for ownership. NULL propagates through `compare`
+/// (any NULL input -> false); use `isDistinct` for null-aware inequality.
 pub const Value = union(enum) {
     null,
     integer: i64,
@@ -29,10 +61,12 @@ pub const Value = union(enum) {
     text: []const u8,
     blob: []const u8,
 
+    /// True only for NULL.
     pub fn isNull(self: Value) bool {
         return self == .null;
     }
 
+    /// SQLite typeof() name: null/integer/real/text/blob.
     pub fn typeName(self: Value) []const u8 {
         return switch (self) {
             .null => "null",
@@ -43,6 +77,8 @@ pub const Value = union(enum) {
         };
     }
 
+    /// Three-valued truthiness: nonzero numbers and nonzero numeric text are
+    /// true; NULL, zero, empty/non-numeric text, blobs, and NaN are false.
     pub fn isTruthy(self: Value) bool {
         return switch (self) {
             .null => false,
@@ -63,10 +99,14 @@ pub const Value = union(enum) {
         };
     }
 
+    /// Negation of `isTruthy` (NULL is falsy here; callers needing UNKNOWN
+    /// propagate NULL before branching).
     pub fn isFalsy(self: Value) bool {
         return !self.isTruthy();
     }
 
+    /// Strict storage identity: same type tag and equal payload (1 integer
+    /// vs 1.0 real is false; NULL equals only NULL).
     pub fn sameValue(self: Value, other: Value) bool {
         return switch (self) {
             .null => other == .null,
@@ -145,6 +185,8 @@ pub const Value = union(enum) {
         };
     }
 
+    /// Total order: NULL < numeric (int/real intermixed) < TEXT < BLOB.
+    /// Text honors `collation`; NaN sorts after non-NaN numerics.
     pub fn order(self: Value, other: Value, collation: Collation) std.math.Order {
         const ca = self.typeClass();
         const cb = other.typeClass();
@@ -172,6 +214,8 @@ pub const Value = union(enum) {
         };
     }
 
+    /// Three-valued comparison: any NULL operand yields false (UNKNOWN).
+    /// Otherwise applies `cmp` to `order`.
     pub fn compare(self: Value, cmp: Comparison, other: Value, collation: Collation) bool {
         if (self == .null or other == .null) return false;
         const ord = self.order(other, collation);
@@ -185,12 +229,16 @@ pub const Value = union(enum) {
         };
     }
 
+    /// `IS DISTINCT FROM`: NULL-safe inequality (NULL vs NULL is false,
+    /// NULL vs value is true).
     pub fn isDistinct(self: Value, other: Value, collation: Collation) bool {
         if (self == .null and other == .null) return false;
         if (self == .null or other == .null) return true;
         return self.order(other, collation) != .eq;
     }
 
+    /// Owned duplicate: text/blob payloads are duped (OOM propagates);
+    /// scalars copy by value. Pair with `free`.
     pub fn clone(self: Value, allocator: std.mem.Allocator) !Value {
         return switch (self) {
             .text => |bytes| .{ .text = try allocator.dupe(u8, bytes) },
@@ -199,6 +247,7 @@ pub const Value = union(enum) {
         };
     }
 
+    /// Releases what `clone` allocated. Never call on borrowed slices.
     pub fn free(self: Value, allocator: std.mem.Allocator) void {
         switch (self) {
             .text => |bytes| allocator.free(bytes),

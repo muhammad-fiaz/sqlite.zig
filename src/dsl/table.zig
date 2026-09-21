@@ -1,15 +1,67 @@
+//! Typed table descriptors: comptime schema with collision-free columns.
+//!
+//! Purpose: turn `sqlite.table("users", struct { ... })` (or a descriptor
+//! struct of `column("sql_name", T)` values) into a table *value* whose fields
+//! are typed `Column` descriptors plus metadata (`tableName`, `columnNames`,
+//! `rowType`, `tableOptions`, `tableAlias`) and — unless the schema declares
+//! its own `all` column — an `all()` operation producing `AllProjection`.
+//!
+//! Responsibilities: comptime struct synthesis (`TableTypeFor`/
+//! `DescribedTypeFor`), value construction (`buildTable`/`buildDescribed`),
+//! alias rebinding (`aliased`), and introspection (`isTableValue`,
+//! `rowTypeOfValue`, `columnsTypeOfValue`, `columnCount`).
+//!
+//! Dependencies: `dsl/column.zig` only (plus `std.builtin` for struct synthesis).
+//! No allocator, no SQL text, no catalog access.
+//!
+//! Ownership/lifetime: everything is comptime-known. Table values and column
+//! descriptors are plain values holding borrowed (usually static) name slices.
+//! `aliased()` returns a fresh value whose column descriptors borrow the
+//! comptime `aliasName` slice — keep that slice alive as long as the alias is
+//! used (string literals are fine). No heap, no `deinit`, nothing invalidates.
+//!
+//! Error behavior: misuse is a `@compileError` (non-struct rows, empty alias,
+//! `aliased()` on a non-table). Runtime errors never originate here.
+//!
+//! SQLite compatibility: Zig names map onto SQL names 1:1 by default;
+//! descriptor form (`.firstName = col("first_name", ...)`) renames them.
+//! Case-insensitive matching happens downstream in the engine.
+//!
+//! Unified pipeline note: Raw SQL, the dynamic DSL, and this typed DSL all
+//! converge on native AST/IR via `ast_builder` — table descriptors never
+//! render SQL strings.
+//!
+//! Column/operation collision rule (load-bearing): schema fields are ALWAYS
+//! plain column descriptors. The `all` operation is synthesized ONLY when the
+//! schema has no `all` field; when a table declares `all`/`count`/`select`/
+//! `where`/`join`/`limit`/..., those fields stay columns (verified by the
+//! `columns named like dsl operations stay plain fields` test) and there is
+//! simply no `all()` operation on that table — use `selectAll()` on the query
+//! builder instead. Operations are calls; fields are schema.
+//!
+//! AllColumns note: `allColumnsOp()`/`AllOpFn` produce the native star marker
+//! `AllProjection`. `query_builder` translates it to the native `.wildcard`
+//! node; a declared `all` *column* never produces it.
+
 const std = @import("std");
 const Column = @import("column.zig").Column;
 
+/// Native all-columns marker. Only produced by the synthesized `all()` call;
+/// a schema field named `all` is a `Column`, never this struct.
 pub const AllProjection = struct {};
 
+/// Build the marker value. Call it (`User.all()`) — passing `User.all`
+/// without calling is a comptime error downstream in `query_builder.select`.
 pub fn allColumnsOp() AllProjection {
     return .{};
 }
+/// Function-pointer type of the synthesized `all` operation field.
 pub const AllOpFn = *const fn () AllProjection;
 
+/// Number of synthesized metadata fields prepended to every table struct.
 pub const metaCount = 5;
 
+/// True when `T` is a `Column(...)` descriptor struct (has `isDslColumn`).
 pub fn isColumnField(comptime T: type) bool {
     if (@typeInfo(T) != .@"struct") return false;
     return @hasDecl(T, "isDslColumn") and T.isDslColumn;
@@ -27,10 +79,15 @@ fn OptHolder(comptime o: anytype) type {
     };
 }
 
+/// Define a typed table from a row struct (`struct { id: i64, ... }`).
+/// Zig field names default to identical SQL names. Returns a table *value*.
 pub fn table(comptime name: []const u8, comptime spec: anytype) TablePublic(name, spec, .{}) {
     return tableWith(name, spec, .{});
 }
 
+/// Table type for `table()`/`tableWith()`: metadata fields plus one `Column`
+/// per schema field, plus a synthesized `all: AllOpFn` unless the schema
+/// declares its own `all` column (collision rule).
 pub fn TablePublic(comptime name: []const u8, comptime spec: anytype, comptime opts: anytype) type {
     if (@TypeOf(spec) == type) {
         const info = @typeInfo(spec);
@@ -40,6 +97,8 @@ pub fn TablePublic(comptime name: []const u8, comptime spec: anytype, comptime o
     return DescribedTypeFor(name, spec, opts);
 }
 
+/// Define a typed table with options (e.g. strict/without-rowid flags).
+/// `spec` is either a row struct or a descriptor struct of `column()` values.
 pub fn tableWith(comptime name: []const u8, comptime spec: anytype, comptime opts: anytype) TablePublic(name, spec, opts) {
     if (@TypeOf(spec) == type) {
         const info = @typeInfo(spec);
@@ -193,6 +252,7 @@ fn buildDescribed(comptime tname: []const u8, comptime spec: anytype, comptime o
     return v;
 }
 
+/// True when `T` is a table *value* type (has all metadata + `all` fields).
 pub fn isTableValue(comptime T: type) bool {
     if (@typeInfo(T) != .@"struct") return false;
     return @hasField(T, "tableName") and @hasField(T, "columnNames") and
@@ -206,6 +266,9 @@ fn isMetaFieldName(comptime name: []const u8) bool {
         comptimeStringEq(name, "tableAlias");
 }
 
+/// Rebind a table value's columns to `aliasName` (for self-joins), keeping
+/// field types and SQL names. `tableName` is preserved; `tableAlias` becomes
+/// the alias. Comptime alias slice must outlive the result.
 pub fn AliasedType(comptime T: type, comptime aliasName: []const u8) type {
     if (!isTableValue(T)) @compileError("aliased() takes a sqlite.table(...) value");
     if (aliasName.len == 0) @compileError("alias must not be empty");
@@ -224,6 +287,7 @@ pub fn AliasedType(comptime T: type, comptime aliasName: []const u8) type {
     return @Struct(.auto, null, &names, &types, makeAttrs(fields.len));
 }
 
+/// Build the aliased table value described by `AliasedType`.
 pub fn aliased(tbl: anytype, comptime aliasName: []const u8) AliasedType(@TypeOf(tbl), aliasName) {
     const T = @TypeOf(tbl);
     const A = AliasedType(T, aliasName);
@@ -247,14 +311,17 @@ pub fn aliased(tbl: anytype, comptime aliasName: []const u8) AliasedType(@TypeOf
     return v;
 }
 
+/// Borrowed SQL table name of a table value.
 pub fn tableNameOfValue(source: anytype) []const u8 {
     return source.tableName;
 }
 
+/// Row struct type carried by a table value type.
 pub fn rowTypeOfValue(comptime T: type) type {
     return @typeInfo(T).@"struct".fields[2].type.value;
 }
 
+/// Options-holder type carried by a table value type.
 pub fn tableOptionsField(comptime T: type) type {
     return @typeInfo(T).@"struct".fields[3].type;
 }
@@ -266,6 +333,8 @@ fn hasTrailingAllOp(comptime T: type) bool {
     return comptimeStringEq(last.name, "all") and last.type == AllOpFn;
 }
 
+/// Columns-only struct type of a table value (metadata + trailing `all` op
+/// stripped). Used by `query_builder` to map result columns positionally.
 pub fn columnsTypeOfValue(comptime T: type) type {
     const f = @typeInfo(T).@"struct".fields;
     const skip: usize = if (hasTrailingAllOp(T)) 1 else 0;
@@ -279,6 +348,7 @@ pub fn columnsTypeOfValue(comptime T: type) type {
     return @Struct(.auto, null, &names, &types, makeAttrs(n));
 }
 
+/// Number of column fields in a table value type (excludes metadata/`all`).
 pub fn columnCount(comptime T: type) usize {
     const f = @typeInfo(T).@"struct".fields;
     const skip: usize = if (hasTrailingAllOp(T)) 1 else 0;
@@ -396,4 +466,21 @@ test "columns named like dsl operations stay plain fields" {
     try std.testing.expectEqualStrings("w", @TypeOf(w.all).table);
     try std.testing.expectEqualStrings("all", @TypeOf(w.all).name);
     try std.testing.expectEqualStrings("where", @TypeOf(w.where).name);
+}
+
+test "column order is declaration order and all() stays last" {
+    const User = table("users", struct { c: i64, a: []const u8, b: f64 });
+    // columnNames (and hence native projection order for selectAll) follows
+    // declaration order, not alphabetical order.
+    try std.testing.expectEqualStrings("c", User.columnNames[0]);
+    try std.testing.expectEqualStrings("a", User.columnNames[1]);
+    try std.testing.expectEqualStrings("b", User.columnNames[2]);
+    try std.testing.expectEqual(@as(usize, 3), columnCount(@TypeOf(User)));
+    // AllColumns marker is distinct from any column value, including a column
+    // literally named `all` on another table.
+    try std.testing.expect(@TypeOf(User.all()) == AllProjection);
+    const Weird = table("weird", struct { all: []const u8, id: i64 });
+    try std.testing.expect(@TypeOf(Weird.all).fieldType == []const u8);
+    try std.testing.expectEqualStrings("all", Weird.columnNames[0]);
+    try std.testing.expectEqualStrings("id", Weird.columnNames[1]);
 }

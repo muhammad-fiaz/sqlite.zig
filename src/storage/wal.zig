@@ -1,18 +1,51 @@
+//! Write-ahead-log codec: header, frames, checksums, and recovery apply.
+//!
+//! Purpose: encode whole database images as WAL frame sequences and replay
+//! (`apply`) a WAL over a base image during recovery/open. Responsibilities:
+//! header/frame framing, the running-checksum chain, and bounded recovery.
+//! Dependencies: `std` only. Ownership: `encodeImage`/`apply` return fresh
+//! caller-owned buffers; all other functions borrow. Error behavior: any
+//! malformed input (bad magic/version/geometry/checksum/salts, zero page
+//! numbers, size mismatches, oversized recovery) fails closed with
+//! `InvalidWal` or `InvalidPageSize` — never panics, over-reads, or
+//! allocates unboundedly (recovery capped by `maxRecoveryBytes`).
+//! Invariants: checksums chain header -> frame[0..8] -> page bytes; each
+//! frame's salts must equal the header salts; page numbers are 1-based.
+//! Compatibility: framing mirrors SQLite WAL (magic, version 3007000,
+//! 32-byte header, 24-byte frame headers); only the little-endian checksum
+//! variant is verified — big-endian-checksummed WALs are rejected.
+
 const std = @import("std");
 
+/// WAL header length in bytes.
 pub const headerSize = 32;
+/// Per-frame header length in bytes.
 pub const frameHeaderSize = 24;
+/// Expected WAL format version (matches SQLite).
 pub const formatVersion: u32 = 3007000;
+/// WAL magic for the little-endian-checksum variant (LSB clear).
 pub const magic: u32 = 0x377f0682;
 
+/// In-memory view of the 32-byte WAL header.
+///
+/// `checksum1/2` on decode are the verified running checksums over bytes
+/// 0..24 (not raw stored values): a header that fails verification never
+/// produces a `WalHeader`.
 pub const WalHeader = struct {
+    /// Database page size framed by this WAL (512..32768, power of two).
     pageSize: u32,
+    /// Checkpoint sequence counter (informational for recovery ordering).
     checkpointSequence: u32 = 0,
+    /// Salt selected at WAL creation; every frame must repeat it.
     salt1: u32 = 0x51f15eed,
+    /// Second salt; every frame must repeat it.
     salt2: u32 = 0x9e3779b9,
+    /// Verified checksum word 1 (filled by `decode`, stored by `encode`).
     checksum1: u32 = 0,
+    /// Verified checksum word 2 (filled by `decode`, stored by `encode`).
     checksum2: u32 = 0,
 
+    /// Serializes the header, computing the checksum over bytes 0..24.
     pub fn encode(self: WalHeader, out: *[headerSize]u8) void {
         @memset(out, 0);
         std.mem.writeInt(u32, out[0..4], magic, .big);
@@ -26,6 +59,10 @@ pub const WalHeader = struct {
         std.mem.writeInt(u32, out[28..32], sums[1], .big);
     }
 
+    /// Parses and fully validates a WAL header (magic, version, geometry,
+    /// checksum). Big-endian-checksummed WALs fail the `WalHeader.decode`
+    /// checksum path or the masked-magic check in `apply` — either way they
+    /// are rejected, never mis-verified.
     pub fn decode(bytes: []const u8) error{InvalidWal}!WalHeader {
         if (bytes.len < headerSize) return error.InvalidWal;
         if (std.mem.readInt(u32, bytes[0..4], .big) != magic) return error.InvalidWal;
@@ -45,14 +82,26 @@ pub const WalHeader = struct {
     }
 };
 
+/// In-memory view of one 24-byte frame header.
+///
+/// The checksum covers frame bytes 0..8 (page number + commit size) chained
+/// with the page image; salts must equal the WAL header salts. `encode`
+/// writes the stored words verbatim (callers compute them via `checksum`).
 pub const FrameHeader = struct {
+    /// 1-based page number this frame replaces (0 is invalid).
     pageNumber: u32,
+    /// Commit size on commit frames, else 0.
     databaseSize: u32,
+    /// Must equal the WAL header `salt1`.
     salt1: u32,
+    /// Must equal the WAL header `salt2`.
     salt2: u32,
+    /// Running checksum word 1 (chained).
     checksum1: u32,
+    /// Running checksum word 2 (chained).
     checksum2: u32,
 
+    /// Serializes the frame header verbatim (no checksum computation).
     pub fn encode(self: FrameHeader, out: *[frameHeaderSize]u8) void {
         std.mem.writeInt(u32, out[0..4], self.pageNumber, .big);
         std.mem.writeInt(u32, out[4..8], self.databaseSize, .big);
@@ -63,6 +112,10 @@ pub const FrameHeader = struct {
     }
 };
 
+/// SQLite WAL running checksum over `bytes` (big-endian u32 words).
+///
+/// Trailing partial words (< 4 bytes) are ignored, matching SQLite. Pure
+/// function of `(seed1, seed2, bytes)`; wrapping arithmetic is intentional.
 pub fn checksum(seed1: u32, seed2: u32, bytes: []const u8) [2]u32 {
     var first = seed1;
     var second = seed2;
@@ -74,6 +127,11 @@ pub fn checksum(seed1: u32, seed2: u32, bytes: []const u8) [2]u32 {
     return .{ first, second };
 }
 
+/// Encodes `image` as a header + one frame per page (fresh owned buffer).
+///
+/// Requires a power-of-two `pageSize` in 512..32768 and `image.len` a
+/// nonzero multiple of it; otherwise `InvalidPageSize`. The result size is a
+/// linear function of the input, so no unbounded allocation is possible.
 pub fn encodeImage(allocator: std.mem.Allocator, image: []const u8, pageSize: usize) ![]u8 {
     if (pageSize < 512 or pageSize > 32768 or (pageSize & (pageSize - 1)) != 0 or image.len == 0 or image.len % pageSize != 0) return error.InvalidPageSize;
     const pageCount: u32 = @intCast(image.len / pageSize);
@@ -105,8 +163,18 @@ pub fn encodeImage(allocator: std.mem.Allocator, image: []const u8, pageSize: us
     return result;
 }
 
+/// Hard cap on `apply`'s output allocation (256 MiB).
+///
+/// Why: the output size derives from the highest framed page number, so a
+/// corrupt frame claiming page 0xffffffff must not force a 2 TB allocation.
 pub const maxRecoveryBytes: usize = 256 * 1024 * 1024;
 
+/// Replays `walImage` over `baseImage` into a fresh owned image.
+///
+/// Two passes: first validates everything (magic mask, endian bit, header,
+/// frame divisibility, per-frame salts, zero page numbers, chained
+/// checksums) and computes the output size; only then allocates (capped) and
+/// copies. A zero-frame WAL copies the base. An empty base grows from zeros.
 pub fn apply(allocator: std.mem.Allocator, baseImage: []const u8, walImage: []const u8) ![]u8 {
     // Recovery validation: masked magic, format version, power-of-two page
     // size in range, header checksum, per-frame salt equality, non-zero
@@ -237,4 +305,31 @@ test "WAL apply rejects corrupt frames without unsafe behavior" {
         std.mem.writeInt(u32, huge[headerSize + 20 .. headerSize + 24][0..4], chain[1], .big);
         try std.testing.expectError(error.InvalidWal, apply(std.testing.allocator, &base, huge));
     }
+}
+
+test "WAL encodeImage validates geometry and frame headers round trip" {
+    // Error: bad geometry and unframed images fail before allocating.
+    var image = [_]u8{0} ** 512;
+    try std.testing.expectError(error.InvalidPageSize, encodeImage(std.testing.allocator, &image, 100));
+    try std.testing.expectError(error.InvalidPageSize, encodeImage(std.testing.allocator, &image, 0));
+    try std.testing.expectError(error.InvalidPageSize, encodeImage(std.testing.allocator, image[0..100], 512));
+    try std.testing.expectError(error.InvalidPageSize, encodeImage(std.testing.allocator, &[_]u8{}, 512));
+    // Normal: frame headers serialize field-exactly (big-endian).
+    const frame = FrameHeader{ .pageNumber = 7, .databaseSize = 9, .salt1 = 1, .salt2 = 2, .checksum1 = 3, .checksum2 = 4 };
+    var frameBytes: [frameHeaderSize]u8 = undefined;
+    frame.encode(&frameBytes);
+    try std.testing.expectEqual(@as(u32, 7), std.mem.readInt(u32, frameBytes[0..4], .big));
+    try std.testing.expectEqual(@as(u32, 9), std.mem.readInt(u32, frameBytes[4..8], .big));
+    // Normal: checksum is deterministic and word-oriented (tails ignored).
+    const a = checksum(0, 0, &[_]u8{ 1, 2, 3, 4 });
+    const b = checksum(0, 0, &[_]u8{ 1, 2, 3, 4 });
+    try std.testing.expectEqual(a, b);
+    try std.testing.expectEqual(checksum(0, 0, &[_]u8{ 1, 2, 3, 4 }), checksum(0, 0, &[_]u8{ 1, 2, 3, 4, 0x99 }));
+    // Boundary: a zero-frame WAL applies to a copy of the base image.
+    var hdr: [headerSize]u8 = undefined;
+    (WalHeader{ .pageSize = 512 }).encode(&hdr);
+    var base = [_]u8{0x5a} ** 512;
+    const copied = try apply(std.testing.allocator, &base, &hdr);
+    defer std.testing.allocator.free(copied);
+    try std.testing.expectEqualSlices(u8, &base, copied);
 }

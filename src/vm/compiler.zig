@@ -1,3 +1,32 @@
+//! Bytecode compiler: AST SELECT/expression -> `opcode.Program`.
+//!
+//! Purpose: lower resolved `sql/ast` nodes into VM programs over registers
+//! and cursors. Responsibilities: register allocation, expression codegen,
+//! SELECT projection/ordering codegen, and `CompiledQuery` packaging with
+//! owned column names.
+//!
+//! Dependencies: `sql/ast`, `vm/opcode`, `vm/value`, optional `catalog/schema`
+//! for name resolution (borrowed, must outlive compilation only), and `vm/vm`
+//! for the execution contract. Raw SQL arrives via `sql/parser`; the DSLs
+//! construct the same AST nodes directly — the compiler never sees SQL text.
+//!
+//! Ownership/lifetime: the returned `CompiledQuery` owns the program and the
+//! column-name strings; caller must `deinit` it. Input ASTs stay caller-owned.
+//!
+//! Error behavior: `error.Unsupported` for statements outside the compiled
+//! SELECT/expression subset (the interpreter in `connection` covers the rest);
+//! OOM propagates. Invalid SQL never reaches here — parsing/resolution rejects
+//! it first.
+//!
+//! SQLite compatibility: codegen preserves three-valued logic, affinity, and
+//! collation as defined by `vm/value`; planner hints (`plan/planner`) select
+//! access paths the emitted cursor opcodes implement.
+// TODO: Extend compiler coverage beyond SELECT/expressions to DML/DDL paths.
+// Current limitation: only SELECT and bare expressions lower to bytecode; the
+// remaining statements execute via the connection interpreter. Expected: one
+// codegen path per statement family with differential tests against the
+// interpreter. Required tests: per-statement compiled-vs-interpreted
+// equivalence plus EXPLAIN output stability.
 const std = @import("std");
 const ast = @import("../sql/ast.zig");
 const opcode = @import("opcode.zig");
@@ -6,11 +35,14 @@ const Schema = @import("../catalog/schema.zig").Schema;
 const Table = @import("../catalog/schema.zig").Table;
 const vm = @import("vm.zig");
 
+/// Owned compiler output: executable program plus owned column names.
+/// Deinit frees names then the program; the VM borrows it during execution.
 pub const CompiledQuery = struct {
     program: opcode.Program,
     columnNames: []const []const u8,
     allocator: std.mem.Allocator,
 
+    /// Frees owned column names then the program.
     pub fn deinit(self: *CompiledQuery) void {
         for (self.columnNames) |name| self.allocator.free(name);
         self.allocator.free(self.columnNames);
@@ -18,11 +50,15 @@ pub const CompiledQuery = struct {
     }
 };
 
+/// Single-use compiler over a borrowed schema. Not thread-safe; create one
+/// per compilation. Register numbers grow monotonically per instance.
 pub const Compiler = struct {
     allocator: std.mem.Allocator,
     schema: ?*const Schema,
     nextRegister: usize = 0,
 
+    /// Single-use compiler over a borrowed schema (may be null for bare
+    /// expressions). Not thread-safe.
     pub fn init(allocator: std.mem.Allocator, schema: ?*const Schema) Compiler {
         return .{
             .allocator = allocator,
@@ -31,12 +67,15 @@ pub const Compiler = struct {
         };
     }
 
+    /// Allocates the next register number (monotonic per instance).
     pub fn allocRegister(self: *Compiler) usize {
         const reg = self.nextRegister;
         self.nextRegister += 1;
         return reg;
     }
 
+    /// Compiles a statement; only SELECT is lowered today, the rest fail
+    /// `Unsupported` and run through the connection interpreter (see TODO).
     pub fn compile(self: *Compiler, statement: ast.Statement) !CompiledQuery {
         switch (statement) {
             .select => |sel| return self.compileSelect(sel),
@@ -44,6 +83,7 @@ pub const Compiler = struct {
         }
     }
 
+    /// Compiles a bare expression into a one-row program.
     pub fn compileExpression(self: *Compiler, expr: ast.Expr) !CompiledQuery {
         var program = opcode.Program.init(self.allocator);
         errdefer program.deinit();

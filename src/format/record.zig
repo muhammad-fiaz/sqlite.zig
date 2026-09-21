@@ -1,30 +1,64 @@
+//! SQLite record (row payload) codec: serial types + header + body.
+//!
+//! Purpose: translate `Value` slices to/from the on-disk record format used
+//! for table-leaf cell payloads and index entries. Responsibilities: serial-
+//! type selection, big-endian integer bodies, header framing. Dependencies:
+//! `format/varint.zig` for all integers on the wire, `vm/value.zig` for the
+//! in-memory `Value` model. Ownership: `encode` returns a fresh caller-owned
+//! buffer; `decode` returns `Value`s whose text/blob slices borrow the input
+//! `bytes` (caller must keep `bytes` alive longer than the result, or dupe).
+//! Error behavior: malformed input fails closed with `Error.InvalidRecord`
+//! (never panics/OOB); allocation failures propagate as `error.OutOfMemory`.
+//! Invariants: header size includes its own varint (fixpoint); serial types
+//! 10/11 are reserved and rejected. Compatibility: serial-type numbers and
+//! integer widths match the SQLite file-format spec.
+
 const std = @import("std");
 const varint = @import("varint.zig");
 const Value = @import("../vm/value.zig").Value;
 
+/// Record failures: truncated input, reserved serial types, or payload that
+/// overruns the buffer. All disk-corruption paths map here (fail closed).
 pub const Error = error{InvalidRecord};
 
+/// Maps a `Value` to its on-disk serial type number.
+///
+/// Why the odd numbers: 0/8/9 are constant values (NULL/0/1, zero body
+/// bytes); 1..6 are fixed-width big-endian integers; 7 is a float64; even
+/// codes >= 12 are blobs and odd codes >= 13 are text with length
+/// `(code - base) / 2`. Length math uses `u64` so huge in-memory slices
+/// cannot wrap `usize` arithmetic before the varint cast.
 fn serialType(value: Value) u64 {
     return switch (value) {
         .null => 0,
         .integer => |n| if (n == 0) 8 else if (n == 1) 9 else if (n >= -128 and n <= 127) 1 else if (n >= -32768 and n <= 32767) 2 else if (n >= -8388608 and n <= 8388607) 3 else if (n >= -2147483648 and n <= 2147483647) 4 else if (n >= -140737488355328 and n <= 140737488355327) 5 else 6,
         .real => 7,
-        .blob => |bytes| 12 + bytes.len * 2,
-        .text => |bytes| 13 + bytes.len * 2,
+        .blob => |bytes| 12 + @as(u64, @intCast(bytes.len)) * 2,
+        .text => |bytes| 13 + @as(u64, @intCast(bytes.len)) * 2,
     };
 }
 
+/// Appends `count` big-endian bytes of `value` to `list`.
+///
+/// Safety: caller selects `count` from the serial-type width table (1, 2, 3,
+/// 4, 6, 8); the shift amount is bounded by `(count - 1) * 8 < 64`.
 fn appendBigEndian(list: *std.ArrayList(u8), allocator: std.mem.Allocator, value: u64, count: usize) !void {
     var i: usize = count;
     while (i > 0) : (i -= 1) try list.append(allocator, @truncate(value >> @intCast((i - 1) * 8)));
 }
 
+/// Appends one varint to `list` (used for the header size + serial types).
 fn appendVarint(list: *std.ArrayList(u8), allocator: std.mem.Allocator, value: u64) !void {
     var buffer: [9]u8 = undefined;
     const length = try varint.encode(value, &buffer);
     try list.appendSlice(allocator, buffer[0..length]);
 }
 
+/// Encodes `values` into a fresh record buffer owned by the caller.
+///
+/// The header size counts its own varint, solved by fixpoint iteration
+/// (converges in <= 2 steps): naive `lengths + len(lengths)` is off by one
+/// when the serial-type bytes sit near a varint boundary (e.g. 127 -> 128).
 pub fn encode(allocator: std.mem.Allocator, values: []const Value) ![]u8 {
     var header = std.ArrayList(u8).empty;
     defer header.deinit(allocator);
@@ -35,7 +69,13 @@ pub fn encode(allocator: std.mem.Allocator, values: []const Value) ![]u8 {
         var tmp: [9]u8 = undefined;
         headerLengths += (try varint.encode(serialType(value), &tmp));
     }
-    try appendVarint(&header, allocator, headerLengths + varint.encodedLength(@intCast(headerLengths)));
+    var headerSizeValue: u64 = @as(u64, @intCast(headerLengths)) + 1;
+    while (true) {
+        const candidate = @as(u64, @intCast(headerLengths)) + varint.encodedLength(headerSizeValue);
+        if (candidate == headerSizeValue) break;
+        headerSizeValue = candidate;
+    }
+    try appendVarint(&header, allocator, headerSizeValue);
     for (values) |value| try appendVarint(&header, allocator, serialType(value));
     for (values) |value| switch (value) {
         .null => {},
@@ -61,6 +101,11 @@ pub fn encode(allocator: std.mem.Allocator, values: []const Value) ![]u8 {
     return result.toOwnedSlice(allocator);
 }
 
+/// Reads a `count`-byte big-endian two's-complement integer with sign
+/// extension (SQLite stores integers in 1, 2, 3, 4, 6, or 8 bytes).
+///
+/// Safety: caller bounds-checks `bytes.len >= count` before calling; the
+/// extension loop is capped at 8 iterations.
 fn readInteger(bytes: []const u8, count: usize) i64 {
     var value: u64 = 0;
     for (bytes[0..count]) |byte| value = (value << 8) | byte;
@@ -71,9 +116,18 @@ fn readInteger(bytes: []const u8, count: usize) i64 {
     return @bitCast(value);
 }
 
+/// Decodes a record; text/blob results borrow `bytes` (see module docs).
+///
+/// Fail-closed rules: empty input, zero/overlong header size, truncated
+/// serial types, reserved codes 10/11, codes < 12 outside the table, and any
+/// body overrun all return `Error.InvalidRecord`. All integer casts from
+/// untrusted varints use checked `std.math.cast` so 32-bit targets cannot
+/// panic on huge codes. Loop bounds: the type loop advances `offset` by >= 1
+/// per iteration up to `headerSize <= bytes.len`; no unbounded allocation
+/// (list capacities derive from `bytes.len`-bounded counts).
 pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) ![]Value {
     const first = varint.decode(bytes) catch return Error.InvalidRecord;
-    const headerSize: usize = @intCast(first.value);
+    const headerSize: usize = std.math.cast(usize, first.value) orelse return Error.InvalidRecord;
     if (headerSize > bytes.len or headerSize == 0) return Error.InvalidRecord;
     var types = std.ArrayList(u64).empty;
     defer types.deinit(allocator);
@@ -112,7 +166,7 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) ![]Value {
             },
             else => {
                 if (code < 12) return Error.InvalidRecord;
-                const length: usize = @intCast((code - 12) / 2);
+                const length: usize = std.math.cast(usize, (code - 12) / 2) orelse return Error.InvalidRecord;
                 if (payload + length > bytes.len) return Error.InvalidRecord;
                 if (code % 2 == 0) try values.append(allocator, .{ .blob = bytes[payload .. payload + length] }) else try values.append(allocator, .{ .text = bytes[payload .. payload + length] });
                 payload += length;
@@ -194,4 +248,32 @@ test "record decoder rejects reserved serial types and truncation" {
     const ok = try decode(std.testing.allocator, bytes);
     defer std.testing.allocator.free(ok);
     try std.testing.expectEqual(@as(usize, 2), ok.len);
+}
+
+test "record header size counts its own varint at the 127-byte boundary" {
+    // 127 one-byte serial types need a 2-byte header-size varint (total 129),
+    // the case a naive `lengths + len(lengths)` fixpoint misses by one.
+    const count = 127;
+    const values = try std.testing.allocator.alloc(Value, count);
+    defer std.testing.allocator.free(values);
+    for (values) |*v| v.* = .null;
+    const bytes = try encode(std.testing.allocator, values);
+    defer std.testing.allocator.free(bytes);
+    const first = try varint.decode(bytes);
+    // 127 one-byte serial types + a 2-byte size varint = 129 header bytes.
+    try std.testing.expectEqual(@as(u64, 129), first.value);
+    try std.testing.expectEqual(@as(u8, 2), first.length);
+    const decoded = try decode(std.testing.allocator, bytes);
+    defer std.testing.allocator.free(decoded);
+    try std.testing.expectEqual(count, decoded.len);
+    // Boundary: empty record is a 1-byte header claiming size 1.
+    const empty = try encode(std.testing.allocator, &[_]Value{});
+    defer std.testing.allocator.free(empty);
+    try std.testing.expectEqual(@as(usize, 1), empty.len);
+    const emptyDecoded = try decode(std.testing.allocator, empty);
+    defer std.testing.allocator.free(emptyDecoded);
+    try std.testing.expectEqual(@as(usize, 0), emptyDecoded.len);
+    // Error: header size 0 and header larger than the buffer fail closed.
+    try std.testing.expectError(Error.InvalidRecord, decode(std.testing.allocator, &[_]u8{0x00}));
+    try std.testing.expectError(Error.InvalidRecord, decode(std.testing.allocator, &[_]u8{ 0x7f, 0x00 }));
 }

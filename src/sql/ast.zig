@@ -1,24 +1,77 @@
+//! SQL abstract syntax tree: owned node vocabulary for the frontend.
+//!
+//! Purpose: single authoritative AST shared by the parser (producer),
+//! `expr.zig` (row-level evaluator), `plan/` (planner/optimizer readers), the
+//! VM compiler, and DSL builders in `src/dsl/` which construct these nodes
+//! directly and never round-trip through SQL strings.
+//!
+//! Responsibilities: declare `Expr`, `Condition`, `Statement`, and all DDL/DML
+//! payload structs; provide ownership helpers (`freeOwnedExpr`,
+//! `cloneOwnedExpr`, `freeExprRec`, `freeConditions`, `deinit`).
+//!
+//! Dependencies: `std`, `../vm/value.zig` (`Value` literals). No lexer/parser
+//! imports (dependency direction is parser -> ast, never the reverse).
+//!
+//! Ownership/lifetime: two flavors coexist and must not be mixed:
+//! - *Borrowed* AST from `Parser`: string slices borrow the source SQL or the
+//!   parser's `allocations` arena; expression *nodes* (`*const Expr` links)
+//!   are individually `allocator.create`d and freed by `ast.deinit`.
+//! - *Owned* AST (e.g. cloned predicates kept by the planner): every string
+//!   and node is heap-owned; free with `freeOwnedExpr` / `freeConditions`.
+//! `freeExprRec` frees node structure but not borrowed strings (parser-arena
+//! case); `freeOwnedExpr` additionally frees owned strings/blobs/names.
+//!
+//! Error behavior: `cloneOwnedExpr` returns `OutOfMemory` only; free functions
+//! are infallible. Callers must not double-free: each node has exactly one owner.
+//!
+//! Invariants: nullable `?*const Expr` links are either null or point at a
+//! live heap node; `&.{}` empty slices are never freed (helpers guard on
+//! `len != 0`); `Statement.isQuery` covers exactly the read-like variants.
+//!
+//! SQLite compatibility: mirrors SQLite surface (conflict policies, generated
+//! columns, strict/without-rowid, partial/expression indexes, triggers,
+//! virtual tables, CTEs, compound selects, pragmas, vacuum/analyze).
+// TODO(sql/ast): recursion in free/clone/deinit is unbounded; a hostile
+// deeply-nested expression (e.g. 100k nested parens surviving the parser
+// depth cap) can still overflow the stack here. Expected: iterative free/clone
+// or an explicit depth cap shared with parser/expr; tests: 10k-deep free and
+// clone fail closed instead of crashing. Subsystem: sql/frontend.
+
 const std = @import("std");
 const Value = @import("../vm/value.zig").Value;
 
+/// WHERE/HAVING comparison operators, including SQLite-only predicates.
 pub const CompareOp = enum { equal, notEqual, less, lessEqual, greater, greaterEqual, like, notLike, glob, notGlob, regexp, notRegexp, match, notMatch, isNull, isNotNull, isValue, isNotValue, isDistinct, isNotDistinct, between, notBetween, in, notIn, exists, notExists, isTrue };
 
+/// One ORDER BY / window-ORDER-BY key: expression plus direction/null placement.
 pub const OrderItem = struct {
+    /// Sort key expression (owned per the enclosing flavor; see module docs).
     expr: Expr,
+    /// True for `DESC`, false for `ASC`/default.
     descending: bool = false,
+    /// True for `NULLS FIRST`, false for default/`NULLS LAST`.
     nullsFirst: bool = false,
 };
 
+/// Window frame unit (`ROWS`/`RANGE`/`GROUPS`).
 pub const WindowFrameKind = enum { rows, range, groups };
+/// One end of a window frame.
 pub const WindowFrameBound = enum { unboundedPreceding, preceding, currentRow, following, unboundedFollowing };
+/// Complete frame descriptor; `end == null` means "same as start" (single-bound form).
 pub const WindowFrame = struct {
+    /// Frame unit.
     kind: WindowFrameKind = .rows,
+    /// Start bound.
     start: WindowFrameBound = .unboundedPreceding,
+    /// `N` in `N PRECEDING`/`N FOLLOWING`; 0 for unbounded/current-row.
     startOffset: usize = 0,
+    /// End bound, or null for the single-bound shorthand.
     end: ?WindowFrameBound = null,
+    /// `N` for the end bound.
     endOffset: usize = 0,
 };
 
+/// Owned expression tree. Pointer children are heap nodes; see module docs.
 pub const Expr = union(enum) {
     literal: Value,
     identifier: []const u8,
@@ -36,33 +89,61 @@ pub const Expr = union(enum) {
     inList: struct { expr: *const Expr, list: []const Expr, negated: bool = false },
     window: struct { funcName: []const u8, argument: ?*const Expr = null, argument2: ?*const Expr = null, extraArgs: []const Expr = &.{}, partitionBy: []const Expr = &.{}, orderBy: []const OrderItem = &.{}, frame: ?WindowFrame = null },
 };
+/// Binary expression operators (arithmetic, bitwise, concat, comparison, logic).
 pub const BinaryOp = enum { add, subtract, multiply, divide, modulo, concat, bitAnd, bitOr, shiftLeft, shiftRight, equal, notEqual, less, lessEqual, greater, greaterEqual, logicalAnd, logicalOr, isOp, isNotOp };
+/// Unary operators; `logicalNot` is three-valued (NULL stays NULL).
 pub const UnaryOp = enum { negate, positive, bitNot, logicalNot };
+/// One `WHEN cond THEN result` arm of a `CASE`.
 pub const CaseWhen = struct { condition: Expr, result: Expr };
 
+/// Legacy flat WHERE conjunct used by the planner/executor fast path.
+/// `leftExpr` carries arbitrary expression keys; `column` the simple-column fast path.
 pub const Condition = struct { column: []const u8, op: CompareOp, value: Expr, value2: ?Expr = null, subquery: ?[]const u8 = null, tableScan: ?TableScan = null, listValues: []const Expr = &.{}, joinOr: bool = false, leftExpr: ?Expr = null, escape: ?Expr = null, negated: bool = false, collate: ?[]const u8 = null };
+/// Correlated table-scan predicate (EXISTS-style delegation to storage).
 pub const TableScan = struct { table: []const u8, column: []const u8 = "", conditions: ?Conditions = null };
+/// HAVING clause as a single comparison until full expression HAVING lands.
 pub const Having = struct { left: Expr, op: CompareOp, right: Expr };
+/// WHERE condition list; `joinOr == true` on element i joins i to i+1 with OR.
 pub const Conditions = []const Condition;
+/// Legacy ORDER BY entry (column-name form; `OrderItem` is the expression form).
 pub const Order = struct { column: []const u8, descending: bool };
+/// Join flavor; `cross` and bare `natural` carry empty join keys.
 pub const JoinKind = enum { inner, left, right, full, cross };
+/// One JOIN arm; USING(single-col) lowers to left/right column pair.
 pub const Join = struct { kind: JoinKind, table: []const u8, tableAlias: ?[]const u8 = null, leftTable: []const u8, leftColumn: []const u8, rightTable: []const u8, rightColumn: []const u8, mergeOutput: bool = false, usingColumns: []const []const u8 = &.{} };
+/// SELECT output item with optional alias.
 pub const Projection = struct { expr: Expr, alias: ?[]const u8 = null };
+/// Inline `REFERENCES t(c)` column constraint.
 pub const ForeignKeyDef = struct { table: []const u8, column: []const u8, onDelete: ReferentialAction = .restrict, onUpdate: ReferentialAction = .restrict };
+/// FK referential actions; default `.restrict` matches the parser default.
 pub const ReferentialAction = enum { restrict, cascade, setNull, setDefault, noAction };
+/// Column definition; `typeName` may be "" (untyped affinity) or multi-word.
 pub const ColumnDef = struct { name: []const u8, typeName: []const u8, primaryKey: bool = false, notNull: bool = false, unique: bool = false, autoincrement: bool = false, foreignKey: ?ForeignKeyDef = null, defaultValue: ?Value = null, checkExpr: ?Expr = null, generatedExpr: ?Expr = null, generatedStored: bool = false };
+/// Table-level `FOREIGN KEY (cols) REFERENCES t(cols)` constraint.
 pub const TableForeignKeyDef = struct { columns: []const []const u8, table: []const u8, referencedColumns: []const []const u8, onDelete: ReferentialAction = .restrict, onUpdate: ReferentialAction = .restrict };
+/// Table-level constraints (PK/UNIQUE/FK/CHECK).
 pub const TableConstraint = union(enum) { primaryKey: []const []const u8, unique: []const []const u8, foreignKey: TableForeignKeyDef, check: Expr };
+/// CREATE INDEX payload; `keyExprs` parallels `columns` (null = plain column).
 pub const IndexDef = struct { name: []const u8, table: []const u8, columns: []const []const u8, keyExprs: []const ?Expr = &.{}, unique: bool = false, ifNotExists: bool = false, whereExpr: ?Expr = null, whereSql: ?[]const u8 = null };
+/// Trigger DML event.
 pub const TriggerEvent = enum { insert, update, delete };
+/// Trigger firing time (SQLite has no INSTEAD OF here yet).
 pub const TriggerTiming = enum { before, after };
+/// CREATE TRIGGER payload; `body`/`whenSql` are retained source slices.
 pub const TriggerDef = struct { name: []const u8, table: []const u8, timing: TriggerTiming = .after, event: TriggerEvent, updateOf: []const []const u8 = &.{}, whenSql: ?[]const u8 = null, body: []const u8, ifNotExists: bool = false, temporary: bool = false };
+/// CREATE VIRTUAL TABLE payload; args are raw token texts.
 pub const VirtualTableDef = struct { name: []const u8, module: []const u8, arguments: []const []const u8, ifNotExists: bool = false };
+/// One WITH arm; queries kept as source SQL for lazy re-parse by connection.
 pub const CteDef = struct { name: []const u8, columns: []const []const u8 = &.{}, querySql: []const u8, recursiveSql: ?[]const u8 = null, recursiveAll: bool = false };
+/// WITH [RECURSIVE] wrapper; body kept as source SQL.
 pub const WithSelect = struct { ctes: []CteDef, bodySql: []const u8, recursive: bool = false };
+/// INSERT OR / UPDATE OR conflict resolution.
 pub const ConflictPolicy = enum { none, ignore, replace, update, abort, fail, rollback };
+/// Upsert execution outcome (used by the executor, not the parser).
 pub const UpsertResult = enum { noConflict, skipped, updated };
+/// UPDATE..FROM join descriptor (single equi-join pair fast path).
 pub const UpdateFrom = struct { table: []const u8, tableSchema: []const u8 = "", leftTable: []const u8, leftColumn: []const u8, rightTable: []const u8, rightColumn: []const u8 };
+/// ALTER TABLE variants supported by the parser.
 pub const AlterTable = union(enum) {
     addColumn: struct { table: []const u8, definition: ColumnDef },
     renameTable: struct { table: []const u8, newName: []const u8 },
@@ -70,9 +151,12 @@ pub const AlterTable = union(enum) {
     dropColumn: struct { table: []const u8, column: []const u8 },
 };
 
+/// Compound SELECT operators (`UNION [ALL]` / `INTERSECT` / `EXCEPT`).
 pub const CompoundOp = enum { unionOp, unionAllOp, intersectOp, exceptOp };
+/// Compound select kept as source slices plus trailing ORDER/LIMIT for lazy execution.
 pub const CompoundSelect = struct { leftSql: []const u8, op: CompoundOp, rightSql: []const u8, orders: []const Order = &.{}, limit: ?usize = null, offset: ?usize = null };
 
+/// Top-level statement union produced by `Parser.parse`.
 pub const Statement = union(enum) {
     createTable: struct { name: []const u8, columns: []ColumnDef, constraints: []TableConstraint = &.{}, ifNotExists: bool = false, strict: bool = false, withoutRowid: bool = false, temporary: bool = false },
     createIndex: IndexDef,
@@ -103,11 +187,15 @@ pub const Statement = union(enum) {
     vacuum: struct { schemaName: ?[]const u8 = null, into: ?Expr = null },
     analyze: struct { target: ?[]const u8 = null },
 
+    /// True for read-like statements (select/with/compound/explain/pragma).
     pub fn isQuery(self: Statement) bool {
         return self == .select or self == .withSelect or self == .compoundSelect or self == .explainQueryPlan or self == .pragma;
     }
 };
 
+/// Free an *owned* expression: node structure plus owned strings/blobs/names.
+/// Each heap node and owned slice is freed exactly once. Borrowed parser
+/// output must use `freeExprRec`/`deinit` instead (they skip string frees).
 pub fn freeOwnedExpr(allocator: std.mem.Allocator, expr: Expr) void {
     switch (expr) {
         .literal => |lit| switch (lit) {
@@ -209,6 +297,8 @@ pub fn freeOwnedExpr(allocator: std.mem.Allocator, expr: Expr) void {
     }
 }
 
+/// Deep-clone an expression into fully-owned memory (`OutOfMemory` on failure).
+/// On error, partially built output is freed; the input is never consumed.
 pub fn cloneOwnedExpr(allocator: std.mem.Allocator, expr: Expr) !Expr {
     switch (expr) {
         .literal => |lit| return .{ .literal = switch (lit) {
@@ -454,6 +544,8 @@ pub fn cloneOwnedExpr(allocator: std.mem.Allocator, expr: Expr) !Expr {
     }
 }
 
+/// Free parser-arena expression node structure without freeing borrowed strings.
+/// Pair with `Parser.allocations` cleanup which owns the string memory.
 pub fn freeExprRec(gpa: anytype, expr: Expr) void {
     switch (expr) {
         .function => |call| {
@@ -543,6 +635,7 @@ pub fn freeExprRec(gpa: anytype, expr: Expr) void {
     }
 }
 
+/// Free a borrowed condition list and its node structure (strings stay arena-owned).
 pub fn freeConditions(allocator: anytype, conditions: Conditions) void {
     for (conditions) |condition| {
         if (condition.leftExpr) |left| freeExprRec(allocator, left);
@@ -556,6 +649,8 @@ pub fn freeConditions(allocator: anytype, conditions: Conditions) void {
     allocator.free(conditions);
 }
 
+/// Free a whole parser-produced statement (node structure; strings via `Parser.deinit`).
+/// Must be called exactly once per successful `Parser.parse`.
 pub fn deinit(allocator: anytype, statement: *Statement) void {
     const freeExpr = struct {
         fn run(gpa: anytype, expr: Expr) void {
@@ -731,4 +826,22 @@ test "ast nodes represent subqueries, compound statements, and returning clauses
         },
     };
     try std.testing.expect(compound.isQuery());
+}
+
+test "ast clone/free round-trips owned expressions" {
+    const alloc = std.testing.allocator;
+    const l = try alloc.create(Expr);
+    defer alloc.destroy(l);
+    l.* = .{ .literal = .{ .integer = 1 } };
+    const r = try alloc.create(Expr);
+    defer alloc.destroy(r);
+    r.* = .{ .literal = .{ .integer = 2 } };
+    const src: Expr = .{ .binary = .{ .op = .add, .left = l, .right = r } };
+    const owned = try cloneOwnedExpr(alloc, src);
+    freeOwnedExpr(alloc, owned);
+}
+
+test "ast isQuery covers read-like statements only" {
+    try std.testing.expect((Statement{ .begin = {} }).isQuery() == false);
+    try std.testing.expect((Statement{ .pragma = .{ .name = "x" } }).isQuery());
 }

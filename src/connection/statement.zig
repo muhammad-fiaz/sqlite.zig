@@ -1,39 +1,111 @@
+//! Prepared statements: reusable SQL text plus bound parameters.
+//!
+//! Purpose: hold one owned SQL string and an ordered parameter list for
+//! repeated `step()` (writes) / `query()` (reads) execution through the
+//! connection's executor hooks. Parameters are 1-based (`bind(1, ...)`), like
+//! SQLite host parameters.
+//!
+//! Responsibilities: Zig-to-`Value` conversion (`bindValue`), gap filling,
+//! in-place rebinding, `reset()` for reuse, and `finalize()` for cleanup.
+//!
+//! Dependencies: `vm/value.zig` (`Value`), `connection/result.zig` (`Result`).
+//!
+//! Ownership/lifetime (critical): the `Statement` OWNS `sql` and the
+//! `parameters` backing. The `connection` pointer and both executor hooks are
+//! BORROWED — the connection must outlive the statement. Bound text/blob
+//! `Value` payloads are BORROWED from the caller (e.g. `bind(1, "ada")` keeps
+//! pointing at the caller's bytes); keep them alive through `step()`/`query()`
+//! and do not free them via the statement. `query()` returns an OWNED `Result`
+//! the caller must `deinit`. `reset()` clears bindings but keeps capacity and
+//! leaves `sql` usable for rebinding. `finalize()` frees `sql` and the
+//! parameter list and resets both to empty, so a second `finalize` is a safe
+//! no-op; after the first `finalize` the statement (and any pointer into its
+//! `sql`/parameters) dangles and must not be stepped/queried. `Connection`
+//! hands out statements that the caller owns — always `finalize`, preferably
+//! via `defer`.
+//!
+//! Error behavior: `bind(0, ...)` fails `error.InvalidParameter`. Binding
+//! past the end fills skipped positions with NULL (like unbound parameters).
+//! `step`/`query` propagate engine errors. Type misuse (unsupported Zig type)
+//! is a `@compileError` in `bindValue`.
+//!
+//! SQLite compatibility: 1-based parameters, NULL-fill for gaps, and
+//! in-place rebinding mirror `sqlite3_bind_*` semantics. Text parameters bind
+//! as TEXT (no affinity coercion here; the engine applies column affinity).
+//!
+//! Unified pipeline note: statements carry raw SQL text plus bound values
+//! straight to the native engine — the DSL pipelines lower to native AST/IR
+//! instead, so statements never take part in a DSL->SQL-string round trip.
+
 const std = @import("std");
 const Value = @import("../vm/value.zig").Value;
 const Result = @import("result.zig").Result;
 
+/// Owned prepared statement. See module docs: owns `sql` + `parameters`,
+/// borrows `connection` + hooks, borrows bound text/blob payloads.
 pub const Statement = struct {
+    /// Borrowed live connection. Must outlive the statement.
     connection: *anyopaque,
+    /// Owned SQL text. Freed by `finalize`; unusable afterwards.
     sql: []u8,
+    /// Borrowed allocator that owns `sql`/`parameters`. Must outlive `finalize`.
     allocator: std.mem.Allocator,
+    /// Owned bound parameters (1-based externally). Text/blob payloads inside
+    /// are BORROWED from the `bind` caller — never freed here.
     parameters: std.ArrayList(Value),
+    /// Borrowed write executor: runs `sql` with the current parameters.
     executeFn: *const fn (*anyopaque, []const u8, []const Value) anyerror!void,
+    /// Borrowed read executor: returns an owned `Result` (caller deinits).
     queryFn: *const fn (*anyopaque, []const u8, []const Value) anyerror!Result,
+    /// Finalize guard. Set by `finalize`; makes a second call a safe no-op.
+    /// Defaults to false so existing struct literals keep compiling.
+    finalized: bool = false,
 
+    /// Bind `value` at 1-based `index`, growing with NULL fill as needed.
+    /// Text/blob payloads stay caller-owned. Fails `InvalidParameter` on 0.
     pub fn bind(self: *Statement, index: usize, value: anytype) !void {
+        if (index == 0) return error.InvalidParameter;
+        if (self.finalized) return error.InvalidParameter;
         const converted: Value = bindValue(value);
         while (self.parameters.items.len < index) try self.parameters.append(self.allocator, .null);
-        if (index == 0) return error.InvalidParameter;
-        if (index - 1 == self.parameters.items.len) try self.parameters.append(self.allocator, converted) else self.parameters.items[index - 1] = converted;
+        self.parameters.items[index - 1] = converted;
     }
 
+    /// Execute as a write with the current bindings. Borrowed payloads must
+    /// still be alive. Propagates engine errors.
     pub fn step(self: *Statement) !void {
         return self.executeFn(self.connection, self.sql, self.parameters.items);
     }
 
+    /// Execute as a read with the current bindings. Returns an owned `Result`
+    /// the caller must `deinit`. Borrowed payloads must still be alive.
     pub fn query(self: *Statement) !Result {
         return self.queryFn(self.connection, self.sql, self.parameters.items);
     }
 
+    /// Clear all bindings for reuse, keeping capacity. `sql` is untouched.
+    /// Safe to call on a fresh or already-reset statement.
     pub fn reset(self: *Statement) void {
         self.parameters.clearRetainingCapacity();
     }
 
+    /// Free `sql` and the parameter list and reset both to empty, making a
+    /// second `finalize` a safe no-op. After the first call the statement
+    /// must not be used. Note: bound text/blob payloads are caller-owned and
+    /// are NOT freed here.
     pub fn finalize(self: *Statement) void {
+        if (self.finalized) return;
+        self.finalized = true;
         self.parameters.deinit(self.allocator);
+        self.parameters = .empty;
         self.allocator.free(self.sql);
+        self.sql = &.{};
     }
 
+    /// Convert a Zig scalar to a borrowed `Value` for binding. `Value`
+    /// passes through; optionals/null map to NULL; bools to 0/1; ints/floats
+    /// convert; pointers bind as TEXT (caller keeps the bytes alive).
+    /// Anything else is a comptime error.
     fn bindValue(value: anytype) Value {
         const T = @TypeOf(value);
         if (T == Value) return value;
@@ -82,4 +154,17 @@ test "statement binding rejects index zero fills gaps and rebinds" {
     // reset() clears bindings for statement reuse.
     statement.reset();
     try std.testing.expectEqual(@as(usize, 0), statement.parameters.items.len);
+}
+
+test "finalize is idempotent and retires the statement" {
+    var statement = Statement{ .connection = undefined, .sql = try std.testing.allocator.dupe(u8, "SELECT 1"), .allocator = std.testing.allocator, .parameters = .empty, .executeFn = undefined, .queryFn = undefined };
+    try statement.bind(1, 7);
+    try statement.bind(2, "text");
+    try std.testing.expectEqual(@as(usize, 2), statement.parameters.items.len);
+    statement.finalize();
+    try std.testing.expect(statement.finalized);
+    try std.testing.expectEqual(@as(usize, 0), statement.sql.len);
+    // Second finalize is a safe no-op; binding after finalize is refused.
+    statement.finalize();
+    try std.testing.expectError(error.InvalidParameter, statement.bind(1, 1));
 }

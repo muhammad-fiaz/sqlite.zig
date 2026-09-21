@@ -1,13 +1,86 @@
+//! In-memory catalog: canonical tables, indexes, views, and triggers.
+//!
+//! Purpose: own the database schema and its rows. `Schema` is the single
+//! owner of every table/index/view/trigger descriptor string, every stored
+//! `Value` payload, and every cloned CHECK/GENERATED/index expression. It
+//! validates DDL, enforces PRIMARY KEY / UNIQUE / FOREIGN KEY / CHECK /
+//! STRICT / WITHOUT ROWID / AUTOINCREMENT rules, maintains `sqlite_sequence`
+//! and `sqlite_stat1`, and rewrites stored SQL/expressions on renames.
+//!
+//! Responsibilities: table/index/view/trigger lifecycle, row append/update
+//! validation, affinity-adjacent STRICT coercion, rowid-alias assignment,
+//! autoindex maintenance, rename propagation, stats collection, and cloning.
+//!
+//! Dependencies: `vm/value.zig` (`Value`), `sql/ast.zig` (column/table
+//! definitions, expressions + clone/free helpers), `sql/expr.zig`
+//! (predicate evaluation), `sql/functions.zig` (aggregate/window guards for
+//! index expressions), `sql/lexer.zig` + `sql/token.zig` (stored-SQL rewrite
+//! tokenization, imported locally at use sites).
+//!
+//! Ownership/lifetime (critical): `Schema` OWNS everything reachable from it.
+//! `createTable`/`createIndex`/`createView`/`createTrigger` duplicate every
+//! name, default, expression, and SQL string into the schema allocator;
+//! callers retain nothing and must keep nothing alive. `find` returns a
+//! mutable borrow into the schema — the pointer dangles after `dropTable`/
+//! `removeTable`/`renameTable` moves the entry or after `deinit`. `Table.rows`
+//! own their `Value` payloads; `appendRow` duplicates inputs. `clone()` returns
+//! a fully independent `Schema` the caller must `deinit`. Call `deinit()`
+//! exactly once; it frees tables (descriptors + rows), indexes (names,
+//! columns, key/where expressions + SQL), views, and triggers. After `deinit`
+//! every borrowed table/index/view pointer dangles.
+//!
+//! Error behavior: DDL misuse yields `TableExists`/`IndexExists`/`ViewExists`/
+//! `TriggerExists`, `UnknownTable`/`UnknownColumn`/`UnknownIndex`/
+//! `UnknownView`/`UnknownTrigger`, `ColumnExists`, `ColumnCountMismatch`,
+//! `ConstraintViolation`, or `InvalidSql`. Allocation failure propagates as
+//! `OutOfMemory`. Failed creates leave the schema unchanged (errdefers free
+//! partial dupes); failed `addColumn` row backfills may leave rows extended —
+//! see the TODO at `addColumn`.
+//!
+//! SQLite compatibility: case-insensitive name resolution throughout;
+//! `sqlite_autoindex_*` maintenance; WITHOUT ROWID requires a PK;
+//! AUTOINCREMENT requires INTEGER PRIMARY KEY on a rowid table; STRICT allows
+//! only INT/INTEGER/REAL/TEXT/BLOB/ANY with NULL passing through;
+//! rowid-alias assignment mirrors SQLite's max+1 rule; partial/expression
+//! indexes reject aggregates, window-only functions, subqueries, and
+//! parameter/wildcard nodes; rename rewrites stored trigger/view/index SQL
+//! and CHECK/GENERATED expressions.
+//!
+//! Unified pipeline note: the catalog sits below all three pipelines — Raw
+//! SQL, the dynamic DSL, and the typed DSL all converge on native AST/IR that
+//! executes against this schema. Nothing here renders or parses SQL except
+//! the rename-path tokenizer, which rewrites already-stored SQL text.
+//!
+//! Column/operation collision note: not applicable — this layer stores raw
+//! column names verbatim (even `where`/`count`/`select`) and never interprets
+//! them as operations.
+//!
+//! AllColumns note: not applicable — star expansion happens above this layer;
+//! the catalog only sees resolved column lists.
+
 const std = @import("std");
 const Value = @import("../vm/value.zig").Value;
 const ast = @import("../sql/ast.zig");
 const exprEvaluator = @import("../sql/expr.zig");
 const functions = @import("../sql/functions.zig");
 
+/// Owned column descriptor. `name`/`typeName`/FK strings are schema-owned
+/// dupes; `defaultValue` owns its text/blob payload; `checkExpr`/
+/// `generatedExpr` are schema-owned cloned ASTs. Borrowed views dangle after
+/// drop/rename/deinit.
 pub const Column = struct { name: []u8, typeName: []u8, primaryKey: bool, notNull: bool, unique: bool = false, autoincrement: bool = false, defaultValue: ?Value = null, foreignTable: ?[]u8 = null, foreignColumn: ?[]u8 = null, onDelete: ast.ReferentialAction = .restrict, onUpdate: ast.ReferentialAction = .restrict, checkExpr: ?ast.Expr = null, generatedExpr: ?ast.Expr = null, generatedStored: bool = false };
+/// Owned row: `values` has one entry per column and owns text/blob payloads.
+/// Freed by schema lifecycle ops; never retain after drop/truncate/deinit.
 pub const Row = struct { values: []Value };
+/// Owned table-level constraint. Name lists and FK strings are schema-owned
+/// dupes; `checkExpr` is a schema-owned cloned AST.
 pub const Constraint = struct { kind: enum { primaryKey, unique, foreignKey, check }, columns: [][]u8, foreignTable: ?[]u8 = null, referencedColumns: [][]u8 = &.{}, onDelete: ast.ReferentialAction = .restrict, onUpdate: ast.ReferentialAction = .restrict, checkExpr: ?ast.Expr = null };
+/// Owned table: heap-allocated by the schema (`tables` holds `*Table`).
+/// `name`/columns/constraints/rows/virtual strings are schema-owned. A `*Table`
+/// from `find` borrows the schema and dangles after drop/remove/deinit.
 pub const Table = struct { name: []u8, columns: []Column, constraints: []Constraint, rows: std.ArrayList(Row), virtualModule: ?[]u8 = null, virtualArguments: [][]u8 = &.{}, strict: bool = false, withoutRowid: bool = false };
+/// Owned index descriptor. Names/columns/SQL are schema-owned dupes;
+/// `keyExprs`/`whereExpr` are schema-owned cloned ASTs.
 pub const Index = struct {
     name: []u8,
     table: []u8,
@@ -17,12 +90,17 @@ pub const Index = struct {
     whereExpr: ?ast.Expr = null,
     whereSql: ?[]u8 = null,
 
+    /// Borrowed key expression for one indexed position, or null for a plain
+    /// column key. The expression stays schema-owned; do not free it.
     pub fn keyExpr(self: *const Index, position: usize) ?ast.Expr {
         if (position >= self.keyExprs.len) return null;
         return self.keyExprs[position];
     }
 };
+/// Owned view: `name` + stored SELECT text, both schema-owned dupes.
 pub const View = struct { name: []u8, sql: []u8 };
+/// Owned trigger descriptor. Names/body/SQL are schema-owned dupes;
+/// `updateOf` holds owned column names (empty means "any UPDATE").
 pub const Trigger = struct {
     name: []u8,
     table: []u8,
@@ -32,6 +110,9 @@ pub const Trigger = struct {
     whenSql: ?[]u8 = null,
     body: []u8,
 
+    /// True when this trigger fires for an UPDATE touching `updatedColumns`.
+    /// Non-UPDATE events and column-less UPDATE triggers always fire.
+    /// Comparison is case-insensitive; borrowed inputs, never fails.
     pub fn firesOnUpdate(self: *const Trigger, updatedColumns: []const []const u8) bool {
         if (self.event != .update) return true;
         if (self.updateOf.len == 0) return true;
@@ -42,6 +123,8 @@ pub const Trigger = struct {
     }
 };
 
+/// The catalog itself. Owns all descriptors, rows, and cloned expressions.
+/// Borrow the allocator for its lifetime; call `deinit` exactly once.
 pub const Schema = struct {
     allocator: std.mem.Allocator,
     tables: std.ArrayList(*Table),
@@ -50,10 +133,14 @@ pub const Schema = struct {
     triggers: std.ArrayList(Trigger),
     foreignKeysEnabled: bool = true,
 
+    /// Borrow an empty catalog over `allocator`. Owns nothing yet; `deinit`
+    /// releases whatever is created afterwards. Never fails.
     pub fn init(allocator: std.mem.Allocator) Schema {
         return .{ .allocator = allocator, .tables = .empty, .indexes = .empty, .views = .empty, .triggers = .empty };
     }
 
+    /// Release every owned descriptor, row, expression, and SQL string. Call
+    /// exactly once; afterwards every borrowed table/index/view pointer dangles.
     pub fn deinit(self: *Schema) void {
         for (self.tables.items) |table| {
             self.deinitTable(table);
@@ -102,40 +189,51 @@ pub const Schema = struct {
         };
     }
 
+    /// Mutable borrow of a table by case-insensitive name, or null. Dangles
+    /// after drop/remove/rename/deinit.
     pub fn find(self: *Schema, name: []const u8) ?*Table {
         for (self.tables.items) |table| if (std.ascii.eqlIgnoreCase(table.name, name)) return table;
         return null;
     }
+    /// Shared borrow of a table by case-insensitive name, or null. Same
+    /// lifetime rules as `find`.
     pub fn findConst(self: *const Schema, name: []const u8) ?*const Table {
         for (self.tables.items) |table| if (std.ascii.eqlIgnoreCase(table.name, name)) return table;
         return null;
     }
 
+    /// Mutable borrow of an index by case-insensitive name, or null.
     pub fn findIndex(self: *Schema, name: []const u8) ?*Index {
         for (self.indexes.items) |*index| if (std.ascii.eqlIgnoreCase(index.name, name)) return index;
         return null;
     }
 
+    /// Shared borrow of an index by case-insensitive name, or null.
     pub fn findIndexConst(self: *const Schema, name: []const u8) ?*const Index {
         for (self.indexes.items) |*index| if (std.ascii.eqlIgnoreCase(index.name, name)) return index;
         return null;
     }
 
+    /// Mutable borrow of a view by case-insensitive name, or null.
     pub fn findView(self: *Schema, name: []const u8) ?*View {
         for (self.views.items) |*view| if (std.ascii.eqlIgnoreCase(view.name, name)) return view;
         return null;
     }
 
+    /// Shared borrow of a view by case-insensitive name, or null.
     pub fn findViewConst(self: *const Schema, name: []const u8) ?*const View {
         for (self.views.items) |*view| if (std.ascii.eqlIgnoreCase(view.name, name)) return view;
         return null;
     }
 
+    /// Create a view, duping `name`/`sql` into the schema. Fails `ViewExists`
+    /// when a table, index, or view already uses the name.
     pub fn createView(self: *Schema, name: []const u8, sql: []const u8) !void {
         if (self.find(name) != null or self.findIndexConst(name) != null or self.findView(name) != null) return error.ViewExists;
         try self.views.append(self.allocator, .{ .name = try self.allocator.dupe(u8, name), .sql = try self.allocator.dupe(u8, sql) });
     }
 
+    /// Drop a view by name, freeing its dupes. Fails `UnknownView` when absent.
     pub fn dropView(self: *Schema, name: []const u8) !void {
         for (self.views.items, 0..) |view, position| if (std.ascii.eqlIgnoreCase(view.name, name)) {
             const removed = self.views.orderedRemove(position);
@@ -146,16 +244,21 @@ pub const Schema = struct {
         return error.UnknownView;
     }
 
+    /// Mutable borrow of a trigger by case-insensitive name, or null.
     pub fn findTrigger(self: *Schema, name: []const u8) ?*Trigger {
         for (self.triggers.items) |*trigger| if (std.ascii.eqlIgnoreCase(trigger.name, name)) return trigger;
         return null;
     }
 
+    /// Shared borrow of a trigger by case-insensitive name, or null.
     pub fn findTriggerConst(self: *const Schema, name: []const u8) ?*const Trigger {
         for (self.triggers.items) |*trigger| if (std.ascii.eqlIgnoreCase(trigger.name, name)) return trigger;
         return null;
     }
 
+    /// Create a trigger from a borrowed def, duping names/SQL/columns after
+    /// validating the target table and UPDATE OF columns. Fails `TriggerExists`,
+    /// `UnknownTable`, `UnknownColumn`, or `InvalidSql` (UPDATE OF on non-UPDATE).
     pub fn createTrigger(self: *Schema, definition: ast.TriggerDef) !void {
         if (self.findTrigger(definition.name) != null) return error.TriggerExists;
         const table = self.find(definition.table) orelse return error.UnknownTable;
@@ -174,6 +277,7 @@ pub const Schema = struct {
         try self.triggers.append(self.allocator, .{ .name = try self.allocator.dupe(u8, definition.name), .table = try self.allocator.dupe(u8, definition.table), .timing = definition.timing, .event = definition.event, .updateOf = updateOf, .whenSql = whenSql, .body = try self.allocator.dupe(u8, definition.body) });
     }
 
+    /// Drop a trigger by name, freeing its dupes. Fails `UnknownTrigger`.
     pub fn dropTrigger(self: *Schema, name: []const u8) !void {
         for (self.triggers.items, 0..) |trigger, position| if (std.ascii.eqlIgnoreCase(trigger.name, name)) {
             const removed = self.triggers.orderedRemove(position);
@@ -236,6 +340,9 @@ pub const Schema = struct {
         }
     }
 
+    /// Evaluate a partial index's WHERE predicate for `values`. No predicate
+    /// means "applies to all rows". Borrowed inputs; transient allocations
+    /// freed before returning.
     pub fn indexPredicateHolds(self: *const Schema, table: *const Table, index: *const Index, values: []const Value) !bool {
         const predicate = index.whereExpr orelse return true;
         var colNames = try self.allocator.alloc([]const u8, table.columns.len);
@@ -244,12 +351,14 @@ pub const Schema = struct {
         return exprEvaluator.evalPredicate(self.allocator, colNames, values, predicate);
     }
 
+    /// Compare two rows' index keys (expression keys evaluated, NULL never
+    /// equal). Borrowed inputs; transient evaluation values freed internally.
     pub fn indexKeysEqual(self: *const Schema, table: *const Table, index: *const Index, colNames: []const []const u8, left: []const Value, right: []const Value) !bool {
         for (index.columns, 0..) |_, position| {
             if (index.keyExpr(position)) |key| {
-                const leftVal = try exprEvaluator.evalTemp(self.allocator, colNames, left, key);
+                const leftVal = try exprEvaluator.eval(self.allocator, colNames, left, key);
                 defer exprEvaluator.freeValue(self.allocator, leftVal);
-                const rightVal = try exprEvaluator.evalTemp(self.allocator, colNames, right, key);
+                const rightVal = try exprEvaluator.eval(self.allocator, colNames, right, key);
                 defer exprEvaluator.freeValue(self.allocator, rightVal);
                 if (leftVal == .null or rightVal == .null) return false;
                 if (!valuesEqual(leftVal, rightVal)) return false;
@@ -262,6 +371,11 @@ pub const Schema = struct {
         return true;
     }
 
+    /// Create an index from a borrowed def: validates columns/key/predicate
+    /// (rejecting aggregates, window-only functions, subqueries, params),
+    /// clones owned state, and pre-checks UNIQUE violations against existing
+    /// rows. Fails `IndexExists`/`UnknownTable`/`UnknownColumn`/`InvalidSql`/
+    /// `ConstraintViolation`.
     pub fn createIndex(self: *Schema, definition: ast.IndexDef) !void {
         if (self.findIndex(definition.name) != null) return error.IndexExists;
         const table = self.find(definition.table) orelse return error.UnknownTable;
@@ -320,6 +434,8 @@ pub const Schema = struct {
         try self.indexes.append(self.allocator, .{ .name = name, .table = tableName, .columns = columns, .keyExprs = keyExprs, .unique = definition.unique, .whereExpr = ownedPredicate, .whereSql = ownedWhereSql });
     }
 
+    /// Drop an index by name, freeing names/columns/cloned exprs/SQL and its
+    /// stat scope. Fails `UnknownIndex` when absent.
     pub fn dropIndex(self: *Schema, name: []const u8) !void {
         for (self.indexes.items, 0..) |index, position| if (std.ascii.eqlIgnoreCase(index.name, name)) {
             self.clearStatScope(index.table, index.name);
@@ -337,6 +453,8 @@ pub const Schema = struct {
         return error.UnknownIndex;
     }
 
+    /// True for the six STRICT table types (INT/INTEGER/REAL/TEXT/BLOB/ANY),
+    /// case-insensitive. Borrowed input; never fails.
     pub fn isValidStrictType(typeName: []const u8) bool {
         if (std.ascii.eqlIgnoreCase(typeName, "INT")) return true;
         if (std.ascii.eqlIgnoreCase(typeName, "INTEGER")) return true;
@@ -347,6 +465,9 @@ pub const Schema = struct {
         return false;
     }
 
+    /// Coerce a borrowed `Value` to a STRICT type, passing NULL through.
+    /// INT/INTEGER accept ints and integral reals; REAL widens ints; TEXT/BLOB
+    /// accept only their kind; ANY passes through. Fails `ConstraintViolation`.
     pub fn coerceStrict(typeName: []const u8, value: Value) !Value {
         if (value == .null) return .null;
         if (std.ascii.eqlIgnoreCase(typeName, "INT") or std.ascii.eqlIgnoreCase(typeName, "INTEGER")) {
@@ -386,15 +507,24 @@ pub const Schema = struct {
         return error.ConstraintViolation;
     }
 
+    /// DDL flags for `createTableWithOptions`. WITHOUT ROWID requires a PK;
+    /// STRICT restricts column types (see `isValidStrictType`).
     pub const TableOptions = struct {
         strict: bool = false,
         withoutRowid: bool = false,
     };
 
+    /// Create a table with default options. Dupes every name/default/expression
+    /// and builds autoindexes for PK/UNIQUE scope. Fails `TableExists` and the
+    /// usual DDL errors.
     pub fn createTable(self: *Schema, name: []const u8, definitions: []const ast.ColumnDef, definitionsConstraints: []const ast.TableConstraint) !void {
         return self.createTableWithOptions(name, definitions, definitionsConstraints, .{});
     }
 
+    /// Create a table with STRICT/WITHOUT ROWID enforcement plus the base
+    /// `createTable` semantics. WITHOUT ROWID without a PK, AUTOINCREMENT on a
+    /// WITHOUT ROWID or non-INTEGER-PK column, and non-STRICT types under
+    /// STRICT all fail (`ConstraintViolation`/`InvalidSql`).
     pub fn createTableWithOptions(self: *Schema, name: []const u8, definitions: []const ast.ColumnDef, definitionsConstraints: []const ast.TableConstraint, options: TableOptions) !void {
         if (self.find(name) != null) return error.TableExists;
         if (options.strict) {
@@ -596,6 +726,10 @@ pub const Schema = struct {
         }
     }
 
+    /// Create the `generate_series` virtual table (the only supported module),
+    /// materializing `start..stop` (inclusive, default step ±1) up to 1M rows
+    /// into a single INTEGER `value` column. Fails `Unsupported`/`InvalidSql`/
+    /// `VirtualTableTooLarge`/`TableExists`.
     pub fn createVirtualTable(self: *Schema, name: []const u8, module: []const u8, arguments: []const []const u8) !void {
         if (self.find(name) != null) return error.TableExists;
         if (!std.ascii.eqlIgnoreCase(module, "generate_series")) return error.Unsupported;
@@ -621,6 +755,8 @@ pub const Schema = struct {
         }
     }
 
+    /// Drop a table and its indexes/triggers/stat scope/sequence row, freeing
+    /// everything. Borrowed name; fails `UnknownTable` when absent.
     pub fn dropTable(self: *Schema, name: []const u8) !void {
         for (self.tables.items, 0..) |table, index| {
             if (std.ascii.eqlIgnoreCase(table.name, name)) {
@@ -895,6 +1031,9 @@ pub const Schema = struct {
         }
     }
 
+    /// Rename a table, updating indexes, triggers, FK references, sequence
+    /// rows, stored expressions, and stored view/trigger/index SQL. Borrowed
+    /// names; fails `TableExists`/`UnknownTable`.
     pub fn renameTable(self: *Schema, oldName: []const u8, newName: []const u8) !void {
         if (self.find(newName) != null) return error.TableExists;
         const table = self.find(oldName) orelse return error.UnknownTable;
@@ -952,6 +1091,8 @@ pub const Schema = struct {
         }
     }
 
+    /// Delete all rows, freeing payloads but retaining capacity and the
+    /// descriptor. Fails `UnknownTable` when absent.
     pub fn truncateTable(self: *Schema, name: []const u8) !void {
         const table = self.find(name) orelse return error.UnknownTable;
         for (table.rows.items) |row| {
@@ -961,6 +1102,14 @@ pub const Schema = struct {
         table.rows.clearRetainingCapacity();
     }
 
+    /// Append a column, backfilling existing rows with the default (or NULL)
+    /// and evaluating GENERATED values plus CHECKs. Rejects PK/UNIQUE/
+    /// AUTOINCREMENT, NOT NULL-without-default on non-empty tables, and
+    /// non-STRICT types under STRICT.
+    /// TODO: backfill is not atomic on allocation failure — rows already
+    /// extended keep the extra slot while `table.columns` still has the old
+    /// length, leaving the table inconsistent. Copy rows into a scratch buffer
+    /// first and swap only after all defaults/GENERATED values succeed.
     pub fn addColumn(self: *Schema, tableName: []const u8, definition: ast.ColumnDef) !void {
         const table = self.find(tableName) orelse return error.UnknownTable;
         for (table.columns) |column| if (std.ascii.eqlIgnoreCase(column.name, definition.name)) return error.ColumnExists;
@@ -1030,6 +1179,10 @@ pub const Schema = struct {
         }
     }
 
+    /// Rename a column, updating indexes, constraints, FK references, trigger
+    /// UPDATE OF lists/bodies, view SQL, and stored CHECK/GENERATED/index
+    /// expressions. Borrowed names; fails `UnknownTable`/`UnknownColumn`/
+    /// `ColumnExists`.
     pub fn renameColumn(self: *Schema, tableName: []const u8, oldName: []const u8, newName: []const u8) !void {
         const table = self.find(tableName) orelse return error.UnknownTable;
         if (self.columnIndex(table, newName)) |_| return error.ColumnExists;
@@ -1104,6 +1257,11 @@ pub const Schema = struct {
         try self.renameIndexSqlFragments(tableName, oldName, newName, false, true);
     }
 
+    /// Drop a column and its row slots, freeing the descriptor. Rejects the
+    /// last column, PK/UNIQUE members, constraint/FK/index references.
+    /// TODO: row-slot rebuild is not atomic on allocation failure — rows
+    /// already rebuilt keep the narrow shape while later rows keep the old
+    /// width. Stage rebuilt rows in scratch storage and swap only on success.
     pub fn dropColumn(self: *Schema, tableName: []const u8, columnName: []const u8) !void {
         const table = self.find(tableName) orelse return error.UnknownTable;
         const index = self.columnIndex(table, columnName) orelse return error.UnknownColumn;
@@ -1212,6 +1370,8 @@ pub const Schema = struct {
         self.allocator.free(table.name);
     }
 
+    /// Position of the INTEGER-PRIMARY-KEY rowid alias, or null for WITHOUT
+    /// ROWID, composite PKs, or non-INTEGER PKs. Borrowed table; never fails.
     pub fn rowidAliasColumn(table: *const Table) ?usize {
         if (table.withoutRowid) return null;
         var found: ?usize = null;
@@ -1250,6 +1410,10 @@ pub const Schema = struct {
         values[alias] = .{ .integer = next };
     }
 
+    /// Append a borrowed row: dupes payloads, assigns AUTOINCREMENT/rowid
+    /// aliases, evaluates GENERATED columns to fixpoint, enforces STRICT and
+    /// NOT NULL, then validates constraints. Fails `ColumnCountMismatch`/
+    /// `ConstraintViolation`.
     pub fn appendRow(self: *Schema, table: *Table, values: []const Value) !void {
         if (values.len != table.columns.len) return error.ColumnCountMismatch;
         const owned = try self.allocator.alloc(Value, values.len);
@@ -1295,6 +1459,9 @@ pub const Schema = struct {
         try table.rows.append(self.allocator, .{ .values = owned });
     }
 
+    /// Validate a proposed in-place row update (AUTOINCREMENT/rowid/STRICT/
+    /// NOT NULL/constraints, ignoring the row itself for uniqueness). The
+    /// caller applies the mutation only on success.
     pub fn validateUpdate(self: *Schema, table: *const Table, rowIndex: usize, values: []Value) !void {
         try self.applyAutoincrement(table, values);
         try assignRowidAlias(table, values);
@@ -1309,6 +1476,8 @@ pub const Schema = struct {
         try self.validateConstraints(table, values, rowIndex);
     }
 
+    /// Re-validate a stored row in place (shape, NOT NULL, constraints).
+    /// Used after external row surgery; fails `ConstraintViolation` on drift.
     pub fn validateExistingRow(self: *const Schema, table: *const Table, rowIndex: usize) !void {
         const row = table.rows.items[rowIndex];
         if (row.values.len != table.columns.len) return error.ConstraintViolation;
@@ -1402,6 +1571,9 @@ pub const Schema = struct {
         return self.find("sqlite_stat1");
     }
 
+    /// Ensure the `sqlite_stat1(tbl, idx, stat)` table exists with the exact
+    /// shape, creating it when absent. Returns a schema-owned borrow. Fails
+    /// `SchemaMismatch` on a wrong-shaped existing table.
     pub fn ensureStatTable(self: *Schema) !*Table {
         if (self.find("sqlite_stat1")) |existing| {
             if (existing.columns.len != 3) return error.SchemaMismatch;
@@ -1420,6 +1592,9 @@ pub const Schema = struct {
         return self.find("sqlite_stat1").?;
     }
 
+    /// Delete stat rows for a table (optionally one index). `null` table
+    /// clears all; `null` index with a table clears the table scope. No-op
+    /// when the stat table is absent. Never fails.
     pub fn clearStatScope(self: *Schema, tableName: ?[]const u8, indexName: ?[]const u8) void {
         const stat = self.find("sqlite_stat1") orelse return;
         var position = stat.rows.items.len;
@@ -1441,6 +1616,8 @@ pub const Schema = struct {
         }
     }
 
+    /// Table row count from the stat table (`tbl` row with NULL `idx`), or
+    /// null when absent/unparseable. Borrowed name; never fails.
     pub fn statRowCount(self: *const Schema, tableName: []const u8) ?usize {
         const stat = self.findConst("sqlite_stat1") orelse return null;
         var tableIdx: ?usize = null;
@@ -1466,6 +1643,7 @@ pub const Schema = struct {
         return null;
     }
 
+    /// Ensure the `sqlite_sequence(name, seq)` table exists. Idempotent.
     pub fn ensureSequenceTable(self: *Schema) anyerror!void {
         if (self.find("sqlite_sequence") != null) return;
         const definitions = [_]ast.ColumnDef{
@@ -1475,6 +1653,8 @@ pub const Schema = struct {
         try self.createTable("sqlite_sequence", &definitions, &.{});
     }
 
+    /// Current AUTOINCREMENT sequence for a table, or 0 when absent. Borrowed
+    /// name; never fails.
     pub fn sequenceValue(self: *const Schema, tableName: []const u8) i64 {
         const sequence = self.findConst("sqlite_sequence") orelse return 0;
         if (sequence.columns.len < 2) return 0;
@@ -1488,6 +1668,8 @@ pub const Schema = struct {
         return 0;
     }
 
+    /// Set the AUTOINCREMENT sequence, creating the row when absent. Borrowed
+    /// name; dupes the name for new rows.
     pub fn setSequenceValue(self: *Schema, tableName: []const u8, next: i64) anyerror!void {
         try self.ensureSequenceTable();
         const sequence = self.find("sqlite_sequence").?;
@@ -1535,7 +1717,7 @@ pub const Schema = struct {
     }
 
     fn statKeyValue(self: *const Schema, table: *const Table, index: *const Index, colNames: []const []const u8, position: usize, values: []const Value) !Value {
-        if (index.keyExpr(position)) |key| return exprEvaluator.evalTemp(self.allocator, colNames, values, key);
+        if (index.keyExpr(position)) |key| return exprEvaluator.eval(self.allocator, colNames, values, key);
         const columnIdx = self.columnIndex(table, index.columns[position]) orelse return error.UnknownColumn;
         return switch (values[columnIdx]) {
             .text => |text| .{ .text = try self.allocator.dupe(u8, text) },
@@ -1571,6 +1753,8 @@ pub const Schema = struct {
         return distinct;
     }
 
+    /// Append a table row-count entry to `sqlite_stat1`. Borrowed table;
+    /// dupes names/payloads into the stat table.
     pub fn collectTableStats(self: *Schema, table: *const Table) !void {
         const stat = try self.ensureStatTable();
         const countText = try std.fmt.allocPrint(self.allocator, "{d}", .{table.rows.items.len});
@@ -1579,6 +1763,9 @@ pub const Schema = struct {
         try self.appendRow(stat, &row);
     }
 
+    /// Append an index selectivity entry (`count avg-per-prefix...`) for rows
+    /// matching the partial predicate. Borrowed inputs; transient evaluation
+    /// values freed internally.
     pub fn collectIndexStats(self: *Schema, table: *const Table, index: *const Index) !void {
         const stat = try self.ensureStatTable();
         var colNames = try self.allocator.alloc([]const u8, table.columns.len);
@@ -1613,6 +1800,9 @@ pub const Schema = struct {
         return index.unique and position + 1 == index.columns.len;
     }
 
+    /// Deep copy: tables (descriptors + rows), non-auto indexes, views, and
+    /// triggers, with FK enforcement restored at the end. Caller owns the
+    /// result and must `deinit` it. Virtual tables re-materialize from args.
     pub fn clone(self: *const Schema) !Schema {
         var result = Schema.init(self.allocator);
         result.foreignKeysEnabled = false;
@@ -1670,6 +1860,8 @@ pub const Schema = struct {
     }
 };
 
+/// Borrowed value equality: NULL==NULL, ints by value, reals numerically
+/// (int/real mix compares as floats), texts/blobs by bytes. Never fails.
 pub fn valuesEqual(left: Value, right: Value) bool {
     return switch (left) {
         .null => right == .null,
@@ -1715,4 +1907,37 @@ test "schema owns tables and rows" {
     var values = [_]Value{ .{ .integer = 1 }, .{ .text = "A" } };
     try schema.appendRow(schema.find("users").?, &values);
     try std.testing.expectEqual(@as(usize, 1), schema.find("users").?.rows.items.len);
+}
+
+test "schema enforces uniqueness strictness and renames" {
+    var schema = Schema.init(std.testing.allocator);
+    defer schema.deinit();
+    // UNIQUE column rejects duplicates but ignores NULL rows (SQLite rule).
+    const defs = [_]ast.ColumnDef{ .{ .name = "id", .typeName = "INTEGER", .primaryKey = true }, .{ .name = "email", .typeName = "TEXT", .unique = true } };
+    try schema.createTable("users", &defs, &.{});
+    const t = schema.find("users").?;
+    try schema.appendRow(t, &[_]Value{ .{ .integer = 1 }, .{ .text = "a" } });
+    try std.testing.expectError(error.ConstraintViolation, schema.appendRow(t, &[_]Value{ .{ .integer = 2 }, .{ .text = "a" } }));
+    try schema.appendRow(t, &[_]Value{ .{ .integer = 3 }, .null });
+    try schema.appendRow(t, &[_]Value{ .{ .integer = 4 }, .null });
+    // Case-insensitive lookup; duplicate create and bad row width fail.
+    try std.testing.expect(schema.find("USERS") != null);
+    try std.testing.expectError(error.TableExists, schema.createTable("users", &defs, &.{}));
+    try std.testing.expectError(error.ColumnCountMismatch, schema.appendRow(t, &[_]Value{.null}));
+    // STRICT table rejects cross-type inserts.
+    const strictDefs = [_]ast.ColumnDef{.{ .name = "id", .typeName = "INTEGER" }};
+    try schema.createTableWithOptions("strict_t", &strictDefs, &.{}, .{ .strict = true });
+    try std.testing.expectError(error.ConstraintViolation, schema.appendRow(schema.find("strict_t").?, &[_]Value{.{ .text = "nope" }}));
+    try schema.appendRow(schema.find("strict_t").?, &[_]Value{.{ .integer = 1 }});
+    // Rename keeps rows and is visible under the new name only.
+    try schema.renameTable("users", "people");
+    try std.testing.expect(schema.find("users") == null);
+    try std.testing.expectEqual(@as(usize, 3), schema.find("people").?.rows.items.len);
+    try schema.renameColumn("people", "email", "mail");
+    try std.testing.expectError(error.UnknownColumn, schema.renameColumn("people", "email", "x"));
+    // valuesEqual covers the NULL/int/real/text matrix used by constraints.
+    try std.testing.expect(valuesEqual(.null, .null));
+    try std.testing.expect(!valuesEqual(.null, .{ .integer = 1 }));
+    try std.testing.expect(valuesEqual(.{ .real = 1.0 }, .{ .integer = 1 }));
+    try std.testing.expect(!valuesEqual(.{ .text = "a" }, .{ .text = "b" }));
 }

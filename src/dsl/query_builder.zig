@@ -1,3 +1,59 @@
+//! Query/mutation builders: value-semantic DSL over the native AST.
+//!
+//! Purpose: provide the typed (`db.from(User)`) and dynamic
+//! (`db.table("users")`) builders that accumulate borrowed SELECT / INSERT /
+//! UPDATE / DELETE / UPSERT state and, on `fetch()`/`execute()`/`insert()`,
+//! lower snapshots through `ast_builder` into native `sql/ast.zig` statements
+//! run by the connection's executor hooks. Builders never render SQL strings.
+//!
+//! Responsibilities: projection/condition/order/limit/offset/group/having/join
+//! accumulation, CTE staging, compound (UNION/INTERSECT/EXCEPT) arms, derived
+//! tables, typed row mapping (`MappedResult`), and mutation execution.
+//!
+//! Dependencies: `dsl/expr.zig`, `dsl/column.zig`, `dsl/table.zig`,
+//! `dsl/ast_builder.zig`, `sql/ast.zig`, `vm/value.zig`,
+//! `connection/result.zig`.
+//!
+//! Ownership/lifetime (critical): builders are small copyable values; every
+//! chaining call returns a *copy*, so the original remains usable. Builders
+//! borrow table/column/alias strings and hold fixed-capacity inline buffers
+//! (32 projections, 16 conditions, 8 orders/CTEs, ...); exceeding a buffer is
+//! a `@panic`. `fetch()` returns an *owned* `Result` (or owned `MappedResult`
+//! rows) that the caller must `deinit` — the `Result` duplicates every text/
+//! blob payload and column name. `fetchOne`/`fetchOptional` duplicate the
+//! single value/row the same way. Mapped rows (`MappedResult.rows`) duplicate
+//! text payloads per row; call `deinit()` (or `freeRow`) exactly once. AST
+//! snapshots are by-value copies taken at fetch time; later builder mutation
+//! never affects an in-flight query. Executor hooks borrow the connection;
+//! the connection must outlive every builder and every outstanding `Result`.
+//!
+//! Error behavior: builder chaining panics on capacity misuse (`too many DSL
+//! projections/predicates/orders/CTEs`, empty `select()`/`orderBy()`) and
+//! compile-errors on type misuse (`select()` with orders, `having()` with a
+//! non-comparison, compound arms from non-builders). Execution returns engine
+//! errors (`UnknownColumn`, `InvalidSql`, `NoRows`, `TooManyRows`, I/O, ...).
+//!
+//! SQLite compatibility: inherits the engine's. `having()` accepts either a
+//! `HavingCond` (`col.count().gt(1)`) or a plain column predicate lowered to
+//! the same shape; unsupported shapes mark the snapshot invalid so
+//! `ast_builder` fails with `InvalidSql` instead of mis-executing.
+//!
+//! Unified pipeline note: Raw SQL, the dynamic DSL, and the typed DSL all
+//! converge on native AST/IR via `ast_builder.buildSelect`/`buildInsert`/
+//! `buildUpdate`/`buildDelete` — builders never emit SQL text for re-parsing.
+//!
+//! Column/operation collision rule: `select()` takes column *values*
+//! (`User.where`, `t.column("count")`) or their aggregate/projection calls;
+//! passing the `all` *operation itself* (`User.all` without calling) is a
+//! `@compileError` directing to `User.all()` or `selectAll()`. Columns named
+//! `select`/`where`/`limit`/`count` therefore flow through as ordinary fields.
+//!
+//! AllColumns note: `AllProjection` (from `User.all()`) routes `select()` to
+//! `selectAll()`, which lowers to the native `.wildcard` (`*`) node.
+//! `QualifiedAllColumns` ordering (e.g. `table.*` in joins) is preserved by
+//! `ast_builder`: join queries keep full qualification while single-table
+//! `selectAll()` renders the historical bare `*`.
+
 const std = @import("std");
 const dslExpr = @import("expr.zig");
 const Expr = dslExpr.Expr;
@@ -14,11 +70,14 @@ const Result = @import("../connection/result.zig").Result;
 
 const tableMod = @import("table.zig");
 
+/// Typed SELECT builder for a `sqlite.table(...)` value type. Compile-errors
+/// on non-table inputs (use `db.table("name")` for runtime tables).
 pub fn Query(comptime TableValueType: type) type {
     if (!tableMod.isTableValue(TableValueType)) @compileError("db.from() takes a typed table value from sqlite.table(...); use db.table(\"name\") for runtime/dynamic tables");
     return Builder(tableMod.rowTypeOfValue(TableValueType), tableMod.columnsTypeOfValue(TableValueType), true);
 }
 
+/// Untyped SELECT builder for runtime tables. See `Builder(void, void, false)`.
 pub const DynamicQuery = Builder(void, void, false);
 
 const ConditionEntry = astBuilder.CondEntry;
@@ -103,6 +162,8 @@ fn setValueOf(value: anytype) dslExpr.SetValue {
     return .{ .literal = columnMod.toValue(value) };
 }
 
+/// Borrowed table name of a join target (typed value, type, string, or
+/// `DynamicTable`). Returned slice is borrowed from the target.
 pub fn tableNameOf(other: anytype) []const u8 {
     const T = @TypeOf(other);
     if (comptime @import("table.zig").isTableValue(T)) return other.tableName;
@@ -113,8 +174,11 @@ pub fn tableNameOf(other: anytype) []const u8 {
     return other;
 }
 
+/// Borrowed join target identity: name plus optional schema/alias.
 pub const JoinTarget = struct { name: []const u8, schema: []const u8 = "", alias: ?[]const u8 = null };
 
+/// Resolve a join target value into a borrowed `JoinTarget`. Accepts typed
+/// table values, `DynamicTable`s, table types, and plain name strings.
 pub fn joinTargetOf(other: anytype) JoinTarget {
     const T = @TypeOf(other);
     if (comptime T != type and @typeInfo(T) == .@"struct" and @hasDecl(T, "isDynamicTable")) {
@@ -139,6 +203,8 @@ fn containsAllMarker(comptime T: type) bool {
     return false;
 }
 
+/// Builder type returned by `select(cols)`: mapped (`selectAll`/star present)
+/// when `T` contains an `AllProjection` marker, unmapped otherwise.
 pub fn SelectOut(comptime Row: type, comptime Columns: type, comptime T: type) type {
     if (containsAllMarker(T)) return Builder(Row, Columns, true);
     return Builder(Row, Columns, false);
@@ -184,19 +250,34 @@ fn storeWindowProjection(windows: []WindowBuilder, windowCount: *usize, out: []P
     outCount.* += 1;
 }
 
+/// Value-semantic query builder. `Row == void` means dynamic/untyped;
+/// otherwise rows map to `Row` via `Columns`. `mapped` selects star (`*`)
+/// versus explicit-projection mode. All chaining methods return copies;
+/// fixed buffers panic on overflow; execution methods return owned results.
+/// See the module docs for the full ownership/lifetime contract.
 pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool) type {
     return struct {
         const Self = @This();
+        /// True for typed builders (`Row != void`); dynamic builders are untyped.
         pub const isTyped = Row != void;
+        /// Row struct the result maps to (or `void` for dynamic).
         pub const rowType = Row;
+        /// Columns descriptor struct (or `void` for dynamic).
         pub const columnsType = Columns;
+        /// True when star mode AND typed, i.e. `fetch()` maps rows.
         pub const isMapped = mapped and isTyped;
 
+        /// Borrowed allocator used for snapshots and owned results.
         allocator: std.mem.Allocator,
+        /// Borrowed opaque live connection; must outlive builder and results.
         connection: *anyopaque,
+        /// Borrowed single-statement executor hook.
         executeFn: astBuilder.ExecFn,
+        /// Borrowed compound executor hook.
         compoundExecuteFn: astBuilder.CompoundExecFn,
+        /// Borrowed derived-table executor hook.
         derivedExecuteFn: astBuilder.DerivedExecFn,
+        /// Borrowed base table name.
         table: []const u8,
         schema: []const u8 = "",
         tableAlias: ?[]const u8 = null,
@@ -319,6 +400,9 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
             };
         }
 
+        /// Project explicit columns/projections in order (order preserved into
+        /// the native AST). `AllProjection` items route to `selectAll()`.
+        /// Passing the `all` operation without calling is a comptime error.
         pub fn select(self: Self, cols: anytype) SelectOut(Row, Columns, @TypeOf(cols)) {
             if (comptime @TypeOf(cols) == tableMod.AllOpFn) @compileError("use User.all() (call it) for the all-columns projection, or db.from(User).selectAll()");
             if (comptime containsAllMarker(@TypeOf(cols))) {
@@ -366,6 +450,8 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
             return copy;
         }
 
+        /// Project native `*` (all columns, declaration order). Mapped builders
+        /// return mapped rows from `fetch()`; unmapped builders return `Result`.
         pub fn selectAll(self: Self) Builder(Row, Columns, true) {
             var copy = self.retype(true);
             copy.allColumns = true;
@@ -1119,6 +1205,10 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
     };
 }
 
+/// Value-semantic compound query (UNION/INTERSECT/EXCEPT arms). Arms are
+/// by-value snapshots; `orderBy`/`limit`/`offset` apply to the whole compound.
+/// `fetch()` returns an owned result the caller must `deinit`. The connection
+/// must outlive the builder and its results.
 pub fn CompoundBuilder(comptime Row: type, comptime Columns: type, comptime mapped: bool) type {
     return struct {
         const Self = @This();
@@ -1353,6 +1443,8 @@ fn dupeValue(allocator: std.mem.Allocator, value: Value) !Value {
     };
 }
 
+/// Release an owned `Value`'s text/blob payload. No-op for ints/reals/null.
+/// Call exactly once per owned value; borrowed values must NOT be freed.
 pub fn freeValue(allocator: std.mem.Allocator, value: Value) void {
     switch (value) {
         .text => |bytes| allocator.free(bytes),
@@ -1701,6 +1793,9 @@ test "typed and dynamic builders share one engine" {
     try std.testing.expect(Query(@TypeOf(T)).isTyped);
 }
 
+/// Value-semantic UPSERT builder (`onConflict(...).doUpdate(...).insert(row)`).
+/// Conflict targets, SET list, and filters are borrowed; `insert()` lowers to
+/// native AST via `ast_builder` and returns an owned `Result` (caller deinits).
 pub fn UpsertBuilder(comptime Row: type, comptime Columns: type) type {
     return struct {
         const Self = @This();
@@ -1916,6 +2011,10 @@ fn upsertValueOf(value: anytype) astBuilder.UpsertValue {
     return .{ .literal = columnMod.toValue(value) };
 }
 
+/// Value-semantic UPDATE/DELETE mutation. Chain `.where(...)` then call
+/// `execute()` for an owned `Result` (caller `deinit`s). `updateFrom` joins a
+/// second table for UPDATEs. Borrowed names/conditions; connection must
+/// outlive the mutation.
 pub const Mutation = struct {
     allocator: std.mem.Allocator,
     connection: *anyopaque,
@@ -2061,4 +2160,29 @@ test "orderBy accepts single orders and tuples of orders" {
     try std.testing.expectEqual(@as(usize, 2), compoundOrdered.orderCount);
     try std.testing.expect(compoundOrdered.orders[0].descending);
     try std.testing.expect(!compoundOrdered.orders[1].descending);
+}
+
+test "select preserves projection order and AllColumns routing" {
+    const conn = @as(*anyopaque, @ptrFromInt(0x1000));
+    const base = DynamicQuery.initRaw(std.testing.allocator, conn, "t", undefined, undefined, undefined);
+    const colA = columnMod.DynamicColumn{ .name = "b" };
+    const colB = columnMod.DynamicColumn{ .name = "a" };
+    // Explicit projections keep caller order (engine maps columns positionally).
+    const ordered = base.select(.{ colA, colB });
+    try std.testing.expectEqual(@as(usize, 2), ordered.projectionCount);
+    try std.testing.expect(!@TypeOf(ordered).isMapped);
+    try std.testing.expectEqualStrings("b", ordered.projections[0].column.name);
+    try std.testing.expectEqualStrings("a", ordered.projections[1].column.name);
+    // Operation-named columns flow through select() as ordinary fields.
+    const weird = base.select(.{columnMod.DynamicColumn{ .name = "where" }});
+    try std.testing.expectEqualStrings("where", weird.projections[0].column.name);
+    // AllColumns marker routes to the mapped star builder (native wildcard).
+    const T = @import("table.zig").table("t", struct { id: i64, name: []const u8 });
+    const Star = @import("table.zig").AllProjection;
+    try std.testing.expect(@TypeOf(Star{}) == Star);
+    const starBase = DynamicQuery.initRaw(std.testing.allocator, conn, "t", undefined, undefined, undefined);
+    const all = starBase.selectAll();
+    try std.testing.expect(all.allColumns);
+    try std.testing.expectEqual(@as(usize, 0), all.projectionCount);
+    _ = T;
 }

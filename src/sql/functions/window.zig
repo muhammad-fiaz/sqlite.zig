@@ -1,16 +1,63 @@
+//! Window SQL functions (`row_number`, `rank`, `lag`, `sum OVER`, ...).
+//!
+//! Purpose: authoritative window evaluation behind `connection.zig`.
+//! Implements partitioning, ORDER BY sorting, peer groups, frames
+//! (`ROWS`/`RANGE`/`GROUPS`, `BETWEEN`, offsets), and all ranking, value, and
+//! aggregate window functions.
+//!
+//! Responsibilities: pure computation over `WindowContext.rows`; never touches
+//! storage. Ranking (`row_number`, `rank`, `dense_rank`, `percent_rank`,
+//! `cume_dist`, `ntile`), navigation (`lag`, `lead`), framing (`first_value`,
+//! `last_value`, `nth_value`), and framed aggregates.
+//!
+//! Dependencies: `std`, `../../vm/value.zig`, `../ast.zig`, `aggregate.zig`.
+//!
+//! Ownership/lifetime: `evalFn` results are *borrowed* (row memory or
+//! connection arenas) and must NOT be freed by this file; every value stored
+//! into `results` is cloned with `allocator` and caller-owned (free text/blob
+//! results plus the slice). Internal `partitions`/`ranks` buffers are freed
+//! before return.
+//!
+//! Error behavior: OOM only (`![]Value`); unknown functions, missing args, or
+//! out-of-range offsets yield `.null` per row, never an error. Empty input
+//! yields an empty (owned) slice.
+//!
+//! Invariants: output length equals input row count; `results[i]` corresponds
+//! to `rows[i]` even after partition-internal reordering; default frame is
+//! `RANGE UNBOUNDED PRECEDING..CURRENT ROW` with ORDER BY, else whole partition.
+//!
+//! SQLite compatibility: peer groups follow ORDER BY equality; `ntile(k)`
+//! requires k > 0; `lag`/`lead` default offset 1 with optional default value.
+// TODO(sql/window): partitioning/sorting is O(n^2) with per-compare `evalFn`
+// calls and no spilling; hostile 100k-row partitions can blow time/memory.
+// Expected: hash partitioning + sort with a work budget; tests: 10k-row perf
+// bound. Subsystem: sql/functions.
+// TODO(sql/window): `evalFn` ownership is implicit (borrowed); computed keys
+// (`x+1`) may allocate without a free contract. Expected: explicit borrowed
+// vs owned contract or arena-scoped eval; tests: computed-key window over
+// 1k rows shows no growth. Subsystem: sql/functions.
+
 const std = @import("std");
 const Value = @import("../../vm/value.zig").Value;
 const ast = @import("../ast.zig");
 const AggState = @import("aggregate.zig").AggState;
 const AggKind = @import("aggregate.zig").AggKind;
 
+/// Input rows plus a row evaluator for partition/order/argument expressions.
+/// `evalFn` results are borrowed and must not be freed by window code.
 pub const WindowContext = struct {
+    /// Allocator for `results` clones and internal buffers.
     allocator: std.mem.Allocator,
+    /// Input rows in original order; output aligns by index.
     rows: []const []const Value,
+    /// Evaluate `expr` against `row`; borrowed result, OOM/errors propagate.
     evalFn: *const fn (ctx: *const anyopaque, expr: ast.Expr, row: []const Value) anyerror!Value,
+    /// Opaque pointer passed through to `evalFn`.
     evalCtx: *const anyopaque,
 };
 
+/// Evaluate window expression `win` over `ctx.rows`; returns caller-owned `[]Value`.
+/// Length equals row count; each element owned (free text/blob + slice).
 pub fn evaluateWindowFunction(
     allocator: std.mem.Allocator,
     win: ast.Expr,
@@ -363,4 +410,86 @@ pub fn evaluateWindowFunction(
     }
 
     return results;
+}
+
+fn testEvalFn(ctx: *const anyopaque, expr: ast.Expr, row: []const Value) anyerror!Value {
+    _ = ctx;
+    return switch (expr) {
+        .identifier => |id| blk: {
+            if (std.ascii.eqlIgnoreCase(id, "x")) break :blk row[0];
+            if (std.ascii.eqlIgnoreCase(id, "g")) break :blk row[1];
+            break :blk .null;
+        },
+        .literal => |lit| lit,
+        else => .null,
+    };
+}
+
+test "window ranking functions" {
+    const alloc = std.testing.allocator;
+    const r1 = [_]Value{ .{ .integer = 10 }, .{ .integer = 1 } };
+    const r2 = [_]Value{ .{ .integer = 20 }, .{ .integer = 1 } };
+    const r3 = [_]Value{ .{ .integer = 30 }, .{ .integer = 2 } };
+    const rows = [_][]const Value{ &r1, &r2, &r3 };
+    const ctx = WindowContext{ .allocator = alloc, .rows = &rows, .evalFn = testEvalFn, .evalCtx = undefined };
+    const win = ast.Expr{ .window = .{ .funcName = "row_number" } };
+    const res = try evaluateWindowFunction(alloc, win, ctx);
+    defer {
+        for (res) |v| v.free(alloc);
+        alloc.free(res);
+    }
+    try std.testing.expectEqual(@as(usize, 3), res.len);
+    try std.testing.expectEqual(@as(i64, 1), res[0].integer);
+    try std.testing.expectEqual(@as(i64, 2), res[1].integer);
+    try std.testing.expectEqual(@as(i64, 3), res[2].integer);
+}
+
+test "window partition and null boundaries" {
+    const alloc = std.testing.allocator;
+    // Empty input yields empty output.
+    const empty_ctx = WindowContext{ .allocator = alloc, .rows = &.{}, .evalFn = testEvalFn, .evalCtx = undefined };
+    const empty = try evaluateWindowFunction(alloc, .{ .window = .{ .funcName = "rank" } }, empty_ctx);
+    defer alloc.free(empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+    // ntile with k<=0 is NULL; unknown functions are NULL.
+    const r1 = [_]Value{ .{ .integer = 1 }, .{ .integer = 1 } };
+    const rows = [_][]const Value{&r1};
+    const ctx = WindowContext{ .allocator = alloc, .rows = &rows, .evalFn = testEvalFn, .evalCtx = undefined };
+    const bad_ntile = ast.Expr{ .window = .{ .funcName = "ntile", .argument = &.{ .literal = .{ .integer = 0 } } } };
+    const bad_res = try evaluateWindowFunction(alloc, bad_ntile, ctx);
+    defer {
+        for (bad_res) |v| v.free(alloc);
+        alloc.free(bad_res);
+    }
+    try std.testing.expect(bad_res[0] == .null);
+    const unknown = try evaluateWindowFunction(alloc, .{ .window = .{ .funcName = "nope" } }, ctx);
+    defer {
+        for (unknown) |v| v.free(alloc);
+        alloc.free(unknown);
+    }
+    try std.testing.expect(unknown[0] == .null);
+}
+
+test "window lag lead and frame aggregates" {
+    const alloc = std.testing.allocator;
+    const r1 = [_]Value{ .{ .integer = 10 }, .{ .integer = 1 } };
+    const r2 = [_]Value{ .{ .integer = 20 }, .{ .integer = 1 } };
+    const rows = [_][]const Value{ &r1, &r2 };
+    const ctx = WindowContext{ .allocator = alloc, .rows = &rows, .evalFn = testEvalFn, .evalCtx = undefined };
+    const x_ident = ast.Expr{ .identifier = "x" };
+    const lag = ast.Expr{ .window = .{ .funcName = "lag", .argument = &x_ident } };
+    const lag_res = try evaluateWindowFunction(alloc, lag, ctx);
+    defer {
+        for (lag_res) |v| v.free(alloc);
+        alloc.free(lag_res);
+    }
+    try std.testing.expect(lag_res[0] == .null);
+    try std.testing.expectEqual(@as(i64, 10), lag_res[1].integer);
+    const sum = ast.Expr{ .window = .{ .funcName = "sum", .argument = &x_ident } };
+    const sum_res = try evaluateWindowFunction(alloc, sum, ctx);
+    defer {
+        for (sum_res) |v| v.free(alloc);
+        alloc.free(sum_res);
+    }
+    try std.testing.expectEqual(@as(i64, 30), sum_res[0].integer);
 }

@@ -1,8 +1,51 @@
+//! Row-level expression evaluator (AST -> `Value`).
+//!
+//! Purpose: interpret `ast.Expr` trees against a single row for CHECK
+//! constraints, generated columns, partial-index predicates, and other
+//! non-VM paths. The full query engine compiles to bytecode instead; this
+//! evaluator is the small, allocation-explicit reference implementation.
+//!
+//! Responsibilities: three-valued-logic `AND`/`OR`/`NOT`, SQLite numeric
+//! ordering across int/real/text/blob, `LIKE`/`GLOB` matching, `CASE`,
+//! `IN`, `COLLATE` passthrough, and scalar-function delegation to the
+//! single authoritative dispatcher `functions.evalScalar`.
+//!
+//! Dependencies: `ast.zig`, `vm/value.zig` (`Value`), `sql/functions.zig`.
+//! No planner/VM imports; `connection.zig` calls in from constraint checks.
+//!
+//! Ownership/lifetime: `eval` clones literals/row values into fresh heap
+//! memory owned by the caller (free with `freeValue`). Intermediate operands
+//! are freed internally via `defer`. Input `row`/`columnNames` are borrowed.
+//!
+//! Error behavior: `UnknownColumn` for unresolvable identifiers, `InvalidSql`
+//! for `*` or mistyped operators, `DivisionByZero` reserved (integer `/`/`%`
+//! by zero currently yield NULL per SQLite), `Unsupported` for unimplemented
+//! expression forms. Scalar-function errors other than OOM map to NULL (SQL
+//! NULL-propagation); OOM always propagates. Deep recursion fails closed with
+//! `InvalidSql` once `max_eval_depth` is exceeded.
+//!
+//! Invariants: NULL propagates through arithmetic/comparison/concat except
+//! `IS`/`IS NOT` (identity) and `AND`/`OR` (Kleene logic); ordering is
+//! NULL < numeric < text < blob with int/real compared numerically.
+//!
+//! SQLite compatibility: integer overflow wraps to REAL (mirrors `vm.zig`);
+//! `x/0`, `x%0` yield NULL; `||` yields NULL if either side is NULL;
+//! unary `-(-9223372036854775808)` yields `9223372036854775808.0` as REAL.
+// TODO(sql/expr): text/blob numeric coercion in arithmetic is a subset gap:
+// `eval` returns NULL for `'6' * '7'` while the VM coerces to 42. Expected:
+// share one `toFloat` helper with `vm.zig` (single authoritative conversion);
+// tests: matrix of int/real/numeric-text/non-numeric-text/blob across
+// +,-,*,/,%. Subsystem: sql/eval.
+
 const std = @import("std");
 const ast = @import("ast.zig");
 const Value = @import("../vm/value.zig").Value;
 const functions = @import("functions.zig");
 
+/// Hard cap on nested-expression depth; hostile `((((...))))` fails closed.
+pub const max_eval_depth: usize = 200;
+
+/// Evaluation failure modes. OOM propagates; most type errors become NULL at runtime.
 pub const EvalError = error{
     UnknownColumn,
     InvalidSql,
@@ -12,6 +55,7 @@ pub const EvalError = error{
     Unsupported,
 };
 
+/// Free a value produced by `eval` (no-op for null/int/real).
 pub fn freeValue(allocator: std.mem.Allocator, value: Value) void {
     switch (value) {
         .text => |t| allocator.free(t),
@@ -75,6 +119,7 @@ fn compareValues(left: Value, op: ast.CompareOp, right: Value) bool {
     };
 }
 
+/// SQLite storage-class rank: NULL(0) < numeric(1) < text(2) < blob(3).
 fn valueOrder(value: Value) u8 {
     return switch (value) {
         .null => 0,
@@ -84,26 +129,65 @@ fn valueOrder(value: Value) u8 {
     };
 }
 
+/// Three-valued-logic truth test; delegates to the single `Value.isTruthy`.
 fn isTruthy(value: Value) bool {
     return value.isTruthy();
 }
 
+/// Iterative GLOB matcher (`*` = any run, `?` = one char, case-sensitive).
+/// Backtracking (no recursion) so hostile `*****...` patterns cannot overflow.
 fn globMatch(text: []const u8, pattern: []const u8) bool {
-    if (pattern.len == 0) return text.len == 0;
-    if (pattern[0] == '*') return globMatch(text, pattern[1..]) or (text.len != 0 and globMatch(text[1..], pattern));
-    if (text.len == 0) return false;
-    if (pattern[0] == '?') return globMatch(text[1..], pattern[1..]);
-    return text[0] == pattern[0] and globMatch(text[1..], pattern[1..]);
+    var ti: usize = 0;
+    var pi: usize = 0;
+    var star: ?usize = null;
+    var star_ti: usize = 0;
+    while (ti < text.len) {
+        if (pi < pattern.len and (pattern[pi] == '?' or pattern[pi] == text[ti])) {
+            ti += 1;
+            pi += 1;
+        } else if (pi < pattern.len and pattern[pi] == '*') {
+            star = pi;
+            star_ti = ti;
+            pi += 1;
+        } else if (star != null) {
+            star_ti += 1;
+            ti = star_ti;
+            pi = star.? + 1;
+        } else return false;
+    }
+    while (pi < pattern.len and pattern[pi] == '*') pi += 1;
+    return pi == pattern.len;
 }
 
+/// Iterative LIKE matcher (`%` = any run, `_` = one char, ASCII case-insensitive).
+/// Backtracking (no recursion) so hostile `%%%%...` patterns cannot overflow.
 fn likeMatch(text: []const u8, pattern: []const u8) bool {
-    if (pattern.len == 0) return text.len == 0;
-    if (pattern[0] == '%') return likeMatch(text, pattern[1..]) or (text.len != 0 and likeMatch(text[1..], pattern));
-    if (text.len == 0) return false;
-    if (pattern[0] == '_') return likeMatch(text[1..], pattern[1..]);
-    return std.ascii.toLower(text[0]) == std.ascii.toLower(pattern[0]) and likeMatch(text[1..], pattern[1..]);
+    var ti: usize = 0;
+    var pi: usize = 0;
+    var star: ?usize = null;
+    var star_ti: usize = 0;
+    while (ti < text.len) {
+        if (pi < pattern.len and pattern[pi] == '_') {
+            ti += 1;
+            pi += 1;
+        } else if (pi < pattern.len and pattern[pi] == '%') {
+            star = pi;
+            star_ti = ti;
+            pi += 1;
+        } else if (pi < pattern.len and std.ascii.toLower(pattern[pi]) == std.ascii.toLower(text[ti])) {
+            ti += 1;
+            pi += 1;
+        } else if (star != null) {
+            star_ti += 1;
+            ti = star_ti;
+            pi = star.? + 1;
+        } else return false;
+    }
+    while (pi < pattern.len and pattern[pi] == '%') pi += 1;
+    return pi == pattern.len;
 }
 
+/// Numeric coercion for arithmetic: integers/reals only (text/blob yield null here).
 fn toFloat(value: Value) ?f64 {
     return switch (value) {
         .integer => |n| @floatFromInt(n),
@@ -112,7 +196,16 @@ fn toFloat(value: Value) ?f64 {
     };
 }
 
+/// Evaluate `expr` against `row`; returns a caller-owned `Value`.
+/// See module docs for NULL/ownership/error semantics. Depth-guarded.
 pub fn eval(allocator: std.mem.Allocator, columnNames: []const []const u8, row: []const Value, expr: ast.Expr) anyerror!Value {
+    return evalDepth(allocator, columnNames, row, expr, 0);
+}
+
+/// Depth-limited worker behind `eval`; `depth > max_eval_depth` fails closed.
+fn evalDepth(allocator: std.mem.Allocator, columnNames: []const []const u8, row: []const Value, expr: ast.Expr, depth: usize) anyerror!Value {
+    if (depth > max_eval_depth) return EvalError.InvalidSql;
+    const child = depth + 1;
     switch (expr) {
         .literal => |lit| return try lit.clone(allocator),
         .identifier => |id| {
@@ -127,7 +220,7 @@ pub fn eval(allocator: std.mem.Allocator, columnNames: []const []const u8, row: 
         .parameter => return .null,
         .wildcard => return EvalError.InvalidSql,
         .unary => |un| {
-            const operand = try eval(allocator, columnNames, row, un.expr.*);
+            const operand = try evalDepth(allocator, columnNames, row, un.expr.*, child);
             defer freeValue(allocator, operand);
             if (operand == .null) return .null;
             return switch (un.op) {
@@ -149,28 +242,28 @@ pub fn eval(allocator: std.mem.Allocator, columnNames: []const []const u8, row: 
         },
         .binary => |bin| {
             if (bin.op == .logicalAnd) {
-                const left = try eval(allocator, columnNames, row, bin.left.*);
+                const left = try evalDepth(allocator, columnNames, row, bin.left.*, child);
                 defer freeValue(allocator, left);
                 if (left != .null and !isTruthy(left)) return .{ .integer = 0 };
-                const right = try eval(allocator, columnNames, row, bin.right.*);
+                const right = try evalDepth(allocator, columnNames, row, bin.right.*, child);
                 defer freeValue(allocator, right);
                 if (right != .null and !isTruthy(right)) return .{ .integer = 0 };
                 if (left == .null or right == .null) return .null;
                 return .{ .integer = if (isTruthy(left) and isTruthy(right)) 1 else 0 };
             }
             if (bin.op == .logicalOr) {
-                const left = try eval(allocator, columnNames, row, bin.left.*);
+                const left = try evalDepth(allocator, columnNames, row, bin.left.*, child);
                 defer freeValue(allocator, left);
                 if (left != .null and isTruthy(left)) return .{ .integer = 1 };
-                const right = try eval(allocator, columnNames, row, bin.right.*);
+                const right = try evalDepth(allocator, columnNames, row, bin.right.*, child);
                 defer freeValue(allocator, right);
                 if (right != .null and isTruthy(right)) return .{ .integer = 1 };
                 if (left == .null or right == .null) return .null;
                 return .{ .integer = 0 };
             }
-            const left = try eval(allocator, columnNames, row, bin.left.*);
+            const left = try evalDepth(allocator, columnNames, row, bin.left.*, child);
             defer freeValue(allocator, left);
-            const right = try eval(allocator, columnNames, row, bin.right.*);
+            const right = try evalDepth(allocator, columnNames, row, bin.right.*, child);
             defer freeValue(allocator, right);
             if (bin.op == .concat) {
                 if (left == .null or right == .null) return .null;
@@ -262,37 +355,37 @@ pub fn eval(allocator: std.mem.Allocator, columnNames: []const []const u8, row: 
             }
             return .null;
         },
-        .collate => |col| return try eval(allocator, columnNames, row, col.expr.*),
+        .collate => |col| return try evalDepth(allocator, columnNames, row, col.expr.*, child),
         .caseExpr => |cs| {
             if (cs.base) |baseExpr| {
-                const baseVal = try eval(allocator, columnNames, row, baseExpr.*);
+                const baseVal = try evalDepth(allocator, columnNames, row, baseExpr.*, child);
                 defer freeValue(allocator, baseVal);
                 for (cs.whens) |when| {
-                    const condVal = try eval(allocator, columnNames, row, when.condition);
+                    const condVal = try evalDepth(allocator, columnNames, row, when.condition, child);
                     defer freeValue(allocator, condVal);
                     if (compareValues(baseVal, .equal, condVal)) {
-                        return try eval(allocator, columnNames, row, when.result);
+                        return try evalDepth(allocator, columnNames, row, when.result, child);
                     }
                 }
             } else {
                 for (cs.whens) |when| {
-                    const condVal = try eval(allocator, columnNames, row, when.condition);
+                    const condVal = try evalDepth(allocator, columnNames, row, when.condition, child);
                     defer freeValue(allocator, condVal);
                     if (isTruthy(condVal)) {
-                        return try eval(allocator, columnNames, row, when.result);
+                        return try evalDepth(allocator, columnNames, row, when.result, child);
                     }
                 }
             }
-            if (cs.otherwise) |other| return try eval(allocator, columnNames, row, other.*);
+            if (cs.otherwise) |other| return try evalDepth(allocator, columnNames, row, other.*, child);
             return .null;
         },
         .inList => |il| {
-            const target = try eval(allocator, columnNames, row, il.expr.*);
+            const target = try evalDepth(allocator, columnNames, row, il.expr.*, child);
             defer freeValue(allocator, target);
             if (target == .null) return .null;
             var matched = false;
             for (il.list) |item| {
-                const itemVal = try eval(allocator, columnNames, row, item);
+                const itemVal = try evalDepth(allocator, columnNames, row, item, child);
                 defer freeValue(allocator, itemVal);
                 if (compareValues(target, .equal, itemVal)) {
                     matched = true;
@@ -303,9 +396,9 @@ pub fn eval(allocator: std.mem.Allocator, columnNames: []const []const u8, row: 
             return .{ .integer = if (isMatch) 1 else 0 };
         },
         .patternMatch => |pm| {
-            const val = try eval(allocator, columnNames, row, pm.value.*);
+            const val = try evalDepth(allocator, columnNames, row, pm.value.*, child);
             defer freeValue(allocator, val);
-            const pat = try eval(allocator, columnNames, row, pm.pattern.*);
+            const pat = try evalDepth(allocator, columnNames, row, pm.pattern.*, child);
             defer freeValue(allocator, pat);
             if (val == .null or pat == .null) return .null;
             if (val != .text or pat != .text) return .{ .integer = 0 };
@@ -323,26 +416,31 @@ pub fn eval(allocator: std.mem.Allocator, columnNames: []const []const u8, row: 
                 argList.deinit(allocator);
             }
             if (f.argument.* == .wildcard) return .null;
-            try argList.append(allocator, try eval(allocator, columnNames, row, f.argument.*));
+            try argList.append(allocator, try evalDepth(allocator, columnNames, row, f.argument.*, child));
             if (f.argument2) |a2| {
                 if (a2.* == .identifier and std.ascii.eqlIgnoreCase(f.name, "cast")) {
                     try argList.append(allocator, .{ .text = a2.identifier });
                 } else {
-                    try argList.append(allocator, try eval(allocator, columnNames, row, a2.*));
+                    try argList.append(allocator, try evalDepth(allocator, columnNames, row, a2.*, child));
                 }
             }
             if (f.argument3) |a3| {
-                try argList.append(allocator, try eval(allocator, columnNames, row, a3.*));
+                try argList.append(allocator, try evalDepth(allocator, columnNames, row, a3.*, child));
             }
             for (f.extraArgs) |ea| {
-                try argList.append(allocator, try eval(allocator, columnNames, row, ea));
+                try argList.append(allocator, try evalDepth(allocator, columnNames, row, ea, child));
             }
-            return functions.evalScalar(allocator, f.name, argList.items) catch .null;
+            return functions.evalScalar(allocator, f.name, argList.items) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                return .null;
+            };
         },
         else => return .null,
     }
 }
 
+/// CHECK-constraint predicate: NULL counts as satisfied (SQL semantics).
+/// Unknown columns propagate as errors; OOM propagates.
 pub fn evalCheck(allocator: std.mem.Allocator, columnNames: []const []const u8, row: []const Value, expr: ast.Expr) !bool {
     const val = try eval(allocator, columnNames, row, expr);
     defer freeValue(allocator, val);
@@ -350,12 +448,10 @@ pub fn evalCheck(allocator: std.mem.Allocator, columnNames: []const []const u8, 
     return val.isTruthy();
 }
 
-pub fn evalTemp(allocator: std.mem.Allocator, columnNames: []const []const u8, row: []const Value, expr: ast.Expr) !Value {
-    return eval(allocator, columnNames, row, expr);
-}
-
+/// Boolean predicate view: NULL/false -> false, truthy -> true.
+/// Used by join/partial-index implication checks.
 pub fn evalPredicate(allocator: std.mem.Allocator, columnNames: []const []const u8, row: []const Value, expr: ast.Expr) !bool {
-    const val = try evalTemp(allocator, columnNames, row, expr);
+    const val = try eval(allocator, columnNames, row, expr);
     defer freeValue(allocator, val);
     return val.isTruthy();
 }
@@ -402,6 +498,8 @@ fn exprListEqual(left: []const ast.Expr, right: []const ast.Expr) bool {
     return true;
 }
 
+/// Structural expression equality (case-insensitive identifiers/names).
+/// Window nodes are never equal (conservative: forces re-evaluation).
 pub fn exprEqual(left: ast.Expr, right: ast.Expr) bool {
     if (std.meta.activeTag(left) != std.meta.activeTag(right)) return false;
     switch (left) {
@@ -457,6 +555,8 @@ pub fn exprEqual(left: ast.Expr, right: ast.Expr) bool {
     }
 }
 
+/// True when every AND-conjunct of `predicate` is an equality implied by `conditions`.
+/// Used for partial-index eligibility; OR-joined conditions imply nothing.
 pub fn partialPredicateImpliedBy(predicate: ast.Expr, conditions: ast.Conditions) bool {
     if (conditions.len == 0) return false;
     var current: ast.Expr = predicate;
@@ -525,4 +625,73 @@ test "logical operators follow SQLite three-valued truth tables" {
     const notGot = try eval(std.testing.allocator, &noCols, &noRow, notNull);
     defer freeValue(std.testing.allocator, notGot);
     try std.testing.expect(notGot == .null);
+}
+
+test "expr null/integer/real/text/blob comparison matrix" {
+    const noCols = [_][]const u8{};
+    const noRow = [_]Value{};
+    const nullLit = ast.Expr{ .literal = .null };
+    const intLit = ast.Expr{ .literal = .{ .integer = 1 } };
+    const realLit = ast.Expr{ .literal = .{ .real = 1.0 } };
+    const textLit = ast.Expr{ .literal = .{ .text = "1" } };
+    const blobLit = ast.Expr{ .literal = .{ .blob = "1" } };
+    // NULL comparisons yield NULL (not false).
+    const eqNull = ast.Expr{ .binary = .{ .op = .equal, .left = &nullLit, .right = &intLit } };
+    const gotNull = try eval(std.testing.allocator, &noCols, &noRow, eqNull);
+    defer freeValue(std.testing.allocator, gotNull);
+    try std.testing.expect(gotNull == .null);
+    // int 1 == real 1.0 (numeric class), but text/blob sort after numeric.
+    const eqNum = ast.Expr{ .binary = .{ .op = .equal, .left = &intLit, .right = &realLit } };
+    const gotNum = try eval(std.testing.allocator, &noCols, &noRow, eqNum);
+    defer freeValue(std.testing.allocator, gotNum);
+    try std.testing.expectEqual(@as(i64, 1), gotNum.integer);
+    const ltCross = ast.Expr{ .binary = .{ .op = .less, .left = &realLit, .right = &textLit } };
+    const gotCross = try eval(std.testing.allocator, &noCols, &noRow, ltCross);
+    defer freeValue(std.testing.allocator, gotCross);
+    try std.testing.expectEqual(@as(i64, 1), gotCross.integer);
+    const gtBlob = ast.Expr{ .binary = .{ .op = .greater, .left = &blobLit, .right = &textLit } };
+    const gotBlob = try eval(std.testing.allocator, &noCols, &noRow, gtBlob);
+    defer freeValue(std.testing.allocator, gotBlob);
+    try std.testing.expectEqual(@as(i64, 1), gotBlob.integer);
+    // IS distinguishes NULL identity from equality.
+    const isNull = ast.Expr{ .binary = .{ .op = .isOp, .left = &nullLit, .right = &nullLit } };
+    const gotIs = try eval(std.testing.allocator, &noCols, &noRow, isNull);
+    defer freeValue(std.testing.allocator, gotIs);
+    try std.testing.expectEqual(@as(i64, 1), gotIs.integer);
+}
+
+test "expr like/glob iterative matchers handle edge cases" {
+    const noCols = [_][]const u8{};
+    const noRow = [_]Value{};
+    const val = ast.Expr{ .literal = .{ .text = "aXc" } };
+    const likePat = ast.Expr{ .literal = .{ .text = "a_c" } };
+    const globPat = ast.Expr{ .literal = .{ .text = "a?c" } };
+    const likeExpr = ast.Expr{ .patternMatch = .{ .value = &val, .pattern = &likePat, .negated = false, .glob = false, .isRegexp = false, .isMatch = false } };
+    const gotLike = try eval(std.testing.allocator, &noCols, &noRow, likeExpr);
+    defer freeValue(std.testing.allocator, gotLike);
+    try std.testing.expectEqual(@as(i64, 1), gotLike.integer);
+    const globExpr = ast.Expr{ .patternMatch = .{ .value = &val, .pattern = &globPat, .negated = false, .glob = true, .isRegexp = false, .isMatch = false } };
+    const gotGlob = try eval(std.testing.allocator, &noCols, &noRow, globExpr);
+    defer freeValue(std.testing.allocator, gotGlob);
+    try std.testing.expectEqual(@as(i64, 1), gotGlob.integer);
+    // Hostile run of wildcards terminates (no recursion) and matches empty.
+    try std.testing.expect(likeMatch("", "%%%%"));
+    try std.testing.expect(globMatch("", "****"));
+    try std.testing.expect(!likeMatch("ab", "a"));
+}
+
+test "expr integer overflow wraps to real and div-by-zero is null" {
+    const noCols = [_][]const u8{};
+    const noRow = [_]Value{};
+    const maxLit = ast.Expr{ .literal = .{ .integer = std.math.maxInt(i64) } };
+    const oneLit = ast.Expr{ .literal = .{ .integer = 1 } };
+    const zeroLit = ast.Expr{ .literal = .{ .integer = 0 } };
+    const add = ast.Expr{ .binary = .{ .op = .add, .left = &maxLit, .right = &oneLit } };
+    const gotAdd = try eval(std.testing.allocator, &noCols, &noRow, add);
+    defer freeValue(std.testing.allocator, gotAdd);
+    try std.testing.expect(gotAdd == .real);
+    const div = ast.Expr{ .binary = .{ .op = .divide, .left = &oneLit, .right = &zeroLit } };
+    const gotDiv = try eval(std.testing.allocator, &noCols, &noRow, div);
+    defer freeValue(std.testing.allocator, gotDiv);
+    try std.testing.expect(gotDiv == .null);
 }

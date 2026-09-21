@@ -1,15 +1,68 @@
+//! Migration runner: ordered, checksummed, transactional schema evolution.
+//!
+//! Purpose: apply a borrowed `Migration` slice to a live `Connection`,
+//! tracking progress in the `_zig_migrations(version, name, checksum)` history
+//! table. Guarantees: versions apply once in ascending order, gaps and
+//! post-apply edits fail loudly, each non-VACUUM migration commits atomically,
+//! and legacy history rows (name/checksum missing) are backfilled.
+//!
+//! Responsibilities: history-table creation/upgrade, applied-row loading,
+//! version sorting + duplicate/gap/edit detection, single-migration apply with
+//! savepoint discipline, and single-step rollback via `downSql`.
+//!
+//! Dependencies: `migration/migration.zig` (`Migration`), and
+//! `connection/connection.zig` (`Connection.exec`, `beginImmediate`,
+//! `commit`, `rollback`). Uses `std.testing`-visible file DBs in tests only.
+//!
+//! Ownership/lifetime: `Runner` borrows the caller's allocator and the
+//! caller's migration slice (strings inside stay caller-owned, usually string
+//! literals). `init` copies nothing. `apply`/`rollback` allocate transient
+//! sorted copies, `Applied` name dupes, and checksum/record SQL, freeing all
+//! of it before returning. The `Connection` must outlive the runner call and
+//! must not be closed mid-apply. History rows are engine-owned once written.
+//!
+//! Error behavior: `DuplicateMigration` (two defs share a version),
+//! `MissingMigration` (applied row without a def, gap above the history peak,
+//! or reordered set skipping an unapplied version below the peak),
+//! `ModifiedMigration` (name/checksum drift on an applied version),
+//! `NoMigrationsApplied` / `NoDownMigration` on empty/missing rollback,
+//! plus engine errors (`InvalidSql`, I/O, constraint violations). A failed
+//! non-VACUUM migration rolls back its own transaction (when the runner began
+//! it) and leaves prior history intact; a failed VACUUM body writes no history
+//! row. When the caller already holds a transaction, the runner joins it and
+//! never commits/rolls back the outer scope.
+//!
+//! SQLite compatibility: `_zig_migrations` uses plain DDL/DML understood by
+//! any SQLite. VACUUM migrations must be self-contained single statements and
+//! run outside a transaction (the engine rejects VACUUM inside BEGIN..COMMIT),
+//! so the runner executes them without wrapping and records history separately.
+//!
+//! Unified pipeline note: migrations execute raw SQL scripts through the
+//! native engine, like every other pipeline — there is no DSL->SQL-string
+//! round trip here.
+//!
+//! Safety note: history INSERT/UPDATE statements interpolate the migration
+//! `name` and hex checksum. Names are caller-controlled; see `escapeLiteral`
+//! and the TODO on moving to bound parameters.
+
 const std = @import("std");
 const Migration = @import("migration.zig").Migration;
 const Connection = @import("../connection/connection.zig").Connection;
 
+/// Borrowed runner over a caller-owned migration slice. Owns nothing; the
+/// slice and its strings must outlive every `apply`/`rollback` call.
 pub const Runner = struct {
     allocator: std.mem.Allocator,
     migrations: []const Migration,
 
+    /// Borrow the allocator (for transient sorted copies/records) and the
+    /// caller-owned migration slice. Copies nothing. Never fails.
     pub fn init(allocator: std.mem.Allocator, migrations: []const Migration) Runner {
         return .{ .allocator = allocator, .migrations = migrations };
     }
 
+    /// One applied history row. `name` is an owned dupe freed with `applied`;
+    /// `hasChecksum` is false for legacy rows predating the checksum column.
     const Applied = struct {
         version: u32,
         name: []const u8,
@@ -17,6 +70,8 @@ pub const Runner = struct {
         hasChecksum: bool,
     };
 
+    /// Create `_zig_migrations` if missing and add `name`/`checksum` columns
+    /// to databases created by older versions. Idempotent; no rows touched.
     fn ensureHistoryTable(connection: *Connection) !void {
         var create = try connection.exec(
             "CREATE TABLE IF NOT EXISTS _zig_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL DEFAULT '', checksum TEXT NOT NULL DEFAULT '');",
@@ -41,6 +96,8 @@ pub const Runner = struct {
         }
     }
 
+    /// Load history rows ordered by version. `name` strings are owned dupes;
+    /// the caller frees each plus the slice. Malformed version cells fail.
     fn loadApplied(self: Runner, connection: *Connection) ![]Applied {
         var result = try connection.exec("SELECT version, name, checksum FROM _zig_migrations ORDER BY version;");
         defer result.deinit();
@@ -80,6 +137,8 @@ pub const Runner = struct {
         return out;
     }
 
+    /// Owned ascending copy of the defs. Fails `DuplicateMigration` on repeat
+    /// versions. Caller frees the slice (structs only; strings stay borrowed).
     fn sortedMigrations(self: Runner) ![]Migration {
         const out = try self.allocator.alloc(Migration, self.migrations.len);
         errdefer self.allocator.free(out);
@@ -110,6 +169,31 @@ pub const Runner = struct {
         return std.fmt.allocPrint(self.allocator, "{x}", .{sum});
     }
 
+    /// Escape a borrowed literal for `'…'` interpolation (single-quote doubling).
+    /// Returned slice is owned; caller must free. Checksum/version need no
+    /// escaping (hex/integer), but migration names are caller-controlled.
+    fn escapeLiteral(self: Runner, raw: []const u8) ![]u8 {
+        var count: usize = 0;
+        for (raw) |b| {
+            if (b == '\'') count += 1;
+        }
+        if (count == 0) return self.allocator.dupe(u8, raw);
+        const out = try self.allocator.alloc(u8, raw.len + count);
+        var w: usize = 0;
+        for (raw) |b| {
+            out[w] = b;
+            w += 1;
+            if (b == '\'') {
+                out[w] = '\'';
+                w += 1;
+            }
+        }
+        return out;
+    }
+
+    /// True when the script's first real keyword is VACUUM (comments and
+    /// empty statements skipped, case-insensitive). VACUUM bodies must run
+    /// outside a transaction; see `applyOne`.
     fn isVacuumMigration(sql: []const u8) bool {
         var i: usize = 0;
         while (i < sql.len) {
@@ -133,6 +217,14 @@ pub const Runner = struct {
         return false;
     }
 
+    /// Apply one def plus its history row. Non-VACUUM bodies run in the
+    /// caller's transaction when one is active, else in a fresh
+    /// BEGIN IMMEDIATE..COMMIT that rolls back on any failure. VACUUM bodies
+    /// run unwrapped and must be a single self-contained statement.
+    /// TODO: route history INSERT/UPDATE through bound parameters instead of
+    /// escaped literals once Connection exposes a parameterized exec path to
+    /// this layer; escaping is correct but parameter binding would remove the
+    /// class entirely.
     fn applyOne(self: Runner, connection: *Connection, m: Migration) !void {
         const sum = m.checksum();
         const sumText = try self.checksumText(sum);
@@ -163,10 +255,12 @@ pub const Runner = struct {
             if (count != 1) return error.InvalidSql;
             var body = try connection.exec(m.upSql);
             body.deinit();
+            const safeName = try self.escapeLiteral(m.name);
+            defer self.allocator.free(safeName);
             const record = try std.fmt.allocPrint(
                 self.allocator,
                 "INSERT INTO _zig_migrations (version, name, checksum) VALUES ({d}, '{s}', '{s}');",
-                .{ m.version, m.name, sumText },
+                .{ m.version, safeName, sumText },
             );
             defer self.allocator.free(record);
             var recorded = try connection.exec(record);
@@ -181,10 +275,12 @@ pub const Runner = struct {
         var body = try connection.exec(m.upSql);
         body.deinit();
         // History advances only after the body succeeded.
+        const safeName = try self.escapeLiteral(m.name);
+        defer self.allocator.free(safeName);
         const record = try std.fmt.allocPrint(
             self.allocator,
             "INSERT INTO _zig_migrations (version, name, checksum) VALUES ({d}, '{s}', '{s}');",
-            .{ m.version, m.name, sumText },
+            .{ m.version, safeName, sumText },
         );
         defer self.allocator.free(record);
         var recorded = try connection.exec(record);
@@ -192,6 +288,11 @@ pub const Runner = struct {
         if (!wasActive) try connection.commit();
     }
 
+    /// Apply all pending migrations in ascending version order. Returns the
+    /// highest applied version (0 when the set is empty). Validates every
+    /// applied row against the supplied defs first, backfilling legacy rows.
+    /// Each migration commits atomically (unless the caller holds the
+    /// transaction, in which case the caller owns commit/rollback).
     pub fn apply(self: Runner, connection: *Connection) !u32 {
         try ensureHistoryTable(connection);
         const sorted = try self.sortedMigrations();
@@ -212,10 +313,12 @@ pub const Runner = struct {
                 if (a.name.len != 0 and !std.mem.eql(u8, a.name, def.name)) return error.ModifiedMigration;
                 const sumText = try self.checksumText(def.checksum());
                 defer self.allocator.free(sumText);
+                const safeName = try self.escapeLiteral(def.name);
+                defer self.allocator.free(safeName);
                 const backfill = try std.fmt.allocPrint(
                     self.allocator,
                     "UPDATE _zig_migrations SET name = '{s}', checksum = '{s}' WHERE version = {d};",
-                    .{ def.name, sumText, def.version },
+                    .{ safeName, sumText, def.version },
                 );
                 defer self.allocator.free(backfill);
                 var done = try connection.exec(backfill);
@@ -250,6 +353,10 @@ pub const Runner = struct {
         return top;
     }
 
+    /// Roll back the single newest applied migration via its `downSql` and
+    /// delete its history row atomically. Returns the rolled-back version.
+    /// Fails `NoMigrationsApplied` when empty, `NoDownMigration` when the def
+    /// has no down SQL, and `ModifiedMigration` on checksum drift.
     pub fn rollback(self: Runner, connection: *Connection) !u32 {
         try ensureHistoryTable(connection);
         const sorted = try self.sortedMigrations();
@@ -381,4 +488,25 @@ test "migrations apply in version order regardless of input order" {
     var history = try db.exec("SELECT version FROM _zig_migrations ORDER BY version;");
     defer history.deinit();
     try std.testing.expectEqual(@as(usize, 3), history.count());
+}
+
+test "quoted migration names round-trip through history" {
+    const path = "sqlite_zig_migration_quote_test.db";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    var db = try Connection.open(std.testing.allocator, path);
+    defer db.close();
+    // A single quote in the name must not break the history INSERT (escaped
+    // by doubling) nor trip the ModifiedMigration check on re-apply.
+    const migrations = [_]Migration{
+        .{ .version = 1, .name = "o'brien", .upSql = "CREATE TABLE mig_q (id INTEGER);", .downSql = "DROP TABLE mig_q;" },
+    };
+    const runner = Runner.init(std.testing.allocator, &migrations);
+    try std.testing.expectEqual(@as(u32, 1), try runner.apply(db));
+    try std.testing.expectEqual(@as(u32, 1), try runner.apply(db));
+    var names = try db.exec("SELECT name FROM _zig_migrations;");
+    defer names.deinit();
+    try std.testing.expectEqual(@as(usize, 1), names.count());
+    try std.testing.expectEqualStrings("o'brien", names.rows[0][0].text);
+    try std.testing.expectEqual(@as(u32, 1), try runner.rollback(db));
 }

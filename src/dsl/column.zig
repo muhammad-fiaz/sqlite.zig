@@ -1,3 +1,51 @@
+//! Typed and dynamic column descriptors: the DSL's expression leaves.
+//!
+//! Purpose: define `Column(table, name, FieldType)` (comptime typed columns),
+//! `DynamicColumn` (runtime columns), `ExcludedColumn` (upsert `excluded`
+//! pseudo-table), plus `CaseBuilder`/`WindowBuilder` expression handles. Every
+//! method here builds a borrowed `dsl/expr.zig` value; nothing executes.
+//!
+//! Responsibilities: Zig-to-`Value` conversion (`toValue`), dotted-name
+//! splitting (`splitRef`), column/predicate/projection/order builders, CASE
+//! and window-function handles, and explicit insert/update markers
+//! (`ExplicitValue`, `ExplicitDefault`).
+//!
+//! Dependencies: `dsl/expr.zig` (IR), `vm/value.zig` (`Value`). No allocator,
+//! no SQL text, no catalog access.
+//!
+//! Ownership/lifetime: descriptors are small copyable values holding borrowed
+//! slices (`name`, `table`, `schema`, function names). Predicates and
+//! projections borrow those slices; `ast_builder` duplicates what the native
+//! AST must own. Values passed to `toValue` with text/blob payloads stay
+//! borrowed — callers keep them alive until the built statement executes.
+//!
+//! Error behavior: type mismatches that are knowable at comptime (assigning
+//! text to an integer column via `value()`, arithmetic on text columns) are
+//! `@compileError`. Runtime misuse of CASE builders (mixing searched/simple
+//! branches, overflowing the fixed 8-branch / 4-partition / 2-order buffers)
+//! is `@panic`, matching the builder-wide fixed-capacity contract.
+//!
+//! SQLite compatibility: method names mirror SQLite operators and scalar
+//! functions (`likeEscape`, `glob`, `regexp`, `matchPattern`, `substr`,
+//! `jsonExtract`, ...). `between`/`notBetween` lower to paired comparisons in
+//! `ast_builder`, preserving SQLite NULL semantics via the native AST.
+//!
+//! Unified pipeline note: Raw SQL, the dynamic DSL, and the typed DSL all
+//! converge on native AST/IR through `ast_builder` — column descriptors never
+//! render SQL strings.
+//!
+//! Column/operation collision rule: schema fields are always plain struct
+//! fields (`User.all`, `User.count`, `User.where` are column descriptors when
+//! the table declares them; see `dsl/table.zig`). DSL operations are methods
+//! *on* those column values (`col.count()`, `col.asc()`) or calls on the table
+//! (`User.all()` only exists when no `all` column is declared), so a column
+//! named `select`/`where`/`limit`/`count` never hides an operation.
+//!
+//! AllColumns note: `.all()` (the all-columns operation) lives on the table
+//! descriptor, not here; projections built here are single-column, aggregate,
+//! scalar, CASE, or window nodes. `tableMod.AllProjection` is the only
+//! star-shaped IR and is produced by the table, never by a column.
+
 const std = @import("std");
 const dslExpr = @import("expr.zig");
 const Expr = dslExpr.Expr;
@@ -8,10 +56,15 @@ const FuncCall = dslExpr.FuncCall;
 const Operator = dslExpr.Operator;
 const Value = @import("../vm/value.zig").Value;
 
+/// Build a typed column value for a descriptor-declared SQL name.
+/// `FieldType` drives `value()` checking and arithmetic gating only.
 pub fn column(comptime name: []const u8, comptime FieldType: type) Column("", name, FieldType) {
     return .{};
 }
 
+/// Convert a Zig scalar to a borrowed `Value` (text/blob stay borrowed).
+/// `Value` passes through; optionals map null -> `.null`; bools -> 0/1.
+/// Anything else is a comptime error.
 pub fn toValue(value: anytype) Value {
     const T = @TypeOf(value);
     if (T == Value) return value;
@@ -36,6 +89,7 @@ pub fn toValue(value: anytype) Value {
     };
 }
 
+/// Split `"table.col"` / `"col"` into a borrowed `ColumnRef`.
 pub fn splitRef(name: []const u8) ColumnRef {
     if (std.mem.indexOfScalar(u8, name, '.')) |dot| {
         return .{ .table = name[0..dot], .name = name[dot + 1 ..] };
@@ -43,6 +97,8 @@ pub fn splitRef(name: []const u8) ColumnRef {
     return .{ .name = name };
 }
 
+/// Resolve a `DynamicColumn` to a `ColumnRef`, preferring explicit
+/// schema/table fields and falling back to dotted-name parsing. Borrowed.
 pub fn dynRef(col: DynamicColumn) ColumnRef {
     if (col.schema.len != 0 or col.table.len != 0) return .{ .schema = col.schema, .table = col.table, .name = col.name };
     return splitRef(col.name);
@@ -53,10 +109,12 @@ fn isTypedColumn(comptime T: type) bool {
     return @hasDecl(T, "isDslColumn") and T.isDslColumn;
 }
 
+/// Convert a column descriptor or literal into an `Rhs` (borrowed).
 pub fn toRhs(value: anytype) dslExpr.Rhs {
     return rhsFrom(value);
 }
 
+/// Convert a typed or dynamic column descriptor into a borrowed `ColumnRef`.
 pub fn toColumnRef(col: anytype) dslExpr.ColumnRef {
     const T = @TypeOf(col);
     if (T == DynamicColumn) return dynRef(col);
@@ -64,8 +122,13 @@ pub fn toColumnRef(col: anytype) dslExpr.ColumnRef {
     @compileError("expected a column descriptor (User.id or table.column(\"x\"))");
 }
 
+/// One CASE branch: searched (`cond` set) or simple (`operand` set).
+/// Borrowed; built by `CaseBuilder.when` / `whenValue`.
 pub const CaseWhen = struct { cond: ?Expr = null, operand: dslExpr.Rhs, result: dslExpr.Rhs, simple: bool };
 
+/// Fixed-capacity (8 branches) CASE builder. Searched (`when`) and simple
+/// (`whenValue` on a `caseValue` base) branches must not mix; misuse panics.
+/// Borrowed; `ast_builder.caseToExpr` validates arity at build time.
 pub const CaseBuilder = struct {
     base: ?dslExpr.ColumnRef = null,
     baseFunc: ?FuncCall = null,
@@ -74,6 +137,8 @@ pub const CaseBuilder = struct {
     otherwise: dslExpr.Rhs = .{ .value = .null },
     hasOtherwise: bool = false,
 
+    /// Append a searched `WHEN cond THEN result`. Panics on simple-case base,
+    /// mixed branch kinds, or more than 8 branches.
     pub fn when(self: @This(), cond: Expr, result: anytype) @This() {
         var copy = self;
         if (copy.base != null or copy.baseFunc != null) @panic("when() needs searched case; use whenValue() with caseValue()");
@@ -84,6 +149,8 @@ pub const CaseBuilder = struct {
         return copy;
     }
 
+    /// Append a simple `WHEN operand THEN result` (needs `caseValue` base).
+    /// Panics on searched-case base, mixed branch kinds, or overflow.
     pub fn whenValue(self: @This(), operand: anytype, result: anytype) @This() {
         var copy = self;
         if (copy.base == null and copy.baseFunc == null) @panic("whenValue() needs simple case; use caseValue()");
@@ -94,6 +161,7 @@ pub const CaseBuilder = struct {
         return copy;
     }
 
+    /// Set the `ELSE` result (default is NULL). Overwrites any prior `else_`.
     pub fn else_(self: @This(), result: anytype) @This() {
         var copy = self;
         copy.otherwise = toRhs(result);
@@ -102,11 +170,13 @@ pub const CaseBuilder = struct {
     }
 };
 
+/// Start a searched CASE builder with one `WHEN cond THEN result`.
 pub fn caseWhen(cond: Expr, result: anytype) CaseBuilder {
     var builder = CaseBuilder{};
     return builder.when(cond, result);
 }
 
+/// Start a simple CASE builder dispatching on `col` (typed or dynamic).
 pub fn caseValue(col: anytype) CaseBuilder {
     const T = @TypeOf(col);
     if (T == DynamicColumn) {
@@ -119,6 +189,7 @@ pub fn caseValue(col: anytype) CaseBuilder {
     @compileError("caseValue() needs a column descriptor");
 }
 
+/// Window frame bound: fixed rows/groups offsets are `usize` counts.
 pub const WindowBound = union(enum) {
     unboundedPreceding,
     preceding: usize,
@@ -127,51 +198,73 @@ pub const WindowBound = union(enum) {
     unboundedFollowing,
 };
 
+/// Window frame unit (ROWS / RANGE / GROUPS).
 pub const WindowFrameKind = enum { rows, range, groups };
 
+/// Window frame span with inclusive start/end bounds.
 pub const WindowFrameSpec = struct {
     kind: WindowFrameKind = .rows,
     start: WindowBound = .unboundedPreceding,
     end: WindowBound = .currentRow,
 };
 
+/// `UNBOUNDED PRECEDING` frame bound.
 pub fn unboundedPreceding() WindowBound {
     return .unboundedPreceding;
 }
 
+/// `<offset> PRECEDING` frame bound.
 pub fn preceding(offset: usize) WindowBound {
     return .{ .preceding = offset };
 }
 
+/// `CURRENT ROW` frame bound.
 pub fn currentRow() WindowBound {
     return .currentRow;
 }
 
+/// `<offset> FOLLOWING` frame bound.
 pub fn following(offset: usize) WindowBound {
     return .{ .following = offset };
 }
 
+/// `UNBOUNDED FOLLOWING` frame bound.
 pub fn unboundedFollowing() WindowBound {
     return .unboundedFollowing;
 }
 
+/// Fixed-capacity (4 partitions, 2 orders) window-function builder.
+/// Methods return copies; `ast_builder.windowToExpr` rejects unknown
+/// function names with `error.InvalidSql` at build time.
 pub const WindowBuilder = struct {
+    /// Borrowed window function name (`"row_number"`, `"lag"`, ...).
     func: []const u8,
+    /// Borrowed target column (for `lag`/`lead`/`first_value`/..., else null).
     arg: ?ColumnRef = null,
+    /// Integer argument (`ntile` buckets, `lag` offset, `nth_value` n).
     argInt: i64 = 0,
+    /// Whether `argInt` is meaningful.
     hasArgInt: bool = false,
+    /// Borrowed default for `lag`/`lead` two-arg form.
     defaultRhs: dslExpr.Rhs = .{ .value = .null },
+    /// Whether `defaultRhs` is meaningful.
     hasDefault: bool = false,
+    /// Borrowed PARTITION BY columns (max 4).
     partitions: [4]ColumnRef = undefined,
+    /// Number of valid `partitions` entries.
     partitionCount: usize = 0,
+    /// ORDER BY keys inside the window (max 2).
     orders: [2]Order = undefined,
+    /// Number of valid `orders` entries.
     orderCount: usize = 0,
+    /// Optional frame span; null means the engine default.
     frame: ?WindowFrameSpec = null,
 
     fn withArg(col: anytype, func: []const u8) WindowBuilder {
         return .{ .func = func, .arg = toColumnRef(col) };
     }
 
+    /// Add PARTITION BY columns (one descriptor or a tuple). Panics past 4.
     pub fn partitionBy(self: @This(), cols: anytype) @This() {
         var copy = self;
         const T = @TypeOf(cols);
@@ -196,6 +289,7 @@ pub const WindowBuilder = struct {
         return copy;
     }
 
+    /// Add window ORDER BY keys (`col.asc()` or a tuple). Panics past 2.
     pub fn orderBy(self: @This(), orders: anytype) @This() {
         var copy = self;
         const T = @TypeOf(orders);
@@ -217,6 +311,7 @@ pub const WindowBuilder = struct {
         return copy;
     }
 
+    /// Set the integer argument (`lag`/`lead` offset, `nth_value` n).
     pub fn offset(self: @This(), amount: i64) @This() {
         var copy = self;
         copy.argInt = amount;
@@ -224,6 +319,7 @@ pub const WindowBuilder = struct {
         return copy;
     }
 
+    /// Set the `lag`/`lead` default value used past the partition edge.
     pub fn defaultValue(self: @This(), value: anytype) @This() {
         var copy = self;
         copy.defaultRhs = toRhs(value);
@@ -237,71 +333,88 @@ pub const WindowBuilder = struct {
         return copy;
     }
 
+    /// `ROWS BETWEEN start AND end` frame.
     pub fn rowsBetween(self: @This(), start: WindowBound, end: WindowBound) @This() {
         return self.frameBetween(.rows, start, end);
     }
 
+    /// `RANGE BETWEEN start AND end` frame.
     pub fn rangeBetween(self: @This(), start: WindowBound, end: WindowBound) @This() {
         return self.frameBetween(.range, start, end);
     }
 
+    /// `GROUPS BETWEEN start AND end` frame.
     pub fn groupsBetween(self: @This(), start: WindowBound, end: WindowBound) @This() {
         return self.frameBetween(.groups, start, end);
     }
 
+    /// `ROWS start TO CURRENT ROW` shorthand frame.
     pub fn rowsFrom(self: @This(), start: WindowBound) @This() {
         return self.frameBetween(.rows, start, .currentRow);
     }
 
+    /// `RANGE start TO CURRENT ROW` shorthand frame.
     pub fn rangeFrom(self: @This(), start: WindowBound) @This() {
         return self.frameBetween(.range, start, .currentRow);
     }
 
+    /// `GROUPS start TO CURRENT ROW` shorthand frame.
     pub fn groupsFrom(self: @This(), start: WindowBound) @This() {
         return self.frameBetween(.groups, start, .currentRow);
     }
 };
 
+/// `row_number() OVER (...)` window handle.
 pub fn rowNumber() WindowBuilder {
     return .{ .func = "row_number" };
 }
 
+/// `rank() OVER (...)` window handle.
 pub fn rank() WindowBuilder {
     return .{ .func = "rank" };
 }
 
+/// `dense_rank() OVER (...)` window handle.
 pub fn denseRank() WindowBuilder {
     return .{ .func = "dense_rank" };
 }
 
+/// `percent_rank() OVER (...)` window handle.
 pub fn percentRank() WindowBuilder {
     return .{ .func = "percent_rank" };
 }
 
+/// `cume_dist() OVER (...)` window handle.
 pub fn cumeDist() WindowBuilder {
     return .{ .func = "cume_dist" };
 }
 
+/// `ntile(buckets) OVER (...)` window handle.
 pub fn ntile(buckets: i64) WindowBuilder {
     return .{ .func = "ntile", .argInt = buckets, .hasArgInt = true };
 }
 
+/// `lag(col) OVER (...)` handle; chain `.offset(n).defaultValue(v)`.
 pub fn lag(col: anytype) WindowBuilder {
     return WindowBuilder.withArg(col, "lag");
 }
 
+/// `lead(col) OVER (...)` handle; chain `.offset(n).defaultValue(v)`.
 pub fn lead(col: anytype) WindowBuilder {
     return WindowBuilder.withArg(col, "lead");
 }
 
+/// `first_value(col) OVER (...)` handle.
 pub fn firstValue(col: anytype) WindowBuilder {
     return WindowBuilder.withArg(col, "first_value");
 }
 
+/// `last_value(col) OVER (...)` handle.
 pub fn lastValue(col: anytype) WindowBuilder {
     return WindowBuilder.withArg(col, "last_value");
 }
 
+/// `nth_value(col, n) OVER (...)` handle.
 pub fn nthValue(col: anytype, n: i64) WindowBuilder {
     var builder = WindowBuilder.withArg(col, "nth_value");
     builder.argInt = n;
@@ -320,11 +433,15 @@ fn orderFromRef(ref: ColumnRef, func: ?FuncCall, descending: bool) Order {
     return .{ .column = ref, .descending = descending, .function = func };
 }
 
+/// Explicit literal marker for INSERT/UPDATE rows (`User.age.value(3)`).
+/// Bypasses `toValue` inference while keeping the borrowed-payload rule.
 pub const ExplicitValue = struct {
     value: Value,
     pub const isExplicitValue = true;
 };
 
+/// DEFAULT marker for INSERT/UPDATE rows (`User.age.defaultValue()`).
+/// The column is omitted from the statement so SQLite applies its default.
 pub const ExplicitDefault = struct {
     pub const isExplicitDefault = true;
 };
@@ -413,6 +530,13 @@ fn arithOf(ref: ColumnRef, op: dslExpr.ArithOp, other: anytype) dslExpr.ArithExp
     return .{ .op = op, .left = .{ .column = ref }, .right = setOperandOf(other) };
 }
 
+/// Typed column descriptor factory. Returns a small copyable struct whose
+/// *fields* are the schema (`table`, `name`, `fieldType`) and whose *methods*
+/// are the DSL operations (`eq`, `lt`, `asc`, `count`, `lower`, `add`, ...).
+/// Because operations are methods on the column *value*, a schema field named
+/// `count`/`where`/`select`/`limit` never collides with an operation: the
+/// field stays a column, the operation stays a call. All names borrowed;
+/// `func` holds an optional scalar wrapper applied by `lower()` & friends.
 pub fn Column(comptime tableName: []const u8, comptime columnName: []const u8, comptime FieldType: type) type {
     return struct {
         const Self = @This();
@@ -673,6 +797,11 @@ pub fn Column(comptime tableName: []const u8, comptime columnName: []const u8, c
     };
 }
 
+/// Runtime column descriptor (`db.table("users").column("age")`). Same method
+/// family as `Column` but typeless: predicates accept any literal at runtime
+/// (mismatches surface as engine errors, not comptime errors). `name` may be
+/// dotted (`"users.age"`); explicit `schema`/`table` fields take precedence.
+/// All slices borrowed from the caller/table handle.
 pub const DynamicColumn = struct {
     name: []const u8,
     schema: []const u8 = "",
@@ -937,6 +1066,8 @@ pub const DynamicColumn = struct {
     }
 };
 
+/// `excluded.*` pseudo-table descriptor for UPSERT `doUpdate` assignments.
+/// Predicates here address the proposed insertion row. Borrowed name.
 pub const ExcludedColumn = struct {
     name: []const u8,
 
@@ -1102,4 +1233,29 @@ test "excluded columns address the proposed upsert row" {
     const range = (ExcludedColumn{ .name = "stock" }).between(1, 9);
     try std.testing.expect(range.operator == .between);
     try std.testing.expect((ExcludedColumn{ .name = "x" }).isNull().operator == .isNull);
+}
+
+test "operation-named typed columns stay usable as fields" {
+    // Collision rule: `all`/`count`/`select`/`where`/`join`/`limit` are plain
+    // fields when the schema declares them; operations are calls on values.
+    const All = Column("t", "all", []const u8);
+    const Count = Column("t", "count", i64);
+    const Select = Column("t", "select", []const u8);
+    const Where = Column("t", "where", []const u8);
+    const Join = Column("t", "join", []const u8);
+    const Limit = Column("t", "limit", i64);
+    try std.testing.expectEqualStrings("all", (All{}).projection().column.name);
+    try std.testing.expectEqualStrings("COUNT", (Count{}).count().function);
+    try std.testing.expect((Select{}).eq("x").operator == .equal);
+    try std.testing.expectEqualStrings("where", (Where{}).like("a%").column.name);
+    try std.testing.expect((Join{}).isNotNull().operator == .isNotNull);
+    try std.testing.expect((Limit{}).desc().descending);
+    try std.testing.expectEqualStrings("limit", (Limit{}).desc().column.name);
+    // Dynamic side mirrors it: dotted names keep table identity.
+    const dyn = DynamicColumn{ .name = "t.where" };
+    try std.testing.expectEqualStrings("where", dynRef(dyn).name);
+    try std.testing.expectEqualStrings("t", dynRef(dyn).table);
+    // CASE base accepts an operation-named column without ambiguity.
+    const builder = caseValue(Where{});
+    try std.testing.expectEqualStrings("where", builder.base.?.name);
 }

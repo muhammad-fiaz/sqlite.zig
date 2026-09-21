@@ -1,3 +1,36 @@
+//! Query planner: access-path selection and `EXPLAIN QUERY PLAN` support.
+//!
+//! Purpose: choose table scans, rowid lookups, index seeks/scans, and covering
+//! indexes for SELECT/UPDATE/DELETE predicates, price them with `plan/cost`,
+//! and render SQLite-style EXPLAIN text. Responsibilities: index matching
+//! (equality prefix + range), covering/sort-satisfying detection, join plan
+//! chaining, and temp-sort flags consumed by `connection` execution.
+//!
+//! Dependencies: `plan/cost`, `sql/ast`, `sql/expr`, `vm/value`,
+//! `catalog/schema` (all borrowed during planning). The optimizer
+//! (`plan/optimizer`) applies rewrites before this access-path pass.
+//!
+//! Ownership/lifetime: `QueryPlan` owns its `eqColumns` copy and chained
+//! `joinPlan`; caller must `deinit`. Index/table name slices stay borrowed
+//! from the schema — do not free them, and do not use a plan after schema
+//! mutation. `explain` returns an owned string the caller frees.
+//!
+//! Error behavior: planning never fails on valid SQL — it degrades to a table
+//! scan. OOM is the only error. Corrupt schemas are rejected at decode time,
+//! not here.
+//!
+//! SQLite compatibility: SCAN/SEARCH vocabulary and covering-index detection
+//! mirror SQLite; partial-index predicate implication and transitive-constraint
+//! derivation are future work (see TODOs).
+// TODO: Implement partial-index predicate implication in the planner.
+// The current planner can use ordinary indexes but does not prove that a
+// WHERE clause implies a partial-index predicate. Add predicate implication
+// analysis and differential tests against SQLite's planner before claiming
+// partial-index parity.
+// TODO: Implement transitive-constraint derivation for join predicates.
+// The current planner matches each table's own predicates but does not derive
+// join-transitive equalities (e.g. a.x = b.x AND b.x = 5 -> a.x = 5). Add
+// equality-closure analysis with EXPLAIN-level tests.
 const std = @import("std");
 const Cost = @import("cost.zig").Cost;
 const cost = @import("cost.zig");
@@ -8,9 +41,15 @@ const Schema = @import("../catalog/schema.zig").Schema;
 const Table = @import("../catalog/schema.zig").Table;
 const Index = @import("../catalog/schema.zig").Index;
 
+/// Chosen access path for one table reference. See module docs for the SCAN /
+/// SEARCH vocabulary and ownership (plan owns eqColumns + joinPlan only).
 pub const Access = enum { tableScan, indexSeek, rowidLookup, coveringIndexScan, indexScan };
+/// Physical scan flavor backing a `QueryPlan`. `coveringIndexScan` serves the
+/// projection from the index alone; `rowidLookup` is an INTEGER PRIMARY KEY path.
 pub const ScanType = enum { tableScan, rowidLookup, indexSeek, coveringIndexScan, indexScan };
 
+/// Index match detail: equality prefix, optional range, covering/order flags.
+/// Name slices borrow the schema; `eqColumns` is an owned copy (see deinit).
 pub const IndexMatch = struct {
     indexName: []const u8,
     tableName: []const u8,
@@ -22,6 +61,8 @@ pub const IndexMatch = struct {
     satisfiesOrderBy: bool = false,
 };
 
+/// Owned plan for one table reference plus an optional chained join plan.
+/// Caller `deinit`s; `explain` renders owned SQLite-style plan text.
 pub const QueryPlan = struct {
     tableName: []const u8,
     scanType: ScanType,

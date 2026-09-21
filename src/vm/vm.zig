@@ -1,3 +1,31 @@
+//! Bytecode virtual machine: register-based execution over table cursors.
+//!
+//! Purpose: execute `opcode.Program`s produced by `vm/compiler.zig` against
+//! in-memory schema state. Responsibilities: register file, cursor lifecycle
+//! (`TableCursor`/`EphemeralCursor`), opcode dispatch with SQLite NULL
+//! semantics, arithmetic/comparison/collation via `vm/value`, function and
+//! aggregate evaluation, and `Result` materialization.
+//!
+//! Dependencies: `vm/opcode`, `vm/value`, `catalog/schema` (borrowed tables),
+//! `connection/result` (owned output). The VM never touches the pager, WAL,
+//! or files directly — persistence is the connection/storage layers' job.
+//!
+//! Ownership/lifetime: the program and schema are borrowed for the call; the
+//! returned `Result` is owned (caller `deinit`s). Cursors borrow tables and
+//! dangle after schema mutation; registers are per-execution scratch.
+//!
+//! Error behavior: OOM, `Unsupported` for unimplemented opcodes/paths, and
+//! propagated function errors. Malformed programs are a compiler bug (fail
+//! loudly), never corrupt disk input — disk bytes are validated far below.
+//!
+//! SQLite compatibility: opcode semantics, NULL propagation, division-by-zero
+//! yielding NULL, collation-aware comparison, and cursor positioning mirror
+//! VDBE behavior; see per-opcode tests at the file bottom.
+// TODO: Implement automatic-index construction for eligible join loops.
+// Current behavior falls back to a table scan when no usable index exists.
+// Expected: SQLite-style ephemeral automatic indexes inside join execution
+// with planner cost integration. Required tests: multi-table join plans using
+// ephemeral indexes plus vacuous-scan regression coverage.
 const std = @import("std");
 const Program = @import("opcode.zig").Program;
 const Instruction = @import("opcode.zig").Instruction;
@@ -9,11 +37,15 @@ const Schema = @import("../catalog/schema.zig").Schema;
 const Table = @import("../catalog/schema.zig").Table;
 const Result = @import("../connection/result.zig").Result;
 
+/// Cursor over a borrowed `Schema.Table`'s row list. Position is an index;
+/// `eof` is true when empty or past the end. Borrowed — dangles after the
+/// table is mutated or freed. `column` returns NULL out of range (never panics).
 pub const TableCursor = struct {
     table: *const Table,
     rowIndex: usize = 0,
     eof: bool = true,
 
+    /// Cursor at the first row; `eof` when the table is empty. Borrows the table.
     pub fn init(table: *const Table) TableCursor {
         return .{
             .table = table,
@@ -22,12 +54,14 @@ pub const TableCursor = struct {
         };
     }
 
+    /// Repositions to the first row; returns true when empty (eof).
     pub fn rewind(self: *TableCursor) bool {
         self.rowIndex = 0;
         self.eof = self.table.rows.items.len == 0;
         return self.eof;
     }
 
+    /// Advances one row; returns false at end (sets eof). Sticky at eof.
     pub fn next(self: *TableCursor) bool {
         if (self.eof) return false;
         self.rowIndex += 1;
@@ -35,6 +69,7 @@ pub const TableCursor = struct {
         return !self.eof;
     }
 
+    /// Steps back one row; returns false at/before the first row.
     pub fn prev(self: *TableCursor) bool {
         if (self.rowIndex == 0 or self.table.rows.items.len == 0) {
             self.eof = true;
@@ -45,6 +80,7 @@ pub const TableCursor = struct {
         return true;
     }
 
+    /// Borrowed cell value; NULL when eof or out of range (never panics).
     pub fn column(self: *const TableCursor, colIdx: usize) Value {
         if (self.eof or self.rowIndex >= self.table.rows.items.len) return .null;
         const row = self.table.rows.items[self.rowIndex];
@@ -52,6 +88,7 @@ pub const TableCursor = struct {
         return .null;
     }
 
+    /// 1-based rowid for the current position (index + 1).
     pub fn rowid(self: *const TableCursor) i64 {
         return @intCast(self.rowIndex + 1);
     }

@@ -1,3 +1,22 @@
+//! SQLite-compatible database image codec (pages, b-trees, schema).
+//!
+//! Purpose: build (`encode`) and parse (`decode`) whole database files in the
+//! SQLite file format: 100-byte header, table/index b-trees with overflow
+//! chains, and the `sqlite_schema` (page 1) catalog. Responsibilities: page
+//! layout, cell framing, schema-SQL synthesis and re-parsing. Dependencies:
+//! `format/header.zig`, `format/varint.zig`, `format/record.zig`,
+//! `catalog/schema.zig`, `vm/value.zig`, `sql/*`. Ownership: `encode*`
+//! return fresh caller-owned images; `decode` returns an owned `Schema`
+//! (call `deinit`) with text/blob bytes duped off the input. Error behavior:
+//! all disk corruption fails closed (`InvalidHeader`/`InvalidPageSize`/
+//! `PageOverflow`/`InvalidParam`, plus schema errors) — never panics, reads
+//! out of bounds, loops forever on cyclic overflow chains, or allocates from
+//! unchecked on-disk sizes. Invariants: page size is a power of two in
+//! 512..65536; b-tree depth is capped (`maxBtreeDepth`); recovery-style
+//! allocations are bounded by the input length. Compatibility: page-1 header,
+//! cell layouts, and overflow math follow the SQLite file-format spec; an
+//! encoded page size of 1 means 65536.
+
 const std = @import("std");
 const Header = @import("../format/header.zig").Header;
 const headerSize = @import("../format/header.zig").size;
@@ -9,24 +28,46 @@ const ast = @import("../sql/ast.zig");
 const Parser = @import("../sql/parser.zig").Parser;
 const exprEvaluator = @import("../sql/expr.zig");
 
+/// Decoded table-leaf cell: rowid plus owned values (text/blob duped).
 const Cell = struct { rowid: u64, values: []Value };
 
+/// Default page size used by `encode` (matches fresh-file geometry).
 pub const pageSize: usize = 4096;
 
-fn putU16(bytes: []u8, offset: usize, value: u16) void {
+/// Maximum b-tree descent depth while decoding.
+///
+/// Why bounded: interior child page numbers come from disk, so a malicious
+/// cycle (A -> B -> A) would otherwise recurse forever and overflow the
+/// stack. Real trees are a handful of levels deep; 64 is generous.
+pub const maxBtreeDepth: usize = 64;
+
+/// Writes a big-endian u16 at `offset`.
+///
+/// Safety: bounds-checked — returns `PageOverflow` instead of writing out of
+/// bounds, so corrupt offsets fail closed on both encode and decode paths.
+fn putU16(bytes: []u8, offset: usize, value: u16) !void {
+    if (offset + 2 > bytes.len) return error.PageOverflow;
     bytes[offset] = @truncate(value >> 8);
     bytes[offset + 1] = @truncate(value);
 }
 
-fn getU16(bytes: []const u8, offset: usize) u16 {
+/// Reads a big-endian u16 at `offset`.
+///
+/// Safety: bounds-checked — short buffers return `InvalidHeader` instead of
+/// reading out of bounds.
+fn getU16(bytes: []const u8, offset: usize) !u16 {
+    if (offset + 2 > bytes.len) return error.InvalidHeader;
     return (@as(u16, bytes[offset]) << 8) | bytes[offset + 1];
 }
 
+/// Case-insensitive column lookup; `null` when the table has no such column.
 fn columnIndex(table: anytype, name: []const u8) ?usize {
     for (table.columns, 0..) |column, index| if (std.ascii.eqlIgnoreCase(column.name, name)) return index;
     return null;
 }
 
+/// Renders a `DEFAULT` literal for regenerated `CREATE TABLE` SQL
+/// (NULL/numbers verbatim, text/blob single-quoted with `''` escapes).
 fn appendSqlLiteral(allocator: std.mem.Allocator, sql: *std.ArrayList(u8), value: Value) !void {
     switch (value) {
         .null => try sql.appendSlice(allocator, "NULL"),
@@ -51,26 +92,38 @@ fn appendSqlLiteral(allocator: std.mem.Allocator, sql: *std.ArrayList(u8), value
     }
 }
 
+/// Appends one varint to a cell being framed (payload lengths, rowids).
 fn appendVarint(list: *std.ArrayList(u8), allocator: std.mem.Allocator, value: u64) !void {
     var buffer: [9]u8 = undefined;
     const length = try varint.encode(value, &buffer);
     try list.appendSlice(allocator, buffer[0..length]);
 }
 
+/// Scratch arena of zeroed page buffers during `encode`.
+///
+/// Owns every page (`deinit` frees all); page numbers are 1-based indices
+/// into `pages`. Overflow pages are allocated up front so cell framing can
+/// link them.
 const PageBuilder = struct {
+    /// Allocator for page buffers and the page list.
     allocator: std.mem.Allocator,
+    /// Image geometry (validated power of two, 512..65536).
     pageSize: usize,
+    /// Owned page images in 1-based page-number order.
     pages: std.ArrayList([]u8),
 
+    /// Creates an empty builder (no pages until `newPage`).
     fn init(allocator: std.mem.Allocator, ps: usize) PageBuilder {
         return .{ .allocator = allocator, .pageSize = ps, .pages = .empty };
     }
 
+    /// Frees every page image and the list itself.
     fn deinit(self: *PageBuilder) void {
         for (self.pages.items) |p| self.allocator.free(p);
         self.pages.deinit(self.allocator);
     }
 
+    /// Appends a zeroed page, returning its 1-based number.
     fn newPage(self: *PageBuilder) !u32 {
         const page = try self.allocator.alloc(u8, self.pageSize);
         @memset(page, 0);
@@ -78,11 +131,17 @@ const PageBuilder = struct {
         return @intCast(self.pages.items.len);
     }
 
+    /// Borrows a built page by 1-based number (caller must hold a valid one).
     fn getPage(self: *PageBuilder, pageNumber: u32) []u8 {
         return self.pages.items[pageNumber - 1];
     }
 };
 
+/// Frames one table-leaf cell (payload varint + rowid varint + local bytes).
+///
+/// Payloads beyond `maxLeaf` spill to freshly allocated overflow pages
+/// linked from the cell tail, using the SQLite local/surplus split. Returns
+/// a caller-owned cell buffer.
 fn buildCell(pageBuilder: *PageBuilder, rowid: u64, values: []const Value, databasePageSize: usize) ![]u8 {
     const payload = try record.encode(pageBuilder.allocator, values);
     defer pageBuilder.allocator.free(payload);
@@ -132,6 +191,10 @@ fn buildCell(pageBuilder: *PageBuilder, rowid: u64, values: []const Value, datab
     }
 }
 
+/// Frames one index-leaf cell (payload varint + local bytes, no rowid).
+///
+/// Index cells use the index-specific max/min-local split; overflow handling
+/// mirrors `buildCell`. Returns a caller-owned cell buffer.
 fn buildIndexCell(pageBuilder: *PageBuilder, values: []const Value, databasePageSize: usize) ![]u8 {
     const payload = try record.encode(pageBuilder.allocator, values);
     defer pageBuilder.allocator.free(payload);
@@ -179,32 +242,54 @@ fn buildIndexCell(pageBuilder: *PageBuilder, values: []const Value, databasePage
     }
 }
 
+/// Lays out one table/index leaf page (encode path).
+///
+/// All space math uses checked arithmetic: `pageStart`/`headerOffset`/
+/// `databasePageSize` combos that overflow, pages smaller than the image
+/// geometry, or cells that cannot fit all return `PageOverflow` instead of
+/// panicking on usize underflow or writing out of bounds. `page[header]`
+/// flag writes are bounds-checked like the u16 fields.
 fn addLeafPage(page: []u8, pageStart: usize, headerOffset: usize, pageType: u8, cells: []const []const u8, databasePageSize: usize) !void {
-    const header = pageStart + headerOffset;
     if (cells.len > 0xffff) return error.PageOverflow;
-    var content = pageStart + databasePageSize;
+    const header = std.math.add(usize, pageStart, headerOffset) catch return error.PageOverflow;
+    const pageEnd = std.math.add(usize, pageStart, databasePageSize) catch return error.PageOverflow;
+    if (pageEnd > page.len) return error.PageOverflow;
+    if (header + 8 > pageEnd) return error.PageOverflow;
+    const arrayBytes = std.math.mul(usize, cells.len, 2) catch return error.PageOverflow;
+    const reservedEnd = std.math.add(usize, header + 8, arrayBytes) catch return error.PageOverflow;
+    if (reservedEnd > pageEnd) return error.PageOverflow;
+    var content = pageEnd;
     for (cells) |item| {
-        if (item.len > content - (header + 8 + cells.len * 2)) return error.PageOverflow;
+        // `content >= reservedEnd` holds by construction, so the subtract
+        // cannot underflow; cells that exceed the free gap overflow cleanly.
+        if (item.len > content - reservedEnd) return error.PageOverflow;
         content -= item.len;
         @memcpy(page[content .. content + item.len], item);
     }
     page[header] = pageType;
-    putU16(page, header + 1, 0);
-    putU16(page, header + 3, @intCast(cells.len));
-    putU16(page, header + 5, @intCast(content - pageStart));
+    try putU16(page, header + 1, 0);
+    try putU16(page, header + 3, @intCast(cells.len));
+    try putU16(page, header + 5, @intCast(content - pageStart));
     page[header + 7] = 0;
-    content = pageStart + databasePageSize;
+    content = pageEnd;
     for (cells, 0..) |item, index| {
         content -= item.len;
-        putU16(page, header + 8 + index * 2, @intCast(content - pageStart));
+        try putU16(page, header + 8 + index * 2, @intCast(content - pageStart));
     }
 }
 
+/// Lays out one table-interior page (encode path; checked like `addLeafPage`).
 fn addInteriorTablePage(allocator: std.mem.Allocator, page: []u8, pageStart: usize, headerOffset: usize, leftChildren: []const u32, keys: []const u64, rightChild: u32, databasePageSize: usize) !void {
-    const header = pageStart + headerOffset;
+    const header = std.math.add(usize, pageStart, headerOffset) catch return error.PageOverflow;
+    const pageEnd = std.math.add(usize, pageStart, databasePageSize) catch return error.PageOverflow;
+    if (pageEnd > page.len) return error.PageOverflow;
+    if (header + 12 > pageEnd) return error.PageOverflow;
     if (leftChildren.len != keys.len) return error.InvalidParam;
     if (leftChildren.len > 0xffff) return error.PageOverflow;
-    var content = pageStart + databasePageSize;
+    const arrayBytes = std.math.mul(usize, leftChildren.len, 2) catch return error.PageOverflow;
+    const reservedEnd = std.math.add(usize, header + 12, arrayBytes) catch return error.PageOverflow;
+    if (reservedEnd > pageEnd) return error.PageOverflow;
+    var content = pageEnd;
     const offsets = try allocator.alloc(u16, leftChildren.len);
     defer allocator.free(offsets);
 
@@ -212,7 +297,7 @@ fn addInteriorTablePage(allocator: std.mem.Allocator, page: []u8, pageStart: usi
         var keyBuf: [9]u8 = undefined;
         const keyLen = try varint.encode(keys[idx], &keyBuf);
         const cellSize = 4 + keyLen;
-        if (cellSize > content - (header + 12 + leftChildren.len * 2)) return error.PageOverflow;
+        if (cellSize > content - reservedEnd) return error.PageOverflow;
         content -= cellSize;
         std.mem.writeInt(u32, page[content .. content + 4][0..4], child, .big);
         @memcpy(page[content + 4 .. content + 4 + keyLen], keyBuf[0..keyLen]);
@@ -220,22 +305,28 @@ fn addInteriorTablePage(allocator: std.mem.Allocator, page: []u8, pageStart: usi
     }
 
     page[header] = 0x05;
-    putU16(page, header + 1, 0);
-    putU16(page, header + 3, @intCast(leftChildren.len));
-    putU16(page, header + 5, @intCast(content - pageStart));
+    try putU16(page, header + 1, 0);
+    try putU16(page, header + 3, @intCast(leftChildren.len));
+    try putU16(page, header + 5, @intCast(content - pageStart));
     page[header + 7] = 0;
     std.mem.writeInt(u32, page[header + 8 .. header + 12][0..4], rightChild, .big);
 
     for (offsets, 0..) |off, idx| {
-        putU16(page, header + 12 + idx * 2, off);
+        try putU16(page, header + 12 + idx * 2, off);
     }
 }
 
 fn addInteriorIndexPage(allocator: std.mem.Allocator, page: []u8, pageStart: usize, headerOffset: usize, leftChildren: []const u32, payloads: []const []const u8, rightChild: u32, databasePageSize: usize) !void {
-    const header = pageStart + headerOffset;
+    const header = std.math.add(usize, pageStart, headerOffset) catch return error.PageOverflow;
+    const pageEnd = std.math.add(usize, pageStart, databasePageSize) catch return error.PageOverflow;
+    if (pageEnd > page.len) return error.PageOverflow;
+    if (header + 12 > pageEnd) return error.PageOverflow;
     if (leftChildren.len != payloads.len) return error.InvalidParam;
     if (leftChildren.len > 0xffff) return error.PageOverflow;
-    var content = pageStart + databasePageSize;
+    const arrayBytes = std.math.mul(usize, leftChildren.len, 2) catch return error.PageOverflow;
+    const reservedEnd = std.math.add(usize, header + 12, arrayBytes) catch return error.PageOverflow;
+    if (reservedEnd > pageEnd) return error.PageOverflow;
+    var content = pageEnd;
     const offsets = try allocator.alloc(u16, leftChildren.len);
     defer allocator.free(offsets);
 
@@ -243,7 +334,7 @@ fn addInteriorIndexPage(allocator: std.mem.Allocator, page: []u8, pageStart: usi
         var lenBuf: [9]u8 = undefined;
         const lenBytes = try varint.encode(payloads[idx].len, &lenBuf);
         const cellSize = 4 + lenBytes + payloads[idx].len;
-        if (cellSize > content - (header + 12 + leftChildren.len * 2)) return error.PageOverflow;
+        if (cellSize > content - reservedEnd) return error.PageOverflow;
         content -= cellSize;
         std.mem.writeInt(u32, page[content .. content + 4][0..4], child, .big);
         @memcpy(page[content + 4 .. content + 4 + lenBytes], lenBuf[0..lenBytes]);
@@ -252,17 +343,21 @@ fn addInteriorIndexPage(allocator: std.mem.Allocator, page: []u8, pageStart: usi
     }
 
     page[header] = 0x02;
-    putU16(page, header + 1, 0);
-    putU16(page, header + 3, @intCast(leftChildren.len));
-    putU16(page, header + 5, @intCast(content - pageStart));
+    try putU16(page, header + 1, 0);
+    try putU16(page, header + 3, @intCast(leftChildren.len));
+    try putU16(page, header + 5, @intCast(content - pageStart));
     page[header + 7] = 0;
     std.mem.writeInt(u32, page[header + 8 .. header + 12][0..4], rightChild, .big);
 
     for (offsets, 0..) |off, idx| {
-        putU16(page, header + 12 + idx * 2, off);
+        try putU16(page, header + 12 + idx * 2, off);
     }
 }
 
+/// Builds a one- or two-level table b-tree, returning its root page.
+///
+/// Single leaf while the cells fit; otherwise chunks cells across leaves
+/// under one interior page. Rowids are positional (`rowIndex + 1`).
 fn buildTableBtree(allocator: std.mem.Allocator, pageBuilder: *PageBuilder, table: anytype, databasePageSize: usize) !u32 {
     var cellsList = std.ArrayList([]u8).empty;
     defer {
@@ -317,6 +412,11 @@ fn buildTableBtree(allocator: std.mem.Allocator, pageBuilder: *PageBuilder, tabl
     return rootPage;
 }
 
+/// Builds an index b-tree over a table's rows, returning its root page.
+///
+/// Applies partial-index predicates and expression keys; each entry carries
+/// the rowid as its trailing key column. Unknown tables/columns surface as
+/// errors (encode of a bad catalog fails instead of writing garbage).
 fn buildIndexBtree(allocator: std.mem.Allocator, pageBuilder: *PageBuilder, schema: *const Schema, index: anytype, databasePageSize: usize) !u32 {
     const table = schema.findConst(index.table) orelse return error.UnknownTable;
     var indexCells = std.ArrayList([]u8).empty;
@@ -337,7 +437,7 @@ fn buildIndexBtree(allocator: std.mem.Allocator, pageBuilder: *PageBuilder, sche
         defer allocator.free(values);
         for (index.columns, 0..) |column, position| {
             if (index.keyExpr(position)) |key| {
-                values[position] = try exprEvaluator.evalTemp(allocator, colNames, row.values, key);
+                values[position] = try exprEvaluator.eval(allocator, colNames, row.values, key);
                 continue;
             }
             values[position] = row.values[columnIndex(table, column) orelse return error.UnknownColumn];
@@ -388,6 +488,10 @@ fn buildIndexBtree(allocator: std.mem.Allocator, pageBuilder: *PageBuilder, sche
     return rootPage;
 }
 
+/// Regenerates canonical `CREATE TABLE` SQL for the page-1 catalog.
+///
+/// CHECK constraints are intentionally skipped (stored separately), and
+/// virtual tables take the `CREATE VIRTUAL TABLE ... USING` path.
 fn createSql(allocator: std.mem.Allocator, table: anytype) ![]u8 {
     var sql = std.ArrayList(u8).empty;
     errdefer sql.deinit(allocator);
@@ -490,6 +594,7 @@ fn createSql(allocator: std.mem.Allocator, table: anytype) ![]u8 {
     return sql.toOwnedSlice(allocator);
 }
 
+/// Regenerates `CREATE [UNIQUE] INDEX` SQL (plus `WHERE` for partial indexes).
 fn createIndexSql(allocator: std.mem.Allocator, index: anytype) ![]u8 {
     var sql = std.ArrayList(u8).empty;
     errdefer sql.deinit(allocator);
@@ -511,6 +616,7 @@ fn createIndexSql(allocator: std.mem.Allocator, index: anytype) ![]u8 {
     return sql.toOwnedSlice(allocator);
 }
 
+/// Regenerates `CREATE VIEW` SQL from the stored select text.
 fn createViewSql(allocator: std.mem.Allocator, view: anytype) ![]u8 {
     var sql = std.ArrayList(u8).empty;
     errdefer sql.deinit(allocator);
@@ -521,6 +627,7 @@ fn createViewSql(allocator: std.mem.Allocator, view: anytype) ![]u8 {
     return sql.toOwnedSlice(allocator);
 }
 
+/// Regenerates `CREATE TRIGGER` SQL (timing, event, column list, body).
 fn createTriggerSql(allocator: std.mem.Allocator, trigger: anytype) ![]u8 {
     var sql = std.ArrayList(u8).empty;
     errdefer sql.deinit(allocator);
@@ -554,6 +661,8 @@ fn createTriggerSql(allocator: std.mem.Allocator, trigger: anytype) ![]u8 {
     return sql.toOwnedSlice(allocator);
 }
 
+/// Frames one page-1 catalog cell (schema rows never use overflow pages:
+/// catalog SQL is short, so the whole payload stays local).
 fn buildSchemaCell(allocator: std.mem.Allocator, rowid: u64, values: []const Value) ![]u8 {
     const payload = try record.encode(allocator, values);
     defer allocator.free(payload);
@@ -565,6 +674,12 @@ fn buildSchemaCell(allocator: std.mem.Allocator, rowid: u64, values: []const Val
     return result.toOwnedSlice(allocator);
 }
 
+/// Encodes `schema` into a fresh caller-owned image with `databasePageSize`.
+///
+/// Validates the page size up front (power of two, 512..65536). Virtual
+/// tables occupy catalog rows with root page 0 (no b-tree); auto-indexes
+/// store NULL SQL like SQLite. The page-1 cell array must fit or encode
+/// fails with `PageOverflow` rather than truncating the catalog.
 pub fn encodeWithPageSize(allocator: std.mem.Allocator, schema: *const Schema, databasePageSize: usize) ![]u8 {
     if (databasePageSize < 512 or databasePageSize > 65536 or (databasePageSize & (databasePageSize - 1)) != 0) return error.InvalidPageSize;
 
@@ -680,12 +795,15 @@ pub fn encodeWithPageSize(allocator: std.mem.Allocator, schema: *const Schema, d
     return finalBytes;
 }
 
+/// Encodes `schema` with the default 4096-byte pages (see `pageSize`).
 pub fn encode(allocator: std.mem.Allocator, schema: *const Schema) ![]u8 {
     return encodeWithPageSize(allocator, schema, pageSize);
 }
 
+/// One parsed catalog row: the b-tree root to replay plus its stored SQL.
 const SchemaEntry = struct { rootPage: u32, sql: []const u8 };
 
+/// Frees a cell's value array (text/blob bodies plus the array itself).
 fn freeCellValues(allocator: std.mem.Allocator, values: []const Value) void {
     for (values) |v| {
         if (v == .text) {
@@ -697,14 +815,28 @@ fn freeCellValues(allocator: std.mem.Allocator, values: []const Value) void {
     allocator.free(values);
 }
 
+/// Reads one table-leaf cell at `cellOffset` (decode path, untrusted input).
+///
+/// Every slice is bounds-checked before use: the payload-length and rowid
+/// varints are decoded from checked tails, `totalPayload` is cast with
+/// overflow checking and must fit inside the image (bounding the reassembly
+/// allocation by `bytes.len`), and the overflow chain is hop-bounded by the
+/// page count so cyclic `next` pointers terminate with `InvalidHeader`
+/// instead of looping forever. A chain that ends early (zero link with bytes
+/// still missing) is truncation, also `InvalidHeader`.
 fn readCell(allocator: std.mem.Allocator, bytes: []const u8, cellOffset: usize, databasePageSize: usize) !Cell {
     var cursor = cellOffset;
-    const payloadLengthDec = try varint.decode(bytes[cursor..]);
-    cursor += payloadLengthDec.length;
-    const rowidDec = try varint.decode(bytes[cursor..]);
-    cursor += rowidDec.length;
+    if (cursor >= bytes.len) return error.InvalidHeader;
+    const payloadLengthDec = varint.decode(bytes[cursor..]) catch return error.InvalidHeader;
+    cursor = std.math.add(usize, cursor, payloadLengthDec.length) catch return error.InvalidHeader;
+    if (cursor >= bytes.len) return error.InvalidHeader;
+    const rowidDec = varint.decode(bytes[cursor..]) catch return error.InvalidHeader;
+    cursor = std.math.add(usize, cursor, rowidDec.length) catch return error.InvalidHeader;
 
-    const totalPayload = @as(usize, @intCast(payloadLengthDec.value));
+    const totalPayload: usize = std.math.cast(usize, payloadLengthDec.value) orelse return error.InvalidHeader;
+    // The whole payload (local + overflow) lives inside the image, so a
+    // larger claim is corruption — and this check bounds the alloc below.
+    if (totalPayload > bytes.len) return error.InvalidHeader;
     const maxLeaf = databasePageSize - 35;
 
     var fullPayload: ?[]u8 = null;
@@ -727,10 +859,18 @@ fn readCell(allocator: std.mem.Allocator, bytes: []const u8, cellOffset: usize, 
         fullPayload = fp;
         @memcpy(fp[0..localBytes], bytes[cursor .. cursor + localBytes]);
 
+        const maxHops: usize = bytes.len / databasePageSize + 1;
         var assembled = localBytes;
         var currentOverflow = firstOverflow;
+        var hops: usize = 0;
         while (currentOverflow != 0 and assembled < totalPayload) {
-            const pageOffset = (@as(usize, currentOverflow) - 1) * databasePageSize;
+            // Each hop consumes a distinct page budget; cycles and over-long
+            // chains exhaust it and fail closed instead of looping forever.
+            if (hops >= maxHops) return error.InvalidHeader;
+            hops += 1;
+            if (currentOverflow == 0) return error.InvalidHeader;
+            if (@as(u64, currentOverflow) > @as(u64, maxHops)) return error.InvalidHeader;
+            const pageOffset = std.math.mul(usize, @as(usize, currentOverflow) - 1, databasePageSize) catch return error.InvalidHeader;
             if (pageOffset + databasePageSize > bytes.len) return error.InvalidHeader;
             const nextPage = std.mem.readInt(u32, bytes[pageOffset .. pageOffset + 4][0..4], .big);
             const chunkLen = @min(usableMinus4, totalPayload - assembled);
@@ -738,6 +878,7 @@ fn readCell(allocator: std.mem.Allocator, bytes: []const u8, cellOffset: usize, 
             assembled += chunkLen;
             currentOverflow = nextPage;
         }
+        if (assembled != totalPayload) return error.InvalidHeader;
 
         rawValues = try record.decode(allocator, fp);
     }
@@ -762,39 +903,74 @@ fn readCell(allocator: std.mem.Allocator, bytes: []const u8, cellOffset: usize, 
     return .{ .rowid = rowidDec.value, .values = rawValues };
 }
 
+/// Walks one table b-tree, appending owned leaf cells to `rowsOut`.
+///
+/// `depth` bounds recursion (`maxBtreeDepth`): child page numbers are read
+/// from disk, so without a cap a cyclic interior graph would overflow the
+/// stack. Page 0 at the entry point means "no b-tree" (virtual tables and
+/// empty roots); page 0 as an interior child, out-of-range pages, unknown
+/// page flags, and cell pointers outside the page all fail with
+/// `InvalidHeader`. The cell-pointer array itself is range-checked before
+/// any pointer is followed.
 fn readTableBtree(allocator: std.mem.Allocator, bytes: []const u8, pageNumber: u32, databasePageSize: usize, rowsOut: *std.ArrayList(Cell)) anyerror!void {
+    return readTableBtreeDepth(allocator, bytes, pageNumber, databasePageSize, rowsOut, 0);
+}
+
+/// Depth-counting worker behind `readTableBtree` (see it for the contract).
+fn readTableBtreeDepth(allocator: std.mem.Allocator, bytes: []const u8, pageNumber: u32, databasePageSize: usize, rowsOut: *std.ArrayList(Cell), depth: usize) anyerror!void {
     if (pageNumber == 0) return;
-    const pageStart = (@as(usize, pageNumber) - 1) * databasePageSize;
+    if (depth > maxBtreeDepth) return error.InvalidHeader;
+    const pageStart = std.math.mul(usize, @as(usize, pageNumber) - 1, databasePageSize) catch return error.InvalidHeader;
     if (pageStart + databasePageSize > bytes.len) return error.InvalidHeader;
     const hOffset: usize = if (pageNumber == 1) headerSize else 0;
     const header = pageStart + hOffset;
+    if (header + 8 > pageStart + databasePageSize) return error.InvalidHeader;
     const pageType = bytes[header];
 
     if (pageType == 0x0d) {
-        const cellCount = getU16(bytes, header + 3);
+        const cellCount = try getU16(bytes, header + 3);
+        const arrayEnd = std.math.add(usize, header + 8, std.math.mul(usize, cellCount, 2) catch return error.InvalidHeader) catch return error.InvalidHeader;
+        if (arrayEnd > pageStart + databasePageSize) return error.InvalidHeader;
         var i: usize = 0;
         while (i < cellCount) : (i += 1) {
-            const cellOffset = pageStart + getU16(bytes, header + 8 + i * 2);
+            const pointer = try getU16(bytes, header + 8 + i * 2);
+            const cellOffset = std.math.add(usize, pageStart, pointer) catch return error.InvalidHeader;
+            if (cellOffset >= pageStart + databasePageSize) return error.InvalidHeader;
             const cellData = try readCell(allocator, bytes, cellOffset, databasePageSize);
             errdefer freeCellValues(allocator, cellData.values);
             try rowsOut.append(allocator, cellData);
         }
     } else if (pageType == 0x05) {
-        const cellCount = getU16(bytes, header + 3);
+        const cellCount = try getU16(bytes, header + 3);
+        const arrayEnd = std.math.add(usize, header + 12, std.math.mul(usize, cellCount, 2) catch return error.InvalidHeader) catch return error.InvalidHeader;
+        if (arrayEnd > pageStart + databasePageSize) return error.InvalidHeader;
+        if (header + 12 > pageStart + databasePageSize) return error.InvalidHeader;
         const rightChild = std.mem.readInt(u32, bytes[header + 8 .. header + 12][0..4], .big);
+        const totalPages: u64 = @as(u64, @intCast(bytes.len / databasePageSize));
+        if (rightChild == 0 or @as(u64, rightChild) > totalPages) return error.InvalidHeader;
         var i: usize = 0;
         while (i < cellCount) : (i += 1) {
-            const cellOffset = pageStart + getU16(bytes, header + 12 + i * 2);
-            if (cellOffset + 4 > bytes.len) return error.InvalidHeader;
+            const pointer = try getU16(bytes, header + 12 + i * 2);
+            const cellOffset = std.math.add(usize, pageStart, pointer) catch return error.InvalidHeader;
+            if (cellOffset + 4 > bytes.len or cellOffset + 4 > pageStart + databasePageSize) return error.InvalidHeader;
             const leftChild = std.mem.readInt(u32, bytes[cellOffset .. cellOffset + 4][0..4], .big);
-            try readTableBtree(allocator, bytes, leftChild, databasePageSize, rowsOut);
+            if (leftChild == 0 or @as(u64, leftChild) > totalPages) return error.InvalidHeader;
+            try readTableBtreeDepth(allocator, bytes, leftChild, databasePageSize, rowsOut, depth + 1);
         }
-        try readTableBtree(allocator, bytes, rightChild, databasePageSize, rowsOut);
+        try readTableBtreeDepth(allocator, bytes, rightChild, databasePageSize, rowsOut, depth + 1);
     } else {
         return error.InvalidHeader;
     }
 }
 
+/// Decodes a whole database image into an owned `Schema`.
+///
+/// Validates the magic, page-size geometry (power of two, 512..65536, 1
+/// meaning 65536), and the page-count claim before touching any page; then
+/// replays the page-1 catalog and each table's b-tree. Negative or
+/// out-of-range root pages in catalog rows are skipped (fail closed per-row)
+/// rather than aborting the whole image. Text/blob values are duped off the
+/// input, so the result outlives `bytes`.
 pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Schema {
     if (bytes.len < headerSize or !std.mem.eql(u8, bytes[0..16], "SQLite format 3\x00")) return error.InvalidHeader;
     const encodedPageSize = std.mem.readInt(u16, bytes[16..18], .big);
@@ -823,6 +999,10 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Schema {
     for (schemaRows.items) |row| {
         if (row.values.len < 5 or row.values[0] != .text) continue;
         if (row.values[3] != .integer or row.values[4] != .text) continue;
+        // The root page rides in a signed record field: negative values are
+        // corruption, not pages — skip the row instead of panicking in the
+        // cast. Out-of-range pages fail later inside `readTableBtree`.
+        if (row.values[3].integer < 0) continue;
         try entries.append(allocator, .{ .rootPage = @intCast(row.values[3].integer), .sql = row.values[4].text });
     }
 
@@ -977,4 +1157,68 @@ test "SQLite image handles overflow pages for large records" {
     try std.testing.expectEqual(@as(usize, 1), decodedTable.rows.items.len);
     try std.testing.expectEqual(@as(i64, 1), decodedTable.rows.items[0].values[0].integer);
     try std.testing.expectEqualStrings(largeString, decodedTable.rows.items[0].values[1].text);
+}
+
+test "SQLite image decode rejects corrupt inputs without panic or overread" {
+    var schema = Schema.init(std.testing.allocator);
+    defer schema.deinit();
+    const definitions = [_]ast.ColumnDef{.{ .name = "id", .typeName = "INTEGER" }};
+    try schema.createTable("t", &definitions, &.{});
+    var values = [_]Value{.{ .integer = 42 }};
+    try schema.appendRow(schema.find("t").?, &values);
+    const bytes = try encode(std.testing.allocator, &schema);
+    defer std.testing.allocator.free(bytes);
+    // Error: empty, truncated, and bad-magic inputs fail closed.
+    try std.testing.expectError(error.InvalidHeader, decode(std.testing.allocator, &[_]u8{}));
+    try std.testing.expectError(error.InvalidHeader, decode(std.testing.allocator, bytes[0..50]));
+    var badMagic = try std.testing.allocator.dupe(u8, bytes);
+    defer std.testing.allocator.free(badMagic);
+    badMagic[0] ^= 0xff;
+    try std.testing.expectError(error.InvalidHeader, decode(std.testing.allocator, badMagic));
+    // Error: every truncation fails closed (sampled stride keeps it fast).
+    // Prefixes shorter than one page report InvalidPageSize, longer corrupt
+    // prefixes report InvalidHeader — both are controlled failures.
+    var cut: usize = 101;
+    while (cut < bytes.len) : (cut += 37) {
+        var decoded = decode(std.testing.allocator, bytes[0..cut]) catch |err| {
+            try std.testing.expect(err == error.InvalidHeader or err == error.InvalidPageSize);
+            continue;
+        };
+        decoded.deinit();
+        return error.TestUnexpectedError;
+    }
+    // Error: impossible page sizes fail closed, including non-powers of two.
+    for ([_]u16{ 0, 100, 511, 513, 1000, 3000 }) |ps| {
+        var badSize = try std.testing.allocator.dupe(u8, bytes);
+        defer std.testing.allocator.free(badSize);
+        std.mem.writeInt(u16, badSize[16..18], ps, .big);
+        try std.testing.expectError(error.InvalidPageSize, decode(std.testing.allocator, badSize));
+    }
+    // Error: unknown page flags are rejected, not misread as tables.
+    for ([_]u8{ 0x00, 0x09, 0xff }) |flag| {
+        var badFlag = try std.testing.allocator.dupe(u8, bytes);
+        defer std.testing.allocator.free(badFlag);
+        badFlag[100] = flag;
+        try std.testing.expectError(error.InvalidHeader, decode(std.testing.allocator, badFlag));
+    }
+    // Error: a cyclic interior graph terminates via the depth bound instead
+    // of recursing forever. A two-page image is built by hand: page 2 loops
+    // to itself as its own right child.
+    {
+        const ps: usize = 512;
+        var cyclic = Schema.init(std.testing.allocator);
+        defer cyclic.deinit();
+        try cyclic.createTable("loop", &definitions, &.{});
+        const img = try encodeWithPageSize(std.testing.allocator, &cyclic, ps);
+        defer std.testing.allocator.free(img);
+        // Corrupt page 1's type byte to interior with right child = 1
+        // (self-loop): decode must fail closed, not stack-overflow.
+        var looped = try std.testing.allocator.dupe(u8, img);
+        defer std.testing.allocator.free(looped);
+        looped[100] = 0x05;
+        // cell count 0, cell content start, fragmented, right child = 1.
+        std.mem.writeInt(u16, looped[103..105], 0, .big);
+        std.mem.writeInt(u32, looped[108..112], 1, .big);
+        try std.testing.expectError(error.InvalidHeader, decode(std.testing.allocator, looped));
+    }
 }

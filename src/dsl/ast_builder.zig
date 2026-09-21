@@ -1,3 +1,55 @@
+//! DSL-to-native-AST lowering: the single convergence point of all pipelines.
+//!
+//! Purpose: translate borrowed DSL IR (`dsl/expr.zig`, `dsl/column.zig`
+//! builders) into owned native `sql/ast.zig` statements wrapped in a
+//! `BuiltStatement`. Raw SQL arrives already parsed; the dynamic DSL and the
+//! typed DSL both arrive here as IR — this module never renders a DSL value to
+//! an SQL string for re-parsing (no DSL->SQL-string round trip).
+//!
+//! Responsibilities: predicate/projection/CASE/window lowering, SELECT /
+//! INSERT / UPDATE / DELETE construction, CTE/compound/derived plumbing types,
+//! and ownership tracking for every duplicated identifier string and heap
+//! `ast.Expr` node.
+//!
+//! Dependencies: `sql/ast.zig` (target IR + `deinit`/`cloneOwnedExpr`/
+//! `freeOwnedExpr`), `dsl/expr.zig`, `dsl/column.zig`, `vm/value.zig`,
+//! `connection/result.zig` (executor return type).
+//!
+//! Ownership/lifetime (critical): the internal `Ctx` accumulates two things:
+//! (1) `owned` identifier strings duplicated for the AST, and (2) heap
+//! `*ast.Expr` nodes that become sub-expressions. On success the nodes are
+//! *transferred* into the returned `BuiltStatement` (their heap pointers now
+//! belong to `stmt`), and the string list moves into
+//! `BuiltStatement.ownedStrings`. The caller owns the `BuiltStatement` and
+//! must call `deinit()` exactly once; after `deinit` the `stmt` and every
+//! borrowed view of it dangle. On failure `Ctx.fail()` destroys all tracked
+//! nodes and frees all owned strings, so the caller owns nothing. `BuiltStatement`
+//! is move-only in practice: do not copy it without also transferring the
+//! `deinit` duty. Builders (`query_builder`) snapshot DSL IR by value before
+//! calling here, so mutating the builder afterwards never affects an already
+//! built statement.
+//!
+//! Error behavior: malformed IR yields `error.InvalidSql` (empty CAST target,
+//! unresolved CASE/WINDOW slot, missing JOIN predicate, bad HAVING op, LIKE
+//! ESCAPE on a non-LIKE operator, ...). Allocation failure propagates as
+//! `error.OutOfMemory`. `Ctx.fail` runs on every `errdefer` path, so failed
+//! builds leak nothing.
+//!
+//! SQLite compatibility: lowering preserves SQLite semantics — BETWEEN
+//! becomes paired comparisons, IS DISTINCT becomes NOT(IS ...), pattern
+//! operators keep their negated/glob/regexp/match flags, LIKE ESCAPE is gated
+//! to LIKE only, single-table references strip the redundant qualifier while
+//! joined references keep full qualification (ambiguity + scope are
+//! load-bearing), and window lowering rejects non-window function names.
+//!
+//! Column/operation collision rule: this layer only sees already-resolved
+//! `ColumnRef`s, so operation-named columns (`where`, `count`, ...) arrive as
+//! ordinary identifiers and need no special casing.
+//!
+//! AllColumns note: `.star` projections lower to the native `.wildcard` node
+//! (bare `*`) and `.countStar` lowers to native `COUNT(*)`; qualified
+//! `table.*` is preserved through `dotted()`/`refName()` stripping rules.
+
 const std = @import("std");
 const ast = @import("../sql/ast.zig");
 const dslExpr = @import("expr.zig");
@@ -7,22 +59,37 @@ const WindowBound = @import("column.zig").WindowBound;
 const Value = @import("../vm/value.zig").Value;
 const Result = @import("../connection/result.zig").Result;
 
+/// One CTE input: borrowed name plus borrowed SQL bodies. The executor parses
+/// these; `ast_builder` never parses them. Slices must outlive the call.
 pub const CteInput = struct { name: []const u8, querySql: []const u8, recursiveSql: ?[]const u8 = null, recursiveAll: bool = false };
 
+/// Executor hook for one lowered statement. `connection` is the opaque live
+/// connection; `ctes`/`recursive` carry the query's CTE inputs. Returns an
+/// owned `Result` the caller must `deinit`.
 pub const ExecFn = *const fn (*anyopaque, *const ast.Statement, []const CteInput, bool) anyerror!Result;
 
+/// One compound arm: borrowed statement plus borrowed CTE inputs.
 pub const CompoundArm = struct { stmt: *const ast.Statement, ctes: []const CteInput, recursive: bool };
 
+/// Executor hook for UNION/INTERSECT/EXCEPT over borrowed arms. Returns an
+/// owned `Result` the caller must `deinit`.
 pub const CompoundExecFn = *const fn (*anyopaque, []const CompoundArm, []const ast.CompoundOp, []const ast.Order, ?usize, ?usize) anyerror!Result;
 
+/// Executor hook for derived-table queries (borrowed sub + outer arms).
+/// Returns an owned `Result` the caller must `deinit`.
 pub const DerivedExecFn = *const fn (*anyopaque, sub: CompoundArm, outer: CompoundArm) anyerror!Result;
 
+/// DSL-level join kind; mapped 1:1 onto `ast.JoinKind` by `mapJoinKind`.
 pub const JoinKind = enum { inner, left, right, full, cross };
 
+/// Base-table identity used to strip redundant single-table qualifiers.
+/// All slices borrowed; `alias` (when set) replaces `table` for stripping.
 pub const StripBase = struct { table: []const u8, schema: []const u8 = "", alias: ?[]const u8 = null };
 
+/// Borrowed predicate plus its AND/OR join flag into the condition list.
 pub const CondEntry = struct { expr: dslExpr.Expr, joinOr: bool = false };
 
+/// Borrowed IN-subquery args: outer column, inner table/schema/column.
 pub const InQueryArgs = struct {
     column: dslExpr.ColumnRef,
     table: []const u8,
@@ -31,6 +98,7 @@ pub const InQueryArgs = struct {
     negated: bool = false,
 };
 
+/// Borrowed EXISTS-subquery args with an optional borrowed ON predicate.
 pub const ExistsQueryArgs = struct {
     table: []const u8,
     schema: []const u8 = "",
@@ -38,22 +106,29 @@ pub const ExistsQueryArgs = struct {
     negated: bool = false,
 };
 
+/// Borrowed literal-IN args: column plus borrowed `Value` list (max 32 upstream).
 pub const LiteralInArgs = struct {
     column: dslExpr.ColumnRef,
     values: []const Value,
     negated: bool = false,
 };
 
+/// Borrowed CASE-filter args: a `CaseBuilder` compared against an `Rhs`.
 pub const CaseWhereArgs = struct {
     case: CaseBuilder,
     value: dslExpr.Rhs,
     joinOr: bool = false,
 };
 
+/// One UPSERT assignment value: literal (borrowed), `excluded.col` (borrowed
+/// name), or a full `SetValue` tree (borrowed refs inside).
 pub const UpsertValue = union(enum) { literal: Value, excluded: []const u8, set: dslExpr.SetValue };
 
+/// One UPSERT assignment: borrowed column name plus value.
 pub const UpsertSet = struct { name: []const u8, value: UpsertValue };
 
+/// Borrowed UPSERT clause: conflict targets, partial-index predicate, SET
+/// list, and post-update filters. Empty targets + empty sets means DO NOTHING.
 pub const UpsertArgs = struct {
     targets: []const []const u8 = &.{},
     targetWhere: ?dslExpr.Expr = null,
@@ -62,11 +137,19 @@ pub const UpsertArgs = struct {
     caseWhens: []const CaseWhereArgs = &.{},
 };
 
+/// Owned lowered statement. `stmt` borrows every entry of `ownedStrings`
+/// (identifier spellings) and owns heap sub-expression nodes transferred from
+/// the build `Ctx`. Caller must call `deinit()` exactly once; after that both
+/// `stmt` and any pointer into it dangle. Never copy without transferring the
+/// `deinit` duty.
 pub const BuiltStatement = struct {
     stmt: ast.Statement,
     ownedStrings: std.ArrayList([]const u8),
     allocator: std.mem.Allocator,
 
+    /// Release `ownedStrings` and `stmt` (via `ast.deinit`). Idempotent only
+    /// in the sense that calling twice is a bug: the second call double-frees.
+    /// Set the value aside / null your handle after calling.
     pub fn deinit(self: *BuiltStatement) void {
         for (self.ownedStrings.items) |s| self.allocator.free(s);
         self.ownedStrings.deinit(self.allocator);
@@ -554,6 +637,9 @@ fn mapHavingOp(operator: []const u8) !ast.CompareOp {
     return error.InvalidSql;
 }
 
+/// Borrowed SELECT assembly inputs. String/column slices are borrowed from
+/// the builder snapshot; `buildSelect` duplicates whatever the AST retains.
+/// `havingValid == false` forces `error.InvalidSql` (unsupported HAVING shape).
 pub const SelectArgs = struct {
     table: []const u8,
     schema: []const u8 = "",
@@ -599,6 +685,11 @@ fn stripBase(table: []const u8, schema: []const u8, alias: ?[]const u8) StripBas
     return .{ .table = table, .schema = schema, .alias = alias };
 }
 
+/// Lower borrowed SELECT inputs into an owned `BuiltStatement`. Single-table
+/// queries strip the redundant self-qualifier; joined queries keep full
+/// qualification. Caller owns the result and must `deinit` it. Fails
+/// `InvalidSql` on bad joins/HAVING/orders and `OutOfMemory` on allocation
+/// failure (no partial ownership escapes on error).
 pub fn buildSelect(allocator: std.mem.Allocator, args: SelectArgs) !BuiltStatement {
     var ctx = Ctx.init(allocator);
     var projections = std.ArrayList(ast.Projection).empty;
@@ -732,6 +823,9 @@ pub fn buildSelect(allocator: std.mem.Allocator, args: SelectArgs) !BuiltStateme
     return .{ .stmt = stmt, .ownedStrings = ctx.takeStrings(), .allocator = allocator };
 }
 
+/// Lower one borrowed INSERT row plus UPSERT/RETURNING clauses into an owned
+/// `BuiltStatement`. `columns.len` must equal `values.len` (else `InvalidSql`).
+/// Caller owns the result and must `deinit` it.
 pub fn buildInsert(allocator: std.mem.Allocator, table: []const u8, schema: []const u8, columns: []const []const u8, values: []const dslExpr.SetValue, conflict: ast.ConflictPolicy, returning: []const dslExpr.Projection, cases: []const CaseBuilder, upsert: UpsertArgs) !BuiltStatement {
     if (columns.len == 0 or columns.len != values.len) return error.InvalidSql;
     var ctx = Ctx.init(allocator);
@@ -790,6 +884,9 @@ pub fn buildInsert(allocator: std.mem.Allocator, table: []const u8, schema: []co
     return .{ .stmt = stmt, .ownedStrings = ctx.takeStrings(), .allocator = allocator };
 }
 
+/// Lower a borrowed UPDATE (optional `from` join source) into an owned
+/// `BuiltStatement`. `setNames.len` must equal `setValues.len` and be non-zero.
+/// Caller owns the result and must `deinit` it.
 pub fn buildUpdate(allocator: std.mem.Allocator, table: []const u8, schema: []const u8, setNames: []const []const u8, setValues: []const dslExpr.SetValue, conditions: []const CondEntry, returning: []const dslExpr.Projection, cases: []const CaseBuilder, caseWhens: []const CaseWhereArgs, from: ?ast.UpdateFrom) !BuiltStatement {
     if (setNames.len == 0 or setNames.len != setValues.len) return error.InvalidSql;
     var ctx = Ctx.init(allocator);
@@ -820,6 +917,8 @@ pub fn buildUpdate(allocator: std.mem.Allocator, table: []const u8, schema: []co
     return .{ .stmt = stmt, .ownedStrings = ctx.takeStrings(), .allocator = allocator };
 }
 
+/// Lower a borrowed DELETE plus filters/RETURNING into an owned
+/// `BuiltStatement`. Caller owns the result and must `deinit` it.
 pub fn buildDelete(allocator: std.mem.Allocator, table: []const u8, schema: []const u8, conditions: []const CondEntry, returning: []const dslExpr.Projection, cases: []const CaseBuilder, caseWhens: []const CaseWhereArgs) !BuiltStatement {
     var ctx = Ctx.init(allocator);
     var condList = std.ArrayList(ast.Condition).empty;
@@ -894,4 +993,76 @@ test "projections convert star, aggregates, and scalars" {
     const casted = try projectionToAst(&ctx, (column{ .name = "v" }).cast("INTEGER").projection(), .{ .table = "t" }, &.{}, &.{});
     try std.testing.expectEqualStrings("CAST", casted.expr.function.name);
     try std.testing.expectEqualStrings("INTEGER", casted.expr.function.argument2.?.*.identifier);
+}
+
+test "buildSelect preserves projection order and star/countStar shapes" {
+    const allocator = std.testing.allocator;
+    const column = @import("column.zig").DynamicColumn;
+    // Explicit projection order is load-bearing: engine maps result columns
+    // positionally, so the builder must not reorder.
+    var ordered = try buildSelect(allocator, .{
+        .table = "t",
+        .allColumns = false,
+        .projections = &.{ (column{ .name = "b" }).projection(), (column{ .name = "a" }).projection() },
+        .distinct = false,
+        .conditions = &.{},
+        .limit = null,
+        .offset = null,
+        .groupBy = null,
+        .having = null,
+        .joinTable = null,
+        .joinKind = .inner,
+        .joinOn = null,
+        .inQuery = null,
+        .existsQuery = null,
+        .literalIn = null,
+    });
+    defer ordered.deinit();
+    try std.testing.expectEqual(@as(usize, 2), ordered.stmt.select.projections.len);
+    try std.testing.expectEqualStrings("b", ordered.stmt.select.projections[0].expr.identifier);
+    try std.testing.expectEqualStrings("a", ordered.stmt.select.projections[1].expr.identifier);
+    // Native AllColumns nodes: star is a bare wildcard, countStar is COUNT(*).
+    var star = try buildSelect(allocator, .{
+        .table = "t",
+        .allColumns = true,
+        .projections = &.{},
+        .distinct = false,
+        .conditions = &.{},
+        .limit = null,
+        .offset = null,
+        .groupBy = null,
+        .having = null,
+        .joinTable = null,
+        .joinKind = .inner,
+        .joinOn = null,
+        .inQuery = null,
+        .existsQuery = null,
+        .literalIn = null,
+    });
+    defer star.deinit();
+    try std.testing.expect(star.stmt.select.projections[0].expr == .wildcard);
+    var counted = try buildSelect(allocator, .{
+        .table = "t",
+        .allColumns = false,
+        .projections = &.{dslExpr.countStar()},
+        .distinct = false,
+        .conditions = &.{},
+        .limit = null,
+        .offset = null,
+        .groupBy = null,
+        .having = null,
+        .joinTable = null,
+        .joinKind = .inner,
+        .joinOn = null,
+        .inQuery = null,
+        .existsQuery = null,
+        .literalIn = null,
+    });
+    defer counted.deinit();
+    try std.testing.expectEqualStrings("COUNT", counted.stmt.select.projections[0].expr.function.name);
+    // Qualified star for a joined-table projection keeps its qualifier.
+    var qctx = Ctx.init(allocator);
+    defer qctx.fail();
+    const qualified = try projectionToAst(&qctx, .{ .kind = .column, .column = .{ .table = "o", .name = "id" } }, null, &.{}, &.{});
+    try std.testing.expectEqualStrings("o.id", qualified.expr.identifier);
 }

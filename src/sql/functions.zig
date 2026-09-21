@@ -1,17 +1,65 @@
+//! Scalar/aggregate/window function registry: single dispatch hub (pipeline stage 3).
+//!
+//! Purpose: authoritative `evalScalar` dispatcher mapping a case-insensitive
+//! SQL function name plus `Value` args to a caller-owned `Value`. Aggregate
+//! iteration lives in `aggregate.zig` (`AggState`), window framing in
+//! `window.zig`; this file only routes scalar calls and the two multi-arg
+//! `min`/`max` scalar forms.
+//!
+//! Responsibilities: arity validation (`error.InvalidArgumentCount`),
+//! argument validation (`error.InvalidArgument`), case-insensitive name
+//! matching, and delegating to one implementation per function family.
+//! No function logic lives here; each `if` arm forwards to exactly one
+//! `scalar.*`, `math.*`, `datetime.*`, or `json.*` helper.
+//!
+//! Dependencies: `../vm/value.zig`, the six `functions/*.zig` modules.
+//! Called by `expr.zig` (CHECK/defaults) and `vm/vm.zig` (`function` opcode).
+//!
+//! Ownership/lifetime: input `args` are borrowed; the returned `Value` is
+//! caller-owned (free text/blob results with the same allocator).
+//!
+//! Error behavior: `InvalidArgumentCount` on wrong arity, `InvalidArgument`
+//! on wrong types (e.g. `CAST(x AS 42)`), `Unsupported` for unknown names,
+//! `OutOfMemory`/`InvalidSql` propagated from callees. Never panics on bad
+//! input; NULL propagation is decided inside each callee per SQLite rules.
+//!
+//! Invariants: `isAggregate(name)` and scalar dispatch are disjoint except
+//! `min`/`max`, which are scalar only when `args.len >= 2` (single-arg form
+//! stays aggregate); `isWindowOnly` names never evaluate here.
+//!
+//! SQLite compatibility: names match SQLite core + common extensions
+//! (`substr`/`substring`, `printf`/`format`, `pow`/`power`, `ceil`/`ceiling`,
+//! `iif`/`if`, `likelihood`/`likely`/`unlikely`, `average` for `avg`,
+//! `string_agg` for `group_concat`); `min`/`max` scalar forms return NULL if
+//! any argument is NULL.
+// TODO(sql/functions): `min`/`max` dual scalar-vs-aggregate routing by arity
+// is subtle and split across this file and `aggregate.zig`. Expected: one
+// resolver returning scalar|aggregate|window|unknown with arity attached;
+// tests: 0/1/2/N-arg min/max matrices for both paths. Subsystem: sql/functions.
+
 const std = @import("std");
 const Value = @import("../vm/value.zig").Value;
 
+/// Scalar function implementations (strings, casts, blobs, misc).
 pub const scalar = @import("functions/scalar.zig");
+/// Math function implementations (`sin`, `log`, `pow`, ...).
 pub const math = @import("functions/math.zig");
+/// Date/time implementations (`date`, `strftime`, ...).
 pub const datetime = @import("functions/datetime.zig");
+/// JSON1 implementations (`json_extract`, `json_object`, ...).
 pub const json = @import("functions/json.zig");
+/// Aggregate state machine (`count`, `sum`, `group_concat`, ...).
 pub const aggregate = @import("functions/aggregate.zig");
+/// Window framing/evaluation (`row_number`, `lag`, ...).
 pub const window = @import("functions/window.zig");
 
+/// True when `name` is an aggregate (`count`, `sum`, `avg`/`average`, ...).
+/// Single-arg `min`/`max` report true here; multi-arg forms are scalar.
 pub fn isAggregate(name: []const u8) bool {
     return aggregate.AggKind.fromName(name) != null;
 }
 
+/// True for window-only functions that require an OVER clause.
 pub fn isWindowOnly(name: []const u8) bool {
     return std.ascii.eqlIgnoreCase(name, "row_number") or
         std.ascii.eqlIgnoreCase(name, "rank") or
@@ -26,6 +74,8 @@ pub fn isWindowOnly(name: []const u8) bool {
         std.ascii.eqlIgnoreCase(name, "nth_value");
 }
 
+/// Evaluate scalar function `name` on borrowed `args`; returns caller-owned `Value`.
+/// Arity/type errors fail closed; unknown names return `error.Unsupported`.
 pub fn evalScalar(allocator: std.mem.Allocator, name: []const u8, args: []const Value) !Value {
     if (std.ascii.eqlIgnoreCase(name, "abs")) {
         if (args.len != 1) return error.InvalidArgumentCount;
@@ -349,4 +399,53 @@ pub fn evalScalar(allocator: std.mem.Allocator, name: []const u8, args: []const 
     }
 
     return error.Unsupported;
+}
+
+test "functions registry routes core families" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(isAggregate("count"));
+    try std.testing.expect(isAggregate("AVERAGE"));
+    try std.testing.expect(!isAggregate("abs"));
+    try std.testing.expect(isWindowOnly("row_number"));
+    try std.testing.expect(!isWindowOnly("abs"));
+
+    const abs = try evalScalar(alloc, "ABS", &.{.{ .integer = -3 }});
+    defer abs.free(alloc);
+    try std.testing.expectEqual(@as(i64, 3), abs.integer);
+
+    const ceil = evalScalar(alloc, "ceil", &.{.{ .real = 1.5 }});
+    const ceil_v = try ceil;
+    defer ceil_v.free(alloc);
+    try std.testing.expectEqual(@as(f64, 2.0), ceil_v.real);
+
+    const d = try evalScalar(alloc, "date", &.{.{ .text = "2024-02-29" }});
+    defer d.free(alloc);
+    try std.testing.expectEqualStrings("2024-02-29", d.text);
+
+    const j = try evalScalar(alloc, "json_valid", &.{.{ .text = "{}" }});
+    defer j.free(alloc);
+    try std.testing.expectEqual(@as(i64, 1), j.integer);
+}
+
+test "functions registry null and boundary behavior" {
+    const alloc = std.testing.allocator;
+    const n = try evalScalar(alloc, "lower", &.{.null});
+    defer n.free(alloc);
+    try std.testing.expect(n == .null);
+    const multi_min = try evalScalar(alloc, "min", &.{ .{ .integer = 3 }, .{ .integer = 1 }, .{ .integer = 2 } });
+    defer multi_min.free(alloc);
+    try std.testing.expectEqual(@as(i64, 1), multi_min.integer);
+    const null_min = try evalScalar(alloc, "max", &.{ .{ .integer = 1 }, .null });
+    defer null_min.free(alloc);
+    try std.testing.expect(null_min == .null);
+}
+
+test "functions registry rejects bad arity and unknown names" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.InvalidArgumentCount, evalScalar(alloc, "abs", &.{}));
+    try std.testing.expectError(error.InvalidArgumentCount, evalScalar(alloc, "abs", &.{ .{ .integer = 1 }, .{ .integer = 2 } }));
+    try std.testing.expectError(error.InvalidArgumentCount, evalScalar(alloc, "substr", &.{.{ .text = "a" }}));
+    try std.testing.expectError(error.InvalidArgument, evalScalar(alloc, "cast", &.{ .{ .integer = 1 }, .{ .integer = 2 } }));
+    try std.testing.expectError(error.Unsupported, evalScalar(alloc, "no_such_fn", &.{.{ .integer = 1 }}));
+    try std.testing.expectError(error.InvalidArgumentCount, evalScalar(alloc, "json_object", &.{.{ .text = "k" }}));
 }
