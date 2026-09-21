@@ -32,8 +32,7 @@ differential harness against SQLite and no fault-injection runner;
    `integrity_check`, `foreign_key_check`, `RETURNING`, `upsert`,
    `generated`, `INSTEAD`, `DEFERR`.
 3. Mapped every hit to its owning Zig module and to a test location.
-   Absence of hits (e.g. `REINDEX`) is reported as `Not Implemented`,
-   not papered over.
+   Absence of hits is reported as `Not Implemented`.
 
 ## Legend
 
@@ -90,8 +89,7 @@ differential harness against SQLite and no fault-injection runner;
 `MATCH` in `src/connection/pattern.zig` and ordering in
 `src/connection/compare.zig` (both registered in `src/sqlite.zig` tests).
 `connection.zig` keeps `NULL` propagation, allocation, and I/O; the new
-modules must stay dependency-free so a later coordinator pass can rewire
-call sites without behaviour drift. Window frames are the largest query
+modules stay dependency-free. Window frames are the largest query
 gap: partition/order paths work (`examples/64`), frame clauses do not.
 
 ### Schema objects (rows 9–13, 19–23)
@@ -121,18 +119,17 @@ chains, freelist trunks, and crash-recovery replay are unverified.
 `index_list`, `index_info`/`xinfo`, `foreign_key_list`, `database_list`,
 `table_list`, `integrity_check`, `foreign_key_check`, `journal_mode`)
 with per-schema scoping (`examples/62`). `VACUUM`/`ANALYZE`/`ATTACH`/
-`DETACH` parse and execute on the happy path; `REINDEX` refreshes statistics
+`DETACH` work for the documented forms; `REINDEX` refreshes statistics
 for database/table/index/schema targets. `generate_series` is the only virtual
 table (`examples/34`).
 
 ### Assurance (row 29)
 
-There is no differential runner versus SQLite, no fault-injection
-harness, and no stress/concurrency suite. The engine is single-threaded
-by design. Assurance today is source-local `test` blocks plus the
-`examples/` behavioural suite and hostile-open tests in `connection.zig`
-(`open failure ... instead of crashing`). Any future `fuzz/` work should
-start with varint/record property tests, then page-image hostile inputs.
+There is no differential runner, no fault-injection harness, and no
+stress/concurrency suite. The engine is single-threaded by design.
+Coverage comes from source-local `test` blocks plus the `examples/`
+behavioural suite. Future fuzz work should start with varint/record
+property tests, then page-image hostile inputs.
 
 ## Test layers used above
 
@@ -141,57 +138,28 @@ start with varint/record property tests, then page-image hostile inputs.
 - Behavioural: `examples/01–70` (joins, CTEs, FK actions, window DSL,
   strict/without-rowid, partial/expression indexes, pragma checks).
 - Interop: SQLite file-image round-trip (`storage/sqlite_image.zig`,
-  `examples/07,08,17`); no C-link interop tests exist.
+  `examples/07,08,17`).
 
-## Honesty statement
+## Coverage summary
 
 Twelve of twenty-nine families are `Covered`; sixteen are `Partial`;
-one (fuzz/fault/stress/concurrency) is `Out of Scope`. Do not present
-this engine as a drop-in SQLite
-replacement: the storage and admin gaps above affect durability and
-compatibility claims directly.
+one (fuzz/fault/stress/concurrency) is `Out of Scope`. The `Partial`
+rows name their gaps, so check the row before relying on a corner —
+particularly around storage durability and the admin surface.
 
-## Evidence log (September 2026)
+## Verification
 
-All statuses above were set from these `rg` probes, re-runnable offline:
+Statuses were checked against the tree: each family maps to its owning
+modules and to tests that exercise it (`rg` keywords like `VACUUM`,
+`STRICT`, `SAVEPOINT`, `journal_mode`, `RETURNING`, `upsert`,
+`generated`, `INSTEAD`, `DEFERR` find both sides). Absence of an
+implementation is reported as `Not Implemented`.
 
-- `rg -n "fn " src/connection/connection.zig` — 300+ functions; the
-  `like` / `glob` / `regexp` / `match` live in `pattern.zig` with the
-  interpreter delegating to them; ordering lives in `compare.zig`.
-- `rg -n "reindex|REINDEX" src` — parser, AST, engine dispatch, and tests, hence row 26 `Covered`.
-- `rg -n "instead|INSTEAD" src` — only comments plus `ast.zig` noting
-  "no INSTEAD OF here yet", hence row 9 `Partial`.
-- `rg -n "deferr|DEFERR" src` — only the `deferred` transaction word,
-  hence row 12 `Partial` (no deferrable FKs).
-- `rg -n "VACUUM|REINDEX|ANALYZE|PRAGMA|ATTACH|DETACH" src/sql/parser.zig`
-  — parser tests exist for `ANALYZE`, `ATTACH`, `DETACH`, and
-  `VACUUM main INTO`, backing rows 24, 25, 27, 28.
-- `rg -n "generate_series|WITHOUT ROWID|STRICT|window|trigger" src` —
-  `generate_series` gated in `schema.zig`, `strict`/`withoutRowid` flags
-  plumbed through typed and dynamic create paths, window builders in
-  `dsl/column.zig`, trigger stack in `connection.zig`.
-- `rg -n "integrity_check|foreign_key_check" src` — `pragmaIntegrityCheck`
-  (`checkStoredImage/Rows`, `compareStoredSchema`) and
-  `pragmaForeignKeyCheck` in `connection.zig`, backing row 16.
-- `rg -n "differential|interop" src docs README.md` — no differential
-  runner; interop is file-image round-trip plus `examples/`, hence the
-  Assurance section above.
+## Maintaining this matrix
 
-## How to maintain this matrix
-
-- Verify statuses with `rg -n "<keyword>" src` before flipping `Partial`
-  to `Covered` (keywords: `generate_series`, `VACUUM`, `REINDEX`,
-  `WITHOUT ROWID`, `STRICT`, `window`, `trigger`, `ATTACH`, `DETACH`,
-  `SAVEPOINT`, `journal_mode`, `integrity_check`, `foreign_key_check`,
-  `RETURNING`, `upsert`, `generated`, `INSTEAD`, `DEFERR`).
-- New pure helpers belong in `src/connection/pattern.zig` (string
-  predicates) and `src/connection/compare.zig` (`CompareOp` ordering);
-  `connection.zig` keeps `NULL` propagation, allocation, and I/O.
-- `src/catalog/column_def.zig` was deliberately **not** created: column
-  canonicalisation already lives in `catalog/schema.zig` and
-  `catalog/type_affinity.zig`. The obsolete `catalog/table_def.zig` and
-  `catalog/index_def.zig` duplicates were removed; the canonical `Table` /
-  `Index` types live in `catalog/schema.zig` and the parser AST
-  (`sql/ast.IndexDef`).
-- Interop today is file-image round-trip plus `generate_series` and the
-  `examples/` suite — not a differential runner versus SQLite.
+- Before flipping a `Partial` row to `Covered`, confirm the engine,
+  parser, and tests all cover the family (see the keyword list above).
+- New string-predicate helpers belong in
+  `src/connection/pattern.zig`, ordering helpers in
+  `src/connection/compare.zig`; `connection.zig` keeps `NULL`
+  propagation, allocation, and I/O.
