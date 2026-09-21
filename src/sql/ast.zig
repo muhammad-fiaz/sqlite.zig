@@ -306,8 +306,11 @@ fn freeOwnedExprChildren(allocator: std.mem.Allocator, expr: Expr, stack: *std.A
 /// Maximum expression depth accepted by `cloneOwnedExpr`. Parser output
 /// never exceeds 200 levels, so legitimate trees always fit; deeper
 /// caller-built trees fail closed with `error.TooDeep` instead of
-/// overflowing the call stack during the recursive descent.
-pub const max_clone_depth: usize = 500;
+/// overflowing the call stack during the recursive descent. The cap is
+/// 400 because Debug Windows frames overflow the default stack near 412
+/// recursive `cloneOwnedExprDepth` calls; 400 keeps a margin above the
+/// parser's 200 limit while still failing closed on hostile depth.
+pub const max_clone_depth: usize = 400;
 
 /// Deep-clone an expression into fully-owned memory (`OutOfMemory` on failure).
 /// On error, partially built output is freed; the input is never consumed.
