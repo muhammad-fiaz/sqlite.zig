@@ -1,15 +1,7 @@
-//! B-tree page view: type byte plus the page-1 header offset.
+//! Minimal view over one raw page image.
 //!
-//! Purpose: minimal read/write accessor for a raw page image's type flag and
-//! the 100-byte database-header reservation on page 1. Responsibilities: map
-//! page numbers to header offsets, translate the flag byte to `PageType`.
-//! Dependencies: `std` only. Ownership: `Page` borrows the caller's byte
-//! slice (no allocation, no copying); mutations write through immediately.
-//! Error behavior: `pageType` returns `null` for short buffers/unknown flags
-//! (fail closed); `setPageType` returns `error.InvalidPage` on a short buffer
-//! instead of writing out of bounds. Invariants: page numbers start at 1;
-//! page 1 reserves the first 100 bytes for `format/header.zig`.
-//! Compatibility: flag values (0x02/0x05/0x0a/0x0d) match SQLite.
+//! `Page` borrows the caller's bytes and never allocates.
+//! Unknown types read as `null`; short writes fail `InvalidPage`.
 
 const std = @import("std");
 
@@ -17,10 +9,6 @@ const std = @import("std");
 pub const PageType = enum(u8) { tableInterior = 0x05, tableLeaf = 0x0d, indexInterior = 0x02, indexLeaf = 0x0a };
 
 /// Borrowed view over one raw page image.
-///
-/// Why a view and not an owner: pages live in the pager/file cache; this
-/// type only interprets memory owned elsewhere, so it must never outlive
-/// `bytes` and never allocates.
 pub const Page = struct {
     /// Raw page image (length should equal the database page size).
     bytes: []u8,
@@ -49,12 +37,7 @@ pub const Page = struct {
         return std.enums.fromInt(PageType, self.bytes[offset]);
     }
 
-    /// Writes the page-type flag.
-    ///
-    /// Safety: fails with `error.InvalidPage` when the buffer cannot hold
-    /// the flag byte (empty slice, or < 101 bytes for page 1) instead of
-    /// writing out of bounds. Page number 0 is rejected: pages are 1-based
-    /// and 0 would alias page 1's data region while claiming no offset.
+    /// Writes the page-type flag. Short buffers fail `InvalidPage`.
     pub fn setPageType(self: Page, kind: PageType) error{InvalidPage}!void {
         if (self.pageNumber == 0) return error.InvalidPage;
         const offset = self.headerOffset();

@@ -1,17 +1,7 @@
-//! Legacy custom schema-image codec (length-prefixed tables/rows).
+//! Older length-prefixed schema image codec.
 //!
-//! Purpose: serialize a whole `catalog/schema.zig` `Schema` (tables, columns,
-//! rows) to bytes and back. This is the older `ZIGSQL1`-era persistence
-//! encoding kept for backward-compatible payload paths; new databases use
-//! `storage/sqlite_image.zig`. Responsibilities: u32 length framing, value
-//! tags, schema rebuild. Dependencies: `catalog/schema.zig`, `vm/value.zig`,
-//! `sql/ast.zig`, `std`. Ownership: `encode` returns a fresh caller-owned
-//! buffer; `decode` builds an owned `Schema` (call `deinit`), duping text/
-//! blob bytes it keeps. Error behavior: truncated input, unknown value tags,
-//! or absurd counts fail closed with `InvalidHeader` (never panics/OOB);
-//! allocation failure propagates. Invariants: counts are DOS-bounded (see
-//! `maxTables`/`maxColumns`/`maxRows`) and every length is re-checked
-//! against the remaining input before allocating.
+//! `encode` returns a fresh buffer; `decode` returns an owned Schema.
+//! Truncated input or bad tags fail with `InvalidHeader`.
 
 const std = @import("std");
 const Schema = @import("../catalog/schema.zig").Schema;
@@ -59,11 +49,8 @@ fn bytes(list: *std.ArrayList(u8), allocator: std.mem.Allocator, value: []const 
     try u32Bytes(list, allocator, @intCast(value.len));
     try list.appendSlice(allocator, value);
 }
-/// Reads a u32-prefixed byte string, duping it into a caller-owned buffer.
-///
-/// Safety: the declared length is checked against the remaining input before
-/// allocating, so the allocation is bounded by `data.len` (no unbounded
-/// alloc from a corrupt length).
+/// Reads a u32-prefixed byte string into a caller-owned buffer.
+/// The length is checked against remaining input before allocating.
 fn readBytes(allocator: std.mem.Allocator, data: []const u8, offset: *usize) ![]u8 {
     const length = try readU32(data, offset);
     if (offset.* + length > data.len) return error.InvalidHeader;
@@ -117,14 +104,8 @@ pub fn encode(allocator: std.mem.Allocator, schema: *const Schema) ![]u8 {
     return result.toOwnedSlice(allocator);
 }
 
-/// Rebuilds an owned `Schema` from `data` (fail closed on corruption).
-///
-/// Foreign-key enforcement is paused during rebuild and restored after, so
-/// partially-loaded tables never trip constraint checks. Every count is
-/// capped (`maxTables`/`maxColumns`/`maxRows`) and every length is checked
-/// against remaining input before use; unknown value tags are rejected.
-/// Every error path frees the strings/values owned so far (tracked counts
-/// with disarmed errdefers), so truncated input never leaks.
+/// Rebuilds an owned `Schema` from `data`; corrupt input fails closed.
+/// Counts and lengths stay bounded and every error path frees what it owns.
 pub fn decode(allocator: std.mem.Allocator, data: []const u8) !Schema {
     var schema = Schema.init(allocator);
     errdefer schema.deinit();

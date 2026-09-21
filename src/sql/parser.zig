@@ -1,49 +1,17 @@
-//! SQL parser: tokens -> owned `ast.zig` statements (pipeline stage 2).
+//! SQL parser: tokens -> owned statements.
 //!
-//! Purpose: recursive-descent frontend accepting the SQLite surface used by
-//! `connection.zig` (DDL/DML/queries, pragmas, CTEs, compound selects, window
-//! specs, RETURNING, upserts). This is the only SQL-string entry point; DSL
-//! builders in `src/dsl/` construct native AST directly and never format SQL.
-//!
-//! Responsibilities: single-statement parse with fail-closed errors,
-//! source-slice retention for lazily re-parsed bodies (views, CTEs,
-//! subqueries, trigger bodies), and arena tracking of owned copies.
-//!
-//! Dependencies: `token.zig`, `lexer.zig`, `ast.zig`, `../vm/value.zig`.
-//! Callers own the returned `Statement` and free it with `ast.deinit`, then
-//! free the parser itself with `Parser.deinit` (which releases the token
-//! slice and all `copy()` allocations).
-//!
-//! Ownership/lifetime: string slices in the AST borrow `source` or the
-//! parser's `allocations` list; expression nodes are heap-owned. `parse()`
-//! consumes exactly one statement plus an optional `;` and rejects trailing
-//! tokens. On error, partially built state is freed via `errdefer` paths.
-//!
-//! Error behavior: `InvalidSql` for grammatically invalid input,
-//! `UnexpectedToken` for a wrong token at a valid position, `Unsupported`
-//! for recognized-but-unimplemented syntax. Lexer/alloc/parse-int/float
-//! errors are unioned into `Error`. Malformed input never yields a partial AST.
-//!
-//! Invariants: `tokens` always ends in `.eof`; `index <= tokens.len`;
-//! `nextParameter` counts anonymous `?` placeholders; nesting depth is capped
-//! by `max_parse_depth` so hostile `((((...))))` fails closed with
-//! `InvalidSql` instead of overflowing the stack.
-//!
-//! SQLite compatibility: quoted keywords are identifiers; `==`/`<>` accepted;
-//! multi-word type names, `CAST(x AS DOUBLE PRECISION)`, rowid aliases,
-//! `INSERT OR ...`, `UPDATE OR ...`, `ON CONFLICT`, `RETURNING`, `STRICT` and
-//! `WITHOUT ROWID` accepted; branch `ORDER BY` allowed only on the final
-//! compound arm.
-// TODO(sql/parser): allocation is O(input) but uncapped (VALUES lists, CTE
-// chains, IN lists); add a shared SQLITE_LIMIT_* budget (variables, columns,
-// compound arms) with `connection.zig`. Expected: one limits unit + error;
-// tests: hostile 100k-element IN list rejected, boundary accepted.
-// Subsystem: sql/frontend.
+//! Recursive-descent frontend; the only SQL-string entry point (DSLs build
+//! AST nodes directly). Parses one statement plus optional `;`, keeps
+//! source slices for lazily re-parsed bodies, and fails closed — never a
+//! partial AST. Callers free the statement with `ast.deinit`, then the
+//! parser with `Parser.deinit`. Budgets from `limits.zig` fail `SqlTooBig`;
+//! nesting depth is capped so hostile input cannot overflow the stack.
 
 const std = @import("std");
 const Token = @import("token.zig").Token;
 const Tag = @import("token.zig").Tag;
 const lexer = @import("lexer.zig");
+const limits = @import("limits.zig");
 const ast = @import("ast.zig");
 const Value = @import("../vm/value.zig").Value;
 
@@ -136,7 +104,7 @@ fn freeParserExpr(allocator: std.mem.Allocator, expr: ast.Expr) void {
     }
 }
 /// Parser failure modes: grammar errors plus unioned lexer/allocator errors.
-pub const Error = error{ InvalidSql, UnexpectedToken, OutOfMemory, Unsupported } || std.mem.Allocator.Error || lexer.Error || std.fmt.ParseIntError || std.fmt.ParseFloatError;
+pub const Error = error{ InvalidSql, UnexpectedToken, OutOfMemory, Unsupported, TooDeep } || std.mem.Allocator.Error || lexer.Error || std.fmt.ParseIntError || std.fmt.ParseFloatError;
 
 /// Maximum nesting depth for expressions/subqueries; hostile input fails closed.
 pub const max_parse_depth: usize = 200;
@@ -346,6 +314,10 @@ pub const Parser = struct {
             var target: ?[]const u8 = null;
             if (self.current().tag == .word) target = try self.tableName();
             statement = .{ .analyze = .{ .target = target } };
+        } else if (self.acceptWord("reindex")) {
+            var target: ?[]const u8 = null;
+            if (self.current().tag == .word) target = try self.tableName();
+            statement = .{ .reindex = .{ .target = target } };
         } else if (self.acceptWord("create")) statement = try self.parseCreate() else if (self.acceptWord("drop")) statement = try self.parseDrop() else if (self.acceptWord("alter")) statement = try self.parseAlter() else if (self.acceptWord("insert")) statement = try self.parseInsert() else if (self.acceptWord("select")) statement = try self.parseSelectOrCompound() else if (self.acceptWord("update")) statement = try self.parseUpdate() else if (self.acceptWord("delete")) statement = try self.parseDelete() else if (self.acceptWord("begin")) {
             _ = self.acceptWord("deferred");
             _ = self.acceptWord("immediate");
@@ -714,6 +686,8 @@ pub const Parser = struct {
             try columns.append(self.allocator, colDef);
             if (!self.acceptTag(.comma)) break;
         }
+        // More than 2000 columns fails fast instead of piling up.
+        if (columns.items.len > limits.max_columns) return error.SqlTooBig;
         try self.requireTag(.rparen);
         var strict = false;
         var withoutRowid = false;
@@ -974,6 +948,8 @@ pub const Parser = struct {
             _ = self.advance();
             const index = if (token.text.len > 1) std.fmt.parseInt(usize, token.text[1..], 10) catch self.nextParameter else self.nextParameter;
             if (token.text.len == 1) self.nextParameter += 1;
+            // Parameter indices run 1..32766; outside that prepare fails.
+            if (index == 0 or index > limits.max_variables) return error.SqlTooBig;
             return .{ .parameter = index };
         }
         if (token.tag == .number) {
@@ -1030,6 +1006,7 @@ pub const Parser = struct {
                 var extraArgs = std.ArrayList(ast.Expr).empty;
                 defer extraArgs.deinit(self.allocator);
                 var distinct = false;
+                var argCount: usize = 0;
                 if (!self.acceptTag(.rparen)) {
                     distinct = self.acceptWord("distinct");
                     if (distinct and !isAggregateName(name)) return Error.UnexpectedToken;
@@ -1037,6 +1014,7 @@ pub const Parser = struct {
                     errdefer self.allocator.destroy(first);
                     first.* = try self.parseExpr();
                     argument = first;
+                    argCount = 1;
                     if (distinct and first.* == .wildcard) return Error.UnexpectedToken;
                     if (std.ascii.eqlIgnoreCase(name, "cast")) {
                         try self.requireWord("as");
@@ -1053,13 +1031,19 @@ pub const Parser = struct {
                             errdefer self.allocator.destroy(second);
                             second.* = try self.parseExpr();
                             argument2 = second;
+                            argCount = 2;
                             if (self.acceptTag(.comma)) {
                                 const third = try self.allocator.create(ast.Expr);
                                 errdefer self.allocator.destroy(third);
                                 third.* = try self.parseExpr();
                                 argument3 = third;
+                                argCount = 3;
                                 while (self.acceptTag(.comma)) {
                                     try extraArgs.append(self.allocator, try self.parseExpr());
+                                    argCount += 1;
+                                    // At most 1000 call arguments; fail before
+                                    // the tail can grow without bound.
+                                    if (argCount > limits.max_function_args) return error.SqlTooBig;
                                 }
                             }
                         }
@@ -1455,6 +1439,8 @@ pub const Parser = struct {
             try projections.append(self.allocator, .{ .expr = expr, .alias = alias });
             if (!self.acceptTag(.comma)) break;
         }
+        // RETURNING output is capped at 2000 columns like SELECT.
+        if (projections.items.len > limits.max_columns) return error.SqlTooBig;
         return try projections.toOwnedSlice(self.allocator);
     }
 
@@ -1832,6 +1818,9 @@ pub const Parser = struct {
             try projections.append(self.allocator, .{ .expr = expr, .alias = alias });
             if (!self.acceptTag(.comma)) break;
         }
+        // SELECT output is capped at 2000 columns (`SELECT *` expands
+        // later against live tables, validated at CREATE TABLE time).
+        if (projections.items.len > limits.max_columns) return error.SqlTooBig;
         var table: ?[]const u8 = null;
         var tableAlias: ?[]const u8 = null;
         var fromSubquery: ?[]const u8 = null;
@@ -2025,6 +2014,7 @@ pub const Parser = struct {
         var pendingBranchHadOrder = selectStmt.select.orders.len != 0;
         var lastBranchOrders: []const ast.Order = &.{};
         var lastBranchOrderStart: ?usize = null;
+        var terms: usize = 1;
         while (true) {
             const op: ast.CompoundOp = if (self.acceptWord("union"))
                 (if (self.acceptWord("all")) .unionAllOp else .unionOp)
@@ -2037,6 +2027,9 @@ pub const Parser = struct {
 
             if (pendingBranchHadOrder) return Error.InvalidSql;
             hasCompound = true;
+            terms += 1;
+            // Compound SELECTs cap at 500 UNION/INTERSECT/EXCEPT terms.
+            if (terms > limits.max_compound_terms) return error.SqlTooBig;
             lastOp = op;
             leftEnd = self.tokens[self.index - if (op == .unionAllOp) @as(usize, 2) else @as(usize, 1)].position;
             rightStart = self.current().position;
@@ -2366,6 +2359,30 @@ test "parser parses analyze with optional target" {
     try std.testing.expectEqualStrings("myindex", s3.analyze.target.?);
 }
 
+test "parser parses reindex with optional target" {
+    var p1 = try Parser.init(std.testing.allocator, "REINDEX;");
+    defer p1.deinit();
+    var s1 = try p1.parse();
+    defer ast.deinit(std.testing.allocator, &s1);
+    try std.testing.expect(s1 == .reindex);
+    try std.testing.expect(s1.reindex.target == null);
+    var p2 = try Parser.init(std.testing.allocator, "REINDEX mytable;");
+    defer p2.deinit();
+    var s2 = try p2.parse();
+    defer ast.deinit(std.testing.allocator, &s2);
+    try std.testing.expectEqualStrings("mytable", s2.reindex.target.?);
+    var p3 = try Parser.init(std.testing.allocator, "REINDEX myindex;");
+    defer p3.deinit();
+    var s3 = try p3.parse();
+    defer ast.deinit(std.testing.allocator, &s3);
+    try std.testing.expectEqualStrings("myindex", s3.reindex.target.?);
+    var p4 = try Parser.init(std.testing.allocator, "REINDEX main.mytable;");
+    defer p4.deinit();
+    var s4 = try p4.parse();
+    defer ast.deinit(std.testing.allocator, &s4);
+    try std.testing.expectEqualStrings("main.mytable", s4.reindex.target.?);
+}
+
 test "parser parses conflict policies on insert and update" {
     var p1 = try Parser.init(std.testing.allocator, "INSERT OR ROLLBACK INTO users VALUES (1);");
     defer p1.deinit();
@@ -2681,4 +2698,139 @@ test "parser unescapes doubled single quotes in string literals" {
     const proj = stmt.select.projections[0];
     try std.testing.expect(proj.expr == .literal);
     try std.testing.expectEqualStrings("o'brien", proj.expr.literal.text);
+}
+
+test "parser enforces the variable-number budget" {
+    // Over the 32766 parameter budget.
+    var over = try Parser.init(std.testing.allocator, "SELECT ?32767;");
+    defer over.deinit();
+    try std.testing.expectError(error.SqlTooBig, over.parse());
+    // Zero is outside the 1-based range.
+    var zero = try Parser.init(std.testing.allocator, "SELECT ?0;");
+    defer zero.deinit();
+    try std.testing.expectError(error.SqlTooBig, zero.parse());
+    // Boundary index parses to the same parameter node.
+    var edge = try Parser.init(std.testing.allocator, "SELECT ?32766;");
+    defer edge.deinit();
+    var stmt = try edge.parse();
+    defer ast.deinit(std.testing.allocator, &stmt);
+    try std.testing.expectEqual(@as(usize, 32766), stmt.select.projections[0].expr.parameter);
+}
+
+test "parser enforces the compound-terms budget" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    // Exactly 500 terms (boundary) is accepted.
+    var ok_sql = std.ArrayList(u8).empty;
+    defer ok_sql.deinit(alloc);
+    for (0..500) |i| {
+        if (i != 0) try ok_sql.appendSlice(alloc, " UNION ");
+        try ok_sql.appendSlice(alloc, "SELECT 1");
+    }
+    try ok_sql.appendSlice(alloc, ";");
+    var ok_p = try Parser.init(std.testing.allocator, ok_sql.items);
+    defer ok_p.deinit();
+    var ok_stmt = try ok_p.parse();
+    defer ast.deinit(std.testing.allocator, &ok_stmt);
+    try std.testing.expect(ok_stmt == .compoundSelect);
+    // The 501st compound term exceeds the 500-term budget.
+    var big_sql = std.ArrayList(u8).empty;
+    defer big_sql.deinit(alloc);
+    for (0..501) |i| {
+        if (i != 0) try big_sql.appendSlice(alloc, " UNION ");
+        try big_sql.appendSlice(alloc, "SELECT 1");
+    }
+    try big_sql.appendSlice(alloc, ";");
+    var big_p = try Parser.init(std.testing.allocator, big_sql.items);
+    defer big_p.deinit();
+    try std.testing.expectError(error.SqlTooBig, big_p.parse());
+}
+
+test "parser enforces the function-argument budget" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    // 1001 arguments exceeds the 1000-argument budget.
+    var big_sql = std.ArrayList(u8).empty;
+    defer big_sql.deinit(alloc);
+    try big_sql.appendSlice(alloc, "SELECT f(");
+    for (0..1001) |i| {
+        if (i != 0) try big_sql.appendSlice(alloc, ", ");
+        try big_sql.appendSlice(alloc, "1");
+    }
+    try big_sql.appendSlice(alloc, ");");
+    var big_p = try Parser.init(std.testing.allocator, big_sql.items);
+    defer big_p.deinit();
+    try std.testing.expectError(error.SqlTooBig, big_p.parse());
+    // Exactly 1000 arguments (boundary) parses.
+    var ok_sql = std.ArrayList(u8).empty;
+    defer ok_sql.deinit(alloc);
+    try ok_sql.appendSlice(alloc, "SELECT f(");
+    for (0..1000) |i| {
+        if (i != 0) try ok_sql.appendSlice(alloc, ", ");
+        try ok_sql.appendSlice(alloc, "1");
+    }
+    try ok_sql.appendSlice(alloc, ");");
+    var ok_p = try Parser.init(std.testing.allocator, ok_sql.items);
+    defer ok_p.deinit();
+    var ok_stmt = try ok_p.parse();
+    defer ast.deinit(std.testing.allocator, &ok_stmt);
+    try std.testing.expect(ok_stmt == .select);
+}
+
+test "parser enforces the column budget" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    // CREATE TABLE with 2001 columns exceeds the 2000-column budget.
+    var big_sql = std.ArrayList(u8).empty;
+    defer big_sql.deinit(alloc);
+    try big_sql.appendSlice(alloc, "CREATE TABLE t (");
+    for (0..2001) |i| {
+        if (i != 0) try big_sql.appendSlice(alloc, ", ");
+        {
+            const name = try std.fmt.allocPrint(alloc, "c{d} INTEGER", .{i});
+            defer alloc.free(name);
+            try big_sql.appendSlice(alloc, name);
+        }
+    }
+    try big_sql.appendSlice(alloc, ");");
+    var big_p = try Parser.init(std.testing.allocator, big_sql.items);
+    defer big_p.deinit();
+    try std.testing.expectError(error.SqlTooBig, big_p.parse());
+    // SELECT with 2001 projections exceeds the same budget.
+    var sel_sql = std.ArrayList(u8).empty;
+    defer sel_sql.deinit(alloc);
+    try sel_sql.appendSlice(alloc, "SELECT ");
+    for (0..2001) |i| {
+        if (i != 0) try sel_sql.appendSlice(alloc, ", ");
+        {
+            const num = try std.fmt.allocPrint(alloc, "{d}", .{i});
+            defer alloc.free(num);
+            try sel_sql.appendSlice(alloc, num);
+        }
+    }
+    try sel_sql.appendSlice(alloc, ";");
+    var sel_p = try Parser.init(std.testing.allocator, sel_sql.items);
+    defer sel_p.deinit();
+    try std.testing.expectError(error.SqlTooBig, sel_p.parse());
+    // Boundary: 2000 columns parses.
+    var ok_sql = std.ArrayList(u8).empty;
+    defer ok_sql.deinit(alloc);
+    try ok_sql.appendSlice(alloc, "CREATE TABLE t (");
+    for (0..2000) |i| {
+        if (i != 0) try ok_sql.appendSlice(alloc, ", ");
+        {
+            const name = try std.fmt.allocPrint(alloc, "c{d} INTEGER", .{i});
+            defer alloc.free(name);
+            try ok_sql.appendSlice(alloc, name);
+        }
+    }
+    try ok_sql.appendSlice(alloc, ");");
+    var ok_p = try Parser.init(std.testing.allocator, ok_sql.items);
+    defer ok_p.deinit();
+    var ok_stmt = try ok_p.parse();
+    defer ast.deinit(std.testing.allocator, &ok_stmt);
+    try std.testing.expectEqual(@as(usize, 2000), ok_stmt.createTable.columns.len);
 }

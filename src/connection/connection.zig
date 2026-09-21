@@ -1,44 +1,10 @@
-//! Engine facade: `Connection` — SQL execution over file-backed schema state.
+//! Engine facade: `Connection` runs SQL against file-backed schemas.
 //!
-//! Purpose: own the database handle and implement the full statement lifecycle:
-//! parse (`sql/parser`) -> resolve against `catalog/schema` -> plan
-//! (`plan/planner`) -> execute (interpreter here + `vm` for compiled
-//! expressions) -> materialize owned `Result`s -> persist via `storage/*`.
-//! Responsibilities: DDL/DML/SELECT, transactions and savepoints, PRAGMAs,
-//! ATTACH/DETACH, VACUUM/ANALYZE, views/triggers/CTEs/compounds, constraints
-//! and foreign-key actions, and the Raw/Dynamic/Typed entry points which all
-//! converge on native AST/IR (never a DSL->SQL-string round trip).
-//!
-//! Dependencies: `storage/file` + `storage/sqlite_image` (persistence),
-//! `catalog/schema`, `sql/*`, `plan/*`, `vm/*`, `dsl/*`. Pure string-matching
-//! lives in `connection/pattern`; ordering bridges live in
-//! `connection/compare` (wiring in progress — see TODO).
-//!
-//! Ownership/lifetime (critical): the `Connection` owns the file handle, the
-//! main/temp/attached schemas, and transaction snapshots. `exec`/`query`
-//! return OWNED `Result`s (caller `deinit`s). `prepare` returns a `Statement`
-//! bound to this connection (finalize before close). `table`/`col` DSL handles
-//! borrow the connection. Cursors/pages borrowed during execution dangle after
-//! the statement completes. Close rolls back an open transaction, persists,
-//! and frees snapshots — never use the handle afterwards.
-//!
-//! Error behavior: structured `errors.Error` (syntax, schema, constraint,
-//! transaction, storage, corruption, I/O, Unsupported). Corrupt file bytes
-//! fail closed via `storage` validation; panics are reserved for caller bugs
-//! (use-after-close, out-of-range access), never for disk content.
-//!
-//! SQLite compatibility: file format, affinity, three-valued logic, FK
-//! actions, and transaction/savepoint semantics track SQLite; known deltas
-//! are documented at the owning helper with source-local TODOs.
-// TODO: Finish wiring connection execution through connection/pattern.zig and
-// connection/compare.zig so GLOB/REGEXP/MATCH and key-based row ordering have
-// one authoritative implementation. Current status: LIKE (like/likeWithEscape)
-// and ordering bridges (isNocase/compare/compareCollated/sameValue/rowsEqual)
-// already delegate to the new modules; GLOB/REGEXP/MATCH still call local
-// copies and compareRowsByKeys uses a local ResolvedSortKey while the module
-// exposes SortKey. Expected: unify the sort-key type and delegate the rest.
-// Required tests: GLOB/REGEXP/MATCH matrices through raw SQL and both DSLs
-// plus ORDER BY stability tests.
+//! Parses to AST, resolves against the catalog, plans, executes, and
+//! materializes owned `Result`s, persisting through the storage layer.
+//! Raw SQL, the dynamic DSL, and the typed DSL all run the same path.
+//! `exec` results are caller-owned; `close` rolls back open work,
+//! persists, and frees everything.
 const std = @import("std");
 const DatabaseFile = @import("../storage/file.zig").DatabaseFile;
 const image = @import("../storage/image.zig");
@@ -64,6 +30,8 @@ const keys = @import("../dsl/keys.zig");
 const planner = @import("../plan/planner.zig");
 const exprEvaluator = @import("../sql/expr.zig");
 const functions = @import("../sql/functions.zig");
+const limits = @import("../sql/limits.zig");
+const coerce = @import("../sql/coerce.zig");
 const patternLib = @import("pattern.zig");
 const compareBridge = @import("compare.zig");
 
@@ -1345,16 +1313,12 @@ pub const Connection = struct {
             .attach => |value| try self.attachCommand(value),
             .detach => |value| try self.detachCommand(value.schemaName),
             .vacuum => |value| try self.vacuumCommand(value.schemaName, value.into),
-            .analyze => |value| blk: {
-                const nested = self.inAtomicStatement;
-                if (!nested) try self.beginStatementAtomic();
-                self.analyzeDatabase(value.target) catch |err| {
-                    if (!nested) self.abortStatementAtomic();
-                    return err;
-                };
-                if (!nested) self.endStatementAtomic();
-                break :blk try emptyResult(self.allocator);
-            },
+            .analyze => |value| try self.analyzeTarget(value.target),
+            // Indexes carry no separate storage to rebuild, so reindexing
+            // refreshes the same statistics ANALYZE maintains (plus name
+            // validation): whole database, one table, one index, or one
+            // schema-qualified target.
+            .reindex => |value| try self.analyzeTarget(value.target),
         };
         if (isSchemaChange(statement)) self.bumpSchemaVersionFor(statement);
         switch (statement) {
@@ -2114,6 +2078,8 @@ pub const Connection = struct {
         if (self.transactionActive or self.inAtomicStatement or self.savepoints.items.len != 0) return error.TransactionActive;
         if (std.ascii.eqlIgnoreCase(value.schemaName, "main") or std.ascii.eqlIgnoreCase(value.schemaName, "temp")) return error.InvalidSql;
         if (value.schemaName.len == 0 or self.resolveSchema(value.schemaName) != null) return error.InvalidSql;
+        // At most 10 attached databases at once.
+        if (self.attached.items.len >= limits.max_attached) return error.SqlTooBig;
         const pathValue = try self.resolve(value.expr, &.{});
         const ownedPath = value.expr == .binary or value.expr == .unary or value.expr == .function or value.expr == .caseExpr;
         defer if (ownedPath) self.freeConcatText(pathValue);
@@ -2250,6 +2216,19 @@ pub const Connection = struct {
 
     fn analyzeScope(self: *Connection, tableName: ?[]const u8) !void {
         return self.analyzeScopeOn(&self.store, .main, tableName);
+    }
+
+    /// Shared ANALYZE/REINDEX execution: statement-atomic statistics refresh
+    /// for one target (or the whole database when null).
+    fn analyzeTarget(self: *Connection, target: ?[]const u8) !Result {
+        const nested = self.inAtomicStatement;
+        if (!nested) try self.beginStatementAtomic();
+        self.analyzeDatabase(target) catch |err| {
+            if (!nested) self.abortStatementAtomic();
+            return err;
+        };
+        if (!nested) self.endStatementAtomic();
+        return try emptyResult(self.allocator);
     }
 
     fn analyzeScopeOn(self: *Connection, store: *Schema, ref: SchemaRef, tableName: ?[]const u8) !void {
@@ -3297,226 +3276,36 @@ pub const Connection = struct {
         return compareBridge.rowsEqual(left, right);
     }
 
-    const RegexEngine = struct {
-        text: []const u8,
-        pattern: []const u8,
-
-        fn matchFull(text: []const u8, pattern: []const u8) bool {
-            var engine = RegexEngine{ .text = text, .pattern = pattern };
-            if (pattern.len != 0 and pattern[0] == '^') {
-                engine.pattern = pattern[1..];
-                return engine.matchAt(0, 0);
-            }
-            var start: usize = 0;
-            while (true) {
-                var attempt = engine;
-                attempt.text = text[start..];
-                if (attempt.matchAt(0, 0)) return true;
-                if (start >= text.len) return false;
-                start += 1;
-            }
-        }
-
-        fn matchAt(self: *RegexEngine, ti: usize, pi: usize) bool {
-            var t = ti;
-            var p = pi;
-            while (p < self.pattern.len) {
-                if (p + 1 < self.pattern.len and self.pattern[p + 1] == '?') {
-                    if (self.atomMatches(t, p)) {
-                        var copy = self.*;
-                        if (copy.matchAt(if (t < self.text.len) t + 1 else t, p + 2)) return true;
-                    }
-                    p += 2;
-                    continue;
-                }
-                if (p + 1 < self.pattern.len and (self.pattern[p + 1] == '*' or self.pattern[p + 1] == '+')) {
-                    const star = self.pattern[p + 1] == '*';
-                    var count: usize = 0;
-                    while (self.atomMatches(t, p)) {
-                        t += 1;
-                        count += 1;
-                        if (t > self.text.len) break;
-                    }
-                    var back = count;
-                    while (true) {
-                        var copy = self.*;
-                        if (copy.matchAt(t, p + 2)) return true;
-                        if (back == 0 or (back == count and !star and count == 0)) break;
-                        if (back == 0) break;
-                        if (t == 0) break;
-                        t -= 1;
-                        back -= 1;
-                        if (!star and back == 0) {
-                            var once = self.*;
-                            if (once.matchAt(t + 1, p + 2)) return true;
-                            break;
-                        }
-                    }
-                    return false;
-                }
-                if (p < self.pattern.len and self.pattern[p] == '$' and p + 1 == self.pattern.len) return t == self.text.len;
-                if (self.pattern[p] == '|') return false;
-                if (!self.atomMatches(t, p)) return false;
-                t += 1;
-                if (t > self.text.len) return false;
-                p = self.atomNext(p);
-            }
-            return true;
-        }
-
-        fn atomNext(self: *RegexEngine, p: usize) usize {
-            if (self.pattern[p] == '[') {
-                var i = p + 1;
-                if (i < self.pattern.len and self.pattern[i] == '^') i += 1;
-                if (i < self.pattern.len and self.pattern[i] == ']') i += 1;
-                while (i < self.pattern.len and self.pattern[i] != ']') : (i += 1) {}
-                return @min(i + 1, self.pattern.len);
-            }
-            if (self.pattern[p] == '\\' and p + 1 < self.pattern.len) return p + 2;
-            return p + 1;
-        }
-
-        fn atomMatches(self: *RegexEngine, t: usize, p: usize) bool {
-            if (p >= self.pattern.len) return false;
-            const c = self.pattern[p];
-            if (c == '$' and p + 1 == self.pattern.len) return t == self.text.len;
-            if (t >= self.text.len) return false;
-            const tc = self.text[t];
-            if (c == '.') return true;
-            if (c == '[') {
-                var i = p + 1;
-                var neg = false;
-                if (i < self.pattern.len and self.pattern[i] == '^') {
-                    neg = true;
-                    i += 1;
-                }
-                var hit = false;
-                while (i < self.pattern.len and self.pattern[i] != ']') {
-                    if (i + 2 < self.pattern.len and self.pattern[i + 1] == '-' and self.pattern[i + 2] != ']') {
-                        if (tc >= self.pattern[i] and tc <= self.pattern[i + 2]) hit = true;
-                        i += 3;
-                    } else {
-                        if (tc == self.pattern[i]) hit = true;
-                        i += 1;
-                    }
-                }
-                return if (neg) !hit else hit;
-            }
-            if (c == '\\' and p + 1 < self.pattern.len) {
-                const e = self.pattern[p + 1];
-                if (e == 'd') return tc >= '0' and tc <= '9';
-                if (e == 'w') return std.ascii.isAlphanumeric(tc) or tc == '_';
-                if (e == 's') return tc == ' ' or tc == '\t' or tc == '\n' or tc == '\r';
-                return tc == e;
-            }
-            return tc == c;
-        }
-    };
-
     fn regexpMatches(text: []const u8, pattern: []const u8) bool {
-        if (std.mem.indexOfScalar(u8, pattern, '|')) |bar| {
-            if (regexpMatches(text, pattern[0..bar])) return true;
-            return regexpMatches(text, pattern[bar + 1 ..]);
-        }
-        var depth: usize = 0;
-        var start: ?usize = null;
-        var pi: usize = 0;
-        while (pi < pattern.len) : (pi += 1) {
-            if (pattern[pi] == '(') {
-                if (depth == 0) start = pi;
-                depth += 1;
-            } else if (pattern[pi] == ')') {
-                if (depth > 0) {
-                    depth -= 1;
-                    if (depth == 0) {
-                        if (regexpMatches(text, pattern[start.? + 1 .. pi])) return true;
-                    }
-                }
-            }
-        }
-        return RegexEngine.matchFull(text, pattern);
+        return patternLib.regexp(text, pattern);
     }
 
     fn matchContains(haystack: []const u8, needle: []const u8) bool {
-        if (needle.len == 0) return true;
-        if (needle.len > haystack.len) return false;
-        var i: usize = 0;
-        while (i + needle.len <= haystack.len) : (i += 1) {
-            var ok = true;
-            for (needle, 0..) |b, j| {
-                if (std.ascii.toLower(haystack[i + j]) != std.ascii.toLower(b)) {
-                    ok = false;
-                    break;
-                }
-            }
-            if (ok) return true;
-        }
-        return false;
+        return patternLib.match(haystack, needle);
     }
 
     fn eval(self: *Connection, tbl: *const Table, row: []const Value, expr: ast.Expr, parameters: []const Value) !Value {
         return self.evalContext(tbl, row, expr, parameters, null);
     }
 
-    const Numeric = struct { isInt: bool, i: i64, r: f64 };
+    /// Integer-preserving numeric view; canonical implementation in
+    /// `sql/coerce.zig` (`toNumeric`, shared integer-preserving scan).
+    const Numeric = coerce.Numeric;
 
     fn numericValue(value: Value) ?Numeric {
-        return switch (value) {
-            .null => null,
-            .integer => |n| .{ .isInt = true, .i = n, .r = 0 },
-            .real => |n| .{ .isInt = false, .i = 0, .r = n },
-            .text => |bytes| parseNumericText(bytes),
-            .blob => |bytes| parseNumericText(bytes),
+        return switch (coerce.toNumeric(value)) {
+            .none => null,
+            .int => |n| .{ .int = n },
+            .real => |r| .{ .real = r },
         };
     }
 
-    fn parseNumericText(bytes: []const u8) Numeric {
-        var i: usize = 0;
-        while (i < bytes.len and isSpaceByte(bytes[i])) i += 1;
-        const numStart = i;
-        if (i < bytes.len and (bytes[i] == '+' or bytes[i] == '-')) i += 1;
-        const intStart = i;
-        while (i < bytes.len and bytes[i] >= '0' and bytes[i] <= '9') i += 1;
-        const hasIntDigits = i > intStart;
-        var isFloat = false;
-        if (i < bytes.len and bytes[i] == '.') {
-            var j = i + 1;
-            while (j < bytes.len and bytes[j] >= '0' and bytes[j] <= '9') j += 1;
-            if (j > i + 1) {
-                isFloat = true;
-                i = j;
-            }
-        }
-        if (i < bytes.len and (bytes[i] == 'e' or bytes[i] == 'E') and (hasIntDigits or isFloat)) {
-            var j = i + 1;
-            if (j < bytes.len and (bytes[j] == '+' or bytes[j] == '-')) j += 1;
-            const expStart = j;
-            while (j < bytes.len and bytes[j] >= '0' and bytes[j] <= '9') j += 1;
-            if (j > expStart) {
-                isFloat = true;
-                i = j;
-            }
-        }
-        if (!hasIntDigits and !isFloat) return .{ .isInt = false, .i = 0, .r = 0 };
-        const token = bytes[numStart..i];
-        if (!isFloat) {
-            if (std.fmt.parseInt(i64, token, 10)) |n| return .{ .isInt = true, .i = n, .r = 0 } else |_| {}
-            if (std.fmt.parseFloat(f64, token)) |n| return .{ .isInt = false, .i = 0, .r = n } else |_| {}
-            return .{ .isInt = false, .i = 0, .r = 0 };
-        }
-        if (std.fmt.parseFloat(f64, token)) |n| return .{ .isInt = false, .i = 0, .r = n } else |_| {}
-        return .{ .isInt = false, .i = 0, .r = 0 };
-    }
-
-    fn isSpaceByte(byte: u8) bool {
-        return byte == ' ' or byte == '\t' or byte == '\n' or byte == '\r' or byte == 0x0b or byte == 0x0c;
-    }
-
     fn intValue(value: Value) ?i64 {
-        const numeric = numericValue(value) orelse return null;
-        if (numeric.isInt) return numeric.i;
-        if (!std.math.isFinite(numeric.r)) return if (numeric.r > 0) std.math.maxInt(i64) else std.math.minInt(i64);
-        return @as(i64, @intFromFloat(numeric.r));
+        return switch (coerce.toNumeric(value)) {
+            .none => null,
+            .int => |n| n,
+            .real => |r| if (!std.math.isFinite(r)) (if (r > 0) std.math.maxInt(i64) else std.math.minInt(i64)) else @as(i64, @intFromFloat(r)),
+        };
     }
 
     fn isTruthy(value: Value) bool {
@@ -3524,12 +3313,7 @@ pub const Connection = struct {
     }
 
     fn realText(self: *Connection, number: f64) ![]u8 {
-        const rendered = try std.fmt.allocPrint(self.allocator, "{d}", .{number});
-        errdefer self.allocator.free(rendered);
-        for (rendered) |byte| if (byte == '.' or byte == 'e' or byte == 'E') return rendered;
-        const withDot = try std.fmt.allocPrint(self.allocator, "{s}.0", .{rendered});
-        self.allocator.free(rendered);
-        return withDot;
+        return try coerce.formatReal(self.allocator, number);
     }
 
     fn stringifyValue(self: *Connection, value: Value) !Value {
@@ -3632,21 +3416,13 @@ pub const Connection = struct {
             return .{ .integer = if (binary.op == .bitAnd) a & b else a | b };
         }
         if (binary.op == .shiftLeft or binary.op == .shiftRight) {
-            var amount = intValue(right).?;
+            const amount = intValue(right).?;
             const value = intValue(left).?;
-            var op = binary.op;
-            if (amount < 0) {
-                op = if (op == .shiftLeft) .shiftRight else .shiftLeft;
-                amount = if (amount > -64) -amount else 64;
-            }
-            if (amount >= 64) return .{ .integer = if (value >= 0 or op == .shiftLeft) 0 else -1 };
-            const bits = @as(u64, @bitCast(value));
-            if (op == .shiftLeft) return .{ .integer = @as(i64, @bitCast(bits << @as(u6, @intCast(amount)))) };
-            return .{ .integer = value >> @as(u6, @intCast(amount)) };
+            return .{ .integer = if (binary.op == .shiftLeft) coerce.shiftLeft(value, amount) else coerce.shiftRight(value, amount) };
         }
-        if (leftNum.isInt and rightNum.isInt) {
-            const a = leftNum.i;
-            const b = rightNum.i;
+        if (leftNum == .int and rightNum == .int) {
+            const a = leftNum.int;
+            const b = rightNum.int;
             switch (binary.op) {
                 .add => {
                     const sum = @addWithOverflow(a, b);
@@ -3676,8 +3452,16 @@ pub const Connection = struct {
                 else => return error.InvalidSql,
             }
         }
-        const a = if (leftNum.isInt) @as(f64, @floatFromInt(leftNum.i)) else leftNum.r;
-        const b = if (rightNum.isInt) @as(f64, @floatFromInt(rightNum.i)) else rightNum.r;
+        const a: f64 = switch (leftNum) {
+            .int => |n| @as(f64, @floatFromInt(n)),
+            .real => |r| r,
+            .none => unreachable,
+        };
+        const b: f64 = switch (rightNum) {
+            .int => |n| @as(f64, @floatFromInt(n)),
+            .real => |r| r,
+            .none => unreachable,
+        };
         switch (binary.op) {
             .add => return .{ .real = a + b },
             .subtract => return .{ .real = a - b },
@@ -3707,6 +3491,15 @@ pub const Connection = struct {
     }
 
     fn evalPattern(self: *Connection, current: Value, pattern: Value, escape: ?Value, glob: bool) !?bool {
+        // Overlong LIKE/GLOB patterns fail fast. Check the borrowed payload
+        // first so a
+        // hostile pattern fails before any duplication work.
+        const rawPatternLen: ?usize = switch (pattern) {
+            .text => |bytes| bytes.len,
+            .blob => |bytes| bytes.len,
+            else => null,
+        };
+        if (rawPatternLen) |n| if (n > limits.max_like_pattern_length) return error.SqlTooBig;
         const currentText = try self.likeOperand(current);
         errdefer self.freeConcatText(currentText);
         const patternText = try self.likeOperand(pattern);
@@ -3865,13 +3658,22 @@ pub const Connection = struct {
                 break :blk switch (unary.op) {
                     .negate => blkNeg: {
                         const numeric = numericValue(operand).?;
-                        if (!numeric.isInt) break :blkNeg Value{ .real = -numeric.r };
-                        if (numeric.i == std.math.minInt(i64)) break :blkNeg Value{ .real = 9223372036854775808.0 };
-                        break :blkNeg Value{ .integer = -numeric.i };
+                        switch (numeric) {
+                            .int => |n| {
+                                if (n == std.math.minInt(i64)) break :blkNeg Value{ .real = 9223372036854775808.0 };
+                                break :blkNeg Value{ .integer = -n };
+                            },
+                            .real => |r| break :blkNeg Value{ .real = -r },
+                            .none => unreachable,
+                        }
                     },
                     .positive => blkPos: {
                         const numeric = numericValue(operand).?;
-                        break :blkPos if (numeric.isInt) Value{ .integer = numeric.i } else Value{ .real = numeric.r };
+                        break :blkPos switch (numeric) {
+                            .int => |n| Value{ .integer = n },
+                            .real => |r| Value{ .real = r },
+                            .none => unreachable,
+                        };
                     },
                     .bitNot => .{ .integer = ~intValue(operand).? },
                     .logicalNot => .{ .integer = if (isTruthy(operand)) 0 else 1 },
@@ -4015,29 +3817,7 @@ pub const Connection = struct {
     }
 
     fn globMatch(text: []const u8, pattern: []const u8) bool {
-        if (pattern.len == 0) return text.len == 0;
-        if (pattern[0] == '*') return globMatch(text, pattern[1..]) or (text.len != 0 and globMatch(text[1..], pattern));
-        if (text.len == 0) return false;
-        if (pattern[0] == '?') return globMatch(text[1..], pattern[1..]);
-        if (pattern[0] == '[') {
-            var i: usize = 1;
-            var matched = false;
-            var negated = false;
-            if (i < pattern.len and (pattern[i] == '^' or pattern[i] == '!')) {
-                negated = true;
-                i += 1;
-            }
-            while (i < pattern.len and pattern[i] != ']') : (i += 1) {
-                if (i + 2 < pattern.len and pattern[i + 1] == '-' and pattern[i + 2] != ']') {
-                    if (text[0] >= pattern[i] and text[0] <= pattern[i + 2]) matched = true;
-                    i += 2;
-                } else if (text[0] == pattern[i]) matched = true;
-            }
-            if (i >= pattern.len) return text[0] == '[' and globMatch(text[1..], pattern[1..]);
-            if (negated) matched = !matched;
-            return matched and globMatch(text[1..], pattern[i + 1 ..]);
-        }
-        return text[0] == pattern[0] and globMatch(text[1..], pattern[1..]);
+        return patternLib.glob(text, pattern);
     }
 
     fn materialize(self: *Connection, tbl: *const Table, row: []const Value, expr: ast.Expr, parameters: []const Value) !Value {
@@ -4395,7 +4175,8 @@ pub const Connection = struct {
                         break :blk try self.copyValue(group.key);
                     },
                     .function => |function| blk: {
-                        if (functions.aggregate.AggKind.fromName(function.name)) |kind| {
+                        if (functions.classify(function.name, functions.argCount(function)) == .aggregate) {
+                            const kind = functions.aggregate.AggKind.fromName(function.name).?;
                             var sep: ?[]const u8 = null;
                             if (function.argument2) |a2| {
                                 const sVal = try self.resolve(a2.*, parameters);
@@ -4433,7 +4214,8 @@ pub const Connection = struct {
                     output[outputIndex] = try self.copyValue(group.key);
                 },
                 .function => |function| {
-                    if (functions.aggregate.AggKind.fromName(function.name)) |kind| {
+                    if (functions.classify(function.name, functions.argCount(function)) == .aggregate) {
+                        const kind = functions.aggregate.AggKind.fromName(function.name).?;
                         var sep: ?[]const u8 = null;
                         if (function.argument2) |a2| {
                             const sVal = try self.resolve(a2.*, parameters);
@@ -4802,7 +4584,7 @@ pub const Connection = struct {
             if (value.groupBy) |groupName| return try self.selectGrouped(tbl, value, groupName, parameters);
             var anyAgg = false;
             for (value.projections) |p| {
-                if (p.expr == .function and functions.aggregate.AggKind.fromName(p.expr.function.name) != null) {
+                if (p.expr == .function and functions.classify(p.expr.function.name, functions.argCount(p.expr.function)) == .aggregate) {
                     anyAgg = true;
                     break;
                 }
@@ -4812,7 +4594,8 @@ pub const Connection = struct {
                 defer self.allocator.free(aggStates);
                 for (value.projections, 0..) |p, i| {
                     if (p.expr == .function) {
-                        if (functions.aggregate.AggKind.fromName(p.expr.function.name)) |kind| {
+                        if (functions.classify(p.expr.function.name, functions.argCount(p.expr.function)) == .aggregate) {
+                            const kind = functions.aggregate.AggKind.fromName(p.expr.function.name).?;
                             var sep: ?[]const u8 = null;
                             if (p.expr.function.argument2) |a2| {
                                 const sVal = try self.resolve(a2.*, parameters);
@@ -4853,7 +4636,8 @@ pub const Connection = struct {
                 if (value.having) |having| {
                     const leftValue: Value = switch (having.left) {
                         .function => |function| blk: {
-                            if (functions.aggregate.AggKind.fromName(function.name)) |kind| {
+                            if (functions.classify(function.name, functions.argCount(function)) == .aggregate) {
+                                const kind = functions.aggregate.AggKind.fromName(function.name).?;
                                 var sep: ?[]const u8 = null;
                                 if (function.argument2) |a2| {
                                     const sVal = try self.resolve(a2.*, parameters);
@@ -5105,14 +4889,25 @@ pub const Connection = struct {
         var indexedColumn: ?usize = null;
         var lookup: Value = .null;
         if (condition) |conditions| if (conditions.len == 1 and conditions[0].op == .equal) {
-            for (self.store.indexes.items) |index| if (index.columns.len == 1 and std.ascii.eqlIgnoreCase(index.table, tbl.name) and std.ascii.eqlIgnoreCase(index.columns[0], conditions[0].column)) {
-                if (index.whereExpr) |predicate| {
-                    if (!exprEvaluator.partialPredicateImpliedBy(predicate, conditions)) continue;
-                }
-                indexedColumn = try columnIndex(tbl, index.columns[0]);
-                lookup = self.resolve(conditions[0].value, parameters) catch .null;
-                break;
+            // The lookup value must resolve without a row (literals,
+            // parameters, pure computed constants). Column references and
+            // subqueries cannot — falling back to the full scan below, where
+            // the complete predicate still filters every row. Resolving
+            // blindly to NULL here would wrongly return no rows.
+            const look = self.resolve(conditions[0].value, parameters) catch |err| blk: {
+                if (err == error.OutOfMemory) return err;
+                break :blk null;
             };
+            if (look) |lookupVal| {
+                for (self.store.indexes.items) |index| if (index.columns.len == 1 and std.ascii.eqlIgnoreCase(index.table, tbl.name) and std.ascii.eqlIgnoreCase(index.columns[0], conditions[0].column)) {
+                    if (index.whereExpr) |predicate| {
+                        if (!exprEvaluator.partialPredicateImpliedBy(predicate, conditions)) continue;
+                    }
+                    indexedColumn = try columnIndex(tbl, index.columns[0]);
+                    lookup = lookupVal;
+                    break;
+                };
+            }
         };
         var indices = std.ArrayList(usize).empty;
         defer indices.deinit(self.allocator);
@@ -5287,19 +5082,14 @@ pub const Connection = struct {
         rows.deinit(self.allocator);
     }
 
-    const ResolvedSortKey = struct { colIdx: usize, descending: bool };
+    const ResolvedSortKey = compareBridge.SortKey;
 
     fn isRowidAlias(name: []const u8) bool {
         return std.ascii.eqlIgnoreCase(name, "rowid") or std.ascii.eqlIgnoreCase(name, "_rowid_") or std.ascii.eqlIgnoreCase(name, "oid");
     }
 
     fn compareRowsByKeys(a: []const Value, b: []const Value, sortKeys: []const ResolvedSortKey) std.math.Order {
-        for (sortKeys) |key| {
-            const ord = a[key.colIdx].order(b[key.colIdx], .binary);
-            if (ord == .eq) continue;
-            return if (key.descending) ord.invert() else ord;
-        }
-        return .eq;
+        return compareBridge.compareRowsByKeys(a, b, sortKeys);
     }
 
     fn resolveSortOutputIndex(columns: []const []const u8, projections: ?[]const ast.Projection, orderColumn: []const u8) ?usize {
@@ -5645,7 +5435,7 @@ pub const Connection = struct {
         }
         var anyAgg = false;
         for (value.projections) |projection| {
-            if (projection.expr == .function and functions.aggregate.AggKind.fromName(projection.expr.function.name) != null) {
+            if (projection.expr == .function and functions.classify(projection.expr.function.name, functions.argCount(projection.expr.function)) == .aggregate) {
                 anyAgg = true;
                 break;
             }
@@ -5812,7 +5602,8 @@ pub const Connection = struct {
         defer self.allocator.free(aggStates);
         for (value.projections, 0..) |projection, index| {
             if (projection.expr == .function) {
-                if (functions.aggregate.AggKind.fromName(projection.expr.function.name)) |kind| {
+                if (functions.classify(projection.expr.function.name, functions.argCount(projection.expr.function)) == .aggregate) {
+                    const kind = functions.aggregate.AggKind.fromName(projection.expr.function.name).?;
                     var sep: ?[]const u8 = null;
                     if (projection.expr.function.argument2) |a2| {
                         const sVal = try self.resolve(a2.*, parameters);
@@ -5933,7 +5724,8 @@ pub const Connection = struct {
                         break :blk try self.copyValue(group.key);
                     },
                     .function => |function| blk: {
-                        if (functions.aggregate.AggKind.fromName(function.name)) |kind| {
+                        if (functions.classify(function.name, functions.argCount(function)) == .aggregate) {
+                            const kind = functions.aggregate.AggKind.fromName(function.name).?;
                             var sep: ?[]const u8 = null;
                             if (function.argument2) |a2| {
                                 const sVal = try self.resolve(a2.*, parameters);
@@ -5977,7 +5769,8 @@ pub const Connection = struct {
                         output[outputIndex] = try self.copyValue(group.key);
                     },
                     .function => |function| {
-                        if (functions.aggregate.AggKind.fromName(function.name)) |kind| {
+                        if (functions.classify(function.name, functions.argCount(function)) == .aggregate) {
+                            const kind = functions.aggregate.AggKind.fromName(function.name).?;
                             var sep: ?[]const u8 = null;
                             if (function.argument2) |a2| {
                                 const sVal = try self.resolve(a2.*, parameters);
@@ -8864,7 +8657,10 @@ test "expression operators follow SQLite semantics" {
     try std.testing.expectEqual(@as(i64, 3), arith.rows[0][2].integer);
     try std.testing.expectEqual(@as(f64, 3.5), arith.rows[0][3].real);
     try std.testing.expectEqual(@as(i64, 1), arith.rows[0][4].integer);
-    try std.testing.expectEqual(@as(i64, 6), arith.rows[0][5].integer);
+    // `||` binds tighter than `*`: 2 * (3 || 'x') = 2 * '3x'. '3x' is only
+    // prefix-numeric, so the integer fast path does not apply and the
+    // product is REAL 6.0, exactly as SQLite reports it.
+    try std.testing.expectEqual(@as(f64, 6.0), arith.rows[0][5].real);
 
     var divZero = try db.exec("SELECT 1 / 0, 7 % 0, 1.0 / 0.0, NULL + 1, '6' * '7', 'abc' + 1 FROM exprs LIMIT 1;");
     defer divZero.deinit();
@@ -12143,6 +11939,35 @@ test "analyze supports table, index, and schema targets" {
     try std.testing.expectEqual(@as(i64, 3), intact.rows[0][0].integer);
 }
 
+test "reindex refreshes table index and database statistics" {
+    const path = "sqlite_zig_reindex_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    var setup = try db.exec("CREATE TABLE r (id INTEGER, code TEXT); CREATE INDEX r_id_idx ON r (id); CREATE INDEX r_code_idx ON r (code); INSERT INTO r VALUES (1, 'a'), (2, 'b');");
+    setup.deinit();
+    // Whole database, then single table, single index, and schema target.
+    var all = try db.exec("REINDEX;");
+    all.deinit();
+    var tableStat = try db.exec("SELECT stat FROM sqlite_stat1 WHERE tbl = 'r' AND idx IS NULL;");
+    defer tableStat.deinit();
+    try std.testing.expectEqualStrings("2", tableStat.rows[0][0].text);
+    var grown = try db.exec("INSERT INTO r VALUES (3, 'c');");
+    grown.deinit();
+    var oneTable = try db.exec("REINDEX r;");
+    oneTable.deinit();
+    var refreshed = try db.exec("SELECT stat FROM sqlite_stat1 WHERE tbl = 'r' AND idx IS NULL;");
+    defer refreshed.deinit();
+    try std.testing.expectEqualStrings("3", refreshed.rows[0][0].text);
+    var oneIndex = try db.exec("REINDEX r_code_idx;");
+    oneIndex.deinit();
+    var idxStat = try db.exec("SELECT stat FROM sqlite_stat1 WHERE idx = 'r_code_idx';");
+    defer idxStat.deinit();
+    try std.testing.expectEqualStrings("3 1", idxStat.rows[0][0].text);
+    var scoped = try db.exec("REINDEX main;");
+    scoped.deinit();
+    try std.testing.expectError(error.UnknownTable, db.exec("REINDEX nope;"));
+}
+
 test "analyze refreshes stale statistics" {
     const path = "sqlite_zig_analyze_stale_test.db";
     var db = try freshDb(path);
@@ -14025,7 +13850,7 @@ test "integer and real edge cases match sqlite" {
     try std.testing.expectEqual(@as(i64, 0), bounds.rows[2][0].integer);
     try std.testing.expectEqual(@as(i64, 1), bounds.rows[3][0].integer);
     try std.testing.expectEqual(@as(i64, std.math.maxInt(i64)), bounds.rows[4][0].integer);
-    // Overflow promotes to REAL, exactly like the reference implementation.
+    // Overflow promotes to REAL instead of trapping.
     var overflow = try db.exec("SELECT 9223372036854775807 + 1, -9223372036854775808 - 1, 3037000500 * 3037000500;");
     defer overflow.deinit();
     try std.testing.expectEqual(@as(f64, 9223372036854775808.0), overflow.rows[0][0].real);
@@ -14225,4 +14050,102 @@ test "dsl-looking column names stay usable end to end" {
     var remaining = try db.exec("SELECT count(*) FROM cf_weird;");
     defer remaining.deinit();
     try std.testing.expectEqual(@as(i64, 1), remaining.rows[0][0].integer);
+}
+
+test "attach enforces the attached-database budget" {
+    // At most 10 attachments: the 11th ATTACH fails SqlTooBig.
+    const path = "sqlite_zig_attach_budget_main_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    var names: [11][]u8 = undefined;
+    for (0..11) |i| names[i] = try std.fmt.allocPrint(std.testing.allocator, "sqlite_zig_attach_budget_{d}_test.db", .{i});
+    defer {
+        for (names) |name| {
+            std.Io.Dir.cwd().deleteFile(std.testing.io, name) catch {};
+            std.testing.allocator.free(name);
+        }
+    }
+    var i: usize = 0;
+    while (i < 10) : (i += 1) {
+        const sql = try std.fmt.allocPrint(std.testing.allocator, "ATTACH '{s}' AS aux{d};", .{ names[i], i });
+        defer std.testing.allocator.free(sql);
+        var attached = try db.exec(sql);
+        attached.deinit();
+    }
+    try std.testing.expectEqual(@as(usize, 10), db.attached.items.len);
+    const over = try std.fmt.allocPrint(std.testing.allocator, "ATTACH '{s}' AS aux10;", .{names[10]});
+    defer std.testing.allocator.free(over);
+    try std.testing.expectError(error.SqlTooBig, db.exec(over));
+    try std.testing.expectEqual(@as(usize, 10), db.attached.items.len);
+}
+
+test "like and glob enforce the pattern-length budget" {
+    // Patterns over 50000 bytes fail with SqlTooBig before any matching work.
+    const path = "sqlite_zig_like_budget_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    const over = try std.testing.allocator.alloc(u8, limits.max_like_pattern_length + 1);
+    defer std.testing.allocator.free(over);
+    @memset(over, 'a');
+    const over_sql = try std.fmt.allocPrint(std.testing.allocator, "SELECT 'x' LIKE '{s}';", .{over});
+    defer std.testing.allocator.free(over_sql);
+    try std.testing.expectError(error.SqlTooBig, db.exec(over_sql));
+    const over_glob = try std.fmt.allocPrint(std.testing.allocator, "SELECT 'x' GLOB '{s}';", .{over});
+    defer std.testing.allocator.free(over_glob);
+    try std.testing.expectError(error.SqlTooBig, db.exec(over_glob));
+    // Boundary length is accepted (empty text mismatches fast, no deep work).
+    const edge = try std.testing.allocator.alloc(u8, limits.max_like_pattern_length);
+    defer std.testing.allocator.free(edge);
+    @memset(edge, 'a');
+    const edge_sql = try std.fmt.allocPrint(std.testing.allocator, "SELECT '' LIKE '{s}';", .{edge});
+    defer std.testing.allocator.free(edge_sql);
+    var matched = try db.exec(edge_sql);
+    defer matched.deinit();
+    try std.testing.expectEqual(@as(usize, 1), matched.count());
+}
+
+test "multi-argument min and max evaluate scalar in aggregate context" {
+    // Routing regression: 2+ args must take the row-wise scalar path even
+    // with FROM present (the aggregate branch would silently keep only the
+    // first argument and collapse to one row).
+    const path = "sqlite_zig_scalar_minmax_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    var setup = try db.exec("CREATE TABLE m (a INTEGER, b INTEGER); INSERT INTO m VALUES (3, 1), (10, 20);");
+    setup.deinit();
+    // Scalar per row: two rows out, minimums and maximums across arguments.
+    var rows = try db.exec("SELECT min(a, b), max(a, b) FROM m WHERE a = 3;");
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(usize, 1), rows.count());
+    try std.testing.expectEqual(@as(i64, 1), rows.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 3), rows.rows[0][1].integer);
+    var both = try db.exec("SELECT min(a, b) FROM m;");
+    defer both.deinit();
+    try std.testing.expectEqual(@as(usize, 2), both.count());
+    // Single-arg forms still aggregate to one row.
+    var agg = try db.exec("SELECT min(a), max(b) FROM m;");
+    defer agg.deinit();
+    try std.testing.expectEqual(@as(usize, 1), agg.count());
+    try std.testing.expectEqual(@as(i64, 3), agg.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 20), agg.rows[0][1].integer);
+    // NULL poisons scalar forms.
+    var nul = try db.exec("SELECT min(1, NULL), max(NULL, 2);");
+    defer nul.deinit();
+    try std.testing.expect(nul.rows[0][0] == .null);
+    try std.testing.expect(nul.rows[0][1] == .null);
+}
+
+test "single-condition column equality scans instead of seeking null" {
+    // Regression: the lookup value must resolve without a row. Resolving a
+    // column reference row-less used to yield NULL and return no rows; now
+    // the engine falls back to a full scan with full predicate filtering.
+    var db = try freshDb("sqlite_zig_column_eq_test.db");
+    defer dropDb(db, "sqlite_zig_column_eq_test.db");
+    var setup = try db.exec("CREATE TABLE t (x INTEGER, y INTEGER); CREATE INDEX t_x ON t(x); INSERT INTO t VALUES (1, 1), (2, 3), (4, 4);");
+    setup.deinit();
+    var rows = try db.exec("SELECT x, y FROM t WHERE x = y ORDER BY x;");
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(usize, 2), rows.count());
+    try std.testing.expectEqual(@as(i64, 1), rows.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 4), rows.rows[1][0].integer);
 }

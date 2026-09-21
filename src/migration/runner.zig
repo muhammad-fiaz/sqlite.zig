@@ -1,49 +1,7 @@
-//! Migration runner: ordered, checksummed, transactional schema evolution.
+//! Applies versioned migrations in order.
 //!
-//! Purpose: apply a borrowed `Migration` slice to a live `Connection`,
-//! tracking progress in the `_zig_migrations(version, name, checksum)` history
-//! table. Guarantees: versions apply once in ascending order, gaps and
-//! post-apply edits fail loudly, each non-VACUUM migration commits atomically,
-//! and legacy history rows (name/checksum missing) are backfilled.
-//!
-//! Responsibilities: history-table creation/upgrade, applied-row loading,
-//! version sorting + duplicate/gap/edit detection, single-migration apply with
-//! savepoint discipline, and single-step rollback via `downSql`.
-//!
-//! Dependencies: `migration/migration.zig` (`Migration`), and
-//! `connection/connection.zig` (`Connection.exec`, `beginImmediate`,
-//! `commit`, `rollback`). Uses `std.testing`-visible file DBs in tests only.
-//!
-//! Ownership/lifetime: `Runner` borrows the caller's allocator and the
-//! caller's migration slice (strings inside stay caller-owned, usually string
-//! literals). `init` copies nothing. `apply`/`rollback` allocate transient
-//! sorted copies, `Applied` name dupes, and checksum/record SQL, freeing all
-//! of it before returning. The `Connection` must outlive the runner call and
-//! must not be closed mid-apply. History rows are engine-owned once written.
-//!
-//! Error behavior: `DuplicateMigration` (two defs share a version),
-//! `MissingMigration` (applied row without a def, gap above the history peak,
-//! or reordered set skipping an unapplied version below the peak),
-//! `ModifiedMigration` (name/checksum drift on an applied version),
-//! `NoMigrationsApplied` / `NoDownMigration` on empty/missing rollback,
-//! plus engine errors (`InvalidSql`, I/O, constraint violations). A failed
-//! non-VACUUM migration rolls back its own transaction (when the runner began
-//! it) and leaves prior history intact; a failed VACUUM body writes no history
-//! row. When the caller already holds a transaction, the runner joins it and
-//! never commits/rolls back the outer scope.
-//!
-//! SQLite compatibility: `_zig_migrations` uses plain DDL/DML understood by
-//! any SQLite. VACUUM migrations must be self-contained single statements and
-//! run outside a transaction (the engine rejects VACUUM inside BEGIN..COMMIT),
-//! so the runner executes them without wrapping and records history separately.
-//!
-//! Unified pipeline note: migrations execute raw SQL scripts through the
-//! native engine, like every other pipeline — there is no DSL->SQL-string
-//! round trip here.
-//!
-//! Safety note: history INSERT/UPDATE statements interpolate the migration
-//! `name` and hex checksum. Names are caller-controlled; see `escapeLiteral`
-//! and the TODO on moving to bound parameters.
+//! Borrows the migration slice; history rows become engine-owned.
+//! Gaps, duplicates, or edits fail; each migration commits atomically.
 
 const std = @import("std");
 const Migration = @import("migration.zig").Migration;
@@ -169,26 +127,36 @@ pub const Runner = struct {
         return std.fmt.allocPrint(self.allocator, "{x}", .{sum});
     }
 
-    /// Escape a borrowed literal for `'…'` interpolation (single-quote doubling).
-    /// Returned slice is owned; caller must free. Checksum/version need no
-    /// escaping (hex/integer), but migration names are caller-controlled.
-    fn escapeLiteral(self: Runner, raw: []const u8) ![]u8 {
-        var count: usize = 0;
-        for (raw) |b| {
-            if (b == '\'') count += 1;
-        }
-        if (count == 0) return self.allocator.dupe(u8, raw);
-        const out = try self.allocator.alloc(u8, raw.len + count);
-        var w: usize = 0;
-        for (raw) |b| {
-            out[w] = b;
-            w += 1;
-            if (b == '\'') {
-                out[w] = '\'';
-                w += 1;
-            }
-        }
-        return out;
+    /// Record one applied migration via bound parameters (names never touch
+    /// SQL text, so quoting is a non-issue). Caller owns transaction scope.
+    fn recordApplied(self: Runner, connection: *Connection, version: u32, name: []const u8, sumHex: []const u8) !void {
+        _ = self;
+        var stmt = try connection.prepare("INSERT INTO _zig_migrations (version, name, checksum) VALUES (?, ?, ?);");
+        defer stmt.finalize();
+        try stmt.bind(1, version);
+        try stmt.bind(2, name);
+        try stmt.bind(3, sumHex);
+        try stmt.step();
+    }
+
+    /// Backfill a legacy history row (pre-checksum era) via bound parameters.
+    fn backfillApplied(self: Runner, connection: *Connection, version: u32, name: []const u8, sumHex: []const u8) !void {
+        _ = self;
+        var stmt = try connection.prepare("UPDATE _zig_migrations SET name = ?, checksum = ? WHERE version = ?;");
+        defer stmt.finalize();
+        try stmt.bind(1, name);
+        try stmt.bind(2, sumHex);
+        try stmt.bind(3, version);
+        try stmt.step();
+    }
+
+    /// Delete one history row via a bound version (rollback path).
+    fn deleteApplied(self: Runner, connection: *Connection, version: u32) !void {
+        _ = self;
+        var stmt = try connection.prepare("DELETE FROM _zig_migrations WHERE version = ?;");
+        defer stmt.finalize();
+        try stmt.bind(1, version);
+        try stmt.step();
     }
 
     /// True when the script's first real keyword is VACUUM (comments and
@@ -217,14 +185,7 @@ pub const Runner = struct {
         return false;
     }
 
-    /// Apply one def plus its history row. Non-VACUUM bodies run in the
-    /// caller's transaction when one is active, else in a fresh
-    /// BEGIN IMMEDIATE..COMMIT that rolls back on any failure. VACUUM bodies
-    /// run unwrapped and must be a single self-contained statement.
-    /// TODO: route history INSERT/UPDATE through bound parameters instead of
-    /// escaped literals once Connection exposes a parameterized exec path to
-    /// this layer; escaping is correct but parameter binding would remove the
-    /// class entirely.
+    /// Applies one migration plus its history row; VACUUM runs unwrapped.
     fn applyOne(self: Runner, connection: *Connection, m: Migration) !void {
         const sum = m.checksum();
         const sumText = try self.checksumText(sum);
@@ -255,16 +216,7 @@ pub const Runner = struct {
             if (count != 1) return error.InvalidSql;
             var body = try connection.exec(m.upSql);
             body.deinit();
-            const safeName = try self.escapeLiteral(m.name);
-            defer self.allocator.free(safeName);
-            const record = try std.fmt.allocPrint(
-                self.allocator,
-                "INSERT INTO _zig_migrations (version, name, checksum) VALUES ({d}, '{s}', '{s}');",
-                .{ m.version, safeName, sumText },
-            );
-            defer self.allocator.free(record);
-            var recorded = try connection.exec(record);
-            recorded.deinit();
+            try self.recordApplied(connection, m.version, m.name, sumText);
             return;
         }
         const wasActive = connection.transactionActive;
@@ -275,24 +227,12 @@ pub const Runner = struct {
         var body = try connection.exec(m.upSql);
         body.deinit();
         // History advances only after the body succeeded.
-        const safeName = try self.escapeLiteral(m.name);
-        defer self.allocator.free(safeName);
-        const record = try std.fmt.allocPrint(
-            self.allocator,
-            "INSERT INTO _zig_migrations (version, name, checksum) VALUES ({d}, '{s}', '{s}');",
-            .{ m.version, safeName, sumText },
-        );
-        defer self.allocator.free(record);
-        var recorded = try connection.exec(record);
-        recorded.deinit();
+        try self.recordApplied(connection, m.version, m.name, sumText);
         if (!wasActive) try connection.commit();
     }
 
-    /// Apply all pending migrations in ascending version order. Returns the
-    /// highest applied version (0 when the set is empty). Validates every
-    /// applied row against the supplied defs first, backfilling legacy rows.
-    /// Each migration commits atomically (unless the caller holds the
-    /// transaction, in which case the caller owns commit/rollback).
+    /// Apply all pending migrations in order; returns the highest version.
+    /// Validates history first and backfills legacy rows.
     pub fn apply(self: Runner, connection: *Connection) !u32 {
         try ensureHistoryTable(connection);
         const sorted = try self.sortedMigrations();
@@ -313,16 +253,7 @@ pub const Runner = struct {
                 if (a.name.len != 0 and !std.mem.eql(u8, a.name, def.name)) return error.ModifiedMigration;
                 const sumText = try self.checksumText(def.checksum());
                 defer self.allocator.free(sumText);
-                const safeName = try self.escapeLiteral(def.name);
-                defer self.allocator.free(safeName);
-                const backfill = try std.fmt.allocPrint(
-                    self.allocator,
-                    "UPDATE _zig_migrations SET name = '{s}', checksum = '{s}' WHERE version = {d};",
-                    .{ safeName, sumText, def.version },
-                );
-                defer self.allocator.free(backfill);
-                var done = try connection.exec(backfill);
-                done.deinit();
+                try self.backfillApplied(connection, def.version, def.name, sumText);
             }
         }
 
@@ -382,14 +313,7 @@ pub const Runner = struct {
         }
         var body = try connection.exec(def.downSql);
         body.deinit();
-        const remove = try std.fmt.allocPrint(
-            self.allocator,
-            "DELETE FROM _zig_migrations WHERE version = {d};",
-            .{def.version},
-        );
-        defer self.allocator.free(remove);
-        var removed = try connection.exec(remove);
-        removed.deinit();
+        try self.deleteApplied(connection, def.version);
         if (!wasActive) try connection.commit();
         return def.version;
     }

@@ -36,6 +36,9 @@ Error values returned by the sqlite.zig engine. The full set lives in
 | `TriggerDepthExceeded` | Triggers nested too deep |
 | `NoRows` | Query returned no rows where exactly one was required |
 | `TooManyRows` | Query returned more than one row where exactly one was required |
+| `SqlTooBig` | Input exceeds a resource budget (SQL length, columns, arguments, patterns, attachments) |
+| `AlreadyFreed` | Page freed twice without reallocation in between |
+| `TooDeep` | Expression or JSON document nested past its depth budget |
 | `InvalidHeader` | Database file header is invalid |
 | `InvalidPageSize` | Database page size is invalid |
 | `InvalidRecord` | Database record encoding is invalid |

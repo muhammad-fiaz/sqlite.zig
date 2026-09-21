@@ -1,14 +1,7 @@
-//! Shared engine error set plus stable human-readable messages.
+//! Engine error set plus stable display strings.
 //!
-//! Purpose: single vocabulary for every recoverable failure (corrupt files,
-//! bad SQL, missing objects, constraint and transaction misuse) and a
-//! `message` mapping for CLI/API surfaces. Responsibilities: error
-//! definitions and display strings only — raising is owned by each
-//! subsystem. Dependencies: `std` (tests only). Ownership: none (pure
-//! values/static strings; returned slices are literals with no lifetime).
-//! Error behavior: this module never fails. Invariants: every `Error`
-//! variant has a non-empty, stable message covered by the exhaustive test
-//! below (do not rename messages without updating clients).
+//! One vocabulary for every recoverable failure; `message` maps each to
+//! text clients can snapshot. Never fails; messages are literals.
 
 const std = @import("std");
 
@@ -19,9 +12,11 @@ const std = @import("std");
 /// `UnexpectedToken`, unknown/ambiguous names), DDL conflicts
 /// (`TableExists` et al.), DML problems (`ColumnCountMismatch`,
 /// `ConstraintViolation`, `SchemaMismatch`), transaction misuse
-/// (`NotInTransaction`, `TransactionActive`), runtime limits
-/// (`IntegerOverflow`, `Unsupported`, `TriggerDepthExceeded`), and result
-/// arity (`NoRows`, `TooManyRows` for single-row queries).
+/// (`NotInTransaction`, `TransactionActive`), runtime limits (`SqlTooBig`
+/// for any `sql/limits.zig` budget, `IntegerOverflow`, `Unsupported`,
+/// `TriggerDepthExceeded`), pager misuse (`AlreadyFreed` on double free),
+/// depth overuse (`TooDeep` on expressions or JSON past nesting budgets),
+/// and result arity (`NoRows`, `TooManyRows` for single-row queries).
 pub const Error = error{
     InvalidHeader,
     InvalidPageSize,
@@ -50,6 +45,9 @@ pub const Error = error{
     TriggerDepthExceeded,
     NoRows,
     TooManyRows,
+    SqlTooBig,
+    AlreadyFreed,
+    TooDeep,
 };
 
 /// Maps an error to its stable display string (static literal, no lifetime).
@@ -85,6 +83,9 @@ pub fn message(err: Error) []const u8 {
         error.TriggerDepthExceeded => "triggers nested too deep",
         error.NoRows => "query returned no rows",
         error.TooManyRows => "query returned more than one row",
+        error.SqlTooBig => "SQL statement exceeds resource limits",
+        error.AlreadyFreed => "page already freed",
+        error.TooDeep => "expression too deeply nested",
     };
 }
 
@@ -121,9 +122,12 @@ test "every error has a distinct non-empty message" {
         error.TriggerDepthExceeded,
         error.NoRows,
         error.TooManyRows,
+        error.SqlTooBig,
+        error.AlreadyFreed,
+        error.TooDeep,
     };
-    // Exhaustive: the test must grow with the error set (27 variants).
-    try std.testing.expectEqual(@as(usize, 27), cases.len);
+    // Exhaustive: the test must grow with the error set (30 variants).
+    try std.testing.expectEqual(@as(usize, 30), cases.len);
     for (cases, 0..) |err, i| {
         const text = message(err);
         try std.testing.expect(text.len > 0);

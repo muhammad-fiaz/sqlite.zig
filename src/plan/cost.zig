@@ -1,28 +1,7 @@
-//! Query-plan cost model: unitless estimates comparing access paths.
+//! Heuristic costs for comparing query plans.
 //!
-//! Purpose: tiny heuristic model behind `planner.zig` — table scans scale
-//! with row count, index seeks divide by 10^eq-columns (x2 for ranges),
-//! unique point lookups cost ~constant, sorts cost N log N, nested-loop joins
-//! multiply. `Cost.compare` breaks ties on startup cost.
-//!
-//! Responsibilities: pure functions only; no schema access, no I/O. The
-//! planner calls these to pick the cheapest `QueryPlan`.
-//!
-//! Dependencies: `std` only.
-//!
-//! Ownership/lifetime: all values (no allocation, no strings).
-//!
-//! Error behavior: infallible; row counts of 0 are clamped to 1 internally.
-//!
-//! Invariants: `rows` estimates are >= 1 for seeks; `ordered` is true exactly
-//! for index-produced orders; costs are monotonic in row count.
-//!
-//! SQLite compatibility: heuristics only (SQLite uses sqlite_stat1); relative
-//! order (unique < range < scan; covering cheaper) matches SQLite's planner.
-// TODO(plan/cost): constants (10x per equality, 0.1/row, 0.05 sort factor)
-// are untuned guesses with no calibration. Expected: stat-driven calibration
-// or at least sensitivity tests locking relative order; tests: TPC-H-ish row
-// counts asserting plan stability. Subsystem: plan/cost.
+//! Pure functions over row counts; no allocation.
+//! Zero rows clamp to one; cheaper `total` wins.
 
 const std = @import("std");
 
@@ -153,4 +132,28 @@ test "cost edge cases clamp and order deterministically" {
     const j1 = joinCost(tableScan(10), tableScan(10));
     const j2 = joinCost(tableScan(10), tableScan(100));
     try std.testing.expect(j1.total < j2.total);
+}
+
+test "cost plan choices stay stable across row-count scales" {
+    // Sensitivity pins: these relative orders are what the planner decides
+    // by. Retuning the constants above must update these expectations on
+    // purpose, not by accident.
+    const scales = [_]usize{ 10, 1000, 100000, 1000000 };
+    for (scales) |rows| {
+        // A selective single-equality seek beats a full scan at every scale.
+        try std.testing.expect(indexSeek(rows, 1, false, false).total < tableScan(rows).total);
+        // Unique seeks stay constant while scans grow.
+        try std.testing.expect(indexSeek(rows, 1, false, true).total < tableScan(rows).total);
+        // Rowid lookups stay constant too.
+        try std.testing.expect(rowidLookup(rows).total < tableScan(rows).total);
+        // Nested-loop inner seeks beat inner scans as the inner side grows.
+        const nestedSeek = joinCost(tableScan(100), indexSeek(rows, 1, false, false));
+        const nestedScan = joinCost(tableScan(100), tableScan(rows));
+        try std.testing.expect(nestedSeek.total < nestedScan.total);
+    }
+    // Tiny tables scan: the seek startup cost exceeds a 1-row scan.
+    try std.testing.expect(tableScan(1).total < indexSeek(1, 1, false, false).total);
+    try std.testing.expect(tableScan(0).total < rowidLookup(0).total);
+    // More equality terms only ever narrow the estimate.
+    try std.testing.expect(indexSeek(100000, 2, false, false).rows < indexSeek(100000, 1, false, false).rows);
 }

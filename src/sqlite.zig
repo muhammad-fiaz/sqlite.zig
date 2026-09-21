@@ -1,34 +1,7 @@
-//! Public client facade: the only module downstream code needs to import.
+//! Public entry point; re-exports client types only.
 //!
-//! Purpose: re-export exactly the client concepts — connections, results,
-//! statements, values, errors, typed/dynamic table handles, scalar/window
-//! helpers, migrations, and version — while keeping every engine subsystem
-//! (`format`, `storage`, `sql`, `catalog`, `btree`, `plan`, `vm`, `txn`, `dsl`
-//! internals) private. The `public surface exposes only client concepts` test
-//! below pins this boundary.
-//!
-//! Responsibilities: none beyond curation. No logic, no state, no allocation.
-//! All pipelines (Raw SQL via `Connection.exec`/`prepare`, dynamic DSL via
-//! `DynamicTable`, typed DSL via `table()`) converge downstream on native
-//! AST/IR — never via a DSL->SQL-string round trip.
-//!
-//! Ownership/lifetime: each re-export keeps its home module's contract.
-//! `Connection` owns the database image and must outlive every `Result`,
-//! `Statement`, table handle, and builder derived from it. `Result` is owned
-//! (caller `deinit`s); `Statement` is owned (caller `finalize`s, idempotent);
-//! table/column descriptors and builders are borrowed values; migration defs
-//! are borrowed slices. Closing the connection first dangles everything.
-//!
-//! Error behavior: none here; see `errors`, `Connection`, and `migration`.
-//!
-//! SQLite compatibility: the facade exposes the full SQLite-compatible
-//! surface (SQL + DSL + migrations) without leaking engine internals.
-//!
-//! Column/operation collision rule: `table()` fields are always columns;
-//! operations are calls (`User.all()`), so operation-named columns stay valid.
-//!
-//! AllColumns note: `User.all()` (call) yields the native star marker;
-//! `selectAll()` on a query builder is the explicit-star spelling.
+//! No logic here. Owners keep their own contracts.
+//! Close the connection after its results and statements.
 
 const std = @import("std");
 const connection = @import("connection/connection.zig");
@@ -126,6 +99,8 @@ test {
     _ = @import("sql/lexer.zig");
     _ = @import("sql/ast.zig");
     _ = @import("sql/parser.zig");
+    _ = @import("sql/limits.zig");
+    _ = @import("sql/coerce.zig");
     _ = @import("sql/expr.zig");
     _ = @import("connection/connection.zig");
     _ = @import("connection/result.zig");

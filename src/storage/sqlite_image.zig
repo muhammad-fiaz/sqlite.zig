@@ -1,21 +1,7 @@
-//! SQLite-compatible database image codec (pages, b-trees, schema).
+//! Database file image codec (pages, b-trees, catalog).
 //!
-//! Purpose: build (`encode`) and parse (`decode`) whole database files in the
-//! SQLite file format: 100-byte header, table/index b-trees with overflow
-//! chains, and the `sqlite_schema` (page 1) catalog. Responsibilities: page
-//! layout, cell framing, schema-SQL synthesis and re-parsing. Dependencies:
-//! `format/header.zig`, `format/varint.zig`, `format/record.zig`,
-//! `catalog/schema.zig`, `vm/value.zig`, `sql/*`. Ownership: `encode*`
-//! return fresh caller-owned images; `decode` returns an owned `Schema`
-//! (call `deinit`) with text/blob bytes duped off the input. Error behavior:
-//! all disk corruption fails closed (`InvalidHeader`/`InvalidPageSize`/
-//! `PageOverflow`/`InvalidParam`, plus schema errors) — never panics, reads
-//! out of bounds, loops forever on cyclic overflow chains, or allocates from
-//! unchecked on-disk sizes. Invariants: page size is a power of two in
-//! 512..65536; b-tree depth is capped (`maxBtreeDepth`); recovery-style
-//! allocations are bounded by the input length. Compatibility: page-1 header,
-//! cell layouts, and overflow math follow the SQLite file-format spec; an
-//! encoded page size of 1 means 65536.
+//! `encode` returns a fresh image; `decode` returns an owned Schema.
+//! Corrupt pages fail closed; b-tree depth and allocs stay bounded.
 
 const std = @import("std");
 const Header = @import("../format/header.zig").Header;
@@ -35,10 +21,7 @@ const Cell = struct { rowid: u64, values: []Value };
 pub const pageSize: usize = 4096;
 
 /// Maximum b-tree descent depth while decoding.
-///
-/// Why bounded: interior child page numbers come from disk, so a malicious
-/// cycle (A -> B -> A) would otherwise recurse forever and overflow the
-/// stack. Real trees are a handful of levels deep; 64 is generous.
+/// Bounds untrusted child pages so cycles fail instead of overflowing.
 pub const maxBtreeDepth: usize = 64;
 
 /// Writes a big-endian u16 at `offset`.
@@ -100,10 +83,7 @@ fn appendVarint(list: *std.ArrayList(u8), allocator: std.mem.Allocator, value: u
 }
 
 /// Scratch arena of zeroed page buffers during `encode`.
-///
-/// Owns every page (`deinit` frees all); page numbers are 1-based indices
-/// into `pages`. Overflow pages are allocated up front so cell framing can
-/// link them.
+/// Owns every page; numbers are 1-based indices into `pages`.
 const PageBuilder = struct {
     /// Allocator for page buffers and the page list.
     allocator: std.mem.Allocator,
@@ -138,10 +118,7 @@ const PageBuilder = struct {
 };
 
 /// Frames one table-leaf cell (payload varint + rowid varint + local bytes).
-///
-/// Payloads beyond `maxLeaf` spill to freshly allocated overflow pages
-/// linked from the cell tail, using the SQLite local/surplus split. Returns
-/// a caller-owned cell buffer.
+/// Large payloads spill to overflow pages; returns a caller-owned buffer.
 fn buildCell(pageBuilder: *PageBuilder, rowid: u64, values: []const Value, databasePageSize: usize) ![]u8 {
     const payload = try record.encode(pageBuilder.allocator, values);
     defer pageBuilder.allocator.free(payload);
@@ -192,9 +169,7 @@ fn buildCell(pageBuilder: *PageBuilder, rowid: u64, values: []const Value, datab
 }
 
 /// Frames one index-leaf cell (payload varint + local bytes, no rowid).
-///
-/// Index cells use the index-specific max/min-local split; overflow handling
-/// mirrors `buildCell`. Returns a caller-owned cell buffer.
+/// Follows `buildCell` for overflow; returns a caller-owned buffer.
 fn buildIndexCell(pageBuilder: *PageBuilder, values: []const Value, databasePageSize: usize) ![]u8 {
     const payload = try record.encode(pageBuilder.allocator, values);
     defer pageBuilder.allocator.free(payload);
@@ -243,12 +218,7 @@ fn buildIndexCell(pageBuilder: *PageBuilder, values: []const Value, databasePage
 }
 
 /// Lays out one table/index leaf page (encode path).
-///
-/// All space math uses checked arithmetic: `pageStart`/`headerOffset`/
-/// `databasePageSize` combos that overflow, pages smaller than the image
-/// geometry, or cells that cannot fit all return `PageOverflow` instead of
-/// panicking on usize underflow or writing out of bounds. `page[header]`
-/// flag writes are bounds-checked like the u16 fields.
+/// Checked arithmetic fails with `PageOverflow` instead of writing out of bounds.
 fn addLeafPage(page: []u8, pageStart: usize, headerOffset: usize, pageType: u8, cells: []const []const u8, databasePageSize: usize) !void {
     if (cells.len > 0xffff) return error.PageOverflow;
     const header = std.math.add(usize, pageStart, headerOffset) catch return error.PageOverflow;
@@ -413,10 +383,7 @@ fn buildTableBtree(allocator: std.mem.Allocator, pageBuilder: *PageBuilder, tabl
 }
 
 /// Builds an index b-tree over a table's rows, returning its root page.
-///
-/// Applies partial-index predicates and expression keys; each entry carries
-/// the rowid as its trailing key column. Unknown tables/columns surface as
-/// errors (encode of a bad catalog fails instead of writing garbage).
+/// Bad tables or columns fail instead of writing garbage.
 fn buildIndexBtree(allocator: std.mem.Allocator, pageBuilder: *PageBuilder, schema: *const Schema, index: anytype, databasePageSize: usize) !u32 {
     const table = schema.findConst(index.table) orelse return error.UnknownTable;
     var indexCells = std.ArrayList([]u8).empty;
@@ -675,11 +642,7 @@ fn buildSchemaCell(allocator: std.mem.Allocator, rowid: u64, values: []const Val
 }
 
 /// Encodes `schema` into a fresh caller-owned image with `databasePageSize`.
-///
-/// Validates the page size up front (power of two, 512..65536). Virtual
-/// tables occupy catalog rows with root page 0 (no b-tree); auto-indexes
-/// store NULL SQL like SQLite. The page-1 cell array must fit or encode
-/// fails with `PageOverflow` rather than truncating the catalog.
+/// Virtual tables use root page 0; a full page-1 catalog fails with `PageOverflow`.
 pub fn encodeWithPageSize(allocator: std.mem.Allocator, schema: *const Schema, databasePageSize: usize) ![]u8 {
     if (databasePageSize < 512 or databasePageSize > 65536 or (databasePageSize & (databasePageSize - 1)) != 0) return error.InvalidPageSize;
 
@@ -816,14 +779,7 @@ fn freeCellValues(allocator: std.mem.Allocator, values: []const Value) void {
 }
 
 /// Reads one table-leaf cell at `cellOffset` (decode path, untrusted input).
-///
-/// Every slice is bounds-checked before use: the payload-length and rowid
-/// varints are decoded from checked tails, `totalPayload` is cast with
-/// overflow checking and must fit inside the image (bounding the reassembly
-/// allocation by `bytes.len`), and the overflow chain is hop-bounded by the
-/// page count so cyclic `next` pointers terminate with `InvalidHeader`
-/// instead of looping forever. A chain that ends early (zero link with bytes
-/// still missing) is truncation, also `InvalidHeader`.
+/// Every slice and overflow hop is bounds-checked; bad chains fail closed.
 fn readCell(allocator: std.mem.Allocator, bytes: []const u8, cellOffset: usize, databasePageSize: usize) !Cell {
     var cursor = cellOffset;
     if (cursor >= bytes.len) return error.InvalidHeader;
@@ -904,14 +860,7 @@ fn readCell(allocator: std.mem.Allocator, bytes: []const u8, cellOffset: usize, 
 }
 
 /// Walks one table b-tree, appending owned leaf cells to `rowsOut`.
-///
-/// `depth` bounds recursion (`maxBtreeDepth`): child page numbers are read
-/// from disk, so without a cap a cyclic interior graph would overflow the
-/// stack. Page 0 at the entry point means "no b-tree" (virtual tables and
-/// empty roots); page 0 as an interior child, out-of-range pages, unknown
-/// page flags, and cell pointers outside the page all fail with
-/// `InvalidHeader`. The cell-pointer array itself is range-checked before
-/// any pointer is followed.
+/// Depth-bounded and range-checked; bad pages fail with `InvalidHeader`.
 fn readTableBtree(allocator: std.mem.Allocator, bytes: []const u8, pageNumber: u32, databasePageSize: usize, rowsOut: *std.ArrayList(Cell)) anyerror!void {
     return readTableBtreeDepth(allocator, bytes, pageNumber, databasePageSize, rowsOut, 0);
 }
@@ -964,13 +913,7 @@ fn readTableBtreeDepth(allocator: std.mem.Allocator, bytes: []const u8, pageNumb
 }
 
 /// Decodes a whole database image into an owned `Schema`.
-///
-/// Validates the magic, page-size geometry (power of two, 512..65536, 1
-/// meaning 65536), and the page-count claim before touching any page; then
-/// replays the page-1 catalog and each table's b-tree. Negative or
-/// out-of-range root pages in catalog rows are skipped (fail closed per-row)
-/// rather than aborting the whole image. Text/blob values are duped off the
-/// input, so the result outlives `bytes`.
+/// Validates geometry first; bad catalog rows are skipped per-row.
 pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Schema {
     if (bytes.len < headerSize or !std.mem.eql(u8, bytes[0..16], "SQLite format 3\x00")) return error.InvalidHeader;
     const encodedPageSize = std.mem.readInt(u16, bytes[16..18], .big);

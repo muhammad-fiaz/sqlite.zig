@@ -1,40 +1,7 @@
-//! Query results: owned, eagerly materialized row sets.
+//! Owned query results.
 //!
-//! Purpose: carry a complete result (`columns` + `rows` + `changes`) from the
-//! engine to the caller. Values are eagerly duplicated at execution time, so a
-//! `Result` never borrows connection, schema, statement, or pager memory and
-//! stays valid after the statement is reset/finalized and after the
-//! transaction commits.
-//!
-//! Responsibilities: column lookup (`columnIndex`, `get`), row views
-//! (`DynamicRow`), iteration (`RowIter`), and full cleanup (`deinit`).
-//!
-//! Dependencies: `vm/value.zig` (`Value`) and `std` only.
-//!
-//! Ownership/lifetime (critical): the `Result` OWNS every column-name string
-//! and every text/blob payload in `rows`. The caller must call `deinit()`
-//! exactly once; after `deinit` the `Result` and every `DynamicRow`/`RowIter`
-//! derived from it dangle. `deinit` is made idempotent here (slices are reset
-//! to empty after freeing) so a defensive second call is a safe no-op, but
-//! correct code calls it once via `defer`. `DynamicRow` values are BORROWED
-//! views into the `Result` — copying a `Value` out copies the payload pointer,
-//! not the bytes; duplicate text/blob before the `Result` is deinited if they
-//! must outlive it. `RowIter` borrows the `Result`; do not `deinit` the result
-//! while iterating. Builders (`query_builder.fetch`) and `Connection.exec`
-//! transfer ownership to the caller on success; on error they own nothing.
-//!
-//! Error behavior: `get` fails `error.UnknownColumn` on a missing name and
-//! panics on an out-of-range row index (same as `at`/`row`). `count`,
-//! `isEmpty`, `slice`, `columnIndex`, `iter` never fail.
-//!
-//! SQLite compatibility: column-name matching is ASCII case-insensitive
-//! (SQLite folds identifiers); duplicate column names resolve to the first
-//! match. `changes` mirrors SQLite's modified-row count for writes and is 0
-//! for reads.
-//!
-//! Unified pipeline note: Raw SQL, the dynamic DSL, and the typed DSL all
-//! converge on native AST/IR execution that materializes this same `Result`
-//! — no pipeline renders SQL strings for another to re-parse.
+//! `Result` owns column names and payloads; rows borrow it.
+//! Caller calls `deinit` once; lookups fail on bad names.
 
 const std = @import("std");
 const Value = @import("../vm/value.zig").Value;

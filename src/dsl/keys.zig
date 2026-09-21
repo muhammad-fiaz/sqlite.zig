@@ -1,42 +1,7 @@
-//! Key and constraint normalization for typed/dynamic table definitions.
+//! Key shapes normalized to borrowed name lists and checked live.
 //!
-//! Purpose: funnel every user-facing key shape — a single typed column, a
-//! `DynamicColumn`, a bare name string, a tuple, an array, or a slice — into
-//! canonical borrowed name lists (`normalizeKey`), foreign-key specs
-//! (`parseFkSpec`), and expected-key sets (`ExpectedKeys`) validated against a
-//! live `catalog/schema.zig` table (`validateKeys`).
-//!
-//! Responsibilities: key-shape normalization, FK reference parsing, Zig-type
-//! to SQL-type mapping (`dslTypeName`), default-value extraction
-//! (`zigDefault`), affinity compatibility (`affinitiesCompatible`), and
-//! PK/UNIQUE/FK drift checks.
-//!
-//! Dependencies: `sql/ast.zig` (referential actions), `catalog/schema.zig`
-//! (read-only validation target), `dsl/column.zig` (column descriptors).
-//!
-//! Ownership/lifetime: all outputs borrow the inputs. `normalizeKey` writes
-//! borrowed `[]const u8` slices into the caller's `out` buffer; `parseFkSpec`
-//! and `ExpectedKeys` likewise retain no memory. The caller must keep the
-//! underlying column descriptors / name strings alive while the spec is used.
-//! Validation borrows both the schema table and the expected set.
-//!
-//! Error behavior: wrong-table columns yield `error.UnknownColumn`; empty or
-//! oversized key lists yield `error.InvalidSql`; drift yields
-//! `error.SchemaMismatch`. Shape misuse that can be detected at comptime
-//! (e.g. FK struct without `.references`) is a `@compileError`.
-//!
-//! SQLite compatibility: name comparison is ASCII case-insensitive throughout
-//! (SQLite identifiers are case-insensitive). Affinity compatibility treats
-//! NUMERIC as interchangeable with INTEGER/REAL, matching SQLite's flexible
-//! typing; TEXT/BLOB never coerce.
-//!
-//! Unified pipeline note: keys describe catalog state, not queries. Raw SQL,
-//! dynamic DSL, and typed DSL all converge on the same native AST/IR; key
-//! specs never render SQL strings.
-//!
-//! Column/operation collision rule: key inputs accept column descriptors as
-//! values (`User.where`) or bare strings; operations remain calls
-//! (`User.all()`), so columns named `all`/`count`/`where` stay addressable.
+//! Outputs borrow the inputs; validation only borrows the table.
+//! Wrong tables give `UnknownColumn`, bad shapes `InvalidSql`, drift `SchemaMismatch`.
 
 const std = @import("std");
 const ast = @import("../sql/ast.zig");
@@ -289,8 +254,7 @@ pub fn zigDefault(comptime F: type, ptr: ?*const anyopaque) ?Value {
     return defaultScalar(v.*);
 }
 
-/// Declared type name -> storage class (`INTEGER`/`TEXT`/`BLOB`/`REAL`/
-/// `NUMERIC`). Case-insensitive substring match mirroring `type_affinity`.
+/// Declared type name -> storage class. Case-insensitive substring match.
 pub fn affinityOf(typeName: []const u8) []const u8 {
     if (typeName.len == 0) return "BLOB";
     if (containsIgnoreCase(typeName, "INT")) return "INTEGER";

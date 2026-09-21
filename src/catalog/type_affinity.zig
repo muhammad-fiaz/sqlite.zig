@@ -1,43 +1,7 @@
-//! Type affinity for column declarations.
+//! Column type affinity and value coercion.
 //!
-//! Purpose: map a `CREATE TABLE` column declaration to one of SQLite's five
-//! affinities (BLOB, TEXT, NUMERIC, INTEGER, REAL) and coerce runtime `Value`s
-//! accordingly. This is the catalog-policy half of storage; the schema
-//! descriptor (`catalog/schema.zig`) owns the declaration strings while this
-//! module owns the mapping rules.
-//!
-//! Responsibilities:
-//! - `fromDeclaration` implements the SQLite affinity decision tree
-//!   (INT -> INTEGER, CHAR/CLOB/TEXT -> TEXT, BLOB/empty -> BLOB,
-//!   REAL/FLOA/DOUB -> REAL, otherwise NUMERIC).
-//! - `apply` / `applyAlloc` coerce a `Value` toward an affinity without
-//!   touching the catalog.
-//!
-//! Dependencies: `vm/value.zig` (`Value`) only. No heap is retained; the
-//! caller owns all inputs and outputs. `applyAlloc` duplicates text/blob
-//! payloads with the caller's allocator; the caller must free the returned
-//! `Value` with `Value.free` (or equivalent) when it holds text/blob.
-//!
-//! Ownership/lifetime: pure functions. Input slices are borrowed and never
-//! retained. `apply` returns its input `Value` unchanged when no conversion
-//! applies (shallow copy; text/blob payloads stay borrowed).
-//! `applyAlloc` returns an owned `Value`; freeing is the caller's duty.
-//!
-//! Error behavior: `apply` never fails — unconvertible values pass through
-//! unchanged (SQLite "convert if possible" rule). `applyAlloc` fails only on
-//! allocation failure.
-//!
-//! SQLite compatibility: mirrors https://www.sqlite.org/datatype3.html
-//! section 3. `fromDeclaration("FLOATING POINT")` contains "INT" and therefore
-//! maps to INTEGER, matching SQLite's rule ordering. `parseTextToNumeric`
-//! accepts only decimal integer/float spellings; SQLite also accepts hex,
-//! exponents with different trims — documented gap, not a divergence for the
-//! common cases. REAL affinity converts integers to floats; TEXT affinity
-//! stringifies integers/reals in `applyAlloc` only.
-//!
-//! Unified pipeline note: affinity is a catalog concern consumed by native
-//! AST/IR execution. Raw SQL, the dynamic DSL, and the typed DSL all converge
-//! on the same native AST — this module never renders or parses SQL strings.
+//! Inputs borrowed; `applyAlloc` returns owned values.
+//! Unconvertible values pass through unchanged.
 
 const std = @import("std");
 const Value = @import("../vm/value.zig").Value;
@@ -85,6 +49,9 @@ pub fn fromDeclaration(declaration: []const u8) Affinity {
     return .numeric;
 }
 
+// Whole-string conversion only: hex, partial numbers, and empty text stay
+// text under every affinity (decimal digits with optional sign, fraction,
+// and exponent convert; embedded NULs have no defined meaning and stay).
 /// Try to read borrowed text as a number: integer first, then finite float.
 /// Returns `null` for empty/whitespace-only or non-numeric text. NaN/Inf are
 /// rejected (SQLite stores them as NULL-ish reals; this engine keeps text).
@@ -92,6 +59,11 @@ pub fn fromDeclaration(declaration: []const u8) Affinity {
 fn parseTextToNumeric(bytes: []const u8) ?Value {
     const trimmed = std.mem.trim(u8, bytes, " \t\r\n");
     if (trimmed.len == 0) return null;
+    // Decimal only: the float parser below accepts hex (`0x2A`) and would
+    // convert text that must stay text, so reject the prefix first.
+    var digits = trimmed;
+    if (digits[0] == '+' or digits[0] == '-') digits = digits[1..];
+    if (digits.len >= 2 and digits[0] == '0' and (digits[1] == 'x' or digits[1] == 'X')) return null;
     if (std.fmt.parseInt(i64, trimmed, 10)) |intVal| {
         return .{ .integer = intVal };
     } else |_| {}
@@ -198,7 +170,7 @@ test "type declarations map to SQLite affinities" {
     try std.testing.expectEqual(Affinity.numeric, fromDeclaration("DECIMAL(10,2)"));
 }
 
-test "sqlite affinity coercion follows reference implementation rules" {
+test "sqlite affinity coercion follows expected rules" {
     const textInt = Value{ .text = "42" };
     const textReal = Value{ .text = "3.14" };
     const intVal = Value{ .integer = 7 };
@@ -233,6 +205,12 @@ test "affinity edge cases: whitespace, blobs, nulls, and casing" {
     try std.testing.expectEqualStrings("  ", apply(.integer, .{ .text = "  " }).text);
     // Out-of-range integral reals stay real under INTEGER affinity.
     try std.testing.expect(apply(.integer, .{ .real = 1.5e300 }).real == 1.5e300);
+    // Whole-string rule: hex, partial numbers, and junk stay text.
+    try std.testing.expectEqualStrings("0x2A", apply(.numeric, .{ .text = "0x2A" }).text);
+    try std.testing.expectEqualStrings("12x", apply(.numeric, .{ .text = "12x" }).text);
+    try std.testing.expectEqualStrings("1e2x", apply(.numeric, .{ .text = "1e2x" }).text);
+    try std.testing.expectEqual(@as(f64, 100.0), apply(.numeric, .{ .text = "1e2" }).real);
+    try std.testing.expectEqual(@as(f64, 100.0), apply(.numeric, .{ .text = "  1e2  " }).real);
     // applyAlloc duplicates payloads so the caller can free unconditionally.
     var dup = try applyAlloc(std.testing.allocator, .numeric, Value{ .text = "9" });
     defer dup.free(std.testing.allocator);
@@ -240,7 +218,4 @@ test "affinity edge cases: whitespace, blobs, nulls, and casing" {
     var kept = try applyAlloc(std.testing.allocator, .blob, Value{ .blob = "xy" });
     defer kept.free(std.testing.allocator);
     try std.testing.expectEqualStrings("xy", kept.blob);
-    // TODO: parseTextToNumeric accepts only decimal int/float spellings; SQLite
-    // also converts hex ("0x2A"), exponents with leading/trailing junk trimmed
-    // differently, and embedded NULs. Extend the parser if compat tests demand it.
 }

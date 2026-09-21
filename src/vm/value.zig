@@ -1,27 +1,8 @@
-//! Runtime scalar values: the single authoritative `Value` representation.
+//! Runtime scalar values: NULL/INTEGER/REAL/TEXT/BLOB.
 //!
-//! Purpose: own the NULL/INTEGER/REAL/TEXT/BLOB universe used by the SQL
-//! evaluator, the VM registers, the catalog defaults, and result materialization.
-//! Responsibilities: total ordering (NULL < numeric < TEXT < BLOB), SQLite
-//! three-valued comparison (`compare` returns false on any NULL input),
-//! `IS DISTINCT FROM` null-aware identity, collations (BINARY/NOCASE/RTRIM),
-//! numeric int<->real equivalence, truthiness, and owned cloning.
-//!
-//! Dependencies: `std` only. Consumers (`sql/expr`, `connection`, `vm`,
-//! `catalog/type_affinity`, `connection/compare`) borrow or clone values;
-//! see `type_affinity.apply` for the canonical storage coercion that sits
-//! above this type.
-//!
-//! Ownership/lifetime: `text`/`blob` payloads are borrowed slices by default.
-//! `clone` duplicates them into owned memory; `free` releases exactly what
-//! `clone` (or an equivalent `dupe`) allocated. Never `free` a borrowed slice.
-//!
-//! Error behavior: infallible except `clone` (OOM). Corrupt or hostile data
-//! cannot reach this layer as raw bytes — decoding/validation happens in
-//! `format/*` and `storage/*`, so no bounds checks are needed here.
-//!
-//! SQLite compatibility: ordering, cross-type numeric equality, NaN placement,
-//! and NOCASE/RTRIM text rules mirror SQLite semantics; see source-local tests.
+//! Total ordering is NULL < numeric < TEXT < BLOB; comparisons return false
+//! on any NULL input. Text/blob payloads borrow by default — `clone` owns,
+//! `free` releases exactly what cloning allocated.
 const std = @import("std");
 
 /// Text comparison collation. BINARY is memcmp; NOCASE folds ASCII case;
@@ -79,6 +60,8 @@ pub const Value = union(enum) {
 
     /// Three-valued truthiness: nonzero numbers and nonzero numeric text are
     /// true; NULL, zero, empty/non-numeric text, blobs, and NaN are false.
+    /// Decimal only: a `0x` hex prefix never counts as numeric (the float
+    /// parser below would accept it, so it is rejected first).
     pub fn isTruthy(self: Value) bool {
         return switch (self) {
             .null => false,
@@ -87,6 +70,9 @@ pub const Value = union(enum) {
             .text => |bytes| blk: {
                 const trimmed = std.mem.trim(u8, bytes, " \t\r\n");
                 if (trimmed.len == 0) break :blk false;
+                var digits = trimmed;
+                if (digits[0] == '+' or digits[0] == '-') digits = digits[1..];
+                if (digits.len >= 2 and digits[0] == '0' and (digits[1] == 'x' or digits[1] == 'X')) break :blk false;
                 if (std.fmt.parseInt(i64, trimmed, 10)) |intVal| {
                     break :blk intVal != 0;
                 } else |_| {}
@@ -326,4 +312,6 @@ test "sqlite truthiness follows three-valued boolean rules" {
     try std.testing.expect((Value{ .text = "123" }).isTruthy());
     try std.testing.expect(!(Value{ .text = "0" }).isTruthy());
     try std.testing.expect(!(Value{ .text = "abc" }).isTruthy());
+    // Hex text is not numeric, so it is falsy.
+    try std.testing.expect(!(Value{ .text = "0x2A" }).isTruthy());
 }

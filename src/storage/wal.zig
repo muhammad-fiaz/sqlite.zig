@@ -1,19 +1,7 @@
-//! Write-ahead-log codec: header, frames, checksums, and recovery apply.
+//! Write-ahead-log frames and recovery.
 //!
-//! Purpose: encode whole database images as WAL frame sequences and replay
-//! (`apply`) a WAL over a base image during recovery/open. Responsibilities:
-//! header/frame framing, the running-checksum chain, and bounded recovery.
-//! Dependencies: `std` only. Ownership: `encodeImage`/`apply` return fresh
-//! caller-owned buffers; all other functions borrow. Error behavior: any
-//! malformed input (bad magic/version/geometry/checksum/salts, zero page
-//! numbers, size mismatches, oversized recovery) fails closed with
-//! `InvalidWal` or `InvalidPageSize` — never panics, over-reads, or
-//! allocates unboundedly (recovery capped by `maxRecoveryBytes`).
-//! Invariants: checksums chain header -> frame[0..8] -> page bytes; each
-//! frame's salts must equal the header salts; page numbers are 1-based.
-//! Compatibility: framing mirrors SQLite WAL (magic, version 3007000,
-//! 32-byte header, 24-byte frame headers); only the little-endian checksum
-//! variant is verified — big-endian-checksummed WALs are rejected.
+//! `encodeImage` and `apply` return fresh buffers; helpers borrow.
+//! Bad framing or checksums fail closed; recovery output is capped.
 
 const std = @import("std");
 
@@ -27,10 +15,7 @@ pub const formatVersion: u32 = 3007000;
 pub const magic: u32 = 0x377f0682;
 
 /// In-memory view of the 32-byte WAL header.
-///
-/// `checksum1/2` on decode are the verified running checksums over bytes
-/// 0..24 (not raw stored values): a header that fails verification never
-/// produces a `WalHeader`.
+/// Decoded checksums are verified values; bad headers never decode.
 pub const WalHeader = struct {
     /// Database page size framed by this WAL (512..32768, power of two).
     pageSize: u32,
@@ -83,10 +68,7 @@ pub const WalHeader = struct {
 };
 
 /// In-memory view of one 24-byte frame header.
-///
-/// The checksum covers frame bytes 0..8 (page number + commit size) chained
-/// with the page image; salts must equal the WAL header salts. `encode`
-/// writes the stored words verbatim (callers compute them via `checksum`).
+/// Checksums chain with the page image; salts must match the WAL header.
 pub const FrameHeader = struct {
     /// 1-based page number this frame replaces (0 is invalid).
     pageNumber: u32,
@@ -127,11 +109,8 @@ pub fn checksum(seed1: u32, seed2: u32, bytes: []const u8) [2]u32 {
     return .{ first, second };
 }
 
-/// Encodes `image` as a header + one frame per page (fresh owned buffer).
-///
-/// Requires a power-of-two `pageSize` in 512..32768 and `image.len` a
-/// nonzero multiple of it; otherwise `InvalidPageSize`. The result size is a
-/// linear function of the input, so no unbounded allocation is possible.
+/// Encodes `image` as a header plus one frame per page.
+/// Needs valid geometry and a non-empty multiple of `pageSize`.
 pub fn encodeImage(allocator: std.mem.Allocator, image: []const u8, pageSize: usize) ![]u8 {
     if (pageSize < 512 or pageSize > 32768 or (pageSize & (pageSize - 1)) != 0 or image.len == 0 or image.len % pageSize != 0) return error.InvalidPageSize;
     const pageCount: u32 = @intCast(image.len / pageSize);
@@ -170,11 +149,7 @@ pub fn encodeImage(allocator: std.mem.Allocator, image: []const u8, pageSize: us
 pub const maxRecoveryBytes: usize = 256 * 1024 * 1024;
 
 /// Replays `walImage` over `baseImage` into a fresh owned image.
-///
-/// Two passes: first validates everything (magic mask, endian bit, header,
-/// frame divisibility, per-frame salts, zero page numbers, chained
-/// checksums) and computes the output size; only then allocates (capped) and
-/// copies. A zero-frame WAL copies the base. An empty base grows from zeros.
+/// Validates first, then allocates; a zero-frame WAL copies the base.
 pub fn apply(allocator: std.mem.Allocator, baseImage: []const u8, walImage: []const u8) ![]u8 {
     // Recovery validation: masked magic, format version, power-of-two page
     // size in range, header checksum, per-frame salt equality, non-zero

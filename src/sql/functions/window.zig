@@ -1,41 +1,7 @@
-//! Window SQL functions (`row_number`, `rank`, `lag`, `sum OVER`, ...).
+//! Window functions over query rows.
 //!
-//! Purpose: authoritative window evaluation behind `connection.zig`.
-//! Implements partitioning, ORDER BY sorting, peer groups, frames
-//! (`ROWS`/`RANGE`/`GROUPS`, `BETWEEN`, offsets), and all ranking, value, and
-//! aggregate window functions.
-//!
-//! Responsibilities: pure computation over `WindowContext.rows`; never touches
-//! storage. Ranking (`row_number`, `rank`, `dense_rank`, `percent_rank`,
-//! `cume_dist`, `ntile`), navigation (`lag`, `lead`), framing (`first_value`,
-//! `last_value`, `nth_value`), and framed aggregates.
-//!
-//! Dependencies: `std`, `../../vm/value.zig`, `../ast.zig`, `aggregate.zig`.
-//!
-//! Ownership/lifetime: `evalFn` results are *borrowed* (row memory or
-//! connection arenas) and must NOT be freed by this file; every value stored
-//! into `results` is cloned with `allocator` and caller-owned (free text/blob
-//! results plus the slice). Internal `partitions`/`ranks` buffers are freed
-//! before return.
-//!
-//! Error behavior: OOM only (`![]Value`); unknown functions, missing args, or
-//! out-of-range offsets yield `.null` per row, never an error. Empty input
-//! yields an empty (owned) slice.
-//!
-//! Invariants: output length equals input row count; `results[i]` corresponds
-//! to `rows[i]` even after partition-internal reordering; default frame is
-//! `RANGE UNBOUNDED PRECEDING..CURRENT ROW` with ORDER BY, else whole partition.
-//!
-//! SQLite compatibility: peer groups follow ORDER BY equality; `ntile(k)`
-//! requires k > 0; `lag`/`lead` default offset 1 with optional default value.
-// TODO(sql/window): partitioning/sorting is O(n^2) with per-compare `evalFn`
-// calls and no spilling; hostile 100k-row partitions can blow time/memory.
-// Expected: hash partitioning + sort with a work budget; tests: 10k-row perf
-// bound. Subsystem: sql/functions.
-// TODO(sql/window): `evalFn` ownership is implicit (borrowed); computed keys
-// (`x+1`) may allocate without a free contract. Expected: explicit borrowed
-// vs owned contract or arena-scoped eval; tests: computed-key window over
-// 1k rows shows no growth. Subsystem: sql/functions.
+//! Results are caller-owned clones aligned with input rows.
+//! Bad functions or offsets yield NULL per row.
 
 const std = @import("std");
 const Value = @import("../../vm/value.zig").Value;
@@ -43,8 +9,31 @@ const ast = @import("../ast.zig");
 const AggState = @import("aggregate.zig").AggState;
 const AggKind = @import("aggregate.zig").AggKind;
 
+/// Free an evalFn temp whose expression may own its payload: binary, unary,
+/// and function results clone or allocate text/blob, while identifiers,
+/// literals, and parameters borrow. Anything else is left alone (freeing a
+/// borrowed payload would corrupt; the remaining shapes are rare as keys).
+fn freeWindowTemp(allocator: std.mem.Allocator, expr: ast.Expr, value: Value) void {
+    switch (expr) {
+        .binary, .unary, .function => if (value == .text) allocator.free(value.text) else if (value == .blob) allocator.free(value.blob),
+        else => {},
+    }
+}
+
+/// True when two rows share every precomputed key (sameValue per key, so
+/// NaN stays singleton and int 1 stays apart from real 1.0).
+fn sameKeyTuple(keys: []const Value, stride: usize, a: usize, b: usize) bool {
+    var k: usize = 0;
+    while (k < stride) : (k += 1) {
+        if (!keys[a * stride + k].sameValue(keys[b * stride + k])) return false;
+    }
+    return true;
+}
+
 /// Input rows plus a row evaluator for partition/order/argument expressions.
-/// `evalFn` results are borrowed and must not be freed by window code.
+/// `evalFn` results follow the interpreter contract: identifiers, literals,
+/// and parameters borrow; computed binary/unary/function results may own
+/// text/blob (free those with `freeWindowTemp` once cloned or consumed).
 pub const WindowContext = struct {
     /// Allocator for `results` clones and internal buffers.
     allocator: std.mem.Allocator,
@@ -86,75 +75,98 @@ pub fn evaluateWindowFunction(
         partitions.deinit(allocator);
     }
 
-    if (w.partitionBy.len == 0) {
+    // Partition and order keys are evaluated once per row into owned clones,
+    // then grouping and sorting compare keys without re-evaluating. Each
+    // eval temp is freed right after cloning (see `freeWindowTemp`).
+    const numPartKeys = w.partitionBy.len;
+    const numOrderKeys = w.orderBy.len;
+    var partKeys = std.ArrayList(Value).empty;
+    defer {
+        for (partKeys.items) |v| v.free(allocator);
+        partKeys.deinit(allocator);
+    }
+    var orderKeys = std.ArrayList(Value).empty;
+    defer {
+        for (orderKeys.items) |v| v.free(allocator);
+        orderKeys.deinit(allocator);
+    }
+    for (ctx.rows) |row| {
+        for (w.partitionBy) |pExpr| {
+            const v = try ctx.evalFn(ctx.evalCtx, pExpr, row);
+            try partKeys.append(allocator, try v.clone(allocator));
+            freeWindowTemp(allocator, pExpr, v);
+        }
+        for (w.orderBy) |ord| {
+            const v = try ctx.evalFn(ctx.evalCtx, ord.expr, row);
+            try orderKeys.append(allocator, try v.clone(allocator));
+            freeWindowTemp(allocator, ord.expr, v);
+        }
+    }
+
+    if (numPartKeys == 0) {
         var allIndices = std.ArrayList(usize).empty;
         try allIndices.ensureTotalCapacity(allocator, numRows);
         for (0..numRows) |i| try allIndices.append(allocator, i);
         try partitions.append(allocator, allIndices);
     } else {
-        for (0..numRows) |rowIdx| {
-            const curRow = ctx.rows[rowIdx];
-            var found = false;
-            for (partitions.items) |*part| {
-                const repRow = ctx.rows[part.items[0]];
-                var matches = true;
-                for (w.partitionBy) |pExpr| {
-                    const v1 = try ctx.evalFn(ctx.evalCtx, pExpr, curRow);
-                    const v2 = try ctx.evalFn(ctx.evalCtx, pExpr, repRow);
-                    if (!v1.sameValue(v2)) {
-                        matches = false;
-                        break;
-                    }
+        // Sort row indices by key tuple (original index breaks ties, so
+        // groups keep insertion order), then cut on sameValue boundaries.
+        // NaN keys never match, so they correctly land alone.
+        var perm = std.ArrayList(usize).empty;
+        defer perm.deinit(allocator);
+        for (0..numRows) |i| try perm.append(allocator, i);
+        const PartCtx = struct {
+            keys: []const Value,
+            stride: usize,
+            pub fn lessThan(cx: @This(), a: usize, b: usize) bool {
+                var k: usize = 0;
+                while (k < cx.stride) : (k += 1) {
+                    const va = cx.keys[a * cx.stride + k];
+                    const vb = cx.keys[b * cx.stride + k];
+                    if (va.sameValue(vb)) continue;
+                    return va.order(vb, .binary) == .lt;
                 }
-                if (matches) {
-                    try part.append(allocator, rowIdx);
-                    found = true;
-                    break;
-                }
+                return a < b;
             }
-            if (!found) {
-                var newPart = std.ArrayList(usize).empty;
-                try newPart.append(allocator, rowIdx);
-                try partitions.append(allocator, newPart);
-            }
+        };
+        std.sort.pdq(usize, perm.items, PartCtx{ .keys = partKeys.items, .stride = numPartKeys }, PartCtx.lessThan);
+        var runStart: usize = 0;
+        var r: usize = 1;
+        while (r <= numRows) : (r += 1) {
+            const boundary = r == numRows or !sameKeyTuple(partKeys.items, numPartKeys, perm.items[r - 1], perm.items[r]);
+            if (!boundary) continue;
+            var group = std.ArrayList(usize).empty;
+            errdefer group.deinit(allocator);
+            for (perm.items[runStart..r]) |idx| try group.append(allocator, idx);
+            try partitions.append(allocator, group);
+            runStart = r;
         }
     }
 
     for (partitions.items) |part| {
         const partIndices = part.items;
-        if (w.orderBy.len > 0) {
-            var i: usize = 0;
-            while (i < partIndices.len) : (i += 1) {
-                var j: usize = i + 1;
-                while (j < partIndices.len) : (j += 1) {
-                    const rowI = ctx.rows[partIndices[i]];
-                    const rowJ = ctx.rows[partIndices[j]];
-                    var shouldSwap = false;
-                    for (w.orderBy) |ord| {
-                        const valI = try ctx.evalFn(ctx.evalCtx, ord.expr, rowI);
-                        const valJ = try ctx.evalFn(ctx.evalCtx, ord.expr, rowJ);
-                        if (valI.sameValue(valJ)) continue;
-                        if (valI == .null) {
-                            shouldSwap = if (ord.nullsFirst) false else true;
-                            break;
-                        }
-                        if (valJ == .null) {
-                            shouldSwap = if (ord.nullsFirst) true else false;
-                            break;
-                        }
-                        const cmp = valI.order(valJ, .binary);
-                        if (ord.descending) {
-                            shouldSwap = cmp == .lt;
-                        } else {
-                            shouldSwap = cmp == .gt;
-                        }
-                        break;
+        if (w.orderBy.len > 0 and partIndices.len > 1) {
+            // Sort by precomputed keys (no re-evaluation); the original row
+            // index breaks ties, reproducing the old stable order exactly.
+            const OrderCtx = struct {
+                keys: []const Value,
+                stride: usize,
+                orders: []const ast.OrderItem,
+                pub fn lessThan(cx: @This(), a: usize, b: usize) bool {
+                    for (cx.orders, 0..) |ord, k| {
+                        const va = cx.keys[a * cx.stride + k];
+                        const vb = cx.keys[b * cx.stride + k];
+                        if (va.sameValue(vb)) continue;
+                        if (va == .null) return ord.nullsFirst;
+                        if (vb == .null) return !ord.nullsFirst;
+                        const cmp = va.order(vb, .binary);
+                        if (cmp == .eq) continue;
+                        return if (ord.descending) cmp == .gt else cmp == .lt;
                     }
-                    if (shouldSwap) {
-                        std.mem.swap(usize, &partIndices[i], &partIndices[j]);
-                    }
+                    return a < b;
                 }
-            }
+            };
+            std.sort.pdq(usize, partIndices, OrderCtx{ .keys = orderKeys.items, .stride = numOrderKeys, .orders = w.orderBy }, OrderCtx.lessThan);
         }
 
         const n = partIndices.len;
@@ -176,15 +188,18 @@ pub fn evaluateWindowFunction(
                 ranks[p] = 1;
                 denseRanks[p] = 1;
             } else {
-                const rowPrev = ctx.rows[partIndices[p - 1]];
-                const rowCur = ctx.rows[partIndices[p]];
+                // Peers compare precomputed order keys (same evaluation the
+                // sort above used, so ranking agrees with ordering).
+                const prevIdx = partIndices[p - 1];
+                const curIdx = partIndices[p];
                 var isPeer = true;
                 if (w.orderBy.len == 0) {
                     isPeer = true;
                 } else {
-                    for (w.orderBy) |ord| {
-                        const valPrev = try ctx.evalFn(ctx.evalCtx, ord.expr, rowPrev);
-                        const valCur = try ctx.evalFn(ctx.evalCtx, ord.expr, rowCur);
+                    var kk: usize = 0;
+                    while (kk < numOrderKeys) : (kk += 1) {
+                        const valPrev = orderKeys.items[prevIdx * numOrderKeys + kk];
+                        const valCur = orderKeys.items[curIdx * numOrderKeys + kk];
                         if (!valPrev.sameValue(valCur)) {
                             isPeer = false;
                             break;
@@ -243,6 +258,7 @@ pub fn evaluateWindowFunction(
                     continue;
                 }
                 const kVal = try ctx.evalFn(ctx.evalCtx, w.argument.?.*, ctx.rows[originalRowIdx]);
+                defer freeWindowTemp(allocator, w.argument.?.*, kVal);
                 const k: i64 = switch (kVal) {
                     .integer => |i| i,
                     .real => |r| @intFromFloat(r),
@@ -266,15 +282,20 @@ pub fn evaluateWindowFunction(
                 var offset: usize = 1;
                 if (w.argument2) |arg2| {
                     const offVal = try ctx.evalFn(ctx.evalCtx, arg2.*, ctx.rows[originalRowIdx]);
+                    defer freeWindowTemp(allocator, arg2.*, offVal);
                     if (offVal == .integer and offVal.integer >= 0) offset = @intCast(offVal.integer);
                 }
                 var defaultVal: Value = .null;
+                var hasDefault = false;
                 if (w.extraArgs.len > 0) {
                     defaultVal = try ctx.evalFn(ctx.evalCtx, w.extraArgs[0], ctx.rows[originalRowIdx]);
+                    hasDefault = true;
                 }
+                defer if (hasDefault) freeWindowTemp(allocator, w.extraArgs[0], defaultVal);
                 if (p >= offset and w.argument != null) {
                     const targetRowIdx = partIndices[p - offset];
                     const raw = try ctx.evalFn(ctx.evalCtx, w.argument.?.*, ctx.rows[targetRowIdx]);
+                    defer freeWindowTemp(allocator, w.argument.?.*, raw);
                     results[originalRowIdx] = try raw.clone(allocator);
                 } else {
                     results[originalRowIdx] = try defaultVal.clone(allocator);
@@ -285,15 +306,20 @@ pub fn evaluateWindowFunction(
                 var offset: usize = 1;
                 if (w.argument2) |arg2| {
                     const offVal = try ctx.evalFn(ctx.evalCtx, arg2.*, ctx.rows[originalRowIdx]);
+                    defer freeWindowTemp(allocator, arg2.*, offVal);
                     if (offVal == .integer and offVal.integer >= 0) offset = @intCast(offVal.integer);
                 }
                 var defaultVal: Value = .null;
+                var hasDefault = false;
                 if (w.extraArgs.len > 0) {
                     defaultVal = try ctx.evalFn(ctx.evalCtx, w.extraArgs[0], ctx.rows[originalRowIdx]);
+                    hasDefault = true;
                 }
+                defer if (hasDefault) freeWindowTemp(allocator, w.extraArgs[0], defaultVal);
                 if (p + offset < n and w.argument != null) {
                     const targetRowIdx = partIndices[p + offset];
                     const raw = try ctx.evalFn(ctx.evalCtx, w.argument.?.*, ctx.rows[targetRowIdx]);
+                    defer freeWindowTemp(allocator, w.argument.?.*, raw);
                     results[originalRowIdx] = try raw.clone(allocator);
                 } else {
                     results[originalRowIdx] = try defaultVal.clone(allocator);
@@ -339,6 +365,7 @@ pub fn evaluateWindowFunction(
                 } else {
                     const targetRow = ctx.rows[partIndices[frameStart]];
                     const raw = try ctx.evalFn(ctx.evalCtx, w.argument.?.*, targetRow);
+                    defer freeWindowTemp(allocator, w.argument.?.*, raw);
                     results[originalRowIdx] = try raw.clone(allocator);
                 }
                 continue;
@@ -349,6 +376,7 @@ pub fn evaluateWindowFunction(
                 } else {
                     const targetRow = ctx.rows[partIndices[frameEnd]];
                     const raw = try ctx.evalFn(ctx.evalCtx, w.argument.?.*, targetRow);
+                    defer freeWindowTemp(allocator, w.argument.?.*, raw);
                     results[originalRowIdx] = try raw.clone(allocator);
                 }
                 continue;
@@ -359,6 +387,7 @@ pub fn evaluateWindowFunction(
                     continue;
                 }
                 const nVal = try ctx.evalFn(ctx.evalCtx, w.argument2.?.*, ctx.rows[originalRowIdx]);
+                defer freeWindowTemp(allocator, w.argument2.?.*, nVal);
                 const nth: i64 = switch (nVal) {
                     .integer => |i| i,
                     .real => |r| @intFromFloat(r),
@@ -375,6 +404,7 @@ pub fn evaluateWindowFunction(
                 } else {
                     const targetRow = ctx.rows[partIndices[targetIdx]];
                     const raw = try ctx.evalFn(ctx.evalCtx, w.argument.?.*, targetRow);
+                    defer freeWindowTemp(allocator, w.argument.?.*, raw);
                     results[originalRowIdx] = try raw.clone(allocator);
                 }
                 continue;
@@ -394,6 +424,7 @@ pub fn evaluateWindowFunction(
                                 aggState.stepWildcard();
                             } else {
                                 const argVal = try ctx.evalFn(ctx.evalCtx, arg.*, targetRow);
+                                defer freeWindowTemp(allocator, arg.*, argVal);
                                 try aggState.step(argVal, false);
                             }
                         } else {
@@ -492,4 +523,78 @@ test "window lag lead and frame aggregates" {
         alloc.free(sum_res);
     }
     try std.testing.expectEqual(@as(i64, 30), sum_res[0].integer);
+}
+
+test "window computed keys group and order without leaking" {
+    // evalFn returning OWNED text for binary exprs: every temp the engine
+    // makes must be freed (the testing allocator fails on leak), and the
+    // single computed partition must still order by the real column.
+    const ownedEval = struct {
+        fn eval(ctxPtr: *const anyopaque, expr: ast.Expr, row: []const Value) anyerror!Value {
+            _ = ctxPtr;
+            return switch (expr) {
+                .identifier => |id| if (std.ascii.eqlIgnoreCase(id, "g")) row[0] else .null,
+                .binary => .{ .text = try std.testing.allocator.dupe(u8, "k") },
+                else => .null,
+            };
+        }
+    }.eval;
+    const alloc = std.testing.allocator;
+    const r0 = [_]Value{.{ .text = "b" }};
+    const r1 = [_]Value{.{ .text = "a" }};
+    const r2 = [_]Value{.{ .text = "b" }};
+    const r3 = [_]Value{.{ .text = "a" }};
+    const rows = [_][]const Value{ &r0, &r1, &r2, &r3 };
+    const ctx = WindowContext{ .allocator = alloc, .rows = &rows, .evalFn = ownedEval, .evalCtx = undefined };
+    var keyLeft = ast.Expr{ .identifier = "g" };
+    var keyRight = ast.Expr{ .literal = .{ .text = "" } };
+    const partKey = ast.Expr{ .binary = .{ .op = .concat, .left = &keyLeft, .right = &keyRight } };
+    const orderKey = ast.Expr{ .identifier = "g" };
+    const win = ast.Expr{ .window = .{ .funcName = "row_number", .partitionBy = &.{partKey}, .orderBy = &.{.{ .expr = orderKey }} } };
+    const res = try evaluateWindowFunction(alloc, win, ctx);
+    defer {
+        for (res) |v| v.free(alloc);
+        alloc.free(res);
+    }
+    // One partition ("k" everywhere), ordered a,a,b,b by insertion order.
+    try std.testing.expectEqual(@as(i64, 3), res[0].integer);
+    try std.testing.expectEqual(@as(i64, 1), res[1].integer);
+    try std.testing.expectEqual(@as(i64, 4), res[2].integer);
+    try std.testing.expectEqual(@as(i64, 2), res[3].integer);
+}
+
+test "window scales to thousands of rows" {
+    const alloc = std.testing.allocator;
+    const rowCount = 5000;
+    var rows = std.ArrayList([]const Value).empty;
+    defer rows.deinit(alloc);
+    var owned: std.ArrayList([]Value) = .empty;
+    defer {
+        for (owned.items) |pair| alloc.free(pair);
+        owned.deinit(alloc);
+    }
+    var i: usize = 0;
+    while (i < rowCount) : (i += 1) {
+        const pair = try alloc.alloc(Value, 2);
+        pair[0] = .{ .integer = @intCast(i % 2) };
+        pair[1] = .{ .integer = @intCast(i % 7) };
+        try owned.append(alloc, pair);
+        try rows.append(alloc, pair);
+    }
+    const ctx = WindowContext{ .allocator = alloc, .rows = rows.items, .evalFn = testEvalFn, .evalCtx = undefined };
+    // testEvalFn maps "x" to row[0] and "g" to row[1].
+    const xIdent = ast.Expr{ .identifier = "x" };
+    const gIdent = ast.Expr{ .identifier = "g" };
+    const win = ast.Expr{ .window = .{ .funcName = "rank", .partitionBy = &.{gIdent}, .orderBy = &.{.{ .expr = xIdent }} } };
+    const res = try evaluateWindowFunction(alloc, win, ctx);
+    defer {
+        for (res) |v| v.free(alloc);
+        alloc.free(res);
+    }
+    try std.testing.expectEqual(@as(usize, rowCount), res.len);
+    // Row 0 leads partition g=0 (rank 1); rows 1 and 15 share partition g=1
+    // with equal x, so they tie each other at a rank above 1.
+    try std.testing.expectEqual(@as(i64, 1), res[0].integer);
+    try std.testing.expect(res[1].integer > 1);
+    try std.testing.expectEqual(res[1].integer, res[15].integer);
 }

@@ -1,44 +1,8 @@
-//! Dynamic (runtime) table handles: stringly-typed entry to the typed engine.
+//! Runtime table handles for tables known only by name.
 //!
-//! Purpose: let callers address tables/columns known only at runtime
-//! (`db.table("users").column("age")`) while still lowering to the same native
-//! AST/IR as the typed DSL. `DynamicTable` is a thin borrowed handle over a
-//! live connection plus three executor hooks; every query method forwards to
-//! `query_builder.DynamicQuery`.
-//!
-//! Responsibilities: table/column identity (`DynamicTable.column`,
-//! alias-aware qualifiers), and pass-through SELECT/JOIN/INSERT/UPDATE/DELETE/
-//! UPSERT/CTE entry points.
-//!
-//! Dependencies: `dsl/column.zig`, `dsl/query_builder.zig`,
-//! `dsl/ast_builder.zig` (executor signatures), `connection/result.zig`.
-//!
-//! Ownership/lifetime: `DynamicTable` and `SchemaHandle` are borrowed handles
-//! — they copy the allocator and the raw `*anyopaque` connection pointer but
-//! own nothing. The connection must outlive every table handle and every
-//! builder/`Result` derived from it. Re-acquire with `db.table()` after
-//! close/reopen; stale handles dangle. `table`/`schema`/`alias` slices are
-//! borrowed from the caller. Query results (`DynamicResult`) are owned and
-//! must be `deinit`ed by the caller.
-//!
-//! Error behavior: handle construction never fails. Query execution returns
-//! the engine's errors (`UnknownTable`, `InvalidSql`, I/O, ...). Alias/column
-//! misuse surfaces at execution, not at handle creation.
-//!
-//! SQLite compatibility: inherits the engine's; dynamic qualifiers follow the
-//! same case-insensitive, schema-aware resolution as typed references.
-//!
-//! Unified pipeline note: Raw SQL, this dynamic DSL, and the typed DSL all
-//! converge on native AST/IR via `ast_builder` — dynamic builders never render
-//! SQL strings for re-parsing.
-//!
-//! Column/operation collision rule: columns are fetched with the `column()`
-//! *call* (`t.column("where")`), so even a column literally named `select` or
-//! `where` is addressable; operations remain distinct method calls on the
-//! table/query value.
-//!
-//! AllColumns note: `selectAll()` lowers to the native star projection; plain
-//! `select(...)` with explicit columns never implies star.
+//! Handles borrow the connection and table names and own nothing.
+//! Query results are owned and must be deinited.
+//! Execution errors surface when the query runs, not at handle creation.
 
 const std = @import("std");
 const columnMod = @import("column.zig");

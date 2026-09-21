@@ -1,25 +1,10 @@
-//! B-tree split math: divide points and local-payload sizes.
+//! Split points and local-payload sizes for b-tree pages.
 //!
-//! Purpose: pure helpers that decide where a page splits and how many payload
-//! bytes stay local vs spill to overflow pages. Used when building images and
-//! balancing trees. Dependencies: `std` (tests only). Ownership: all inputs
-//! are values/slices borrowed for the call; no allocation, no lifetime.
-//! Error behavior: total functions — no errors, no panics. Degenerate inputs
-//! (zero counts/capacities, undersized pages) yield safe zeros instead of
-//! underflowing (notably `splitPoint` guards `pageCapacity == 0`, where a
-//! naive `capacity - 1` would wrap to `maxInt(usize)`).
-//! Invariants: results always satisfy `result < itemCount` (for `itemCount >
-//! 0`) and `minLocal <= local <= maxLocal` for valid page sizes.
-//! Compatibility: the local-payload formulas mirror SQLite's PTF/MTF
-//! fractions (max = usable - 35, min = ((usable - 12) * 32 / 255) - 23).
+//! Pure helpers over borrowed slices; no allocation and no failures.
 
 const std = @import("std");
 
 /// Chooses a count-based split index for `itemCount` items.
-///
-/// Returns the midpoint clamped below `pageCapacity`; 0 items splits at 0.
-/// A zero capacity cannot hold anything, so any nonzero input splits at 0
-/// (safe bound) instead of wrapping `capacity - 1` around.
 pub fn splitPoint(itemCount: usize, pageCapacity: usize) usize {
     if (itemCount == 0) return 0;
     if (pageCapacity == 0) return 0;
@@ -28,11 +13,6 @@ pub fn splitPoint(itemCount: usize, pageCapacity: usize) usize {
 }
 
 /// Chooses a byte-based split index so the left side reaches `targetLimit`.
-///
-/// Each cell costs `size + 2` (pointer slot). The first cell never splits
-/// alone (`index > 0` guard), and when nothing reaches the target the middle
-/// is returned (0 for 0..1 cells). Always `< cellSizes.len` for nonempty
-/// input.
 pub fn splitPointByBytes(cellSizes: []const usize, targetLimit: usize) usize {
     if (cellSizes.len == 0) return 0;
     var accumulated: usize = 0;
@@ -51,17 +31,13 @@ pub fn maxLocalPayload(pageSize: usize) usize {
     return pageSize - 35;
 }
 
-/// Minimum local payload for overflowed cells (SQLite MTF formula, else 0).
+/// Minimum local payload for overflowed cells, else 0.
 pub fn minLocalPayload(pageSize: usize) usize {
     if (pageSize < 12) return 0;
     return ((pageSize - 12) * 32 / 255) - 23;
 }
 
-/// Local byte count for `payloadSize` on `pageSize` pages (SQLite surplus
-/// rule). Small payloads stay whole; large ones keep `surplus` (or the
-/// minimum when surplus exceeds the maximum). Undersized pages yield 0 via
-/// the max/min helpers, and the divisor is floored at 1 so tiny pages cannot
-/// divide by zero.
+/// Local byte count for `payloadSize` on `pageSize` pages.
 pub fn localPayloadSize(payloadSize: usize, pageSize: usize) usize {
     const maxLocal = maxLocalPayload(pageSize);
     if (payloadSize <= maxLocal) return payloadSize;

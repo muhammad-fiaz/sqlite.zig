@@ -1,46 +1,16 @@
-//! Row-level expression evaluator (AST -> `Value`).
+//! Row-level expression evaluator (AST -> value).
 //!
-//! Purpose: interpret `ast.Expr` trees against a single row for CHECK
-//! constraints, generated columns, partial-index predicates, and other
-//! non-VM paths. The full query engine compiles to bytecode instead; this
-//! evaluator is the small, allocation-explicit reference implementation.
-//!
-//! Responsibilities: three-valued-logic `AND`/`OR`/`NOT`, SQLite numeric
-//! ordering across int/real/text/blob, `LIKE`/`GLOB` matching, `CASE`,
-//! `IN`, `COLLATE` passthrough, and scalar-function delegation to the
-//! single authoritative dispatcher `functions.evalScalar`.
-//!
-//! Dependencies: `ast.zig`, `vm/value.zig` (`Value`), `sql/functions.zig`.
-//! No planner/VM imports; `connection.zig` calls in from constraint checks.
-//!
-//! Ownership/lifetime: `eval` clones literals/row values into fresh heap
-//! memory owned by the caller (free with `freeValue`). Intermediate operands
-//! are freed internally via `defer`. Input `row`/`columnNames` are borrowed.
-//!
-//! Error behavior: `UnknownColumn` for unresolvable identifiers, `InvalidSql`
-//! for `*` or mistyped operators, `DivisionByZero` reserved (integer `/`/`%`
-//! by zero currently yield NULL per SQLite), `Unsupported` for unimplemented
-//! expression forms. Scalar-function errors other than OOM map to NULL (SQL
-//! NULL-propagation); OOM always propagates. Deep recursion fails closed with
-//! `InvalidSql` once `max_eval_depth` is exceeded.
-//!
-//! Invariants: NULL propagates through arithmetic/comparison/concat except
-//! `IS`/`IS NOT` (identity) and `AND`/`OR` (Kleene logic); ordering is
-//! NULL < numeric < text < blob with int/real compared numerically.
-//!
-//! SQLite compatibility: integer overflow wraps to REAL (mirrors `vm.zig`);
-//! `x/0`, `x%0` yield NULL; `||` yields NULL if either side is NULL;
-//! unary `-(-9223372036854775808)` yields `9223372036854775808.0` as REAL.
-// TODO(sql/expr): text/blob numeric coercion in arithmetic is a subset gap:
-// `eval` returns NULL for `'6' * '7'` while the VM coerces to 42. Expected:
-// share one `toFloat` helper with `vm.zig` (single authoritative conversion);
-// tests: matrix of int/real/numeric-text/non-numeric-text/blob across
-// +,-,*,/,%. Subsystem: sql/eval.
+//! Interprets trees against one row for CHECK constraints, generated
+//! columns, and partial-index predicates. `eval` clones into caller-owned
+//! values (free with `freeValue`); inputs borrow. NULL propagates except
+//! through `IS` and Kleene `AND`/`OR`; overflow widens to REAL; `x/0`
+//! yields NULL. Depth-guarded against hostile nesting.
 
 const std = @import("std");
 const ast = @import("ast.zig");
 const Value = @import("../vm/value.zig").Value;
 const functions = @import("functions.zig");
+const coerce = @import("coerce.zig");
 
 /// Hard cap on nested-expression depth; hostile `((((...))))` fails closed.
 pub const max_eval_depth: usize = 200;
@@ -187,15 +157,6 @@ fn likeMatch(text: []const u8, pattern: []const u8) bool {
     return pi == pattern.len;
 }
 
-/// Numeric coercion for arithmetic: integers/reals only (text/blob yield null here).
-fn toFloat(value: Value) ?f64 {
-    return switch (value) {
-        .integer => |n| @floatFromInt(n),
-        .real => |r| r,
-        else => null,
-    };
-}
-
 /// Evaluate `expr` against `row`; returns a caller-owned `Value`.
 /// See module docs for NULL/ownership/error semantics. Depth-guarded.
 pub fn eval(allocator: std.mem.Allocator, columnNames: []const []const u8, row: []const Value, expr: ast.Expr) anyerror!Value {
@@ -225,17 +186,23 @@ fn evalDepth(allocator: std.mem.Allocator, columnNames: []const []const u8, row:
             if (operand == .null) return .null;
             return switch (un.op) {
                 .logicalNot => .{ .integer = if (isTruthy(operand)) 0 else 1 },
-                .negate => switch (operand) {
-                    .integer => |n| if (n == std.math.minInt(i64)) .{ .real = 9223372036854775808.0 } else .{ .integer = -n },
+                // Text/blob coerce integer-preserving like the interpreter
+                // (unary minus applies numeric affinity): -'6' is INTEGER -6,
+                // -'6.5' is REAL -6.5.
+                .negate => switch (coerce.toNumeric(operand)) {
+                    .none => .null,
+                    .int => |n| if (n == std.math.minInt(i64)) .{ .real = 9223372036854775808.0 } else .{ .integer = -n },
                     .real => |r| .{ .real = -r },
-                    else => .null,
                 },
-                .positive => switch (operand) {
-                    .integer, .real => operand,
-                    else => .null,
+                .positive => switch (coerce.toNumeric(operand)) {
+                    .none => .null,
+                    .int => |n| .{ .integer = n },
+                    .real => |r| .{ .real = r },
                 },
                 .bitNot => switch (operand) {
                     .integer => |n| .{ .integer = ~n },
+                    .real => |r| .{ .integer = ~coerce.saturatingTrunc(r) },
+                    .text, .blob => .{ .integer = coerce.toInt(operand) orelse 0 },
                     else => .null,
                 },
             };
@@ -298,9 +265,15 @@ fn evalDepth(allocator: std.mem.Allocator, columnNames: []const []const u8, row:
                 return .{ .integer = if (compareValues(left, cmpOp, right)) 1 else 0 };
             }
             if (left == .null or right == .null) return .null;
-            if (left == .integer and right == .integer) {
-                const a = left.integer;
-                const b = right.integer;
+            // Integer-preserving arithmetic mirroring the interpreter:
+            // operands that coerce to integers take checked
+            // integer ops (overflow widens to REAL); anything else computes
+            // in REAL with longest-prefix coercion. '6' * '7' is INTEGER 42.
+            const leftNum = coerce.toNumeric(left);
+            const rightNum = coerce.toNumeric(right);
+            if (leftNum == .int and rightNum == .int) {
+                const a = leftNum.int;
+                const b = rightNum.int;
                 switch (bin.op) {
                     .add => {
                         const sum = @addWithOverflow(a, b);
@@ -329,31 +302,44 @@ fn evalDepth(allocator: std.mem.Allocator, columnNames: []const []const u8, row:
                     },
                     .bitAnd => return .{ .integer = a & b },
                     .bitOr => return .{ .integer = a | b },
-                    .shiftLeft => {
-                        if (b < 0 or b >= 64) return .{ .integer = 0 };
-                        return .{ .integer = a << @intCast(b) };
-                    },
-                    .shiftRight => {
-                        if (b < 0 or b >= 64) return .{ .integer = if (a >= 0) 0 else -1 };
-                        return .{ .integer = a >> @intCast(b) };
-                    },
+                    .shiftLeft => return .{ .integer = coerce.shiftLeft(a, b) },
+                    .shiftRight => return .{ .integer = coerce.shiftRight(a, b) },
                     else => return EvalError.InvalidSql,
                 }
             }
-            const fa = toFloat(left);
-            const fb = toFloat(right);
-            if (fa != null and fb != null) {
-                const a = fa.?;
-                const b = fb.?;
+            // Integer-class operators coerce non-integer operands through
+            // integers (prefix scan, saturating), like the interpreter.
+            if (bin.op == .modulo or bin.op == .bitAnd or bin.op == .bitOr or bin.op == .shiftLeft or bin.op == .shiftRight) {
+                // NULL was checked above, so these never fail.
+                const a = coerce.toInt(left) orelse return .null;
+                const b = coerce.toInt(right) orelse return .null;
                 switch (bin.op) {
-                    .add => return .{ .real = a + b },
-                    .subtract => return .{ .real = a - b },
-                    .multiply => return .{ .real = a * b },
-                    .divide => if (b == 0) return .null else return .{ .real = a / b },
-                    else => return EvalError.InvalidSql,
+                    .modulo => {
+                        if (b == 0) return .null;
+                        const divisor = if (b == -1) @as(i64, 1) else b;
+                        return .{ .integer = @rem(a, divisor) };
+                    },
+                    .bitAnd => return .{ .integer = a & b },
+                    .bitOr => return .{ .integer = a | b },
+                    .shiftLeft => return .{ .integer = coerce.shiftLeft(a, b) },
+                    .shiftRight => return .{ .integer = coerce.shiftRight(a, b) },
+                    else => unreachable,
                 }
             }
-            return .null;
+            const fa = coerce.toFloat(left) orelse return .null;
+            const fb = coerce.toFloat(right) orelse return .null;
+            switch (bin.op) {
+                .add => return .{ .real = fa + fb },
+                .subtract => return .{ .real = fa - fb },
+                .multiply => return .{ .real = fa * fb },
+                .divide => {
+                    if (fb == 0) return .null;
+                    const quotient = fa / fb;
+                    if (std.math.isNan(quotient)) return .null;
+                    return .{ .real = quotient };
+                },
+                else => return EvalError.InvalidSql,
+            }
         },
         .collate => |col| return try evalDepth(allocator, columnNames, row, col.expr.*, child),
         .caseExpr => |cs| {
@@ -578,6 +564,51 @@ test "evaluates arithmetic, logic, and comparisons" {
     const addExpr = ast.Expr{ .binary = .{ .op = .add, .left = &leftExpr, .right = &rightExpr } };
     const res = try eval(std.testing.allocator, &colNames, &row, addExpr);
     try std.testing.expectEqual(@as(i64, 30), res.integer);
+}
+
+test "arithmetic coerces text and blob with prefix rules" {
+    // Shared coercion with scalar/math/VM, integer-preserving:
+    // integer-looking text computes as INTEGER ('6' * '7' is 42),
+    // other text is 0.0/0, and NULL still propagates as NULL.
+    const noCols = [_][]const u8{};
+    const noRow = [_]Value{};
+    const cases = [_]struct {
+        op: ast.BinaryOp,
+        left: Value,
+        right: Value,
+        expectNull: bool,
+        expectInt: ?i64,
+        expectReal: f64,
+    }{
+        .{ .op = .add, .left = .{ .text = "6" }, .right = .{ .text = "7" }, .expectNull = false, .expectInt = 13, .expectReal = 0.0 },
+        .{ .op = .multiply, .left = .{ .text = "6" }, .right = .{ .text = "7" }, .expectNull = false, .expectInt = 42, .expectReal = 0.0 },
+        .{ .op = .subtract, .left = .{ .text = "12x" }, .right = .{ .integer = 2 }, .expectNull = false, .expectInt = null, .expectReal = 10.0 },
+        .{ .op = .divide, .left = .{ .text = "abc" }, .right = .{ .integer = 2 }, .expectNull = false, .expectInt = null, .expectReal = 0.0 },
+        .{ .op = .add, .left = .{ .blob = "3" }, .right = .{ .integer = 4 }, .expectNull = false, .expectInt = 7, .expectReal = 0.0 },
+        .{ .op = .shiftLeft, .left = .{ .integer = 4 }, .right = .{ .text = "-1" }, .expectNull = false, .expectInt = 2, .expectReal = 0.0 },
+        .{ .op = .add, .left = .null, .right = .{ .integer = 1 }, .expectNull = true, .expectInt = null, .expectReal = 0.0 },
+        .{ .op = .multiply, .left = .{ .integer = 2 }, .right = .null, .expectNull = true, .expectInt = null, .expectReal = 0.0 },
+    };
+    for (cases) |c| {
+        var l = ast.Expr{ .literal = c.left };
+        var r = ast.Expr{ .literal = c.right };
+        const expr = ast.Expr{ .binary = .{ .op = c.op, .left = &l, .right = &r } };
+        const got = try eval(std.testing.allocator, &noCols, &noRow, expr);
+        defer freeValue(std.testing.allocator, got);
+        if (c.expectNull) {
+            try std.testing.expect(got == .null);
+        } else if (c.expectInt) |want| {
+            try std.testing.expectEqual(want, got.integer);
+        } else {
+            try std.testing.expectEqual(c.expectReal, got.real);
+        }
+    }
+    // Unary minus coerces text like the interpreter.
+    var negText = ast.Expr{ .literal = .{ .text = "6" } };
+    const negExpr = ast.Expr{ .unary = .{ .op = .negate, .expr = &negText } };
+    const negGot = try eval(std.testing.allocator, &noCols, &noRow, negExpr);
+    defer freeValue(std.testing.allocator, negGot);
+    try std.testing.expectEqual(@as(i64, -6), negGot.integer);
 }
 
 test "evalCheck accepts truthy and null and rejects zero" {

@@ -1,49 +1,17 @@
-//! SQL lexer: bytes -> `token.zig` tokens (pipeline stage 1).
+//! SQL lexer: bytes -> tokens.
 //!
-//! Purpose: single-pass scanner producing the token stream `Parser` consumes.
-//! Handles whitespace, `--`/`/* */` comments, quoted identifiers and string
-//! literals (`'it''s'`, `"ident"`, `` `ident` ``), numbers (decimal, float,
-//! exponent, `0x` hex, leading-dot floats), bind parameters (`?`, `?NNN`,
-//! `:name`, `@name`, `$name`), and all single/double-char operators
-//! (`||`, `<<`, `>>`, `<=`, `>=`, `==`, `!=`, `<>`).
-//!
-//! Responsibilities: tokenize only; no keyword classification (that stays in
-//! the parser so quoted keywords remain identifiers) and no semantic checks.
-//! DSL builders bypass this stage by constructing `ast.zig` nodes directly.
-//!
-//! Dependencies: `token.zig` (`Token`, `Tag`) and `std` only.
-//!
-//! Ownership/lifetime: returned `[]Token` is heap-owned by the caller; each
-//! `Token.text` borrows the input `sql` slice. Caller frees the slice with
-//! `allocator.free(tokens)`; no per-token frees.
-//!
-//! Error behavior: fails closed on hostile input — `InvalidCharacter` for
-//! stray bytes/`!` without `=`, `UnterminatedString` for a missing close
-//! quote, `UnterminatedComment` for a missing `*/`. No partial token stream
-//! is returned on error (`errdefer` cleans up).
-//!
-//! Invariants: output always ends with exactly one `.eof` token whose
-//! `position == sql.len`; every other token satisfies
-//! `text.len > 0` and `position + text.len <= sql.len` (modulo quote stripping).
-//!
-//! SQLite compatibility: `==` accepted as `=`; `<>` and `!=` both map to
-//! `.notEqual`; `--` runs to newline; `/* */` is non-nesting, as in SQLite.
-//!
-//! Hostile-input notes: token count is O(sql.len) (each token consumes >= 1
-//! byte), so allocation is linear in input the caller already holds.
-//! No recursion is used; the scanner loop itself cannot stack-overflow.
-// TODO(sql/lexer): enforce a SQLITE_LIMIT_SQL_LENGTH-style cap (SQLite
-// defaults to 1_000_000 bytes) and surface `error.SqlTooBig` so a
-// multi-megabyte hostile string fails fast instead of allocating O(n) tokens.
-// Expected: lexer + parser + connection agree on one constant and one error;
-// tests: over-limit SQL rejected, boundary length accepted, limit documented.
+//! Single-pass scanner for the parser: strings, quoted identifiers, numbers,
+//! bind parameters, operators, comments. Token texts borrow the input; the
+//! caller frees the token slice. Fails closed (bad bytes, unterminated
+//! strings/comments); overlong input fails `SqlTooBig` before allocating.
 
 const std = @import("std");
 const Token = @import("token.zig").Token;
 const Tag = @import("token.zig").Tag;
+const limits = @import("limits.zig");
 
 /// Lexer failure modes; all fail closed with no partial output.
-pub const Error = error{ InvalidCharacter, UnterminatedString, UnterminatedComment };
+pub const Error = error{ InvalidCharacter, UnterminatedString, UnterminatedComment, SqlTooBig };
 
 fn isWordStart(byte: u8) bool {
     return std.ascii.isAlphabetic(byte) or byte == '_' or byte >= 0x80;
@@ -55,7 +23,17 @@ fn isWordPart(byte: u8) bool {
 /// Scan `sql` into a heap-owned token slice ending in `.eof`.
 /// Caller owns the returned slice (`allocator.free`) while token texts borrow `sql`.
 /// Fails closed with `Error` on bad bytes, unterminated strings, or comments.
+/// Inputs longer than `limits.max_sql_length` fail fast with `SqlTooBig`
+/// before any token is allocated.
 pub fn tokenize(allocator: std.mem.Allocator, sql: []const u8) ![]Token {
+    return tokenizeLimited(allocator, sql, limits.max_sql_length);
+}
+
+/// Scan with an explicit byte budget (same semantics as `tokenize`).
+/// Exposed so tests can prove the limit mechanism without allocating a
+/// gigabyte; production callers use `tokenize`.
+pub fn tokenizeLimited(allocator: std.mem.Allocator, sql: []const u8, max_bytes: usize) ![]Token {
+    if (sql.len > max_bytes) return Error.SqlTooBig;
     var tokens = std.ArrayList(Token).empty;
     errdefer tokens.deinit(allocator);
     var i: usize = 0;
@@ -279,4 +257,21 @@ test "lexer handles empty input and comments only" {
     const comments = try tokenize(std.testing.allocator, "-- hi\n/* x */");
     defer std.testing.allocator.free(comments);
     try std.testing.expectEqual(@as(usize, 1), comments.len);
+}
+
+test "lexer enforces the SQL length budget fail-closed" {
+    // Mechanism proven with a small budget (the production 1GB budget needs
+    // no gigabyte allocation to trust: same comparison, pinned constant).
+    try std.testing.expectEqual(@as(usize, 1_000_000_000), limits.max_sql_length);
+    const sql = "SELECT 12345678901234567890;";
+    try std.testing.expectError(Error.SqlTooBig, tokenizeLimited(std.testing.allocator, sql, 7));
+    // Boundary length is accepted and tokenizes normally.
+    const ok = try tokenizeLimited(std.testing.allocator, sql, sql.len);
+    defer std.testing.allocator.free(ok);
+    try std.testing.expectEqual(Tag.word, ok[0].tag);
+    try std.testing.expectEqual(Tag.eof, ok[ok.len - 1].tag);
+    // Empty input is within every budget, including zero.
+    const empty = try tokenizeLimited(std.testing.allocator, "", 0);
+    defer std.testing.allocator.free(empty);
+    try std.testing.expectEqual(@as(usize, 1), empty.len);
 }

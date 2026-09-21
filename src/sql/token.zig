@@ -1,41 +1,12 @@
-//! SQL token vocabulary for the sqlite.zig frontend.
+//! Token vocabulary for the lexer and parser.
 //!
-//! Purpose: defines the smallest lexical units produced by `lexer.zig` and
-//! consumed by `parser.zig`. This is stage 1 of the
-//! lexer -> parser -> AST -> resolver -> planner -> compiler -> VM pipeline.
-//! DSL builders construct native `ast.zig` nodes directly and never go
-//! through this token layer.
-//!
-//! Responsibilities:
-//! - Enumerate every terminal the grammar needs (`Tag`).
-//! - Carry the source slice (`text`), byte offset (`position`), and whether a
-//!   `word` came from a quoted identifier (`quoted`) so the parser can treat
-//!   quoted keywords as identifiers (SQLite semantics).
-//!
-//! Dependencies: `std.ascii` only. No allocation, no I/O.
-//!
-//! Ownership/lifetime: `Token.text` borrows the original SQL string; tokens
-//! never own memory. The token slice itself is owned by the caller of
-//! `lexer.tokenize`.
-//!
-//! Error behavior: infallible; keyword comparison is ASCII case-insensitive.
-//!
-//! Invariants:
-//! - `text` is always a subslice of the input SQL (except the trailing `eof`
-//!   token whose text is the empty slice at `sql.len`).
-//! - `quoted == true` implies `tag == .word` (double-quote/backtick path).
-//!
-//! SQLite compatibility: single `=` and double `==` both map to `.equal`;
-//! `<>` and `!=` both map to `.notEqual`, matching SQLite's accepted forms.
+//! Tokens borrow the source SQL; the token slice is caller-owned.
+//! Keyword match is case-insensitive.
 
 const std = @import("std");
 
 /// Terminal symbols of the SQL grammar.
-///
-/// A minimal vocabulary: identifiers/keywords share `.word` (the parser
-/// distinguishes them case-insensitively), literals are `.number`/`.string`,
-/// and every single- or multi-character operator the parser needs has its own
-/// tag. `eof` is always the final token.
+/// Words, literals, operators, and a trailing `eof`.
 pub const Tag = enum {
     /// Identifier or keyword (quoted identifiers included; see `Token.quoted`).
     word,
@@ -109,10 +80,7 @@ pub const Token = struct {
 };
 
 /// Case-insensitive keyword comparison for `.word` tokens.
-///
-/// Used by the parser's `acceptWord`/`requireWord` helpers. Non-word tokens
-/// can also be compared (their `text` is the operator spelling) but callers
-/// conventionally check `tag` first.
+/// Used by the parser's word helpers.
 pub fn eql(token: Token, word: []const u8) bool {
     return std.ascii.eqlIgnoreCase(token.text, word);
 }

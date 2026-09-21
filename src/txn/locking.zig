@@ -1,15 +1,7 @@
-//! Process-local connection lock (SHARED/RESERVED/EXCLUSIVE state machine).
+//! Connection lock (SHARED/RESERVED/EXCLUSIVE state machine).
 //!
-//! Purpose: serialize readers and writers inside one process with SQLite's
-//! lock vocabulary. This is a state tracker, not an OS lock: it grants or
-//! refuses transitions and reports contention as `error.Busy`. Dependencies:
-//! `std` (tests only). Ownership: `Lock` is a value — no allocation, no
-//! lifetime, safe to embed in a connection struct. Error behavior:
-//! conflicting acquisition returns `error.Busy` without changing state.
-//! Invariants: exactly one of the four states holds; `release` always lands
-//! on `unlocked`. Compatibility: state names mirror SQLite's locking model.
-//! Safety note: no atomics/mutex — concurrent threads must externally
-//! serialize access to a shared `Lock` (see TODO below).
+//! Tracks lock state in-process and reports contention as `Busy`. Every
+//! transition holds an internal mutex; share by pointer, never copy.
 
 const std = @import("std");
 
@@ -33,15 +25,21 @@ pub const LockState = enum {
 pub const Lock = struct {
     /// Current level (starts `unlocked`).
     state: LockState = .unlocked,
+    /// Guards every transition below; share the `Lock` by pointer, never copy.
+    mutex: std.atomic.Mutex = .unlocked,
     /// Acquires a read lock. Fails with `Busy` when `exclusive` is held;
     /// allowed from `unlocked`/`shared`/`reserved` (re-acquire is idempotent).
     pub fn acquireShared(self: *Lock) !void {
+        self.spinLock();
+        defer self.mutex.unlock();
         if (self.state == .exclusive) return error.Busy;
         self.state = .shared;
     }
     /// Declares write intent. Fails with `Busy` when `reserved`/`exclusive`
     /// is already held; upgrades from `unlocked`/`shared`.
     pub fn acquireReserved(self: *Lock) !void {
+        self.spinLock();
+        defer self.mutex.unlock();
         if (self.state == .reserved or self.state == .exclusive) return error.Busy;
         self.state = .reserved;
     }
@@ -49,15 +47,23 @@ pub const Lock = struct {
     /// `shared`/`reserved` must release first (prevents silent lock upgrades
     /// that would deadlock against other readers); otherwise `Busy`.
     pub fn acquireExclusive(self: *Lock) !void {
+        self.spinLock();
+        defer self.mutex.unlock();
         if (self.state != .unlocked) return error.Busy;
         self.state = .exclusive;
     }
+    /// Spins until the internal mutex is held (critical sections are a
+    /// few instructions; no thread ever sleeps while holding it).
+    fn spinLock(self: *Lock) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+    }
     /// Drops any held level back to `unlocked` (never fails).
     pub fn release(self: *Lock) void {
+        self.spinLock();
+        defer self.mutex.unlock();
         self.state = .unlocked;
     }
 };
-// TODO: make Lock thread-safe for shared connections. Current limitation: plain enum state with no mutex/atomic, so concurrent acquire/release from multiple threads races. Expected behavior: internal mutex or documented external-locking contract enforced by debug assertions. Tests needed: multi-thread acquisition stress test asserting no state corruption.
 
 test "connection lock transitions are serialized" {
     var lock = Lock{};
@@ -94,5 +100,32 @@ test "connection lock contention fails closed without state change" {
     try lock.acquireShared();
     lock.release();
     lock.release();
+    try std.testing.expectEqual(LockState.unlocked, lock.state);
+}
+
+test "lock survives concurrent acquisition without corruption" {
+    var lock = Lock{};
+    const Worker = struct {
+        fn run(l: *Lock) void {
+            var i: usize = 0;
+            while (i < 500) : (i += 1) {
+                // Contention is expected (Busy is fine); corruption is not:
+                // every acquired level is always released, so the lock must
+                // end unlocked regardless of interleaving.
+                l.acquireShared() catch {};
+                l.release();
+                l.acquireExclusive() catch {};
+                l.release();
+            }
+        }
+    };
+    var t1 = try std.Thread.spawn(.{}, Worker.run, .{&lock});
+    var t2 = try std.Thread.spawn(.{}, Worker.run, .{&lock});
+    var t3 = try std.Thread.spawn(.{}, Worker.run, .{&lock});
+    var t4 = try std.Thread.spawn(.{}, Worker.run, .{&lock});
+    t1.join();
+    t2.join();
+    t3.join();
+    t4.join();
     try std.testing.expectEqual(LockState.unlocked, lock.state);
 }

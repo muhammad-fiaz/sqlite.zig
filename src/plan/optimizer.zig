@@ -1,41 +1,14 @@
 //! Query optimizer: constant folding and predicate pushdown checks.
 //!
-//! Purpose: cheap logical rewrites before planning — fold literal-only
-//! arithmetic/comparisons and boolean identities, and answer whether a
-//! predicate can be pushed to a given table scan.
-//!
-//! Responsibilities: pure AST->AST transform (`foldConstants`) allocating
-//! replacement nodes with the caller allocator; `canPushDownPredicate` is a
-//! conservative syntactic check used by the planner.
-//!
-//! Dependencies: `../sql/ast.zig`, `../vm/value.zig`; no schema/VM imports.
-//!
-//! Ownership/lifetime: input `expr` is borrowed; the returned tree owns its
-//! *new* nodes (free dropped sides internally; caller frees the result
-//! structure with `ast.freeExprRec` plus its own arena policy). Literals need
-//! no freeing.
-//!
-//! Error behavior: OOM only. Folding is overflow-safe: overflowing `+ - *` or
-//! unary `-` on minInt is left unfolded (runtime handles widening) rather
-//! than trapping.
-//!
-//! Invariants: folding preserves three-valued logic; `AND`/`OR` identities
-//! only apply to literal sides; non-literal trees are rebuilt, never mutated.
-//!
-//! SQLite compatibility: matches SQLite's `truthy` (via `Value.isTruthy`)
-//! for boolean identities; arithmetic identities are intentionally minimal.
-// TODO(plan/optimizer): `canPushDownPredicate` ignores `targetTable` and
-// returns true for any bare identifier, so qualified `a.x` could push to `b`.
-// Expected: qualifier-aware check (split on `.`, compare to target/alias);
-// tests: `a.x` pushable to `a` only, `x` pushable anywhere. Subsystem: plan/opt.
-// TODO(plan/optimizer): folding covers only int `+ - * /` and `=`/`!=`;
-// floats, comparisons, and string concat are left unfolded. Expected: reuse
-// `expr.zig` evaluation for full literal folding; tests: `1.5+2.5`,
-// `'a'||'b'` fold matrices. Subsystem: plan/opt.
+//! Folds literal-only subtrees with evaluator semantics (overflow widens to
+//! REAL, `x/0` folds to NULL) and answers whether a predicate can run on one
+//! table's scan. Input borrows; folded text results are caller-owned (free
+//! with `freeFoldedExpr`, never with the parser's freer).
 
 const std = @import("std");
 const ast = @import("../sql/ast.zig");
 const Value = @import("../vm/value.zig").Value;
+const exprEval = @import("../sql/expr.zig");
 
 /// Trivial boolean-constant predicate (kept for call-site readability).
 pub fn isConstantTrue(value: bool) bool {
@@ -88,43 +61,18 @@ pub fn foldConstants(allocator: std.mem.Allocator, expr: ast.Expr) !ast.Expr {
                 }
             }
 
-            if (foldedLeft == .literal and foldedRight == .literal) {
-                const valA = foldedLeft.literal;
-                const valB = foldedRight.literal;
-                switch (bin.op) {
-                    .add => {
-                        if (valA == .integer and valB == .integer) {
-                            const res = @addWithOverflow(valA.integer, valB.integer);
-                            if (res[1] == 0) return .{ .literal = .{ .integer = res[0] } };
-                        }
-                    },
-                    .subtract => {
-                        if (valA == .integer and valB == .integer) {
-                            const res = @subWithOverflow(valA.integer, valB.integer);
-                            if (res[1] == 0) return .{ .literal = .{ .integer = res[0] } };
-                        }
-                    },
-                    .multiply => {
-                        if (valA == .integer and valB == .integer) {
-                            const res = @mulWithOverflow(valA.integer, valB.integer);
-                            if (res[1] == 0) return .{ .literal = .{ .integer = res[0] } };
-                        }
-                    },
-                    .divide => {
-                        if (valA == .integer and valB == .integer and valB.integer != 0) {
-                            if (valA.integer == std.math.minInt(i64) and valB.integer == -1) {
-                                // Leave minInt / -1 unfolded; runtime widens to REAL.
-                            } else return .{ .literal = .{ .integer = @divTrunc(valA.integer, valB.integer) } };
-                        }
-                    },
-                    .equal => {
-                        return .{ .literal = .{ .integer = if (valA.sameValue(valB)) 1 else 0 } };
-                    },
-                    .notEqual => {
-                        return .{ .literal = .{ .integer = if (!valA.sameValue(valB)) 1 else 0 } };
-                    },
-                    else => {},
-                }
+            // Both sides literal: evaluate once with the same semantics as
+            // runtime (`expr.eval`), covering int/real arithmetic (overflow
+            // widens to REAL), bitwise ops, all comparisons with three-valued
+            // NULL logic, IS/IS NOT, and text-text concatenation. Anything
+            // else (identifiers, calls, patterns, subqueries) rebuilds below.
+            if (foldedLeft == .literal and foldedRight == .literal and isFoldableBinary(bin.op)) {
+                var lNode = foldedLeft;
+                var rNode = foldedRight;
+                const probe = ast.Expr{ .binary = .{ .op = bin.op, .left = &lNode, .right = &rNode } };
+                const noCols = [_][]const u8{};
+                const noRow = [_]Value{};
+                return .{ .literal = try exprEval.eval(allocator, &noCols, &noRow, probe) };
             }
 
             const lNode = try allocator.create(ast.Expr);
@@ -135,18 +83,12 @@ pub fn foldConstants(allocator: std.mem.Allocator, expr: ast.Expr) !ast.Expr {
         },
         .unary => |un| {
             const foldedInner = try foldConstants(allocator, un.expr.*);
-            if (foldedInner == .literal) {
-                const val = foldedInner.literal;
-                switch (un.op) {
-                    .negate => {
-                        if (val == .integer) return .{ .literal = .{ .integer = -val.integer } };
-                        if (val == .real) return .{ .literal = .{ .real = -val.real } };
-                    },
-                    .logicalNot => {
-                        return .{ .literal = .{ .integer = if (val.isTruthy()) 0 else 1 } };
-                    },
-                    else => {},
-                }
+            if (foldedInner == .literal and isFoldableUnary(un.op)) {
+                var innerNode = foldedInner;
+                const probe = ast.Expr{ .unary = .{ .op = un.op, .expr = &innerNode } };
+                const noCols = [_][]const u8{};
+                const noRow = [_]Value{};
+                return .{ .literal = try exprEval.eval(allocator, &noCols, &noRow, probe) };
             }
             const innerNode = try allocator.create(ast.Expr);
             innerNode.* = foldedInner;
@@ -156,14 +98,68 @@ pub fn foldConstants(allocator: std.mem.Allocator, expr: ast.Expr) !ast.Expr {
     }
 }
 
+/// Binary operators safe to fold when both sides are literals: pure,
+/// row-independent, and evaluated by `expr.eval` with runtime-identical
+/// semantics. Functions, patterns, IN, CASE, and subqueries are excluded —
+/// they need catalog/row context or have their own dispatch.
+fn isFoldableBinary(op: ast.BinaryOp) bool {
+    return switch (op) {
+        .add, .subtract, .multiply, .divide, .modulo, .bitAnd, .bitOr, .shiftLeft, .shiftRight, .equal, .notEqual, .less, .lessEqual, .greater, .greaterEqual, .isOp, .isNotOp, .concat => true,
+        .logicalAnd, .logicalOr => false,
+    };
+}
+
+/// Unary operators safe to fold on a literal operand (same rationale).
+fn isFoldableUnary(op: ast.UnaryOp) bool {
+    return switch (op) {
+        .negate, .positive, .bitNot, .logicalNot => true,
+    };
+}
+
+/// Free a tree produced by `foldConstants`: releases owned text/blob literal
+/// payloads (concat folding allocates them) before the node structure.
+/// Never use on parser-borrowed trees, whose literal slices are borrowed.
+pub fn freeFoldedExpr(allocator: std.mem.Allocator, expr: ast.Expr) void {
+    switch (expr) {
+        .literal => |lit| lit.free(allocator),
+        .binary => |bin| {
+            freeFoldedExpr(allocator, bin.left.*);
+            freeFoldedExpr(allocator, bin.right.*);
+            allocator.destroy(bin.left);
+            allocator.destroy(bin.right);
+        },
+        .unary => |un| {
+            freeFoldedExpr(allocator, un.expr.*);
+            allocator.destroy(un.expr);
+        },
+        else => ast.freeExprRec(allocator, expr),
+    }
+}
+/// Whether `expr` may be evaluated on scans of `targetTable` alone.
+/// Bare identifiers push anywhere; qualified `table.column` references push
+/// only when the qualifier's last segment matches the target (so `a.x` pushes
+/// to `a` but never to `b`, and `schema.tbl.col` matches `tbl`). Literals
+/// push anywhere; calls, patterns, and subqueries never push (conservative).
 pub fn canPushDownPredicate(expr: ast.Expr, targetTable: []const u8) bool {
     switch (expr) {
-        .identifier => return true,
+        .identifier => |name| return qualifierMatchesTarget(name, targetTable),
         .binary => |b| return canPushDownPredicate(b.left.*, targetTable) and canPushDownPredicate(b.right.*, targetTable),
         .unary => |u| return canPushDownPredicate(u.expr.*, targetTable),
         .literal => return true,
         else => return false,
     }
+}
+
+/// Qualifier check behind `canPushDownPredicate`: unqualified names are
+/// scope-free; otherwise the segment before the final dot (itself possibly
+/// schema-qualified) must equal the target, ASCII case-insensitive.
+fn qualifierMatchesTarget(name: []const u8, targetTable: []const u8) bool {
+    const dot = std.mem.lastIndexOfScalar(u8, name, '.') orelse return true;
+    if (dot == 0 or dot + 1 >= name.len) return false;
+    const qualifier = name[0..dot];
+    const segment = if (std.mem.lastIndexOfScalar(u8, qualifier, '.')) |d| qualifier[d + 1 ..] else qualifier;
+    if (segment.len == 0) return false;
+    return std.ascii.eqlIgnoreCase(segment, targetTable);
 }
 
 test "optimizer identifies boolean constants" {
@@ -189,4 +185,80 @@ test "optimizer simplifies boolean logic" {
     const folded = try foldConstants(std.testing.allocator, andExpr);
     try std.testing.expect(folded == .literal);
     try std.testing.expectEqual(@as(i64, 0), folded.literal.integer);
+}
+
+test "optimizer folds float arithmetic and text concat" {
+    var a = ast.Expr{ .literal = .{ .real = 1.5 } };
+    var b = ast.Expr{ .literal = .{ .real = 2.5 } };
+    const add = ast.Expr{ .binary = .{ .op = .add, .left = &a, .right = &b } };
+    const foldedAdd = try foldConstants(std.testing.allocator, add);
+    defer freeFoldedExpr(std.testing.allocator, foldedAdd);
+    try std.testing.expectEqual(@as(f64, 4.0), foldedAdd.literal.real);
+
+    var s1 = ast.Expr{ .literal = .{ .text = "a" } };
+    var s2 = ast.Expr{ .literal = .{ .text = "b" } };
+    const concat = ast.Expr{ .binary = .{ .op = .concat, .left = &s1, .right = &s2 } };
+    const foldedConcat = try foldConstants(std.testing.allocator, concat);
+    defer freeFoldedExpr(std.testing.allocator, foldedConcat);
+    try std.testing.expectEqualStrings("ab", foldedConcat.literal.text);
+}
+
+test "optimizer folding preserves null, overflow, and shift rules" {
+    // NULL comparisons fold to NULL, not to 0/1 (three-valued logic).
+    var n1 = ast.Expr{ .literal = .null };
+    var n2 = ast.Expr{ .literal = .null };
+    const eqNull = ast.Expr{ .binary = .{ .op = .equal, .left = &n1, .right = &n2 } };
+    const foldedNull = try foldConstants(std.testing.allocator, eqNull);
+    defer freeFoldedExpr(std.testing.allocator, foldedNull);
+    try std.testing.expect(foldedNull.literal == .null);
+
+    // Integer overflow widens to REAL instead of trapping.
+    var big = ast.Expr{ .literal = .{ .integer = std.math.maxInt(i64) } };
+    var one = ast.Expr{ .literal = .{ .integer = 1 } };
+    const overflow = ast.Expr{ .binary = .{ .op = .add, .left = &big, .right = &one } };
+    const foldedBig = try foldConstants(std.testing.allocator, overflow);
+    defer freeFoldedExpr(std.testing.allocator, foldedBig);
+    try std.testing.expect(foldedBig.literal == .real);
+
+    // Unary minus on minInt widens instead of trapping.
+    var min = ast.Expr{ .literal = .{ .integer = std.math.minInt(i64) } };
+    const neg = ast.Expr{ .unary = .{ .op = .negate, .expr = &min } };
+    const foldedNeg = try foldConstants(std.testing.allocator, neg);
+    defer freeFoldedExpr(std.testing.allocator, foldedNeg);
+    try std.testing.expectEqual(@as(f64, 9223372036854775808.0), foldedNeg.literal.real);
+
+    // Negative shifts flip direction: 4 << -1 is 4 >> 1.
+    var four = ast.Expr{ .literal = .{ .integer = 4 } };
+    var negOne = ast.Expr{ .literal = .{ .integer = -1 } };
+    const shift = ast.Expr{ .binary = .{ .op = .shiftLeft, .left = &four, .right = &negOne } };
+    const foldedShift = try foldConstants(std.testing.allocator, shift);
+    defer freeFoldedExpr(std.testing.allocator, foldedShift);
+    try std.testing.expectEqual(@as(i64, 2), foldedShift.literal.integer);
+
+    // Non-foldable trees rebuild instead of folding.
+    var col = ast.Expr{ .identifier = "x" };
+    var five = ast.Expr{ .literal = .{ .integer = 5 } };
+    const colAdd = ast.Expr{ .binary = .{ .op = .add, .left = &col, .right = &five } };
+    const foldedCol = try foldConstants(std.testing.allocator, colAdd);
+    defer freeFoldedExpr(std.testing.allocator, foldedCol);
+    try std.testing.expect(foldedCol == .binary);
+}
+
+test "pushdown respects column qualifiers" {
+    const bare = ast.Expr{ .identifier = "x" };
+    try std.testing.expect(canPushDownPredicate(bare, "a"));
+    try std.testing.expect(canPushDownPredicate(bare, "b"));
+    const qualified = ast.Expr{ .identifier = "a.x" };
+    try std.testing.expect(canPushDownPredicate(qualified, "a"));
+    try std.testing.expect(canPushDownPredicate(qualified, "A"));
+    try std.testing.expect(!canPushDownPredicate(qualified, "b"));
+    const schemaQualified = ast.Expr{ .identifier = "aux.orders.amount" };
+    try std.testing.expect(canPushDownPredicate(schemaQualified, "orders"));
+    try std.testing.expect(!canPushDownPredicate(schemaQualified, "aux"));
+    try std.testing.expect(!canPushDownPredicate(schemaQualified, "users"));
+    var left = ast.Expr{ .identifier = "a.x" };
+    var right = ast.Expr{ .literal = .{ .integer = 1 } };
+    const pred = ast.Expr{ .binary = .{ .op = .equal, .left = &left, .right = &right } };
+    try std.testing.expect(canPushDownPredicate(pred, "a"));
+    try std.testing.expect(!canPushDownPredicate(pred, "b"));
 }

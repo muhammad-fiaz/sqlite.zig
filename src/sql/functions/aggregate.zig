@@ -1,41 +1,15 @@
 //! Aggregate SQL functions (`count`, `sum`, `avg`, `min`, `max`, ...).
 //!
-//! Purpose: single authoritative streaming aggregate state machine behind
-//! GROUP BY / window-aggregate paths. `AggKind.fromName` is also the
-//! `functions.isAggregate` predicate, so naming stays in one place.
-//!
-//! Responsibilities: per-group `step` accumulation with DISTINCT dedup,
-//! overflow-safe integer sums (widening to REAL), type-aware `min`/`max`,
-//! and `group_concat`/`string_agg` string building.
-//!
-//! Dependencies: `std`, `../../vm/value.zig`, `scalar.zig` (`formatReal`).
-//! Driven by `connection.zig` and `window.zig` (frame aggregates).
-//!
-//! Ownership/lifetime: `AggState` owns cloned `minVal`/`maxVal`, `concatPieces`
-//! strings, and DISTINCT `seenValues`; release with `deinit`. `step` borrows
-//! its input; `final` returns a fresh caller-owned `Value`.
-//!
-//! Error behavior: `step`/`final` fail only on OOM. NULL inputs are skipped
-//! (except `count(*)` via `stepWildcard`); empty groups yield NULL except
-//! `count` (0) and `total` (0.0).
-//!
-//! Invariants: `hasValue` tracks any non-NULL row; `isReal` forces REAL sums;
-//! `separator` is borrowed (caller must keep it alive through `final`).
-//!
-//! SQLite compatibility: `avg`/`average` alias; `total` never returns NULL;
-//! `sum` of all-NULL/empty is NULL; `group_concat` default separator `,`;
-//! DISTINCT uses `sameValue` identity (int 1 != real 1.0).
-// TODO(sql/aggregate): DISTINCT dedup is O(n^2) linear scan plus a full clone
-// per distinct value; hostile 100k-row GROUP BY can blow time/memory.
-// Expected: hash-based dedup with a size budget; tests: 10k-distinct perf
-// bound + budget rejection. Subsystem: sql/functions.
-// TODO(sql/aggregate): text `sum`/`avg` coercion uses strict trim+parse while
-// scalar prefix parsing is lenient. Expected: shared coercion (see scalar
-// TODO); tests: `'12x'` sum matrix identical across paths. Subsystem: sql/functions.
+//! Streaming per-group accumulator (`AggState`: `step` rows in, `final`
+//! reads the result out, `deinit` releases). `sum`/`avg` text must be
+//! wholly numeric or the row is skipped — deliberately stricter than the
+//! prefix scans scalar `abs` uses (`sum('12x')` skips, `abs('12x')` is 12).
 
 const std = @import("std");
 const Value = @import("../../vm/value.zig").Value;
 const scalar = @import("scalar.zig");
+const coerce = @import("../coerce.zig");
+const limits = @import("../limits.zig");
 
 /// Aggregate function identity; `fromName` is the single name resolver.
 pub const AggKind = enum {
@@ -62,6 +36,58 @@ pub const AggKind = enum {
     }
 };
 
+/// Hashable DISTINCT identity: same-type equality exactly like
+/// `Value.sameValue` (integers never equal reals; `-0.0` normalizes to
+/// `0.0`; NaN never reaches the map — it is always distinct).
+const DistinctKey = union(enum) {
+    integer: i64,
+    real: u64,
+    text: []const u8,
+    blob: []const u8,
+};
+
+/// Hash/equality for `DistinctKey`: tag + payload bytes; text/blob compare
+/// by contents. Reals hash by bits with `-0.0` already normalized to `0.0`
+/// at key build time, so equal values always share a bucket.
+const DistinctContext = struct {
+    pub fn hash(_: @This(), key: DistinctKey) u64 {
+        var hasher = std.hash.Wyhash.init(0);
+        hasher.update(&[_]u8{@intFromEnum(key)});
+        switch (key) {
+            .integer => |n| hasher.update(std.mem.asBytes(&n)),
+            .real => |bits| hasher.update(std.mem.asBytes(&bits)),
+            .text => |t| hasher.update(t),
+            .blob => |b| hasher.update(b),
+        }
+        return hasher.final();
+    }
+    pub fn eql(_: @This(), a: DistinctKey, b: DistinctKey) bool {
+        if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+        return switch (a) {
+            .integer => |n| n == b.integer,
+            .real => |bits| @as(f64, @bitCast(bits)) == @as(f64, @bitCast(b.real)),
+            .text => |t| std.mem.eql(u8, t, b.text),
+            .blob => |x| std.mem.eql(u8, x, b.blob),
+        };
+    }
+};
+
+/// Build a dedup key, or null when the value must bypass the map (NULL and
+/// NaN are always distinct and never stored, matching `sameValue`).
+fn distinctKey(val: Value) ?DistinctKey {
+    return switch (val) {
+        .null => null,
+        .integer => |n| .{ .integer = n },
+        .real => |r| {
+            if (std.math.isNan(r)) return null;
+            const normalized: f64 = if (r == 0.0) 0.0 else r;
+            return .{ .real = @bitCast(normalized) };
+        },
+        .text => |t| .{ .text = t },
+        .blob => |b| .{ .blob = b },
+    };
+}
+
 /// Streaming per-group accumulator; create with `init`, release with `deinit`.
 pub const AggState = struct {
     /// Allocator for clones/pieces/seen-values.
@@ -86,8 +112,8 @@ pub const AggState = struct {
     separator: []const u8 = ",",
     /// Owned string pieces for concat (freed by `deinit`; joined by `final`).
     concatPieces: std.ArrayList([]const u8),
-    /// Owned DISTINCT history (linear scan; see module TODO).
-    seenValues: std.ArrayList(Value),
+    /// Owned DISTINCT key set (hash dedup; text/blob payloads duped).
+    seenValues: std.HashMap(DistinctKey, void, DistinctContext, 80),
 
     /// Create an empty accumulator; `sep` borrows (defaults to `","`).
     pub fn init(allocator: std.mem.Allocator, kind: AggKind, sep: ?[]const u8) AggState {
@@ -103,24 +129,25 @@ pub const AggState = struct {
             .maxVal = null,
             .separator = sep orelse ",",
             .concatPieces = std.ArrayList([]const u8).empty,
-            .seenValues = std.ArrayList(Value).empty,
+            .seenValues = std.HashMap(DistinctKey, void, DistinctContext, 80).init(allocator),
         };
     }
 
-    /// Release owned min/max, concat pieces, and DISTINCT history.
+    /// Release owned min/max, concat pieces, and DISTINCT key payloads.
     pub fn deinit(self: *AggState) void {
         for (self.concatPieces.items) |piece| {
             self.allocator.free(piece);
         }
         self.concatPieces.deinit(self.allocator);
-        for (self.seenValues.items) |v| {
-            switch (v) {
+        var keyIterator = self.seenValues.keyIterator();
+        while (keyIterator.next()) |key| {
+            switch (key.*) {
                 .text => |t| self.allocator.free(t),
                 .blob => |b| self.allocator.free(b),
                 else => {},
             }
         }
-        self.seenValues.deinit(self.allocator);
+        self.seenValues.deinit();
         if (self.minVal) |v| {
             switch (v) {
                 .text => |t| self.allocator.free(t),
@@ -138,11 +165,18 @@ pub const AggState = struct {
     }
 
     fn isDistinctDuplicate(self: *AggState, val: Value) !bool {
-        for (self.seenValues.items) |seen| {
-            if (seen.sameValue(val)) return true;
+        // NULL and NaN bypass the map (always distinct, never stored),
+        // matching `sameValue` identity exactly.
+        const key = distinctKey(val) orelse return false;
+        if (self.seenValues.count() >= limits.max_distinct_values) return error.SqlTooBig;
+        const entry = try self.seenValues.getOrPut(key);
+        if (entry.found_existing) return true;
+        // Own text/blob payloads; scalars need no storage.
+        switch (key) {
+            .text => |t| entry.key_ptr.* = .{ .text = try self.allocator.dupe(u8, t) },
+            .blob => |b| entry.key_ptr.* = .{ .blob = try self.allocator.dupe(u8, b) },
+            else => {},
         }
-        const cloned = try val.clone(self.allocator);
-        try self.seenValues.append(self.allocator, cloned);
         return false;
     }
 
@@ -183,16 +217,20 @@ pub const AggState = struct {
                         self.sumReal += r;
                     },
                     .text => |t| {
-                        if (std.fmt.parseInt(i64, std.mem.trim(u8, t, " \t\r\n"), 10)) |i| {
+                        const trimmed = std.mem.trim(u8, t, " \t\r\n");
+                        if (std.fmt.parseInt(i64, trimmed, 10)) |i| {
                             const res = @addWithOverflow(self.sumInt, i);
                             self.sumInt = res[0];
                             if (res[1] != 0) self.isReal = true;
                             self.sumReal += @as(f64, @floatFromInt(i));
                         } else |_| {
-                            if (std.fmt.parseFloat(f64, std.mem.trim(u8, t, " \t\r\n"))) |r| {
+                            // Whole-string decimal only: hex and trailing
+                            // junk stay text (skipped), matching the strict
+                            // conversion `sum` requires.
+                            if (coerce.toFloatStrict(.{ .text = t })) |r| {
                                 self.isReal = true;
                                 self.sumReal += r;
-                            } else |_| {}
+                            }
                         }
                     },
                     .null, .blob => {},
@@ -360,4 +398,50 @@ test "aggregate overflow and error-equivalents" {
     defer ov.free(alloc);
     // Overflow widens to REAL instead of trapping.
     try std.testing.expect(ov == .real);
+}
+
+test "sum skips hex and partial numbers like strict conversion" {
+    const alloc = std.testing.allocator;
+    var s = AggState.init(alloc, .sum, null);
+    defer s.deinit();
+    try s.step(.{ .text = "0x2A" }, false);
+    try s.step(.{ .text = "12x" }, false);
+    try s.step(.{ .integer = 5 }, false);
+    const total = try s.final();
+    defer total.free(alloc);
+    try std.testing.expectEqual(@as(i64, 5), total.integer);
+}
+
+test "distinct dedup matches sameValue identity at scale" {
+    const alloc = std.testing.allocator;
+    var d = AggState.init(alloc, .count, null);
+    defer d.deinit();
+    // Integers dedupe; int 1 and real 1.0 stay distinct (strict types).
+    try d.step(.{ .integer = 1 }, true);
+    try d.step(.{ .integer = 1 }, true);
+    try d.step(.{ .real = 1.0 }, true);
+    // -0.0 normalizes onto 0.0; NaN never matches, not even itself.
+    try d.step(.{ .real = 0.0 }, true);
+    try d.step(.{ .real = -0.0 }, true);
+    try d.step(.{ .real = std.math.nan(f64) }, true);
+    try d.step(.{ .real = std.math.nan(f64) }, true);
+    // Text and blob dedupe by contents across duplicates.
+    var i: usize = 0;
+    while (i < 10000) : (i += 1) {
+        try d.step(.{ .integer = @intCast(i) }, true);
+        try d.step(.{ .text = "dup" }, true);
+    }
+    // 1, 1.0, 0.0, nan, nan, ints 0..9999 minus the dup 1, "dup".
+    try std.testing.expectEqual(@as(i64, 10005), (try d.final()).integer);
+}
+
+test "distinct accumulation rejects past its budget" {
+    const alloc = std.testing.allocator;
+    var d = AggState.init(alloc, .count, null);
+    defer d.deinit();
+    var i: i64 = 0;
+    while (i < @as(i64, limits.max_distinct_values)) : (i += 1) {
+        try d.step(.{ .integer = i }, true);
+    }
+    try std.testing.expectError(error.SqlTooBig, d.step(.{ .integer = -1 }, true));
 }

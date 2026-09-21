@@ -1,11 +1,6 @@
-//! Engine version constants.
+//! Library and compatibility version strings.
 //!
-//! Purpose: single source of truth for the library release (`sqliteVersion`)
-//! and the SQLite compatibility version this engine targets
-//! (`sqliteEngineVersion`, surfaced via `sqlite_version()`). Dependencies:
-//! none. Ownership: static strings, no lifetime. Invariants: both are
-//! `major.minor.patch` numeric strings; the engine version tracks a real
-//! upstream SQLite release so clients can gate on file-format features.
+//! Both are static dotted triples with no allocation.
 
 const std = @import("std");
 

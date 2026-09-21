@@ -1,13 +1,7 @@
-//! Secondary-index overlay: key -> rowid map over a `BTree`.
+//! Secondary index overlay mapping keys to rowids.
 //!
-//! Purpose: maintain the `key -> rowid` lookup an index needs, encoding each
-//! rowid as 8 big-endian bytes in the underlying map payload. Dependencies:
-//! `btree/btree.zig`, `std`. Ownership/lifetime: `Index` owns its `BTree`
-//! (`deinit` frees); `rowid` returns a copied integer (no lifetime).
-//! Error behavior: short/corrupt payloads yield `null` from `rowid` (fail
-//! closed, never panics on slicing); allocation failures propagate from
-//! `insert`. Invariants: every stored payload is exactly 8 bytes; inserting
-//! an existing key overwrites its rowid.
+//! Owns its `BTree` with 8-byte big-endian rowid payloads.
+//! Misses and short payloads read as `null`.
 
 const std = @import("std");
 const BTree = @import("btree.zig").BTree;
@@ -35,10 +29,6 @@ pub const Index = struct {
     }
 
     /// Looks up the rowid for `key`, or `null` when absent or corrupt.
-    ///
-    /// Why the length check: payloads should always be 8 bytes, but a short
-    /// payload (only reachable via direct `tree` manipulation or a bug)
-    /// returns `null` instead of panicking on the fixed slice.
     pub fn rowid(self: *const Index, key: u64) ?u64 {
         const value = self.tree.get(key) orelse return null;
         if (value.len < 8) return null;

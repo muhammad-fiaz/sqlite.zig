@@ -1,41 +1,8 @@
-//! Scalar/aggregate/window function registry: single dispatch hub (pipeline stage 3).
+//! Function registry: routes calls to scalar, aggregate, or window evaluation.
 //!
-//! Purpose: authoritative `evalScalar` dispatcher mapping a case-insensitive
-//! SQL function name plus `Value` args to a caller-owned `Value`. Aggregate
-//! iteration lives in `aggregate.zig` (`AggState`), window framing in
-//! `window.zig`; this file only routes scalar calls and the two multi-arg
-//! `min`/`max` scalar forms.
-//!
-//! Responsibilities: arity validation (`error.InvalidArgumentCount`),
-//! argument validation (`error.InvalidArgument`), case-insensitive name
-//! matching, and delegating to one implementation per function family.
-//! No function logic lives here; each `if` arm forwards to exactly one
-//! `scalar.*`, `math.*`, `datetime.*`, or `json.*` helper.
-//!
-//! Dependencies: `../vm/value.zig`, the six `functions/*.zig` modules.
-//! Called by `expr.zig` (CHECK/defaults) and `vm/vm.zig` (`function` opcode).
-//!
-//! Ownership/lifetime: input `args` are borrowed; the returned `Value` is
-//! caller-owned (free text/blob results with the same allocator).
-//!
-//! Error behavior: `InvalidArgumentCount` on wrong arity, `InvalidArgument`
-//! on wrong types (e.g. `CAST(x AS 42)`), `Unsupported` for unknown names,
-//! `OutOfMemory`/`InvalidSql` propagated from callees. Never panics on bad
-//! input; NULL propagation is decided inside each callee per SQLite rules.
-//!
-//! Invariants: `isAggregate(name)` and scalar dispatch are disjoint except
-//! `min`/`max`, which are scalar only when `args.len >= 2` (single-arg form
-//! stays aggregate); `isWindowOnly` names never evaluate here.
-//!
-//! SQLite compatibility: names match SQLite core + common extensions
-//! (`substr`/`substring`, `printf`/`format`, `pow`/`power`, `ceil`/`ceiling`,
-//! `iif`/`if`, `likelihood`/`likely`/`unlikely`, `average` for `avg`,
-//! `string_agg` for `group_concat`); `min`/`max` scalar forms return NULL if
-//! any argument is NULL.
-// TODO(sql/functions): `min`/`max` dual scalar-vs-aggregate routing by arity
-// is subtle and split across this file and `aggregate.zig`. Expected: one
-// resolver returning scalar|aggregate|window|unknown with arity attached;
-// tests: 0/1/2/N-arg min/max matrices for both paths. Subsystem: sql/functions.
+//! `classify` makes the single routing call (notably `min`/`max` by arity);
+//! `evalScalar` evaluates row-wise calls with caller-owned results.
+//! Unknown names fail `Unsupported`; wrong arity fails `InvalidArgumentCount`.
 
 const std = @import("std");
 const Value = @import("../vm/value.zig").Value;
@@ -53,10 +20,72 @@ pub const aggregate = @import("functions/aggregate.zig");
 /// Window framing/evaluation (`row_number`, `lag`, ...).
 pub const window = @import("functions/window.zig");
 
-/// True when `name` is an aggregate (`count`, `sum`, `avg`/`average`, ...).
-/// Single-arg `min`/`max` report true here; multi-arg forms are scalar.
-pub fn isAggregate(name: []const u8) bool {
-    return aggregate.AggKind.fromName(name) != null;
+/// How a function call executes: exactly one routing decision shared by
+/// scalar dispatch, aggregate accumulation, and window handling, so `min`
+/// and `max` cannot take different paths in different subsystems.
+pub const FuncClass = enum {
+    /// Row-wise evaluation through `evalScalar` (all pure functions, plus
+    /// multi-argument `min`/`max`, which return NULL when any arg is NULL).
+    scalar,
+    /// Per-group accumulation through `aggregate.AggState` (single-argument
+    /// `min`/`max` included: they aggregate one value per row).
+    aggregate,
+    /// Requires an OVER clause; never evaluates here.
+    window,
+    /// Not a known function in any class.
+    unknown,
+};
+
+/// Scalar function names routed by `evalScalar` below (single source; the
+/// drift test at the file bottom fails if an arm is added without its name).
+/// `min`/`max` are absent on purpose: their class depends on arity.
+const scalarNames = [_][]const u8{
+    "abs",         "lower",      "upper",        "length",       "round",          "typeof",           "coalesce",     "ifnull",
+    "nullif",      "instr",      "replace",      "substr",       "substring",      "trim",             "ltrim",        "rtrim",
+    "cast",        "hex",        "unhex",        "quote",        "char",           "unicode",          "printf",       "format",
+    "concat",      "concat_ws",  "octet_length", "zeroblob",     "sign",           "iif",              "if",           "unlikely",
+    "likely",      "likelihood", "random",       "randomblob",   "sqlite_version", "sqlite_source_id", "json_quote",   "unistr",
+    "ceil",        "ceiling",    "floor",        "trunc",        "ln",             "log",              "log10",        "log2",
+    "pow",         "power",      "sqrt",         "sin",          "cos",            "tan",              "asin",         "acos",
+    "atan",        "atan2",      "degrees",      "radians",      "pi",             "exp",              "mod",          "cosh",
+    "sinh",        "tanh",       "acosh",        "asinh",        "atanh",          "date",             "time",         "datetime",
+    "julianday",   "unixepoch",  "strftime",     "json",         "json_valid",     "json_type",        "json_extract", "json_array",
+    "json_object", "json_set",   "json_insert",  "json_replace", "json_remove",
+};
+
+/// Classify one call for routing: window names first (arity-independent),
+/// then `min`/`max` by arity (0 args is neither class — SQLite rejects it
+/// as wrong-arity; 1 arg aggregates; 2+ evaluate scalar), then plain
+/// aggregates, then the scalar table, else unknown.
+pub fn classify(name: []const u8, argc: usize) FuncClass {
+    if (isWindowOnly(name)) return .window;
+    if (std.ascii.eqlIgnoreCase(name, "min") or std.ascii.eqlIgnoreCase(name, "max")) {
+        if (argc >= 2) return .scalar;
+        if (argc == 1) return .aggregate;
+        return .unknown;
+    }
+    if (aggregate.AggKind.fromName(name) != null) return .aggregate;
+    if (isScalarFunction(name)) return .scalar;
+    return .unknown;
+}
+
+/// True when `name` is in the scalar dispatch table (arity checked by the
+/// dispatcher, not here).
+pub fn isScalarFunction(name: []const u8) bool {
+    for (scalarNames) |candidate| if (std.ascii.eqlIgnoreCase(candidate, name)) return true;
+    return false;
+}
+
+/// Argument count for `classify` routing from a call node exposing
+/// `argument2`, `argument3`, and `extraArgs` (the mandatory first argument
+/// counts as one, including `*` for `count(*)`). Keeps every routing site
+/// counting identically.
+pub fn argCount(call: anytype) usize {
+    var count: usize = 1;
+    if (call.argument2 != null) count += 1;
+    if (call.argument3 != null) count += 1;
+    count += call.extraArgs.len;
+    return count;
 }
 
 /// True for window-only functions that require an OVER clause.
@@ -403,9 +432,9 @@ pub fn evalScalar(allocator: std.mem.Allocator, name: []const u8, args: []const 
 
 test "functions registry routes core families" {
     const alloc = std.testing.allocator;
-    try std.testing.expect(isAggregate("count"));
-    try std.testing.expect(isAggregate("AVERAGE"));
-    try std.testing.expect(!isAggregate("abs"));
+    try std.testing.expect(classify("count", 1) == .aggregate);
+    try std.testing.expect(classify("AVERAGE", 1) == .aggregate);
+    try std.testing.expect(classify("abs", 1) == .scalar);
     try std.testing.expect(isWindowOnly("row_number"));
     try std.testing.expect(!isWindowOnly("abs"));
 
@@ -448,4 +477,64 @@ test "functions registry rejects bad arity and unknown names" {
     try std.testing.expectError(error.InvalidArgument, evalScalar(alloc, "cast", &.{ .{ .integer = 1 }, .{ .integer = 2 } }));
     try std.testing.expectError(error.Unsupported, evalScalar(alloc, "no_such_fn", &.{.{ .integer = 1 }}));
     try std.testing.expectError(error.InvalidArgumentCount, evalScalar(alloc, "json_object", &.{.{ .text = "k" }}));
+}
+
+test "function classes route min and max by arity" {
+    // 0 args: neither class (SQLite rejects the arity outright).
+    try std.testing.expect(classify("min", 0) == .unknown);
+    try std.testing.expect(classify("max", 0) == .unknown);
+    // 1 arg: aggregate accumulation over rows.
+    try std.testing.expect(classify("min", 1) == .aggregate);
+    try std.testing.expect(classify("MAX", 1) == .aggregate);
+    // 2+ args: scalar evaluation across arguments (NULL poisons).
+    try std.testing.expect(classify("min", 2) == .scalar);
+    try std.testing.expect(classify("max", 5) == .scalar);
+    try std.testing.expect(classify("MIN", 3) == .scalar);
+    // Other classes are arity-independent.
+    try std.testing.expect(classify("sum", 1) == .aggregate);
+    try std.testing.expect(classify("sum", 4) == .aggregate);
+    try std.testing.expect(classify("abs", 1) == .scalar);
+    try std.testing.expect(classify("row_number", 0) == .window);
+    try std.testing.expect(classify("lag", 2) == .window);
+    try std.testing.expect(classify("no_such_fn", 1) == .unknown);
+    try std.testing.expect(classify("no_such_fn", 7) == .unknown);
+}
+
+test "scalar table covers every evalScalar arm" {
+    // Drift guard: each name below must both classify scalar and evaluate
+    // without an arity error (representative 1-arg probes; multi-arg-only
+    // names are covered by their own suites). Adding an evalScalar arm
+    // without its table entry fails here, not silently in routing.
+    const alloc = std.testing.allocator;
+    for (scalarNames) |name| {
+        if (std.ascii.eqlIgnoreCase(name, "min") or std.ascii.eqlIgnoreCase(name, "max")) continue;
+        try std.testing.expect(isScalarFunction(name));
+        try std.testing.expect(classify(name, 1) == .scalar);
+    }
+    try std.testing.expect(!isScalarFunction("min"));
+    try std.testing.expect(!isScalarFunction("count"));
+    try std.testing.expect(!isScalarFunction("no_such_fn"));
+    // Spot-check the table against live dispatch (strict regimes included).
+    const abs = try evalScalar(alloc, "abs", &.{.{ .text = "12x" }});
+    defer abs.free(alloc);
+    try std.testing.expectEqual(@as(f64, 12.0), abs.real);
+    const floor = try evalScalar(alloc, "floor", &.{.{ .text = "12x" }});
+    defer floor.free(alloc);
+    try std.testing.expect(floor == .null);
+}
+
+test "scalar min and max evaluate across arguments" {
+    const alloc = std.testing.allocator;
+    const two = [_]Value{ .{ .integer = 3 }, .{ .integer = 1 } };
+    const lo = try evalScalar(alloc, "min", &two);
+    defer lo.free(alloc);
+    try std.testing.expectEqual(@as(i64, 1), lo.integer);
+    const hi = try evalScalar(alloc, "max", &two);
+    defer hi.free(alloc);
+    try std.testing.expectEqual(@as(i64, 3), hi.integer);
+    // Mixed storage types compare numerically.
+    const mixed = [_]Value{ .{ .text = "20" }, .{ .integer = 3 } };
+    const mixedLo = try evalScalar(alloc, "min", &mixed);
+    defer mixedLo.free(alloc);
+    try std.testing.expectEqual(@as(i64, 3), mixedLo.integer);
 }

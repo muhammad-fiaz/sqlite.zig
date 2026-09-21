@@ -31,6 +31,7 @@ description: "The hand-written SQL lexer, parser, and bytecode compiler supporti
 | **Compound SELECT** | `UNION [ALL]`, `INTERSECT`, `EXCEPT` with `ORDER BY` / `LIMIT` / `OFFSET` |
 | **CTE** | `WITH ...` / `WITH RECURSIVE ...` |
 | **VACUUM** | `VACUUM [schema]` rebuilds the main or an attached database; `VACUUM INTO 'file'` writes a copy |
+| **REINDEX** | `REINDEX [schema.]table|index` refreshes statistics for one object, or the whole database bare |
 | **EXPLAIN QUERY PLAN** | `EXPLAIN QUERY PLAN SELECT ...` reports index use vs table scans |
 | **CREATE VIRTUAL TABLE** | `generate_series` module only; other modules return an explicit error |
 | **DROP** | `DROP TABLE/INDEX/VIEW/TRIGGER [IF EXISTS] name` |

@@ -1,34 +1,7 @@
-//! Migration definitions: versioned, checksummed SQL transitions.
+//! Versioned SQL migrations.
 //!
-//! Purpose: declare ordered schema transitions (`Migration`) and collect them
-//! (`Set`) for `migration/runner.zig` to apply. A migration carries a
-//! monotonically increasing `version`, a human `name`, an `upSql` transition,
-//! and an optional `downSql` rollback. `checksum()` fingerprints the
-//! name + statements so the runner can detect post-apply edits.
-//!
-//! Responsibilities: value definition, Wyhash checksum, and an ordered
-//! definition list. No I/O, no SQL parsing, no execution.
-//!
-//! Dependencies: `std` only. All slices are borrowed from the caller (usually
-//! string literals or test-owned buffers).
-//!
-//! Ownership/lifetime: `Migration` is a plain copyable value borrowing its
-//! strings; `Set` borrows each stored `Migration`'s strings too (it copies the
-//! struct, not the bytes). Keep the underlying bytes alive while the set/runner
-//! is in use. `Set.deinit` releases only the list backing, never the strings.
-//! Cloning a `Set`'s slice is a shallow copy with the same borrow rules.
-//!
-//! Error behavior: `add` fails only on allocation failure. `checksum` never
-//! fails. Semantic errors (duplicate versions, gaps, edits) are reported by
-//! `Runner`, not here.
-//!
-//! SQLite compatibility: `upSql`/`downSql` may contain multiple statements;
-//! they run through the engine's script executor, so SQLite script semantics
-//! apply (VACUUM restrictions are enforced by the runner).
-//!
-//! Unified pipeline note: migrations are raw-SQL transitions executed as
-//! scripts; like every other pipeline they run against the native engine —
-//! never through a DSL->SQL-string round trip.
+//! `Migration` and `Set` borrow their strings; `Set` owns only its list.
+//! `add` fails only on out of memory.
 
 const std = @import("std");
 

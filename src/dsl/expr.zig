@@ -1,42 +1,7 @@
-//! DSL intermediate representation: predicates, projections, and assignments.
+//! Shared borrowed IR for predicates, projections, and assignments.
 //!
-//! Purpose: the vocabulary shared by the typed DSL (`dsl/column.zig`,
-//! `dsl/table.zig`) and the dynamic DSL (`dsl/dynamic.zig`). Every entry here
-//! is a plain, non-owning value — table/column names and function names are
-//! borrowed slices, `Value`s borrow text/blob payloads.
-//!
-//! Responsibilities: define `ColumnRef`, `FuncCall`, `Operator`, `Expr`,
-//! `Order`, `Projection`, `HavingCond`, and the `SetValue` assignment union
-//! consumed by `dsl/ast_builder.zig`.
-//!
-//! Dependencies: `vm/value.zig` only. No allocator, no SQL text.
-//!
-//! Ownership/lifetime: all structs are `Copyable` values. String and `Value`
-//! payloads are borrowed; `ast_builder` duplicates whatever the native AST
-//! must retain into `BuiltStatement.ownedStrings`. Dropping an `Expr`
-//! invalidates nothing. AST builders copy the struct, so mutating the DSL
-//! value after `where()`/`select()` has no effect.
-//!
-//! Error behavior: pure data; no fallible operations. Validation (unknown
-//! columns, bad HAVING shapes) happens later in `ast_builder` and returns
-//! `error.InvalidSql`.
-//!
-//! SQLite compatibility: `Operator.sql` renders reference keywords
-//! (`IS DISTINCT FROM`, `GLOB`, `MATCH`, ...). DSL operators map 1:1 onto
-//! `ast.CompareOp`/`ast.BinaryOp` in `ast_builder`.
-//!
-//! Unified pipeline note: Raw SQL, the dynamic DSL, and the typed DSL all
-//! converge on native AST/IR via `ast_builder` — this IR is never rendered to
-//! an SQL string and re-parsed.
-//!
-//! Column/operation collision rule: schema fields are always valid struct
-//! fields (`User.where`, `User.count` are column descriptors); DSL operations
-//! are methods/calls on those values (`User.all()`, `col.count()`), so user
-//! columns named like operations never collide.
-//!
-//! AllColumns note: `Projection.kind` distinguishes `.star` (native `*`) from
-//! `.countStar` (native `COUNT(*)`); `countStar()` builds the latter without
-//! touching a column descriptor.
+//! All values are plain copies; strings and payloads stay borrowed.
+//! Pure data with no failures; bad shapes fail later as `InvalidSql`.
 
 const std = @import("std");
 const Value = @import("../vm/value.zig").Value;

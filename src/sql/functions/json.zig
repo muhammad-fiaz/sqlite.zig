@@ -1,36 +1,7 @@
-//! JSON1 SQL functions (`json`, `json_extract`, `json_object`, ...).
+//! JSON SQL functions.
 //!
-//! Purpose: authoritative JSON implementations behind `functions.evalScalar`.
-//! Paths follow the `$.a.b[0]`Subset (`$"quoted"`, `[N]`, negative-from-end,
-//! `[#N]` legacy form); values convert between `std.json.Value` and SQL
-//! `Value` (bool <-> 1/0, array/object <-> canonical text).
-//!
-//! Responsibilities: path parsing, pointed lookup, `set`/`insert`/`replace`
-//! modification, `remove`, and constructors (`json_array`, `json_object`).
-//!
-//! Dependencies: `std.json`, `../../vm/value.zig` only.
-//!
-//! Ownership/lifetime: inputs borrowed; text outputs heap-owned by the caller.
-//! Internal `std.json` trees live in a function-local arena freed on return;
-//! `PathStep.key` slices borrow the path text, `steps` arrays are freed by
-//! the caller of `parsePath`.
-//!
-//! Error behavior: malformed JSON or path mismatches yield `.null` (never an
-//! error) except `json_object` with odd arity (`InvalidArgumentCount`) or
-//! non-text keys (`InvalidArgument`). OOM propagates.
-//!
-//! Invariants: `getPath` never mutates; `setPath`/`removePath` silently ignore
-//! type mismatches (SQLite-compatible no-op); negative indexes count from end.
-//!
-//! SQLite compatibility: subset — `->`/`->>` operators are parser-level,
-//! JSON5 extensions unsupported, `[#N]` maps toward end-anchored indexes.
-// TODO(sql/json): nested-document recursion (`cloneJson`, `std.json` parse)
-// has no explicit depth cap; hostile 10k-deep `[..]` can stack-overflow.
-// Expected: depth-limited parse/clone failing closed to NULL; tests: deep
-// nesting returns NULL instead of crashing. Subsystem: sql/functions.
-// TODO(sql/json): no document-size cap; a multi-MB hostile JSON arg can OOM
-// the arena. Expected: shared input-size budget with lexer/parser; tests:
-// over-limit JSON arg yields NULL. Subsystem: sql/functions.
+//! Inputs borrowed; text results are caller-owned.
+//! Bad JSON or paths yield NULL.
 
 const std = @import("std");
 const Value = @import("../../vm/value.zig").Value;
@@ -125,13 +96,52 @@ fn sqlValueToJson(arena: std.mem.Allocator, val: Value) !std.json.Value {
         .integer => |i| .{ .integer = i },
         .real => |r| .{ .float = r },
         .text => |t| blk: {
-            const parsed = std.json.parseFromSlice(std.json.Value, arena, t, .{}) catch {
+            const parsed = parseJsonDocument(arena, t) catch {
                 break :blk .{ .string = t };
             };
             break :blk parsed.value;
         },
         .blob => .null,
     };
+}
+
+// Deep documents must fail closed, not stack-overflow: every parse below
+// goes through `parseJsonDocument`, which rejects nesting past
+// `max_json_depth` before the recursive parser, cloner, and formatter run.
+// Sized for small stacks: each level costs several frames across parse,
+// clone, and format, and 400-deep input already overflows a 1MB stack.
+const max_json_depth: usize = 128;
+
+/// Iterative bracket-depth scan: true when nesting stays within budget.
+/// String-aware (escapes respected), saturating on unbalanced closers.
+/// Invalid documents pass here and fail later in the real parser as NULL.
+fn jsonDepthWithin(text: []const u8, maxDepth: usize) bool {
+    var depth: usize = 0;
+    var i: usize = 0;
+    var inString = false;
+    while (i < text.len) {
+        const c = text[i];
+        if (inString) {
+            if (c == '\\') i += 1;
+            if (c == '"') inString = false;
+        } else if (c == '"') {
+            inString = true;
+        } else if (c == '[' or c == '{') {
+            depth += 1;
+            if (depth > maxDepth) return false;
+        } else if (c == ']' or c == '}') {
+            depth -|= 1;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+/// Parse one JSON document with the depth gate applied. Too-deep input
+/// fails `TooDeep` (callers map it to NULL like any other bad document).
+fn parseJsonDocument(allocator: std.mem.Allocator, text: []const u8) !std.json.Parsed(std.json.Value) {
+    if (!jsonDepthWithin(text, max_json_depth)) return error.TooDeep;
+    return try std.json.parseFromSlice(std.json.Value, allocator, text, .{});
 }
 
 fn cloneJson(arena: std.mem.Allocator, val: std.json.Value) !std.json.Value {
@@ -296,9 +306,11 @@ fn removePath(root: *std.json.Value, steps: []const PathStep) void {
 }
 
 /// `json(X)`: canonical minified JSON text, or NULL for non-text/NULL/bad JSON.
+/// Large documents allocate proportionally and fail closed on OOM; depth is
+/// capped by `parseJsonDocument`, size is not (big JSON is legitimate input).
 pub fn evalJson(allocator: std.mem.Allocator, arg: Value) !Value {
     if (arg == .null or arg != .text) return .null;
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, arg.text, .{}) catch return .null;
+    const parsed = parseJsonDocument(allocator, arg.text) catch return .null;
     defer parsed.deinit();
     const str = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(parsed.value, .{})});
     return .{ .text = str };
@@ -307,7 +319,7 @@ pub fn evalJson(allocator: std.mem.Allocator, arg: Value) !Value {
 /// `json_valid(X)`: 1 when X is well-formed JSON text, else 0 (never NULL).
 pub fn evalJsonValid(allocator: std.mem.Allocator, arg: Value) Value {
     if (arg == .null or arg != .text) return .{ .integer = 0 };
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, arg.text, .{}) catch return .{ .integer = 0 };
+    const parsed = parseJsonDocument(allocator, arg.text) catch return .{ .integer = 0 };
     parsed.deinit();
     return .{ .integer = 1 };
 }
@@ -315,7 +327,7 @@ pub fn evalJsonValid(allocator: std.mem.Allocator, arg: Value) Value {
 /// `json_type(X[,path])`: `null|true|false|integer|real|text|array|object` or NULL.
 pub fn evalJsonType(allocator: std.mem.Allocator, args: []const Value) !Value {
     if (args.len == 0 or args[0] == .null or args[0] != .text) return .null;
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, args[0].text, .{}) catch return .null;
+    const parsed = parseJsonDocument(allocator, args[0].text) catch return .null;
     defer parsed.deinit();
     if (args.len >= 2 and args[1] != .null and args[1] == .text) {
         const steps = try parsePath(allocator, args[1].text);
@@ -330,7 +342,7 @@ pub fn evalJsonType(allocator: std.mem.Allocator, args: []const Value) !Value {
 /// Missing paths yield NULL (single) or JSON null elements (multi).
 pub fn evalJsonExtract(allocator: std.mem.Allocator, args: []const Value) !Value {
     if (args.len < 2 or args[0] == .null or args[0] != .text) return .null;
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, args[0].text, .{}) catch return .null;
+    const parsed = parseJsonDocument(allocator, args[0].text) catch return .null;
     defer parsed.deinit();
 
     if (args.len == 2) {
@@ -401,7 +413,7 @@ pub fn evalJsonModify(allocator: std.mem.Allocator, args: []const Value, mode: M
     defer arena.deinit();
     const arenaAlloc = arena.allocator();
 
-    const parsed = std.json.parseFromSlice(std.json.Value, arenaAlloc, args[0].text, .{}) catch return .null;
+    const parsed = parseJsonDocument(arenaAlloc, args[0].text) catch return .null;
     var root = try cloneJson(arenaAlloc, parsed.value);
 
     var i: usize = 1;
@@ -425,7 +437,7 @@ pub fn evalJsonRemove(allocator: std.mem.Allocator, args: []const Value) !Value 
     defer arena.deinit();
     const arenaAlloc = arena.allocator();
 
-    const parsed = std.json.parseFromSlice(std.json.Value, arenaAlloc, args[0].text, .{}) catch return .null;
+    const parsed = parseJsonDocument(arenaAlloc, args[0].text) catch return .null;
     var root = try cloneJson(arenaAlloc, parsed.value);
 
     for (args[1..]) |pathVal| {
@@ -490,4 +502,34 @@ test "json error behavior" {
     try std.testing.expectError(error.InvalidArgument, evalJsonObject(alloc, &.{ .{ .integer = 1 }, .{ .integer = 2 } }));
     try std.testing.expect((try evalJsonModify(alloc, &.{ .{ .text = "{bad" }, .{ .text = "$.a" }, .{ .integer = 1 } }, .set)) == .null);
     try std.testing.expect((try evalJsonRemove(alloc, &.{.null})) == .null);
+}
+
+test "json rejects hostile nesting depth without crashing" {
+    const alloc = std.testing.allocator;
+    // 600-deep arrays: far past the gate, tiny in bytes.
+    var deep = std.ArrayList(u8).empty;
+    defer deep.deinit(alloc);
+    for (0..600) |_| try deep.appendSlice(alloc, "[");
+    for (0..600) |_| try deep.appendSlice(alloc, "]");
+    const deepText = try deep.toOwnedSlice(alloc);
+    defer alloc.free(deepText);
+    try std.testing.expect((try evalJson(alloc, .{ .text = deepText })) == .null);
+    try std.testing.expectEqual(@as(i64, 0), evalJsonValid(alloc, .{ .text = deepText }).integer);
+    try std.testing.expect((try evalJsonExtract(alloc, &.{ .{ .text = deepText }, .{ .text = "$[0]" } })) == .null);
+    try std.testing.expect((try evalJsonModify(alloc, &.{ .{ .text = deepText }, .{ .text = "$[0]" }, .{ .integer = 1 } }, .set)) == .null);
+    // Brackets inside strings do not count toward depth.
+    const tricky = try evalJson(alloc, .{ .text = "{\"a\":\"[[[[\"}" });
+    defer tricky.free(alloc);
+    try std.testing.expectEqualStrings("{\"a\":\"[[[[\"}", tricky.text);
+    // Boundary depth still parses.
+    var edge = std.ArrayList(u8).empty;
+    defer edge.deinit(alloc);
+    for (0..max_json_depth) |_| try edge.appendSlice(alloc, "[");
+    try edge.appendSlice(alloc, "0");
+    for (0..max_json_depth) |_| try edge.appendSlice(alloc, "]");
+    const edgeText = try edge.toOwnedSlice(alloc);
+    defer alloc.free(edgeText);
+    const edgeOk = try evalJson(alloc, .{ .text = edgeText });
+    defer edgeOk.free(alloc);
+    try std.testing.expect(edgeOk == .text);
 }

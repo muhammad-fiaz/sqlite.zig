@@ -1,24 +1,12 @@
-//! Ordered cursor over an in-memory `BTree` map.
+//! Ordered cursor over an in-memory `BTree`.
 //!
-//! Purpose: positional (first/last/next/prev) and keyed (GE/LE/EQ) traversal
-//! of `btree/btree.zig` entries without copying payloads. Responsibilities:
-//! index bookkeeping and binary search only. Dependencies: `btree/btree.zig`,
-//! `std` (tests). Ownership/lifetime: `Cursor` borrows the tree (`tree` must
-//! outlive every cursor); `key`/`value` return borrowed data valid until the
-//! tree is mutated. There is no allocation and no failure mode: out-of-range
-//! positions are represented as invalid cursors (`valid() == false`), never
-//! panics — `next` past the end parks at `len`, `prev` at index 0 parks at
-//! `len` (invalid), and empty trees yield invalid cursors everywhere.
-//! Invariants: `index <= entries.len`; `valid()` iff `index < len`.
+//! The cursor borrows the tree and never allocates.
+//! Out-of-range positions are invalid, never a panic.
 
 const std = @import("std");
 const BTree = @import("btree.zig").BTree;
 
 /// Borrowed traversal position over a `BTree`.
-///
-/// Why index-based and not pointer-based: the entry list can reallocate on
-/// insert, so stability comes from revalidating `index` per access instead
-/// of holding element pointers.
 pub const Cursor = struct {
     /// Borrowed map (must outlive the cursor).
     tree: *const BTree,
@@ -47,10 +35,6 @@ pub const Cursor = struct {
     }
 
     /// Steps back one entry; stepping back from index 0 parks invalid.
-    ///
-    /// Why park invalid instead of wrapping: index 0 has no predecessor, and
-    /// wrapping to `maxInt(usize)` would panic on the next access — parking
-    /// at `len` keeps every state representable and testable.
     pub fn prev(self: *Cursor) void {
         if (self.index > 0) {
             self.index -= 1;
@@ -75,10 +59,6 @@ pub const Cursor = struct {
     }
 
     /// Seeks the last entry with key <= `targetKey`.
-    ///
-    /// Implemented as `seekGE` plus at most one step back, so exact hits
-    /// stay and in-between targets land on the predecessor; below-minimum
-    /// targets park invalid.
     pub fn seekLE(self: *Cursor, targetKey: u64) void {
         self.seekGE(targetKey);
         if (self.valid()) {

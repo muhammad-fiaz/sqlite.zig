@@ -1,39 +1,7 @@
-//! Date/time SQL functions (`date`, `time`, `datetime`, `julianday`, ...).
+//! Date and time SQL functions.
 //!
-//! Purpose: authoritative SQLite-compatible date/time evaluation behind
-//! `functions.evalScalar`. Parses `YYYY-MM-DD[ HH:MM:SS[.SSS]]`, `HH:MM[:SS]`,
-//! Julian-day numbers, `now`, and `unixepoch`-tagged integers, then applies
-//! modifier chains (`N days/months/years/hours/minutes/seconds`,
-//! `start of day/month/year`, `weekday N`, `utc`/`localtime` no-ops).
-//!
-//! Responsibilities: proleptic-Gregorian Julian-day conversion, modifier
-//! application, and `strftime` formatting for the `%Y %m %d %H %M %S %f %s
-//! %j %J %w %W %%` subset.
-//!
-//! Dependencies: `std`, `../../vm/value.zig` only (plus libc `gettimeofday`
-//! on Apple/BSD targets for `now`).
-//!
-//! Ownership/lifetime: inputs borrowed; text outputs heap-owned by the caller.
-//! No state is retained between calls.
-//!
-//! Error behavior: unparseable input yields `.null` (never an error), matching
-//! SQLite; `strftime` with < 2 args or non-text format yields `.null`.
-//! `getCurrentTimestamp` failure makes `now` unparseable (NULL).
-//!
-//! Invariants: `DateTime` fields are calendar components (month 1-12 for
-//! well-formed input); `fromJulianDay(toJulianDay(dt))` round-trips.
-//!
-//! SQLite compatibility: `date`/`time`/`datetime` return UTC text;
-//! `julianday` returns REAL, `unixepoch` INTEGER seconds; unknown modifiers
-//! are ignored; `localtime`/`utc` are accepted no-ops in this build.
-// TODO(sql/datetime): `utc`/`localtime` are no-ops and sub-second/timezone
-// parsing is a subset (`Z` suffix, `±HH:MM` offsets ignored). Expected:
-// real offset handling or explicit Unsupported-tz docs; tests: `Z`/offset
-// matrices, fractional-second preservation through modifiers.
-// Subsystem: sql/functions.
-// TODO(sql/datetime): `now` uses wall-clock syscalls, making tests
-// time-dependent. Expected: injectable clock for deterministic tests;
-// tests: frozen-clock `now`/`date('now')` golden values. Subsystem: sql/functions.
+//! Inputs borrowed; text results are caller-owned.
+//! Unparseable input yields NULL.
 
 const std = @import("std");
 const Value = @import("../../vm/value.zig").Value;
@@ -147,13 +115,28 @@ fn parseTimeOnly(str: []const u8) ?DateTime {
     if (str.len < 5 or str[2] != ':') return null;
     hour = std.fmt.parseInt(i32, str[0..2], 10) catch return null;
     min = std.fmt.parseInt(i32, str[3..5], 10) catch return null;
+    var rest: []const u8 = "";
     if (str.len >= 8 and str[5] == ':') {
         sec = std.fmt.parseInt(i32, str[6..8], 10) catch return null;
         if (str.len > 8 and str[8] == '.') {
-            frac = std.fmt.parseFloat(f64, str[8..]) catch 0.0;
+            var j: usize = 9;
+            var num: f64 = 0.0;
+            var den: f64 = 1.0;
+            while (j < str.len and str[j] >= '0' and str[j] <= '9') : (j += 1) {
+                num = num * 10.0 + @as(f64, @floatFromInt(str[j] - '0'));
+                den *= 10.0;
+            }
+            if (j > 9) {
+                frac = num / den;
+                rest = str[j..];
+            } else {
+                rest = str[8..];
+            }
+        } else if (str.len > 8) {
+            rest = str[8..];
         }
     }
-    return .{
+    var dt = DateTime{
         .year = 2000,
         .month = 1,
         .day = 1,
@@ -163,11 +146,77 @@ fn parseTimeOnly(str: []const u8) ?DateTime {
         .fraction = frac,
         .valid = true,
     };
+    shiftByZoneOffset(&dt, zoneOffsetMinutes(rest));
+    return dt;
+}
+
+/// Minutes east of UTC from a trailing `Z`/`z` (zero) or `±HH[:MM]` suffix.
+/// Anything else (including absent) is zero; unrecognized text is ignored
+/// rather than failing, preserving the long-standing lenient parse.
+fn zoneOffsetMinutes(rest: []const u8) i32 {
+    if (rest.len == 0) return 0;
+    if (rest[0] == 'Z' or rest[0] == 'z') return 0;
+    if (rest[0] != '+' and rest[0] != '-') return 0;
+    const neg = rest[0] == '-';
+    var s = rest[1..];
+    if (s.len < 2 or !isDigit(s[0]) or !isDigit(s[1])) return 0;
+    const hh: i32 = @as(i32, s[0] - '0') * 10 + @as(i32, s[1] - '0');
+    s = s[2..];
+    var mm: i32 = 0;
+    if (s.len > 0 and s[0] == ':') {
+        s = s[1..];
+        if (s.len < 2 or !isDigit(s[0]) or !isDigit(s[1])) return 0;
+        mm = @as(i32, s[0] - '0') * 10 + @as(i32, s[1] - '0');
+    } else if (s.len >= 2 and isDigit(s[0]) and isDigit(s[1])) {
+        mm = @as(i32, s[0] - '0') * 10 + @as(i32, s[1] - '0');
+    }
+    if (hh > 23 or mm > 59) return 0;
+    const total = hh * 60 + mm;
+    return if (neg) -total else total;
+}
+
+fn isDigit(c: u8) bool {
+    return c >= '0' and c <= '9';
+}
+
+/// Shift a timestamp by `-offsetMinutes` (local wall time to UTC), carrying
+/// whole days through the Julian calendar. Zero offsets are a no-op.
+fn shiftByZoneOffset(dt: *DateTime, offsetMinutes: i32) void {
+    if (offsetMinutes == 0) return;
+    var totalMin: i32 = dt.hour * 60 + dt.minute - offsetMinutes;
+    var dayCarry: i32 = 0;
+    while (totalMin < 0) {
+        totalMin += 1440;
+        dayCarry -= 1;
+    }
+    while (totalMin >= 1440) {
+        totalMin -= 1440;
+        dayCarry += 1;
+    }
+    dt.hour = @divTrunc(totalMin, 60);
+    dt.minute = @mod(totalMin, 60);
+    if (dayCarry != 0) {
+        const noon = DateTime{ .year = dt.year, .month = dt.month, .day = dt.day, .hour = 12, .minute = 0, .second = 0, .fraction = 0.0, .valid = true };
+        const shifted = DateTime.fromJulianDay(noon.toJulianDay() + @as(f64, @floatFromInt(dayCarry)));
+        dt.year = shifted.year;
+        dt.month = shifted.month;
+        dt.day = shifted.day;
+    }
 }
 
 const ClockError = error{ClockUnavailable};
 
+/// Frozen "now" for deterministic tests; null means the wall clock.
+/// Test-only: set it, run, and reset to null when done.
+var testClock: ?i64 = null;
+
+/// Pin or release the frozen test clock (epoch seconds, UTC).
+pub fn setTestClock(seconds: ?i64) void {
+    testClock = seconds;
+}
+
 fn getCurrentTimestamp() ClockError!i64 {
+    if (testClock) |frozen| return frozen;
     const builtin = @import("builtin");
     switch (builtin.os.tag) {
         .windows => {
@@ -214,6 +263,7 @@ fn parseDateTimeString(str: []const u8) ?DateTime {
         var min: i32 = 0;
         var sec: i32 = 0;
         var frac: f64 = 0.0;
+        var offsetMinutes: i32 = 0;
         if (trimmed.len > 10 and (trimmed[10] == ' ' or trimmed[10] == 'T')) {
             const timePart = trimmed[11..];
             if (timePart.len >= 5 and timePart[2] == ':') {
@@ -222,12 +272,24 @@ fn parseDateTimeString(str: []const u8) ?DateTime {
                 if (timePart.len >= 8 and timePart[5] == ':') {
                     sec = std.fmt.parseInt(i32, timePart[6..8], 10) catch return null;
                     if (timePart.len > 8 and timePart[8] == '.') {
-                        frac = std.fmt.parseFloat(f64, timePart[8..]) catch 0.0;
+                        var j: usize = 9;
+                        var num: f64 = 0.0;
+                        var den: f64 = 1.0;
+                        while (j < timePart.len and timePart[j] >= '0' and timePart[j] <= '9') : (j += 1) {
+                            num = num * 10.0 + @as(f64, @floatFromInt(timePart[j] - '0'));
+                            den *= 10.0;
+                        }
+                        if (j > 9) {
+                            frac = num / den;
+                            offsetMinutes = zoneOffsetMinutes(timePart[j..]);
+                        }
+                    } else if (timePart.len > 8) {
+                        offsetMinutes = zoneOffsetMinutes(timePart[8..]);
                     }
                 }
             }
         }
-        return .{
+        var dt = DateTime{
             .year = y,
             .month = m,
             .day = d,
@@ -237,6 +299,8 @@ fn parseDateTimeString(str: []const u8) ?DateTime {
             .fraction = frac,
             .valid = true,
         };
+        shiftByZoneOffset(&dt, offsetMinutes);
+        return dt;
     }
     if (parseTimeOnly(trimmed)) |dt| return dt;
     if (std.fmt.parseFloat(f64, trimmed)) |num| {
@@ -245,6 +309,8 @@ fn parseDateTimeString(str: []const u8) ?DateTime {
     return null;
 }
 
+// `utc` is an exact no-op (timestamps are already UTC); `localtime` cannot
+// convert without a timezone database, so it stays unconverted.
 fn applyModifiers(dt: *DateTime, modifiers: []const Value) void {
     for (modifiers) |modVal| {
         if (modVal != .text) continue;
@@ -576,4 +642,50 @@ test "datetime invalid modifiers fail soft to null or ignored" {
     // Non-text modifier skipped; unixepoch modifier path with bad int is NULL.
     try std.testing.expect(evalUnixepoch(&.{ .{ .text = "abc" }, .{ .text = "unixepoch" } }) == .null);
     try std.testing.expect(evalJulianday(&.{.null}) == .null);
+}
+
+test "datetime parses timezone suffixes into UTC" {
+    const alloc = std.testing.allocator;
+    // Z means UTC already.
+    const zulu = try evalDatetime(alloc, &.{.{ .text = "2024-03-04 05:06:07Z" }});
+    defer zulu.free(alloc);
+    try std.testing.expectEqualStrings("2024-03-04 05:06:07", zulu.text);
+    // Positive offsets shift back; negative shift forward, across midnight.
+    const plus = try evalDatetime(alloc, &.{.{ .text = "2024-03-04 05:06:07+02:00" }});
+    defer plus.free(alloc);
+    try std.testing.expectEqualStrings("2024-03-04 03:06:07", plus.text);
+    const minus = try evalDatetime(alloc, &.{.{ .text = "2024-03-04 00:30:00-02:00" }});
+    defer minus.free(alloc);
+    try std.testing.expectEqualStrings("2024-03-04 02:30:00", minus.text);
+    const backDay = try evalDate(alloc, &.{.{ .text = "2024-03-04 01:00:00+03:00" }});
+    defer backDay.free(alloc);
+    try std.testing.expectEqualStrings("2024-03-03", backDay.text);
+    const fwdDay = try evalDate(alloc, &.{.{ .text = "2024-03-04 23:00:00-03:00" }});
+    defer fwdDay.free(alloc);
+    try std.testing.expectEqualStrings("2024-03-05", fwdDay.text);
+    // Compact +HHMM and bare +HH forms work the same.
+    const compact = try evalTime(alloc, &.{.{ .text = "05:06:07+0200" }});
+    defer compact.free(alloc);
+    try std.testing.expectEqualStrings("03:06:07", compact.text);
+    const bareHour = try evalTime(alloc, &.{.{ .text = "05:06:07+02" }});
+    defer bareHour.free(alloc);
+    try std.testing.expectEqualStrings("03:06:07", bareHour.text);
+    // T separator plus fractional seconds survive the shift.
+    const frac = try evalStrftime(alloc, &.{ .{ .text = "%Y-%m-%d %H:%M:%f" }, .{ .text = "2024-03-04T05:06:07.5+02:00" } });
+    defer frac.free(alloc);
+    try std.testing.expectEqualStrings("2024-03-04 03:06:07.500", frac.text);
+}
+
+test "datetime frozen clock pins now deterministically" {
+    const alloc = std.testing.allocator;
+    setTestClock(1704067200); // 2024-01-01 00:00:00 UTC.
+    defer setTestClock(null);
+    const d = try evalDate(alloc, &.{.{ .text = "now" }});
+    defer d.free(alloc);
+    try std.testing.expectEqualStrings("2024-01-01", d.text);
+    const dt = try evalDatetime(alloc, &.{.{ .text = "now" }});
+    defer dt.free(alloc);
+    try std.testing.expectEqualStrings("2024-01-01 00:00:00", dt.text);
+    const ux = evalUnixepoch(&.{.{ .text = "now" }});
+    try std.testing.expectEqual(@as(i64, 1704067200), ux.integer);
 }

@@ -1,41 +1,13 @@
-//! Query planner: access-path selection and `EXPLAIN QUERY PLAN` support.
+//! Picks table scans, index seeks, and join order.
 //!
-//! Purpose: choose table scans, rowid lookups, index seeks/scans, and covering
-//! indexes for SELECT/UPDATE/DELETE predicates, price them with `plan/cost`,
-//! and render SQLite-style EXPLAIN text. Responsibilities: index matching
-//! (equality prefix + range), covering/sort-satisfying detection, join plan
-//! chaining, and temp-sort flags consumed by `connection` execution.
-//!
-//! Dependencies: `plan/cost`, `sql/ast`, `sql/expr`, `vm/value`,
-//! `catalog/schema` (all borrowed during planning). The optimizer
-//! (`plan/optimizer`) applies rewrites before this access-path pass.
-//!
-//! Ownership/lifetime: `QueryPlan` owns its `eqColumns` copy and chained
-//! `joinPlan`; caller must `deinit`. Index/table name slices stay borrowed
-//! from the schema — do not free them, and do not use a plan after schema
-//! mutation. `explain` returns an owned string the caller frees.
-//!
-//! Error behavior: planning never fails on valid SQL — it degrades to a table
-//! scan. OOM is the only error. Corrupt schemas are rejected at decode time,
-//! not here.
-//!
-//! SQLite compatibility: SCAN/SEARCH vocabulary and covering-index detection
-//! mirror SQLite; partial-index predicate implication and transitive-constraint
-//! derivation are future work (see TODOs).
-// TODO: Implement partial-index predicate implication in the planner.
-// The current planner can use ordinary indexes but does not prove that a
-// WHERE clause implies a partial-index predicate. Add predicate implication
-// analysis and differential tests against SQLite's planner before claiming
-// partial-index parity.
-// TODO: Implement transitive-constraint derivation for join predicates.
-// The current planner matches each table's own predicates but does not derive
-// join-transitive equalities (e.g. a.x = b.x AND b.x = 5 -> a.x = 5). Add
-// equality-closure analysis with EXPLAIN-level tests.
+//! Plans borrow the schema; `QueryPlan` owns its column copies.
+//! Planning falls back to a scan; only out of memory fails.
 const std = @import("std");
 const Cost = @import("cost.zig").Cost;
 const cost = @import("cost.zig");
 const ast = @import("../sql/ast.zig");
 const exprEvaluator = @import("../sql/expr.zig");
+const functions = @import("../sql/functions.zig");
 const Value = @import("../vm/value.zig").Value;
 const Schema = @import("../catalog/schema.zig").Schema;
 const Table = @import("../catalog/schema.zig").Table;
@@ -189,6 +161,109 @@ pub const Plan = struct {
     queryPlan: ?QueryPlan = null,
 };
 
+/// One derived `column = constant` equality; both borrow the condition list.
+const DerivedEquality = struct { column: []const u8, value: Value };
+
+/// True when `conditions[index]` is AND-joined (not OR-joined, not negated).
+/// Only such predicates are safe to seek on or derive from: an OR branch or
+/// a negation does not hold for every result row.
+fn isConjunctive(conditions: []const ast.Condition, index: usize) bool {
+    if (conditions[index].negated) return false;
+    if (conditions[index].joinOr) return false;
+    if (index > 0 and conditions[index - 1].joinOr) return false;
+    return true;
+}
+
+/// Case-insensitive full-string column key match (`a.x` and `b.x` differ).
+fn columnKeyEq(a: []const u8, b: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(a, b);
+}
+
+fn derivedHasColumn(entries: []const DerivedEquality, column: []const u8) bool {
+    for (entries) |entry| if (columnKeyEq(entry.column, column)) return true;
+    return false;
+}
+
+fn derivedLiteralFor(entries: []const DerivedEquality, column: []const u8) ?Value {
+    for (entries) |entry| if (columnKeyEq(entry.column, column)) return entry.value;
+    return null;
+}
+
+/// True when an equality or range bound can drive an index seek: the value
+/// must resolve without a row (literals, parameters, pure combinations).
+/// Column references, subqueries, and anything else fall back to scans —
+/// seeking on them would bind a meaningless lookup (this mirrors what the
+/// executor can resolve row-less in `plannedIndices`).
+fn isSeekableValue(expr: ast.Expr) bool {
+    return switch (expr) {
+        .literal, .parameter => true,
+        .unary => |un| isSeekableValue(un.expr.*),
+        .binary => |bin| isSeekableValue(bin.left.*) and isSeekableValue(bin.right.*),
+        .function => |call| functions.classify(call.name, functions.argCount(call)) == .scalar and seekableCallArgs(call),
+        else => false,
+    };
+}
+
+/// All arguments of a scalar call must themselves be seekable.
+fn seekableCallArgs(call: anytype) bool {
+    if (!isSeekableValue(call.argument.*)) return false;
+    if (call.argument2) |a2| if (!isSeekableValue(a2.*)) return false;
+    if (call.argument3) |a3| if (!isSeekableValue(a3.*)) return false;
+    for (call.extraArgs) |arg| if (!isSeekableValue(arg)) return false;
+    return true;
+}
+
+/// Equality closure over AND-joined `=` predicates: direct column=literal
+/// facts plus column=column edges resolved to fixpoint, so
+/// `a.x = b.x AND b.x = 5` also yields `a.x = 5`. OR-joined, negated,
+/// parameter, null, and subquery equalities never derive. Entries whose
+/// qualifier names `tableName` are additionally emitted bare, so the
+/// planned table's own index matching (which compares bare names) sees
+/// them. Output borrows `conditions`; the caller frees the outer slice.
+/// Bounded: at most conditions.len + 1 fixpoint passes over a monotone set.
+fn transitiveEqualities(
+    allocator: std.mem.Allocator,
+    conditions: []const ast.Condition,
+    tableName: []const u8,
+) ![]DerivedEquality {
+    var out = std.ArrayList(DerivedEquality).empty;
+    errdefer out.deinit(allocator);
+    for (conditions, 0..) |cond, i| {
+        if (!isConjunctive(conditions, i) or cond.op != .equal) continue;
+        if (cond.value != .literal or cond.value.literal == .null) continue;
+        if (derivedHasColumn(out.items, cond.column)) continue;
+        try out.append(allocator, .{ .column = cond.column, .value = cond.value.literal });
+    }
+    var changed = true;
+    var passes: usize = 0;
+    while (changed and passes <= conditions.len) : (passes += 1) {
+        changed = false;
+        for (conditions, 0..) |cond, i| {
+            if (!isConjunctive(conditions, i) or cond.op != .equal) continue;
+            if (cond.value != .identifier) continue;
+            if (derivedHasColumn(out.items, cond.column)) continue;
+            if (derivedLiteralFor(out.items, cond.value.identifier)) |lit| {
+                try out.append(allocator, .{ .column = cond.column, .value = lit });
+                changed = true;
+            }
+        }
+    }
+    // Bare duplicates for own-table keys so bare-name index matching sees
+    // `a.x = 5` on table `a` as `x = 5` (sound: the equality holds for
+    // every result row, exactly like a directly written conjunct).
+    const baseLen = out.items.len;
+    var k: usize = 0;
+    while (k < baseLen) : (k += 1) {
+        const entry = out.items[k];
+        const dot = std.mem.indexOfScalar(u8, entry.column, '.') orelse continue;
+        if (!std.ascii.eqlIgnoreCase(entry.column[0..dot], tableName)) continue;
+        const bare = entry.column[dot + 1 ..];
+        if (bare.len == 0 or derivedHasColumn(out.items, bare)) continue;
+        try out.append(allocator, .{ .column = bare, .value = entry.value });
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 pub fn choose(rowCount: usize, hasIndex: bool, selective: bool) Plan {
     if (hasIndex and selective) return .{ .access = .indexSeek, .cost = cost.indexSeek(rowCount, 1, false, false) };
     return .{ .access = .tableScan, .cost = cost.tableScan(rowCount) };
@@ -225,7 +300,20 @@ pub fn planSelect(allocator: std.mem.Allocator, schema: *const Schema, selectStm
     }
 
     if (conditionOpt) |conditions| {
-        for (conditions) |cond| {
+        // Derived equalities join the direct ones for every access-path
+        // check below (rowid, equality, range): each holds for every result
+        // row exactly like a written AND conjunct, so seeking on one is
+        // sound whenever seeking on a direct predicate is.
+        const derived = try transitiveEqualities(allocator, conditions, table.name);
+        defer allocator.free(derived);
+        var allConds = try allocator.alloc(ast.Condition, conditions.len + derived.len);
+        defer allocator.free(allConds);
+        @memcpy(allConds[0..conditions.len], conditions);
+        for (derived, 0..) |d, i| {
+            allConds[conditions.len + i] = .{ .column = d.column, .op = .equal, .value = .{ .literal = d.value } };
+        }
+        const conds = allConds;
+        for (conds) |cond| {
             const isRowid = std.ascii.eqlIgnoreCase(cond.column, "rowid") or std.ascii.eqlIgnoreCase(cond.column, "_rowid_") or std.ascii.eqlIgnoreCase(cond.column, "oid");
             var isPkInt = false;
             for (table.columns) |col| {
@@ -234,7 +322,7 @@ pub fn planSelect(allocator: std.mem.Allocator, schema: *const Schema, selectStm
                     break;
                 }
             }
-            if ((isRowid or isPkInt) and cond.op == .equal) {
+            if ((isRowid or isPkInt) and cond.op == .equal and isSeekableValue(cond.value)) {
                 var rowidCost = cost.rowidLookup(rowCount);
                 // A rowid-ordered scan satisfies the ORDER BY only when the
                 // leading key is the looked-up rowid column (prefix rule).
@@ -262,7 +350,7 @@ pub fn planSelect(allocator: std.mem.Allocator, schema: *const Schema, selectStm
         for (schema.indexes.items) |index| {
             if (!std.ascii.eqlIgnoreCase(index.table, table.name)) continue;
             if (index.whereExpr) |predicate| {
-                if (!exprEvaluator.partialPredicateImpliedBy(predicate, conditions)) continue;
+                if (!exprEvaluator.partialPredicateImpliedBy(predicate, conds)) continue;
             }
 
             var eqCols = std.ArrayList([]const u8).empty;
@@ -275,11 +363,11 @@ pub fn planSelect(allocator: std.mem.Allocator, schema: *const Schema, selectStm
             for (index.columns, 0..) |idxCol, keyPosition| {
                 if (index.keyExpr(keyPosition)) |key| {
                     var conjunctive = true;
-                    for (conditions, 0..) |cond, condPosition| {
+                    for (conds, 0..) |cond, condPosition| {
                         if (condPosition > 0 and cond.joinOr) conjunctive = false;
                     }
                     var foundExprEq = false;
-                    if (conjunctive) for (conditions) |cond| {
+                    if (conjunctive) for (conds) |cond| {
                         if (cond.leftExpr == null or cond.op != .equal) continue;
                         if (exprEvaluator.exprEqual(cond.leftExpr.?, key)) {
                             try eqCols.append(allocator, idxCol);
@@ -290,8 +378,8 @@ pub fn planSelect(allocator: std.mem.Allocator, schema: *const Schema, selectStm
                     if (foundExprEq) continue;
                 }
                 var foundEq = false;
-                for (conditions) |cond| {
-                    if (std.ascii.eqlIgnoreCase(cond.column, idxCol) and cond.op == .equal) {
+                for (conds) |cond| {
+                    if (std.ascii.eqlIgnoreCase(cond.column, idxCol) and cond.op == .equal and isSeekableValue(cond.value)) {
                         try eqCols.append(allocator, idxCol);
                         foundEq = true;
                         break;
@@ -299,8 +387,8 @@ pub fn planSelect(allocator: std.mem.Allocator, schema: *const Schema, selectStm
                 }
                 if (foundEq) continue;
 
-                for (conditions) |cond| {
-                    if (std.ascii.eqlIgnoreCase(cond.column, idxCol)) {
+                for (conds) |cond| {
+                    if (std.ascii.eqlIgnoreCase(cond.column, idxCol) and isSeekableValue(cond.value)) {
                         if (cond.op == .greater or cond.op == .greaterEqual or cond.op == .less or cond.op == .lessEqual) {
                             if (rangeCol == null) {
                                 rangeCol = idxCol;
@@ -780,4 +868,114 @@ test "planner row counts follow analyzed statistics" {
     });
     defer stale.deinit();
     try std.testing.expectEqual(@as(f64, 5.0), stale.cost.total);
+}
+
+test "planner derives join-transitive equalities for index seeks" {
+    var schema = Schema.init(std.testing.allocator);
+    defer schema.deinit();
+
+    const aCols = [_]ast.ColumnDef{
+        .{ .name = "id", .typeName = "INTEGER" },
+        .{ .name = "x", .typeName = "INTEGER" },
+    };
+    try schema.createTable("a", &aCols, &.{});
+    const idxCols = [_][]const u8{"x"};
+    try schema.createIndex(.{
+        .name = "a_x_idx",
+        .table = "a",
+        .columns = &idxCols,
+    });
+    const bCols = [_]ast.ColumnDef{
+        .{ .name = "id", .typeName = "INTEGER" },
+        .{ .name = "x", .typeName = "INTEGER" },
+    };
+    try schema.createTable("b", &bCols, &.{});
+
+    // a.x = b.x AND b.x = 5 derives a.x = 5: index seek, not a scan.
+    const conds = [_]ast.Condition{
+        .{ .column = "a.x", .op = .equal, .value = .{ .identifier = "b.x" } },
+        .{ .column = "b.x", .op = .equal, .value = .{ .literal = .{ .integer = 5 } } },
+    };
+    var plan = try planSelect(std.testing.allocator, &schema, .{
+        .table = @as(?[]const u8, "a"),
+        .condition = @as(?ast.Conditions, &conds),
+        .orders = @as([]const ast.Order, &.{}),
+        .projections = @as([]const ast.Projection, &.{}),
+        .joins = @as([]const ast.Join, &.{}),
+    });
+    defer plan.deinit();
+
+    const explained = try plan.explain(std.testing.allocator);
+    defer std.testing.allocator.free(explained);
+    try std.testing.expectEqualStrings("SEARCH a USING INDEX a_x_idx (x=?)", explained);
+}
+
+test "planner chains single-table equalities to constants" {
+    var schema = Schema.init(std.testing.allocator);
+    defer schema.deinit();
+
+    const cols = [_]ast.ColumnDef{
+        .{ .name = "x", .typeName = "INTEGER" },
+        .{ .name = "y", .typeName = "INTEGER" },
+    };
+    try schema.createTable("t", &cols, &.{});
+    const idxCols = [_][]const u8{"x"};
+    try schema.createIndex(.{
+        .name = "t_x_idx",
+        .table = "t",
+        .columns = &idxCols,
+    });
+
+    // x = y AND y = 7 derives x = 7 through the equality closure.
+    const conds = [_]ast.Condition{
+        .{ .column = "x", .op = .equal, .value = .{ .identifier = "y" } },
+        .{ .column = "y", .op = .equal, .value = .{ .literal = .{ .integer = 7 } } },
+    };
+    var plan = try planSelect(std.testing.allocator, &schema, .{
+        .table = @as(?[]const u8, "t"),
+        .condition = @as(?ast.Conditions, &conds),
+        .orders = @as([]const ast.Order, &.{}),
+        .projections = @as([]const ast.Projection, &.{}),
+        .joins = @as([]const ast.Join, &.{}),
+    });
+    defer plan.deinit();
+
+    const explained = try plan.explain(std.testing.allocator);
+    defer std.testing.allocator.free(explained);
+    try std.testing.expectEqualStrings("SEARCH t USING INDEX t_x_idx (x=?)", explained);
+}
+
+test "planner never derives through OR branches" {
+    var schema = Schema.init(std.testing.allocator);
+    defer schema.deinit();
+
+    const cols = [_]ast.ColumnDef{
+        .{ .name = "x", .typeName = "INTEGER" },
+        .{ .name = "y", .typeName = "INTEGER" },
+    };
+    try schema.createTable("t", &cols, &.{});
+    const idxCols = [_][]const u8{"x"};
+    try schema.createIndex(.{
+        .name = "t_x_idx",
+        .table = "t",
+        .columns = &idxCols,
+    });
+
+    // x = y OR y = 7: neither arm holds for every row, so no seek.
+    const conds = [_]ast.Condition{
+        .{ .column = "x", .op = .equal, .value = .{ .identifier = "y" }, .joinOr = true },
+        .{ .column = "y", .op = .equal, .value = .{ .literal = .{ .integer = 7 } } },
+    };
+    var plan = try planSelect(std.testing.allocator, &schema, .{
+        .table = @as(?[]const u8, "t"),
+        .condition = @as(?ast.Conditions, &conds),
+        .orders = @as([]const ast.Order, &.{}),
+        .projections = @as([]const ast.Projection, &.{}),
+        .joins = @as([]const ast.Join, &.{}),
+    });
+    defer plan.deinit();
+
+    const explained = try plan.explain(std.testing.allocator);
+    defer std.testing.allocator.free(explained);
+    try std.testing.expectEqualStrings("SCAN t", explained);
 }

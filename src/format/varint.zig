@@ -1,26 +1,14 @@
-//! SQLite big-endian varint codec (1..9 bytes).
+//! Big-endian varint codec, 1 to 9 bytes.
 //!
-//! Purpose: encode/decode the record header, serial-type, and cell-header
-//! integers used across `format/record.zig` and `storage/sqlite_image.zig`.
-//! Responsibilities: minimal-length encoding, bounded decoding, and nothing
-//! else (no allocation, no I/O). Dependencies: `std` only. Ownership: all
-//! functions borrow caller buffers; no allocation or lifetime beyond the call.
-//! Error behavior: short output buffers and truncated inputs fail closed with
-//! `Error.InvalidVarint` — never panics, over-reads, or loops unboundedly.
-//! Invariants: `encodedLength` is the minimal length; byte 9 of a 9-byte
-//! varint carries 8 data bits (SQLite rule). Compatibility: byte layout
-//! matches SQLite file format varints (7 data bits per leading byte).
+//! Functions borrow caller buffers and never allocate.
+//! Short buffers and truncated input fail with `InvalidVarint`.
 
 const std = @import("std");
 
 /// Codec failure: output buffer too small or input truncated/missing.
 pub const Error = error{InvalidVarint};
 
-/// Returns the minimal SQLite varint length (1..9) for `value`.
-///
-/// Why minimal-length matters: record headers and cell payload-length
-/// prefixes must round-trip byte-identically with SQLite; overlong encodings
-/// would be rejected by strict readers and break size fixpoint math.
+/// Returns the minimal varint length (1..9) for `value`.
 pub fn encodedLength(value: u64) u8 {
     if (value <= 0x7f) return 1;
     if (value <= 0x3fff) return 2;
@@ -34,10 +22,6 @@ pub fn encodedLength(value: u64) u8 {
 }
 
 /// Encodes `value` into `out`, returning the bytes written.
-///
-/// Safety: requires `out.len >= encodedLength(value)`; otherwise returns
-/// `Error.InvalidVarint` instead of writing out of bounds. The 9-byte form
-/// stores the low 8 bits raw in the final byte per the SQLite spec.
 pub fn encode(value: u64, out: []u8) Error!u8 {
     const length = encodedLength(value);
     if (out.len < length) return Error.InvalidVarint;
@@ -63,14 +47,7 @@ pub fn encode(value: u64, out: []u8) Error!u8 {
     return length;
 }
 
-/// Decodes the leading varint in `input`.
-///
-/// Returns the value plus the bytes consumed (1..9) without advancing past
-/// trailing bytes, so callers can slice `input[length..]` for the payload.
-/// Empty input and inputs that end mid-varint (continuation bits with no
-/// terminator in the first 8 bytes) return `Error.InvalidVarint`. The loop is
-/// capped at 9 iterations and only indexes `input[i]` with `i < input.len`,
-/// so corrupt data can never cause an over-read, panic, or infinite loop.
+/// Decodes the leading varint in `input`. Truncated input fails `InvalidVarint`.
 pub fn decode(input: []const u8) Error!struct { value: u64, length: u8 } {
     if (input.len == 0) return Error.InvalidVarint;
     var result: u64 = 0;

@@ -1,24 +1,8 @@
 //! VM instruction set: opcodes, operands, and programs.
 //!
-//! Purpose: define the bytecode vocabulary (`OpCode`), the operand-carrying
-//! `Instruction`, and the append-only `Program` built by `vm/compiler.zig`
-//! and executed by `vm/vm.zig` (modeled on SQLite's VDBE architecture).
-//! Responsibilities: stable opcode enumeration, register addressing (`p2`/
-//! `register`), jump fixups for control flow, and program lifetime.
-//!
-//! Dependencies: `vm/value.zig` for `p4`/`value` payloads. No storage, catalog,
-//! or SQL dependencies — the compiler lowers those away before emitting.
-//!
-//! Ownership/lifetime: `Program` owns its instruction list; `p4`/`value`
-//! payloads borrow or are cloned per the compiler's contract and are freed
-//! with the `CompiledQuery`. Instructions are plain data — no finalization.
-//!
-//! Error behavior: `append`/`emit` fail only on OOM; `fixupJump` is infallible
-//! but panics on an out-of-range address (compiler bug, never corrupt input).
-//!
-//! SQLite compatibility: opcode names track VDBE concepts (cursors, seeks,
-//! `makeRecord`, aggregates); every opcode's runtime semantics and NULL
-//! behavior are implemented and tested in `vm/vm.zig`.
+//! `Program` owns its instruction list; payloads follow the compiler's
+//! ownership contract. `fixupJump` panics on a bad address (compiler bug,
+//! never corrupt input). Semantics per opcode live in `vm/vm.zig`.
 const std = @import("std");
 const Value = @import("value.zig").Value;
 
@@ -83,7 +67,7 @@ pub const OpCode = enum {
     aggFinal,
 };
 
-/// Single instruction: opcode plus VDBE-style operands. `p1`/`p2`/`p3` are
+/// Single instruction: opcode plus operands. `p1`/`p2`/`p3` are
 /// integer operands (registers, jump targets, cursor ids); `p4`/`value`
 /// carry an optional scalar payload; `p5` holds flags. `register` mirrors
 /// the destination register when `p2 >= 0`.

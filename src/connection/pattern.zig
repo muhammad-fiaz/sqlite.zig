@@ -1,25 +1,9 @@
-//! Pure pattern-matching predicates for SQL `LIKE`, `GLOB`, `REGEXP`, and `MATCH`.
+//! Pure `LIKE`/`GLOB`/`REGEXP`/`MATCH` predicates over byte slices.
 //!
-//! This module extracts the stateless byte-slice semantics previously embedded in
-//! `src/connection/connection.zig` so future refactors can import them without
-//! depending on `Connection`, the parser, or the catalog.
-//!
-//! SQLite compatibility notes:
-//! - `LIKE` is ASCII case-insensitive (`%` matches any sequence including empty,
-//!   `_` matches exactly one code unit) with an optional single-byte `ESCAPE`.
-//! - `GLOB` is case-sensitive (`*`, `?`, `[...]` with `^`/`!` negation and
-//!   `a-b` ranges); an unterminated `[` matches a literal `[`.
-//! - `REGEXP` is a small built-in subset (`.`, `[...]`, `\d`/`\w`/`\s`, escaped
-//!   literals, `?`/`*`/`+`, `^`/`$` anchors, top-level `|` alternation, and
-//!   parenthesised group probing). It is NOT PCRE; see `regexp` docs.
-//! - `MATCH` here is the engine's case-insensitive substring fallback used for
-//!   `MATCH` expressions (SQLite proper reserves `MATCH` for FTS modules).
-//!
-//! Ownership and errors: all functions are pure and infallible. Inputs are
-//! borrowed `[]const u8` slices retained by the caller; no allocation occurs and
-//! no errors are returned. SQL `NULL` propagation is handled by the caller:
-//! if either operand is SQL `NULL`, the caller must yield SQL `NULL` (unknown)
-//! instead of calling these predicates.
+//! `LIKE` folds ASCII case (`%` any run, `_` one byte, optional `ESCAPE`);
+//! `GLOB` is case-sensitive (`*`, `?`, `[...]` classes); `REGEXP` is a small
+//! built-in subset, not PCRE; `MATCH` is a case-insensitive substring test.
+//! Pure and infallible; NULL handling stays with the caller.
 
 const std = @import("std");
 

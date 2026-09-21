@@ -1,28 +1,9 @@
 //! Pure value comparison and ordering helpers for SQL predicates.
 //!
-//! This module extracts the stateless comparison semantics previously embedded
-//! in `src/connection/connection.zig` so future refactors can evaluate
-//! `sql.ast.CompareOp` predicates without depending on `Connection`.
-//!
-//! Relationship to `vm.Value`: `vm/value.zig` already owns the canonical total
-//! ordering (`Value.order`), tri-state `Value.compare`, and strict-identity
-//! `Value.sameValue`. The helpers here are a thin `sql.ast.CompareOp` adapter
-//! over that model: ordering operators (`=`, `<>`, `<`, `<=`, `>`, `>=`)
-//! delegate to collation-aware ordering, while every other `CompareOp`
-//! (`LIKE`, `GLOB`, `IN`, `BETWEEN`, `IS`, ...) returns `false` because those
-//! operators are evaluated elsewhere (see `connection/pattern.zig` and the
-//! expression evaluator). Prefer `Value.compare`/`Value.order` directly for
-//! new code that already speaks `vm.value.Comparison`.
-//!
-//! Collation note: only `NOCASE` (ASCII fold, text-vs-text only) affects the
-//! legacy `compareCollated` path, matching `connection.zig`. Full `RTRIM` and
-//! cross-type total ordering live on `Value.order`; this adapter keeps the
-//! historical subset so extracted behaviour stays byte-identical.
-//!
-//! Ownership and errors: all functions are pure and infallible. `Value`
-//! payloads (`text`/`blob` slices) are borrowed; callers retain ownership and
-//! must handle SQL `NULL` propagation before/after calling (any `NULL`
-//! operand yields `false` here, i.e. SQL `UNKNOWN` in a `WHERE` filter).
+//! Thin `CompareOp` adapter over `Value.order`: ordering operators compare
+//! (NOCASE folds ASCII text), every other operator returns false (LIKE,
+//! IN, BETWEEN, and friends evaluate elsewhere). Pure and infallible;
+//! NULL on either side yields false, payloads borrow.
 
 const std = @import("std");
 const Value = @import("../vm/value.zig").Value;

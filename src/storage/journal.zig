@@ -1,15 +1,7 @@
-//! Rollback-journal header codec (28-byte prefix of the `-journal` file).
+//! Rollback-journal header codec.
 //!
-//! Purpose: encode/decode the journal header that records how many pages
-//! follow and the sector/page geometry they were written with. Only the
-//! header is modeled here; journal-record replay lives with the pager and
-//! connection layers. Dependencies: `std` only. Ownership: `encode` fills a
-//! caller-owned `[headerSize]u8`; `decode` borrows its input (no allocation,
-//! no lifetime). Error behavior: short buffers, bad magic, and impossible
-//! geometry fail closed with `InvalidJournal` (never panics/OOB).
-//! Invariants: `headerSize == 28`; magic is 8 fixed bytes.
-//! Compatibility: magic and field offsets match the SQLite rollback-journal
-//! format; a zero sector size means "do not do sector-size-aligned writes".
+//! `encode` fills a caller buffer; `decode` borrows its input.
+//! Bad magic or geometry fails with `InvalidJournal`.
 
 const std = @import("std");
 
@@ -20,11 +12,7 @@ pub const headerSize = 28;
 pub const magic = [_]u8{ 0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7 };
 
 /// In-memory view of the journal header.
-///
-/// `sectorSize == 0` is legal (no sector alignment); any other value must be
-/// a power of two in 512..65536. `pageSize` follows the database geometry
-/// rule (power of two, 512..32768). `pageCount` is informational here: frame
-/// iteration is driven by the file size, not this count.
+/// Zero `sectorSize` means no alignment; `pageCount` is informational.
 pub const JournalHeader = struct {
     /// Number of page records claimed to follow (informational).
     pageCount: u32 = 0,
@@ -43,10 +31,7 @@ pub const JournalHeader = struct {
     }
 
     /// Parses and validates a journal header.
-    ///
-    /// Why geometry is validated here (unlike `format/header.zig`): the
-    /// sector size directly constrains write alignment, so accepting a bogus
-    /// value would corrupt recovery rather than merely mislabel a file.
+    /// Bad geometry fails here because it would corrupt recovery.
     pub fn decode(bytes: []const u8) error{InvalidJournal}!JournalHeader {
         if (bytes.len < headerSize) return error.InvalidJournal;
         if (!std.mem.eql(u8, bytes[0..8], &magic)) return error.InvalidJournal;

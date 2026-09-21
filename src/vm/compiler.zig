@@ -1,32 +1,9 @@
-//! Bytecode compiler: AST SELECT/expression -> `opcode.Program`.
+//! Bytecode compiler: AST SELECT/expression -> opcode programs.
 //!
-//! Purpose: lower resolved `sql/ast` nodes into VM programs over registers
-//! and cursors. Responsibilities: register allocation, expression codegen,
-//! SELECT projection/ordering codegen, and `CompiledQuery` packaging with
-//! owned column names.
-//!
-//! Dependencies: `sql/ast`, `vm/opcode`, `vm/value`, optional `catalog/schema`
-//! for name resolution (borrowed, must outlive compilation only), and `vm/vm`
-//! for the execution contract. Raw SQL arrives via `sql/parser`; the DSLs
-//! construct the same AST nodes directly — the compiler never sees SQL text.
-//!
-//! Ownership/lifetime: the returned `CompiledQuery` owns the program and the
-//! column-name strings; caller must `deinit` it. Input ASTs stay caller-owned.
-//!
-//! Error behavior: `error.Unsupported` for statements outside the compiled
-//! SELECT/expression subset (the interpreter in `connection` covers the rest);
-//! OOM propagates. Invalid SQL never reaches here — parsing/resolution rejects
-//! it first.
-//!
-//! SQLite compatibility: codegen preserves three-valued logic, affinity, and
-//! collation as defined by `vm/value`; planner hints (`plan/planner`) select
-//! access paths the emitted cursor opcodes implement.
-// TODO: Extend compiler coverage beyond SELECT/expressions to DML/DDL paths.
-// Current limitation: only SELECT and bare expressions lower to bytecode; the
-// remaining statements execute via the connection interpreter. Expected: one
-// codegen path per statement family with differential tests against the
-// interpreter. Required tests: per-statement compiled-vs-interpreted
-// equivalence plus EXPLAIN output stability.
+//! Lowers resolved AST nodes into register/cursor programs with owned column
+//! names. Only SELECT and bare expressions compile today; every other
+//! statement runs through the connection interpreter (`compile` says
+//! `Unsupported` for those). Input ASTs stay caller-owned.
 const std = @import("std");
 const ast = @import("../sql/ast.zig");
 const opcode = @import("opcode.zig");
@@ -74,8 +51,10 @@ pub const Compiler = struct {
         return reg;
     }
 
-    /// Compiles a statement; only SELECT is lowered today, the rest fail
-    /// `Unsupported` and run through the connection interpreter (see TODO).
+    /// Compiles a statement; only SELECT lowers today, the rest fail
+    /// `Unsupported` and run through the connection interpreter.
+    // TODO: Lower DML/DDL families here too, one codegen path per family
+    // with compiled-vs-interpreted equivalence tests per statement.
     pub fn compile(self: *Compiler, statement: ast.Statement) !CompiledQuery {
         switch (statement) {
             .select => |sel| return self.compileSelect(sel),

@@ -1,41 +1,7 @@
-//! SQL abstract syntax tree: owned node vocabulary for the frontend.
+//! Syntax tree nodes shared by the parser and planner.
 //!
-//! Purpose: single authoritative AST shared by the parser (producer),
-//! `expr.zig` (row-level evaluator), `plan/` (planner/optimizer readers), the
-//! VM compiler, and DSL builders in `src/dsl/` which construct these nodes
-//! directly and never round-trip through SQL strings.
-//!
-//! Responsibilities: declare `Expr`, `Condition`, `Statement`, and all DDL/DML
-//! payload structs; provide ownership helpers (`freeOwnedExpr`,
-//! `cloneOwnedExpr`, `freeExprRec`, `freeConditions`, `deinit`).
-//!
-//! Dependencies: `std`, `../vm/value.zig` (`Value` literals). No lexer/parser
-//! imports (dependency direction is parser -> ast, never the reverse).
-//!
-//! Ownership/lifetime: two flavors coexist and must not be mixed:
-//! - *Borrowed* AST from `Parser`: string slices borrow the source SQL or the
-//!   parser's `allocations` arena; expression *nodes* (`*const Expr` links)
-//!   are individually `allocator.create`d and freed by `ast.deinit`.
-//! - *Owned* AST (e.g. cloned predicates kept by the planner): every string
-//!   and node is heap-owned; free with `freeOwnedExpr` / `freeConditions`.
-//! `freeExprRec` frees node structure but not borrowed strings (parser-arena
-//! case); `freeOwnedExpr` additionally frees owned strings/blobs/names.
-//!
-//! Error behavior: `cloneOwnedExpr` returns `OutOfMemory` only; free functions
-//! are infallible. Callers must not double-free: each node has exactly one owner.
-//!
-//! Invariants: nullable `?*const Expr` links are either null or point at a
-//! live heap node; `&.{}` empty slices are never freed (helpers guard on
-//! `len != 0`); `Statement.isQuery` covers exactly the read-like variants.
-//!
-//! SQLite compatibility: mirrors SQLite surface (conflict policies, generated
-//! columns, strict/without-rowid, partial/expression indexes, triggers,
-//! virtual tables, CTEs, compound selects, pragmas, vacuum/analyze).
-// TODO(sql/ast): recursion in free/clone/deinit is unbounded; a hostile
-// deeply-nested expression (e.g. 100k nested parens surviving the parser
-// depth cap) can still overflow the stack here. Expected: iterative free/clone
-// or an explicit depth cap shared with parser/expr; tests: 10k-deep free and
-// clone fail closed instead of crashing. Subsystem: sql/frontend.
+//! Borrowed trees free with `deinit`; owned trees free with `freeOwnedExpr`.
+//! Cloning fails only on out of memory.
 
 const std = @import("std");
 const Value = @import("../vm/value.zig").Value;
@@ -186,6 +152,7 @@ pub const Statement = union(enum) {
     detach: struct { schemaName: []const u8 },
     vacuum: struct { schemaName: ?[]const u8 = null, into: ?Expr = null },
     analyze: struct { target: ?[]const u8 = null },
+    reindex: struct { target: ?[]const u8 = null },
 
     /// True for read-like statements (select/with/compound/explain/pragma).
     pub fn isQuery(self: Statement) bool {
@@ -196,7 +163,53 @@ pub const Statement = union(enum) {
 /// Free an *owned* expression: node structure plus owned strings/blobs/names.
 /// Each heap node and owned slice is freed exactly once. Borrowed parser
 /// output must use `freeExprRec`/`deinit` instead (they skip string frees).
+/// Iterative (explicit work stack), so even pathologically deep caller-built
+/// trees free without touching the call stack.
+const FreeWork = union(enum) {
+    destroy: *const Expr,
+    borrowed: *const Expr,
+    exprs: []const Expr,
+    whens: []const CaseWhen,
+    orders: []const OrderItem,
+};
+
 pub fn freeOwnedExpr(allocator: std.mem.Allocator, expr: Expr) void {
+    var root = expr;
+    var stack = std.ArrayList(FreeWork).empty;
+    defer stack.deinit(allocator);
+    stack.append(allocator, .{ .borrowed = &root }) catch return;
+    while (stack.pop()) |work| {
+        switch (work) {
+            .destroy => |node| {
+                freeOwnedExprChildren(allocator, node.*, &stack) catch continue;
+                allocator.destroy(node);
+            },
+            .borrowed => |node| {
+                freeOwnedExprChildren(allocator, node.*, &stack) catch continue;
+            },
+            .exprs => |items| {
+                for (items) |*item| stack.append(allocator, .{ .borrowed = item }) catch continue;
+                if (items.len != 0) allocator.free(items);
+            },
+            .whens => |items| {
+                for (items) |*item| {
+                    stack.append(allocator, .{ .borrowed = &item.result }) catch continue;
+                    stack.append(allocator, .{ .borrowed = &item.condition }) catch continue;
+                }
+                if (items.len != 0) allocator.free(items);
+            },
+            .orders => |items| {
+                for (items) |*item| stack.append(allocator, .{ .borrowed = &item.expr }) catch continue;
+                if (items.len != 0) allocator.free(items);
+            },
+        }
+    }
+}
+
+/// Single-node visit for the iterative `freeOwnedExpr`: frees the node's own
+/// strings and queues child work. Never recurses; OOM while queueing skips
+/// the remaining subtree (leaks under OOM only, never crashes).
+fn freeOwnedExprChildren(allocator: std.mem.Allocator, expr: Expr, stack: *std.ArrayList(FreeWork)) !void {
     switch (expr) {
         .literal => |lit| switch (lit) {
             .text => |t| allocator.free(t),
@@ -206,92 +219,70 @@ pub fn freeOwnedExpr(allocator: std.mem.Allocator, expr: Expr) void {
         .identifier => |id| allocator.free(id),
         .function => |call| {
             allocator.free(call.name);
-            freeOwnedExpr(allocator, call.argument.*);
-            allocator.destroy(call.argument);
-            if (call.argument2) |argument| {
-                freeOwnedExpr(allocator, argument.*);
-                allocator.destroy(argument);
+            try stack.append(allocator, .{ .destroy = call.argument });
+            if (call.argument2) |argument| try stack.append(allocator, .{ .destroy = argument });
+            if (call.argument3) |argument| try stack.append(allocator, .{ .destroy = argument });
+            if (call.extraArgs.len != 0) {
+                for (call.extraArgs) |*item| try stack.append(allocator, .{ .borrowed = item });
+                try stack.append(allocator, .{ .exprs = call.extraArgs });
             }
-            if (call.argument3) |argument| {
-                freeOwnedExpr(allocator, argument.*);
-                allocator.destroy(argument);
-            }
-            for (call.extraArgs) |argument| {
-                freeOwnedExpr(allocator, argument);
-            }
-            if (call.extraArgs.len != 0) allocator.free(call.extraArgs);
         },
         .binary => |binary| {
-            freeOwnedExpr(allocator, binary.left.*);
-            freeOwnedExpr(allocator, binary.right.*);
-            allocator.destroy(binary.left);
-            allocator.destroy(binary.right);
+            try stack.append(allocator, .{ .destroy = binary.left });
+            try stack.append(allocator, .{ .destroy = binary.right });
         },
         .unary => |unary| {
-            freeOwnedExpr(allocator, unary.expr.*);
-            allocator.destroy(unary.expr);
+            try stack.append(allocator, .{ .destroy = unary.expr });
         },
         .caseExpr => |caseBlock| {
-            if (caseBlock.base) |base| {
-                freeOwnedExpr(allocator, base.*);
-                allocator.destroy(base);
+            if (caseBlock.base) |base| try stack.append(allocator, .{ .destroy = base });
+            if (caseBlock.whens.len != 0) {
+                for (caseBlock.whens) |*item| {
+                    try stack.append(allocator, .{ .borrowed = &item.result });
+                    try stack.append(allocator, .{ .borrowed = &item.condition });
+                }
+                try stack.append(allocator, .{ .whens = caseBlock.whens });
             }
-            for (caseBlock.whens) |when| {
-                freeOwnedExpr(allocator, when.condition);
-                freeOwnedExpr(allocator, when.result);
-            }
-            allocator.free(caseBlock.whens);
-            if (caseBlock.otherwise) |otherwise| {
-                freeOwnedExpr(allocator, otherwise.*);
-                allocator.destroy(otherwise);
-            }
+            if (caseBlock.otherwise) |otherwise| try stack.append(allocator, .{ .destroy = otherwise });
         },
         .patternMatch => |match| {
-            freeOwnedExpr(allocator, match.value.*);
-            allocator.destroy(match.value);
-            freeOwnedExpr(allocator, match.pattern.*);
-            allocator.destroy(match.pattern);
-            if (match.escape) |escape| {
-                freeOwnedExpr(allocator, escape.*);
-                allocator.destroy(escape);
-            }
+            try stack.append(allocator, .{ .destroy = match.value });
+            try stack.append(allocator, .{ .destroy = match.pattern });
+            if (match.escape) |escape| try stack.append(allocator, .{ .destroy = escape });
         },
         .collate => |node| {
             allocator.free(node.name);
-            freeOwnedExpr(allocator, node.expr.*);
-            allocator.destroy(node.expr);
+            try stack.append(allocator, .{ .destroy = node.expr });
         },
         .inSubquery => |inSub| {
-            freeOwnedExpr(allocator, inSub.expr.*);
-            allocator.destroy(inSub.expr);
+            try stack.append(allocator, .{ .destroy = inSub.expr });
             allocator.free(inSub.subquery);
         },
         .inList => |inL| {
-            freeOwnedExpr(allocator, inL.expr.*);
-            allocator.destroy(inL.expr);
-            for (inL.list) |item| freeOwnedExpr(allocator, item);
-            if (inL.list.len != 0) allocator.free(inL.list);
+            try stack.append(allocator, .{ .destroy = inL.expr });
+            if (inL.list.len != 0) {
+                for (inL.list) |*item| try stack.append(allocator, .{ .borrowed = item });
+                try stack.append(allocator, .{ .exprs = inL.list });
+            }
         },
-        .scalarSubquery => |s| allocator.free(s),
-        .existsSubquery => |s| allocator.free(s),
+        .scalarSubquery => |sub| allocator.free(sub),
+        .existsSubquery => |sub| allocator.free(sub),
         .window => |w| {
             allocator.free(w.funcName);
-            if (w.argument) |arg| {
-                freeOwnedExpr(allocator, arg.*);
-                allocator.destroy(arg);
+            if (w.argument) |arg| try stack.append(allocator, .{ .destroy = arg });
+            if (w.argument2) |arg| try stack.append(allocator, .{ .destroy = arg });
+            if (w.extraArgs.len != 0) {
+                for (w.extraArgs) |*item| try stack.append(allocator, .{ .borrowed = item });
+                try stack.append(allocator, .{ .exprs = w.extraArgs });
             }
-            if (w.argument2) |arg| {
-                freeOwnedExpr(allocator, arg.*);
-                allocator.destroy(arg);
+            if (w.partitionBy.len != 0) {
+                for (w.partitionBy) |*item| try stack.append(allocator, .{ .borrowed = item });
+                try stack.append(allocator, .{ .exprs = w.partitionBy });
             }
-            for (w.extraArgs) |arg| {
-                freeOwnedExpr(allocator, arg);
+            if (w.orderBy.len != 0) {
+                for (w.orderBy) |*item| try stack.append(allocator, .{ .borrowed = &item.expr });
+                try stack.append(allocator, .{ .orders = w.orderBy });
             }
-            if (w.extraArgs.len != 0) allocator.free(w.extraArgs);
-            for (w.partitionBy) |item| freeOwnedExpr(allocator, item);
-            if (w.partitionBy.len != 0) allocator.free(w.partitionBy);
-            for (w.orderBy) |item| freeOwnedExpr(allocator, item.expr);
-            if (w.orderBy.len != 0) allocator.free(w.orderBy);
         },
         else => {},
     }
@@ -299,7 +290,21 @@ pub fn freeOwnedExpr(allocator: std.mem.Allocator, expr: Expr) void {
 
 /// Deep-clone an expression into fully-owned memory (`OutOfMemory` on failure).
 /// On error, partially built output is freed; the input is never consumed.
+/// Maximum expression depth accepted by `cloneOwnedExpr`. Parser output
+/// never exceeds 200 levels, so legitimate trees always fit; deeper
+/// caller-built trees fail closed with `error.TooDeep` instead of
+/// overflowing the call stack during the recursive descent.
+pub const max_clone_depth: usize = 500;
+
+/// Deep-clone an expression into fully-owned memory (`OutOfMemory` on failure).
+/// On error, partially built output is freed; the input is never consumed.
+/// Trees deeper than `max_clone_depth` fail with `error.TooDeep`.
 pub fn cloneOwnedExpr(allocator: std.mem.Allocator, expr: Expr) !Expr {
+    return cloneOwnedExprDepth(allocator, expr, 0);
+}
+
+fn cloneOwnedExprDepth(allocator: std.mem.Allocator, expr: Expr, depth: usize) !Expr {
+    if (depth > max_clone_depth) return error.TooDeep;
     switch (expr) {
         .literal => |lit| return .{ .literal = switch (lit) {
             .text => |t| .{ .text = try allocator.dupe(u8, t) },
@@ -314,13 +319,13 @@ pub fn cloneOwnedExpr(allocator: std.mem.Allocator, expr: Expr) !Expr {
             errdefer allocator.free(ownedName);
             const arg1 = try allocator.create(Expr);
             errdefer allocator.destroy(arg1);
-            arg1.* = try cloneOwnedExpr(allocator, call.argument.*);
+            arg1.* = try cloneOwnedExprDepth(allocator, call.argument.*, depth + 1);
             errdefer freeOwnedExpr(allocator, arg1.*);
             var arg2: ?*const Expr = null;
             if (call.argument2) |a2| {
                 const node = try allocator.create(Expr);
                 errdefer allocator.destroy(node);
-                node.* = try cloneOwnedExpr(allocator, a2.*);
+                node.* = try cloneOwnedExprDepth(allocator, a2.*, depth + 1);
                 arg2 = node;
             }
             errdefer if (arg2) |n| {
@@ -331,7 +336,7 @@ pub fn cloneOwnedExpr(allocator: std.mem.Allocator, expr: Expr) !Expr {
             if (call.argument3) |a3| {
                 const node = try allocator.create(Expr);
                 errdefer allocator.destroy(node);
-                node.* = try cloneOwnedExpr(allocator, a3.*);
+                node.* = try cloneOwnedExprDepth(allocator, a3.*, depth + 1);
                 arg3 = node;
             }
             errdefer if (arg3) |n| {
@@ -347,7 +352,7 @@ pub fn cloneOwnedExpr(allocator: std.mem.Allocator, expr: Expr) !Expr {
                     allocator.free(list);
                 }
                 for (call.extraArgs, 0..) |item, idx| {
-                    list[idx] = try cloneOwnedExpr(allocator, item);
+                    list[idx] = try cloneOwnedExprDepth(allocator, item, depth + 1);
                     count += 1;
                 }
                 extraArgs = list;
@@ -357,17 +362,17 @@ pub fn cloneOwnedExpr(allocator: std.mem.Allocator, expr: Expr) !Expr {
         .binary => |bin| {
             const left = try allocator.create(Expr);
             errdefer allocator.destroy(left);
-            left.* = try cloneOwnedExpr(allocator, bin.left.*);
+            left.* = try cloneOwnedExprDepth(allocator, bin.left.*, depth + 1);
             errdefer freeOwnedExpr(allocator, left.*);
             const right = try allocator.create(Expr);
             errdefer allocator.destroy(right);
-            right.* = try cloneOwnedExpr(allocator, bin.right.*);
+            right.* = try cloneOwnedExprDepth(allocator, bin.right.*, depth + 1);
             return .{ .binary = .{ .op = bin.op, .left = left, .right = right } };
         },
         .unary => |un| {
             const inner = try allocator.create(Expr);
             errdefer allocator.destroy(inner);
-            inner.* = try cloneOwnedExpr(allocator, un.expr.*);
+            inner.* = try cloneOwnedExprDepth(allocator, un.expr.*, depth + 1);
             return .{ .unary = .{ .op = un.op, .expr = inner } };
         },
         .collate => |col| {
@@ -375,7 +380,7 @@ pub fn cloneOwnedExpr(allocator: std.mem.Allocator, expr: Expr) !Expr {
             errdefer allocator.free(ownedName);
             const inner = try allocator.create(Expr);
             errdefer allocator.destroy(inner);
-            inner.* = try cloneOwnedExpr(allocator, col.expr.*);
+            inner.* = try cloneOwnedExprDepth(allocator, col.expr.*, depth + 1);
             return .{ .collate = .{ .name = ownedName, .expr = inner } };
         },
         .caseExpr => |cs| {
@@ -383,7 +388,7 @@ pub fn cloneOwnedExpr(allocator: std.mem.Allocator, expr: Expr) !Expr {
             if (cs.base) |b| {
                 const node = try allocator.create(Expr);
                 errdefer allocator.destroy(node);
-                node.* = try cloneOwnedExpr(allocator, b.*);
+                node.* = try cloneOwnedExprDepth(allocator, b.*, depth + 1);
                 baseNode = node;
             }
             errdefer if (baseNode) |n| {
@@ -401,8 +406,8 @@ pub fn cloneOwnedExpr(allocator: std.mem.Allocator, expr: Expr) !Expr {
             }
             for (cs.whens, 0..) |w, idx| {
                 whens[idx] = .{
-                    .condition = try cloneOwnedExpr(allocator, w.condition),
-                    .result = try cloneOwnedExpr(allocator, w.result),
+                    .condition = try cloneOwnedExprDepth(allocator, w.condition, depth + 1),
+                    .result = try cloneOwnedExprDepth(allocator, w.result, depth + 1),
                 };
                 whensCount += 1;
             }
@@ -410,7 +415,7 @@ pub fn cloneOwnedExpr(allocator: std.mem.Allocator, expr: Expr) !Expr {
             if (cs.otherwise) |o| {
                 const node = try allocator.create(Expr);
                 errdefer allocator.destroy(node);
-                node.* = try cloneOwnedExpr(allocator, o.*);
+                node.* = try cloneOwnedExprDepth(allocator, o.*, depth + 1);
                 otherwiseNode = node;
             }
             return .{ .caseExpr = .{ .base = baseNode, .whens = whens, .otherwise = otherwiseNode } };
@@ -418,17 +423,17 @@ pub fn cloneOwnedExpr(allocator: std.mem.Allocator, expr: Expr) !Expr {
         .patternMatch => |pm| {
             const val = try allocator.create(Expr);
             errdefer allocator.destroy(val);
-            val.* = try cloneOwnedExpr(allocator, pm.value.*);
+            val.* = try cloneOwnedExprDepth(allocator, pm.value.*, depth + 1);
             errdefer freeOwnedExpr(allocator, val.*);
             const pat = try allocator.create(Expr);
             errdefer allocator.destroy(pat);
-            pat.* = try cloneOwnedExpr(allocator, pm.pattern.*);
+            pat.* = try cloneOwnedExprDepth(allocator, pm.pattern.*, depth + 1);
             errdefer freeOwnedExpr(allocator, pat.*);
             var esc: ?*const Expr = null;
             if (pm.escape) |e| {
                 const node = try allocator.create(Expr);
                 errdefer allocator.destroy(node);
-                node.* = try cloneOwnedExpr(allocator, e.*);
+                node.* = try cloneOwnedExprDepth(allocator, e.*, depth + 1);
                 esc = node;
             }
             return .{ .patternMatch = .{ .value = val, .pattern = pat, .escape = esc, .negated = pm.negated, .glob = pm.glob, .isRegexp = pm.isRegexp, .isMatch = pm.isMatch } };
@@ -436,7 +441,7 @@ pub fn cloneOwnedExpr(allocator: std.mem.Allocator, expr: Expr) !Expr {
         .inList => |il| {
             const target = try allocator.create(Expr);
             errdefer allocator.destroy(target);
-            target.* = try cloneOwnedExpr(allocator, il.expr.*);
+            target.* = try cloneOwnedExprDepth(allocator, il.expr.*, depth + 1);
             errdefer freeOwnedExpr(allocator, target.*);
             const list = try allocator.alloc(Expr, il.list.len);
             var listCount: usize = 0;
@@ -445,7 +450,7 @@ pub fn cloneOwnedExpr(allocator: std.mem.Allocator, expr: Expr) !Expr {
                 allocator.free(list);
             }
             for (il.list, 0..) |item, idx| {
-                list[idx] = try cloneOwnedExpr(allocator, item);
+                list[idx] = try cloneOwnedExprDepth(allocator, item, depth + 1);
                 listCount += 1;
             }
             return .{ .inList = .{ .expr = target, .list = list, .negated = il.negated } };
@@ -453,7 +458,7 @@ pub fn cloneOwnedExpr(allocator: std.mem.Allocator, expr: Expr) !Expr {
         .inSubquery => |is| {
             const target = try allocator.create(Expr);
             errdefer allocator.destroy(target);
-            target.* = try cloneOwnedExpr(allocator, is.expr.*);
+            target.* = try cloneOwnedExprDepth(allocator, is.expr.*, depth + 1);
             errdefer freeOwnedExpr(allocator, target.*);
             const sub = try allocator.dupe(u8, is.subquery);
             return .{ .inSubquery = .{ .expr = target, .subquery = sub, .negated = is.negated } };
@@ -467,7 +472,7 @@ pub fn cloneOwnedExpr(allocator: std.mem.Allocator, expr: Expr) !Expr {
             if (w.argument) |a1| {
                 const node = try allocator.create(Expr);
                 errdefer allocator.destroy(node);
-                node.* = try cloneOwnedExpr(allocator, a1.*);
+                node.* = try cloneOwnedExprDepth(allocator, a1.*, depth + 1);
                 arg1 = node;
             }
             errdefer if (arg1) |n| {
@@ -478,7 +483,7 @@ pub fn cloneOwnedExpr(allocator: std.mem.Allocator, expr: Expr) !Expr {
             if (w.argument2) |a2| {
                 const node = try allocator.create(Expr);
                 errdefer allocator.destroy(node);
-                node.* = try cloneOwnedExpr(allocator, a2.*);
+                node.* = try cloneOwnedExprDepth(allocator, a2.*, depth + 1);
                 arg2 = node;
             }
             errdefer if (arg2) |n| {
@@ -494,7 +499,7 @@ pub fn cloneOwnedExpr(allocator: std.mem.Allocator, expr: Expr) !Expr {
                     allocator.free(list);
                 }
                 for (w.extraArgs, 0..) |item, idx| {
-                    list[idx] = try cloneOwnedExpr(allocator, item);
+                    list[idx] = try cloneOwnedExprDepth(allocator, item, depth + 1);
                     count += 1;
                 }
                 extraArgs = list;
@@ -508,7 +513,7 @@ pub fn cloneOwnedExpr(allocator: std.mem.Allocator, expr: Expr) !Expr {
                     allocator.free(list);
                 }
                 for (w.partitionBy, 0..) |item, idx| {
-                    list[idx] = try cloneOwnedExpr(allocator, item);
+                    list[idx] = try cloneOwnedExprDepth(allocator, item, depth + 1);
                     count += 1;
                 }
                 parts = list;
@@ -523,7 +528,7 @@ pub fn cloneOwnedExpr(allocator: std.mem.Allocator, expr: Expr) !Expr {
                 }
                 for (w.orderBy, 0..) |item, idx| {
                     list[idx] = .{
-                        .expr = try cloneOwnedExpr(allocator, item.expr),
+                        .expr = try cloneOwnedExprDepth(allocator, item.expr, depth + 1),
                         .descending = item.descending,
                         .nullsFirst = item.nullsFirst,
                     };
@@ -839,6 +844,28 @@ test "ast clone/free round-trips owned expressions" {
     const src: Expr = .{ .binary = .{ .op = .add, .left = l, .right = r } };
     const owned = try cloneOwnedExpr(alloc, src);
     freeOwnedExpr(alloc, owned);
+}
+
+test "ast frees deep trees iteratively and refuses to clone them" {
+    // 10k-deep left-leaning chain: freeing must not touch the call stack
+    // (iterative work list), while cloning fails closed past the cap.
+    const alloc = std.testing.allocator;
+    var root: Expr = .{ .literal = .{ .integer = 0 } };
+    var depth: usize = 0;
+    while (depth < 10000) : (depth += 1) {
+        const left = try alloc.create(Expr);
+        left.* = root;
+        errdefer {
+            freeOwnedExpr(alloc, left.*);
+            alloc.destroy(left);
+        }
+        const one = try alloc.create(Expr);
+        one.* = .{ .literal = .{ .integer = 1 } };
+        errdefer alloc.destroy(one);
+        root = .{ .binary = .{ .op = .add, .left = left, .right = one } };
+    }
+    try std.testing.expectError(error.TooDeep, cloneOwnedExpr(alloc, root));
+    freeOwnedExpr(alloc, root);
 }
 
 test "ast isQuery covers read-like statements only" {

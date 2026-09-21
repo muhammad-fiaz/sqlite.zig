@@ -1,21 +1,8 @@
 //! Raw database file access: pages, header, payload and WAL sidecar.
 //!
-//! Purpose: own the OS file handle plus its page geometry and expose
-//! positional page/byte I/O to the pager and connection layers. This module
-//! also hosts two persistence encodings: the legacy `ZIGSQL1` length-prefixed
-//! payload region and the WAL (`-wal`) sidecar applied over the base image.
-//! Responsibilities: file create/open, header validation, page read/write,
-//! whole-image read/write with optional WAL overlay. Dependencies:
-//! `format/header.zig` (geometry), `storage/wal.zig` (sidecar codec), `std`.
-//! Ownership/lifetime: `DatabaseFile` owns `path`, `threaded`, and `file`;
-//! callers own buffers returned by `readPage`/`readBytes`/`readImage` and
-//! must free them. `close` releases everything. Error behavior: corrupt or
-//! short data fails closed (`InvalidHeader`/`InvalidPageSize`/`InvalidWal`);
-//! page 0 is rejected (pages are 1-based); oversized reads that would force
-//! unbounded allocation fail with `OutOfMemory`-mapped `InvalidHeader`.
-//! Invariants: `pageSize` is a power of two in 512..32768 after `open`.
-//! Compatibility: header layout matches SQLite; `-wal` framing matches
-//! `wal.zig` (SQLite-style checksums, little-endian variant only).
+//! Owns the OS handle and page geometry; callers own returned buffers and
+//! free them. Corrupt or short data fails closed; oversized reads are
+//! rejected before allocating. Page size is a power of two in 512..32768.
 
 const std = @import("std");
 const Io = std.Io;
@@ -206,17 +193,14 @@ pub const DatabaseFile = struct {
     /// Persists `bytes` as the new database image.
     ///
     /// Stamps the cached schema/user/application versions into the header
-    /// region first (mutating the caller's buffer via const-cast: the slice
-    /// must be mutable memory despite the `[]const u8` type, which is kept
-    /// for compatibility with `connection` call sites that hold immutable
-    /// views). Routes to the WAL sidecar when `walEnabled`, else rewrites
-    /// and truncates the base file. Callers passing truly read-only memory
-    /// must copy first.
-    // TODO: take `[]u8` instead of `[]const u8` so the header stamp is type-checked. Current signature permits read-only input whose mutation would fault; expected behavior is a mutable-slice parameter. Tests needed: compile-time const-slice rejection test plus a stamp-visibility test.
-    pub fn writeImage(self: *DatabaseFile, bytes: []const u8) !void {
-        if (bytes.len >= 44) std.mem.writeInt(u32, @constCast(bytes[40..44]), self.schemaVersion, .big);
-        if (bytes.len >= 64) std.mem.writeInt(u32, @constCast(bytes[60..64]), self.userVersion, .big);
-        if (bytes.len >= 72) std.mem.writeInt(u32, @constCast(bytes[68..72]), self.applicationId, .big);
+    /// region first. The slice is `[]u8` (not `[]const u8`) precisely so the
+    /// stamp is type-checked: passing read-only memory fails to compile
+    /// instead of faulting at runtime. Routes to the WAL sidecar when
+    /// `walEnabled`, else rewrites and truncates the base file.
+    pub fn writeImage(self: *DatabaseFile, bytes: []u8) !void {
+        if (bytes.len >= 44) std.mem.writeInt(u32, bytes[40..44], self.schemaVersion, .big);
+        if (bytes.len >= 64) std.mem.writeInt(u32, bytes[60..64], self.userVersion, .big);
+        if (bytes.len >= 72) std.mem.writeInt(u32, bytes[68..72], self.applicationId, .big);
         if (self.walEnabled) return self.writeWal(bytes);
         try self.file.writePositionalAll(self.threaded.io(), bytes, 0);
         try self.file.setLength(self.threaded.io(), bytes.len);
@@ -414,4 +398,25 @@ test "database file journal mode and version accessors" {
     try std.testing.expectEqual(@as(u32, 77), db.getUserVersion());
     try std.testing.expectEqual(@as(u32, 88), db.getApplicationId());
     try std.testing.expectEqual(@as(u32, 99), db.getSchemaVersion());
+}
+
+test "writeImage stamps versions into the header image" {
+    const path = "sqlite_zig_file_stamp_test.db";
+    defer Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    var db = try DatabaseFile.open(std.testing.allocator, path);
+    defer db.close();
+    db.setUserVersion(0x01020304);
+    db.setApplicationId(0x05060708);
+    db.setSchemaVersion(0x090a0b0c);
+    var image = try std.testing.allocator.alloc(u8, 100);
+    defer std.testing.allocator.free(image);
+    @memset(image, 0);
+    try db.writeImage(image);
+    // The mutable-slice stamp is visible in the caller's buffer and on disk.
+    try std.testing.expectEqual(@as(u32, 0x090a0b0c), std.mem.readInt(u32, image[40..44], .big));
+    try std.testing.expectEqual(@as(u32, 0x01020304), std.mem.readInt(u32, image[60..64], .big));
+    try std.testing.expectEqual(@as(u32, 0x05060708), std.mem.readInt(u32, image[68..72], .big));
+    const stored = try db.readBytes(0, 100);
+    defer std.testing.allocator.free(stored);
+    try std.testing.expectEqualSlices(u8, image, stored);
 }

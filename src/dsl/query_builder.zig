@@ -1,58 +1,8 @@
-//! Query/mutation builders: value-semantic DSL over the native AST.
+//! Value-semantic query and mutation builders over the native AST.
 //!
-//! Purpose: provide the typed (`db.from(User)`) and dynamic
-//! (`db.table("users")`) builders that accumulate borrowed SELECT / INSERT /
-//! UPDATE / DELETE / UPSERT state and, on `fetch()`/`execute()`/`insert()`,
-//! lower snapshots through `ast_builder` into native `sql/ast.zig` statements
-//! run by the connection's executor hooks. Builders never render SQL strings.
-//!
-//! Responsibilities: projection/condition/order/limit/offset/group/having/join
-//! accumulation, CTE staging, compound (UNION/INTERSECT/EXCEPT) arms, derived
-//! tables, typed row mapping (`MappedResult`), and mutation execution.
-//!
-//! Dependencies: `dsl/expr.zig`, `dsl/column.zig`, `dsl/table.zig`,
-//! `dsl/ast_builder.zig`, `sql/ast.zig`, `vm/value.zig`,
-//! `connection/result.zig`.
-//!
-//! Ownership/lifetime (critical): builders are small copyable values; every
-//! chaining call returns a *copy*, so the original remains usable. Builders
-//! borrow table/column/alias strings and hold fixed-capacity inline buffers
-//! (32 projections, 16 conditions, 8 orders/CTEs, ...); exceeding a buffer is
-//! a `@panic`. `fetch()` returns an *owned* `Result` (or owned `MappedResult`
-//! rows) that the caller must `deinit` — the `Result` duplicates every text/
-//! blob payload and column name. `fetchOne`/`fetchOptional` duplicate the
-//! single value/row the same way. Mapped rows (`MappedResult.rows`) duplicate
-//! text payloads per row; call `deinit()` (or `freeRow`) exactly once. AST
-//! snapshots are by-value copies taken at fetch time; later builder mutation
-//! never affects an in-flight query. Executor hooks borrow the connection;
-//! the connection must outlive every builder and every outstanding `Result`.
-//!
-//! Error behavior: builder chaining panics on capacity misuse (`too many DSL
-//! projections/predicates/orders/CTEs`, empty `select()`/`orderBy()`) and
-//! compile-errors on type misuse (`select()` with orders, `having()` with a
-//! non-comparison, compound arms from non-builders). Execution returns engine
-//! errors (`UnknownColumn`, `InvalidSql`, `NoRows`, `TooManyRows`, I/O, ...).
-//!
-//! SQLite compatibility: inherits the engine's. `having()` accepts either a
-//! `HavingCond` (`col.count().gt(1)`) or a plain column predicate lowered to
-//! the same shape; unsupported shapes mark the snapshot invalid so
-//! `ast_builder` fails with `InvalidSql` instead of mis-executing.
-//!
-//! Unified pipeline note: Raw SQL, the dynamic DSL, and the typed DSL all
-//! converge on native AST/IR via `ast_builder.buildSelect`/`buildInsert`/
-//! `buildUpdate`/`buildDelete` — builders never emit SQL text for re-parsing.
-//!
-//! Column/operation collision rule: `select()` takes column *values*
-//! (`User.where`, `t.column("count")`) or their aggregate/projection calls;
-//! passing the `all` *operation itself* (`User.all` without calling) is a
-//! `@compileError` directing to `User.all()` or `selectAll()`. Columns named
-//! `select`/`where`/`limit`/`count` therefore flow through as ordinary fields.
-//!
-//! AllColumns note: `AllProjection` (from `User.all()`) routes `select()` to
-//! `selectAll()`, which lowers to the native `.wildcard` (`*`) node.
-//! `QualifiedAllColumns` ordering (e.g. `table.*` in joins) is preserved by
-//! `ast_builder`: join queries keep full qualification while single-table
-//! `selectAll()` renders the historical bare `*`.
+//! Builders are copies that borrow names; `fetch`/`execute` return owned results.
+//! The connection must outlive every builder and result.
+//! Overflow panics; execution returns engine errors.
 
 const std = @import("std");
 const dslExpr = @import("expr.zig");
@@ -250,11 +200,7 @@ fn storeWindowProjection(windows: []WindowBuilder, windowCount: *usize, out: []P
     outCount.* += 1;
 }
 
-/// Value-semantic query builder. `Row == void` means dynamic/untyped;
-/// otherwise rows map to `Row` via `Columns`. `mapped` selects star (`*`)
-/// versus explicit-projection mode. All chaining methods return copies;
-/// fixed buffers panic on overflow; execution methods return owned results.
-/// See the module docs for the full ownership/lifetime contract.
+/// Value-semantic query builder. Chaining returns copies; results are owned.
 pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool) type {
     return struct {
         const Self = @This();

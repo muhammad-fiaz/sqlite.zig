@@ -1,62 +1,10 @@
-//! In-memory catalog: canonical tables, indexes, views, and triggers.
+//! In-memory catalog: tables, indexes, views, triggers, and their rows.
 //!
-//! Purpose: own the database schema and its rows. `Schema` is the single
-//! owner of every table/index/view/trigger descriptor string, every stored
-//! `Value` payload, and every cloned CHECK/GENERATED/index expression. It
-//! validates DDL, enforces PRIMARY KEY / UNIQUE / FOREIGN KEY / CHECK /
-//! STRICT / WITHOUT ROWID / AUTOINCREMENT rules, maintains `sqlite_sequence`
-//! and `sqlite_stat1`, and rewrites stored SQL/expressions on renames.
-//!
-//! Responsibilities: table/index/view/trigger lifecycle, row append/update
-//! validation, affinity-adjacent STRICT coercion, rowid-alias assignment,
-//! autoindex maintenance, rename propagation, stats collection, and cloning.
-//!
-//! Dependencies: `vm/value.zig` (`Value`), `sql/ast.zig` (column/table
-//! definitions, expressions + clone/free helpers), `sql/expr.zig`
-//! (predicate evaluation), `sql/functions.zig` (aggregate/window guards for
-//! index expressions), `sql/lexer.zig` + `sql/token.zig` (stored-SQL rewrite
-//! tokenization, imported locally at use sites).
-//!
-//! Ownership/lifetime (critical): `Schema` OWNS everything reachable from it.
-//! `createTable`/`createIndex`/`createView`/`createTrigger` duplicate every
-//! name, default, expression, and SQL string into the schema allocator;
-//! callers retain nothing and must keep nothing alive. `find` returns a
-//! mutable borrow into the schema — the pointer dangles after `dropTable`/
-//! `removeTable`/`renameTable` moves the entry or after `deinit`. `Table.rows`
-//! own their `Value` payloads; `appendRow` duplicates inputs. `clone()` returns
-//! a fully independent `Schema` the caller must `deinit`. Call `deinit()`
-//! exactly once; it frees tables (descriptors + rows), indexes (names,
-//! columns, key/where expressions + SQL), views, and triggers. After `deinit`
-//! every borrowed table/index/view pointer dangles.
-//!
-//! Error behavior: DDL misuse yields `TableExists`/`IndexExists`/`ViewExists`/
-//! `TriggerExists`, `UnknownTable`/`UnknownColumn`/`UnknownIndex`/
-//! `UnknownView`/`UnknownTrigger`, `ColumnExists`, `ColumnCountMismatch`,
-//! `ConstraintViolation`, or `InvalidSql`. Allocation failure propagates as
-//! `OutOfMemory`. Failed creates leave the schema unchanged (errdefers free
-//! partial dupes); failed `addColumn` row backfills may leave rows extended —
-//! see the TODO at `addColumn`.
-//!
-//! SQLite compatibility: case-insensitive name resolution throughout;
-//! `sqlite_autoindex_*` maintenance; WITHOUT ROWID requires a PK;
-//! AUTOINCREMENT requires INTEGER PRIMARY KEY on a rowid table; STRICT allows
-//! only INT/INTEGER/REAL/TEXT/BLOB/ANY with NULL passing through;
-//! rowid-alias assignment mirrors SQLite's max+1 rule; partial/expression
-//! indexes reject aggregates, window-only functions, subqueries, and
-//! parameter/wildcard nodes; rename rewrites stored trigger/view/index SQL
-//! and CHECK/GENERATED expressions.
-//!
-//! Unified pipeline note: the catalog sits below all three pipelines — Raw
-//! SQL, the dynamic DSL, and the typed DSL all converge on native AST/IR that
-//! executes against this schema. Nothing here renders or parses SQL except
-//! the rename-path tokenizer, which rewrites already-stored SQL text.
-//!
-//! Column/operation collision note: not applicable — this layer stores raw
-//! column names verbatim (even `where`/`count`/`select`) and never interprets
-//! them as operations.
-//!
-//! AllColumns note: not applicable — star expansion happens above this layer;
-//! the catalog only sees resolved column lists.
+//! Owns every descriptor string, stored value, and cloned expression.
+//! `find` borrows (dangles after drop/rename/deinit); `appendRow` and the
+//! create calls duplicate inputs. `deinit` frees everything exactly once.
+//! DDL misuse returns the matching error; failed creates leave the schema
+//! unchanged. Names resolve case-insensitively.
 
 const std = @import("std");
 const Value = @import("../vm/value.zig").Value;
@@ -329,8 +277,9 @@ pub const Schema = struct {
                 for (list.list) |item| try self.validateIndexPredicate(table, tableName, item, sawColumn);
             },
             .function => |call| {
-                if (functions.aggregate.AggKind.fromName(call.name) != null) return error.InvalidSql;
-                if (functions.isWindowOnly(call.name)) return error.InvalidSql;
+                // Aggregates and window functions cannot appear here; scalar
+                // functions (including multi-arg min/max) validate per-arg.
+                if (functions.classify(call.name, functions.argCount(call)) != .scalar) return error.InvalidSql;
                 try self.validateIndexPredicate(table, tableName, call.argument.*, sawColumn);
                 if (call.argument2) |argument| try self.validateIndexPredicate(table, tableName, argument.*, sawColumn);
                 if (call.argument3) |argument| try self.validateIndexPredicate(table, tableName, argument.*, sawColumn);
@@ -584,21 +533,33 @@ pub const Schema = struct {
             const clonedGen = if (definition.generatedExpr) |gen| try ast.cloneOwnedExpr(self.allocator, gen) else null;
             errdefer if (clonedGen) |gen| ast.freeOwnedExpr(self.allocator, gen);
 
-            columns[index] = .{
-                .name = try self.allocator.dupe(u8, definition.name),
-                .typeName = try self.allocator.dupe(u8, definition.typeName),
-                .primaryKey = isPk,
-                .notNull = isNotNull,
-                .unique = definition.unique,
-                .autoincrement = definition.autoincrement,
-                .defaultValue = if (definition.defaultValue) |value| try self.copyValue(value) else null,
-                .foreignTable = if (definition.foreignKey) |foreignKey| try self.allocator.dupe(u8, foreignKey.table) else null,
-                .foreignColumn = if (definition.foreignKey) |foreignKey| try self.allocator.dupe(u8, foreignKey.column) else null,
-                .onDelete = if (definition.foreignKey) |foreignKey| foreignKey.onDelete else .restrict,
-                .onUpdate = if (definition.foreignKey) |foreignKey| foreignKey.onUpdate else .restrict,
-                .checkExpr = clonedCheck,
-                .generatedExpr = clonedGen,
-                .generatedStored = definition.generatedStored,
+            columns[index] = blk: {
+                const ownedColName = try self.allocator.dupe(u8, definition.name);
+                errdefer self.allocator.free(ownedColName);
+                const ownedColType = try self.allocator.dupe(u8, definition.typeName);
+                errdefer self.allocator.free(ownedColType);
+                const ownedColDefault = if (definition.defaultValue) |value| try self.copyValue(value) else null;
+                errdefer if (ownedColDefault) |val| freeValue(self.allocator, val);
+                const ownedColForeignTable = if (definition.foreignKey) |foreignKey| try self.allocator.dupe(u8, foreignKey.table) else null;
+                errdefer if (ownedColForeignTable) |val| self.allocator.free(val);
+                const ownedColForeignColumn = if (definition.foreignKey) |foreignKey| try self.allocator.dupe(u8, foreignKey.column) else null;
+                errdefer if (ownedColForeignColumn) |val| self.allocator.free(val);
+                break :blk .{
+                    .name = ownedColName,
+                    .typeName = ownedColType,
+                    .primaryKey = isPk,
+                    .notNull = isNotNull,
+                    .unique = definition.unique,
+                    .autoincrement = definition.autoincrement,
+                    .defaultValue = ownedColDefault,
+                    .foreignTable = ownedColForeignTable,
+                    .foreignColumn = ownedColForeignColumn,
+                    .onDelete = if (definition.foreignKey) |foreignKey| foreignKey.onDelete else .restrict,
+                    .onUpdate = if (definition.foreignKey) |foreignKey| foreignKey.onUpdate else .restrict,
+                    .checkExpr = clonedCheck,
+                    .generatedExpr = clonedGen,
+                    .generatedStored = definition.generatedStored,
+                };
             };
             count += 1;
         }
@@ -1105,11 +1066,10 @@ pub const Schema = struct {
     /// Append a column, backfilling existing rows with the default (or NULL)
     /// and evaluating GENERATED values plus CHECKs. Rejects PK/UNIQUE/
     /// AUTOINCREMENT, NOT NULL-without-default on non-empty tables, and
-    /// non-STRICT types under STRICT.
-    /// TODO: backfill is not atomic on allocation failure — rows already
-    /// extended keep the extra slot while `table.columns` still has the old
-    /// length, leaving the table inconsistent. Copy rows into a scratch buffer
-    /// first and swap only after all defaults/GENERATED values succeed.
+    /// non-STRICT types under STRICT. Atomic: new row images are fully staged
+    /// in scratch (defaults, GENERATED values, CHECKs) before anything is
+    /// swapped in, so any allocation or constraint failure leaves the table
+    /// exactly as it was.
     pub fn addColumn(self: *Schema, tableName: []const u8, definition: ast.ColumnDef) !void {
         const table = self.find(tableName) orelse return error.UnknownTable;
         for (table.columns) |column| if (std.ascii.eqlIgnoreCase(column.name, definition.name)) return error.ColumnExists;
@@ -1117,30 +1077,50 @@ pub const Schema = struct {
         if (definition.primaryKey or definition.unique or definition.autoincrement) return error.ConstraintViolation;
         if (definition.notNull and definition.defaultValue == null and table.rows.items.len != 0 and definition.generatedExpr == null) return error.ConstraintViolation;
 
-        const clonedCheck = if (definition.checkExpr) |chk| try ast.cloneOwnedExpr(self.allocator, chk) else null;
+        var clonedCheck = if (definition.checkExpr) |chk| try ast.cloneOwnedExpr(self.allocator, chk) else null;
         errdefer if (clonedCheck) |chk| ast.freeOwnedExpr(self.allocator, chk);
-        const clonedGen = if (definition.generatedExpr) |gen| try ast.cloneOwnedExpr(self.allocator, gen) else null;
+        var clonedGen = if (definition.generatedExpr) |gen| try ast.cloneOwnedExpr(self.allocator, gen) else null;
         errdefer if (clonedGen) |gen| ast.freeOwnedExpr(self.allocator, gen);
 
         const newColumns = try self.allocator.alloc(Column, table.columns.len + 1);
         errdefer self.allocator.free(newColumns);
         for (table.columns, 0..) |column, index| newColumns[index] = column;
-        newColumns[table.columns.len] = .{
-            .name = try self.allocator.dupe(u8, definition.name),
-            .typeName = try self.allocator.dupe(u8, definition.typeName),
-            .primaryKey = definition.primaryKey,
-            .notNull = definition.notNull,
-            .unique = definition.unique,
-            .autoincrement = definition.autoincrement,
-            .defaultValue = if (definition.defaultValue) |value| try self.copyValue(value) else null,
-            .foreignTable = if (definition.foreignKey) |foreignKey| try self.allocator.dupe(u8, foreignKey.table) else null,
-            .foreignColumn = if (definition.foreignKey) |foreignKey| try self.allocator.dupe(u8, foreignKey.column) else null,
-            .onDelete = if (definition.foreignKey) |foreignKey| foreignKey.onDelete else .noAction,
-            .onUpdate = if (definition.foreignKey) |foreignKey| foreignKey.onUpdate else .noAction,
-            .checkExpr = clonedCheck,
-            .generatedExpr = clonedGen,
-            .generatedStored = definition.generatedStored,
+        // Built in a block so a mid-literal allocation failure frees only
+        // the pieces duped so far (a flat literal would leak them, since the
+        // array-level errdefer below cannot see partial fields).
+        newColumns[table.columns.len] = blk: {
+            const ownedName = try self.allocator.dupe(u8, definition.name);
+            errdefer self.allocator.free(ownedName);
+            const ownedType = try self.allocator.dupe(u8, definition.typeName);
+            errdefer self.allocator.free(ownedType);
+            const ownedDefault = if (definition.defaultValue) |value| try self.copyValue(value) else null;
+            errdefer if (ownedDefault) |val| freeValue(self.allocator, val);
+            const ownedForeignTable = if (definition.foreignKey) |foreignKey| try self.allocator.dupe(u8, foreignKey.table) else null;
+            errdefer if (ownedForeignTable) |val| self.allocator.free(val);
+            const ownedForeignColumn = if (definition.foreignKey) |foreignKey| try self.allocator.dupe(u8, foreignKey.column) else null;
+            errdefer if (ownedForeignColumn) |val| self.allocator.free(val);
+            break :blk .{
+                .name = ownedName,
+                .typeName = ownedType,
+                .primaryKey = definition.primaryKey,
+                .notNull = definition.notNull,
+                .unique = definition.unique,
+                .autoincrement = definition.autoincrement,
+                .defaultValue = ownedDefault,
+                .foreignTable = ownedForeignTable,
+                .foreignColumn = ownedForeignColumn,
+                .onDelete = if (definition.foreignKey) |foreignKey| foreignKey.onDelete else .noAction,
+                .onUpdate = if (definition.foreignKey) |foreignKey| foreignKey.onUpdate else .noAction,
+                .checkExpr = clonedCheck,
+                .generatedExpr = clonedGen,
+                .generatedStored = definition.generatedStored,
+            };
         };
+        // Ownership moved into newColumns above: disarm the clone errdefers
+        // so a later staging failure frees each expression exactly once (via
+        // the array-level errdefer below, not here).
+        clonedCheck = null;
+        clonedGen = null;
         errdefer {
             self.allocator.free(newColumns[table.columns.len].name);
             self.allocator.free(newColumns[table.columns.len].typeName);
@@ -1152,31 +1132,63 @@ pub const Schema = struct {
         }
 
         const defaultVal = if (definition.defaultValue) |value| value else .null;
-        for (table.rows.items) |*row| {
-            const values = try self.allocator.realloc(row.values, row.values.len + 1);
-            row.values = values;
-            row.values[row.values.len - 1] = try self.copyValue(defaultVal);
+        // Stage every new row image in scratch: a failure anywhere below
+        // (default copy, GENERATED eval, CHECK) frees scratch and leaves the
+        // table untouched.
+        const staged = try self.allocator.alloc([]Value, table.rows.items.len);
+        errdefer self.allocator.free(staged);
+        var stagedCount: usize = 0;
+        errdefer {
+            for (staged[0..stagedCount]) |values| {
+                for (values) |value| freeValue(self.allocator, value);
+                self.allocator.free(values);
+            }
         }
-        self.allocator.free(table.columns);
-        table.columns = newColumns;
+        for (table.rows.items) |row| {
+            // Deep copy: staged rows must own their payloads, since the
+            // commit phase below frees every old payload.
+            const values = try self.allocator.alloc(Value, row.values.len + 1);
+            var copied: usize = 0;
+            errdefer {
+                for (values[0..copied]) |value| freeValue(self.allocator, value);
+                self.allocator.free(values);
+            }
+            for (row.values, 0..) |value, index| {
+                values[index] = try self.copyValue(value);
+                copied += 1;
+            }
+            values[row.values.len] = try self.copyValue(defaultVal);
+            staged[stagedCount] = values;
+            stagedCount += 1;
+        }
 
-        var colNames = try self.allocator.alloc([]const u8, table.columns.len);
+        var colNames = try self.allocator.alloc([]const u8, newColumns.len);
         defer self.allocator.free(colNames);
-        for (table.columns, 0..) |col, idx| colNames[idx] = col.name;
+        for (newColumns, 0..) |col, idx| colNames[idx] = col.name;
 
         if (definition.generatedExpr) |genExpr| {
-            for (table.rows.items) |*row| {
-                const genVal = try exprEvaluator.eval(self.allocator, colNames, row.values, genExpr);
-                freeValue(self.allocator, row.values[row.values.len - 1]);
-                row.values[row.values.len - 1] = genVal;
+            for (staged[0..stagedCount]) |rowValues| {
+                const genVal = try exprEvaluator.eval(self.allocator, colNames, rowValues, genExpr);
+                freeValue(self.allocator, rowValues[rowValues.len - 1]);
+                rowValues[rowValues.len - 1] = genVal;
             }
         }
         if (definition.checkExpr) |chk| {
-            for (table.rows.items) |row| {
-                const passed = try exprEvaluator.evalCheck(self.allocator, colNames, row.values, chk);
+            for (staged[0..stagedCount]) |rowValues| {
+                const passed = try exprEvaluator.evalCheck(self.allocator, colNames, rowValues, chk);
                 if (!passed) return error.ConstraintViolation;
             }
         }
+
+        // Commit: infallible swap of row images, then of the column list.
+        for (table.rows.items, 0..) |*row, index| {
+            for (row.values) |value| freeValue(self.allocator, value);
+            self.allocator.free(row.values);
+            row.values = staged[index];
+        }
+        self.allocator.free(staged);
+        self.allocator.free(table.columns);
+        table.columns = newColumns;
     }
 
     /// Rename a column, updating indexes, constraints, FK references, trigger
@@ -1258,10 +1270,9 @@ pub const Schema = struct {
     }
 
     /// Drop a column and its row slots, freeing the descriptor. Rejects the
-    /// last column, PK/UNIQUE members, constraint/FK/index references.
-    /// TODO: row-slot rebuild is not atomic on allocation failure — rows
-    /// already rebuilt keep the narrow shape while later rows keep the old
-    /// width. Stage rebuilt rows in scratch storage and swap only on success.
+    /// last column, PK/UNIQUE members, constraint/FK/index references. Atomic:
+    /// narrowed row images are staged in scratch before anything is dropped,
+    /// so an allocation failure leaves every row at the old width.
     pub fn dropColumn(self: *Schema, tableName: []const u8, columnName: []const u8) !void {
         const table = self.find(tableName) orelse return error.UnknownTable;
         const index = self.columnIndex(table, columnName) orelse return error.UnknownColumn;
@@ -1290,26 +1301,40 @@ pub const Schema = struct {
         }
         const oldColumn = table.columns[index];
         var newColumns = try self.allocator.alloc(Column, table.columns.len - 1);
+        // Contents stay borrowed until commit; only the array is owned here.
+        errdefer self.allocator.free(newColumns);
         var targetIndex: usize = 0;
         for (table.columns, 0..) |column, sourceIndex| {
             if (sourceIndex == index) continue;
             newColumns[targetIndex] = column;
             targetIndex += 1;
         }
-        for (table.rows.items) |*row| {
+        // Stage narrowed rows: payloads stay owned by the live rows until
+        // commit, so staging cleanup frees arrays only, never payloads.
+        const staged = try self.allocator.alloc([]Value, table.rows.items.len);
+        errdefer self.allocator.free(staged);
+        var stagedCount: usize = 0;
+        errdefer {
+            for (staged[0..stagedCount]) |values| self.allocator.free(values);
+        }
+        for (table.rows.items) |row| {
             const newValues = try self.allocator.alloc(Value, row.values.len - 1);
             var valueIndex: usize = 0;
             for (row.values, 0..) |value, sourceIndex| {
-                if (sourceIndex == index) {
-                    freeValue(self.allocator, value);
-                } else {
-                    newValues[valueIndex] = value;
-                    valueIndex += 1;
-                }
+                if (sourceIndex == index) continue;
+                newValues[valueIndex] = value;
+                valueIndex += 1;
             }
-            self.allocator.free(row.values);
-            row.values = newValues;
+            staged[stagedCount] = newValues;
+            stagedCount += 1;
         }
+        // Commit: drop each removed payload, swap arrays and descriptors.
+        for (table.rows.items, 0..) |*row, position| {
+            freeValue(self.allocator, row.values[index]);
+            self.allocator.free(row.values);
+            row.values = staged[position];
+        }
+        self.allocator.free(staged);
         self.allocator.free(oldColumn.name);
         self.allocator.free(oldColumn.typeName);
         if (oldColumn.defaultValue) |value| freeValue(self.allocator, value);
@@ -1940,4 +1965,121 @@ test "schema enforces uniqueness strictness and renames" {
     try std.testing.expect(!valuesEqual(.null, .{ .integer = 1 }));
     try std.testing.expect(valuesEqual(.{ .real = 1.0 }, .{ .integer = 1 }));
     try std.testing.expect(!valuesEqual(.{ .text = "a" }, .{ .text = "b" }));
+}
+
+test "addColumn stages fully before committing" {
+    var schema = Schema.init(std.testing.allocator);
+    defer schema.deinit();
+    const defs = [_]ast.ColumnDef{.{ .name = "id", .typeName = "INTEGER" }};
+    try schema.createTable("t", &defs, &.{});
+    const t = schema.find("t").?;
+    try schema.appendRow(t, &[_]Value{.{ .integer = 1 }});
+    try schema.appendRow(t, &[_]Value{.{ .integer = 2 }});
+    // Happy path: default backfills every row.
+    try schema.addColumn("t", .{ .name = "extra", .typeName = "INTEGER", .defaultValue = .{ .integer = 9 } });
+    try std.testing.expectEqual(@as(usize, 2), t.columns.len);
+    try std.testing.expectEqual(@as(i64, 9), t.rows.items[0].values[1].integer);
+    try std.testing.expectEqual(@as(i64, 9), t.rows.items[1].values[1].integer);
+    // CHECK failure stages nothing: no column, old widths, intact values.
+    const bad = ast.ColumnDef{ .name = "nope", .typeName = "INTEGER", .checkExpr = .{ .literal = .{ .integer = 0 } } };
+    try std.testing.expectError(error.ConstraintViolation, schema.addColumn("t", bad));
+    try std.testing.expectEqual(@as(usize, 2), t.columns.len);
+    for (t.rows.items) |row| {
+        try std.testing.expectEqual(@as(usize, 2), row.values.len);
+        try std.testing.expect(row.values[0] == .integer);
+    }
+    try std.testing.expectEqual(@as(i64, 1), t.rows.items[0].values[0].integer);
+    try std.testing.expectEqual(@as(i64, 2), t.rows.items[1].values[0].integer);
+    try std.testing.expectEqual(@as(i64, 9), t.rows.items[0].values[1].integer);
+}
+
+test "addColumn survives allocation failure without partial state" {
+    // Fail-point sweep over addColumn only: the schema is built once with
+    // the real allocator, then each iteration swaps in a fresh failing
+    // allocator (counter starts at zero, so fail_index names addColumn's
+    // own allocation sites exactly). Every OOM must leave columns, widths,
+    // and values untouched; some index must succeed to prove the sweep ran
+    // past the last failure point. The allocator is restored before deinit.
+    const defs = [_]ast.ColumnDef{.{ .name = "id", .typeName = "INTEGER" }};
+    var schema = Schema.init(std.testing.allocator);
+    defer schema.deinit();
+    try schema.createTable("t", &defs, &.{});
+    const t = schema.find("t").?;
+    try schema.appendRow(t, &[_]Value{.{ .integer = 1 }});
+    try schema.appendRow(t, &[_]Value{.{ .integer = 2 }});
+    var succeeded = false;
+    var failAt: usize = 0;
+    while (failAt < 128) : (failAt += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = failAt });
+        schema.allocator = failing.allocator();
+        const extra = ast.ColumnDef{ .name = "extra", .typeName = "INTEGER", .defaultValue = .{ .integer = 9 } };
+        schema.addColumn("t", extra) catch |err| {
+            schema.allocator = std.testing.allocator;
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expectEqual(@as(usize, 1), t.columns.len);
+            for (t.rows.items) |row| {
+                try std.testing.expectEqual(@as(usize, 1), row.values.len);
+                try std.testing.expect(row.values[0] == .integer);
+            }
+            try std.testing.expectEqual(@as(i64, 1), t.rows.items[0].values[0].integer);
+            try std.testing.expectEqual(@as(i64, 2), t.rows.items[1].values[0].integer);
+            continue;
+        };
+        schema.allocator = std.testing.allocator;
+        try std.testing.expectEqual(@as(usize, 2), t.columns.len);
+        try std.testing.expectEqual(@as(i64, 9), t.rows.items[0].values[1].integer);
+        succeeded = true;
+        break;
+    }
+    schema.allocator = std.testing.allocator;
+    try std.testing.expect(succeeded);
+}
+
+test "dropColumn stages fully before committing" {
+    var schema = Schema.init(std.testing.allocator);
+    defer schema.deinit();
+    const defs = [_]ast.ColumnDef{ .{ .name = "id", .typeName = "INTEGER" }, .{ .name = "gone", .typeName = "TEXT" } };
+    try schema.createTable("t", &defs, &.{});
+    const t = schema.find("t").?;
+    try schema.appendRow(t, &[_]Value{ .{ .integer = 1 }, .{ .text = "a" } });
+    try schema.appendRow(t, &[_]Value{ .{ .integer = 2 }, .{ .text = "b" } });
+    try schema.dropColumn("t", "gone");
+    try std.testing.expectEqual(@as(usize, 1), t.columns.len);
+    try std.testing.expectEqualStrings("id", t.columns[0].name);
+    for (t.rows.items) |row| try std.testing.expectEqual(@as(usize, 1), row.values.len);
+    try std.testing.expectEqual(@as(i64, 1), t.rows.items[0].values[0].integer);
+    try std.testing.expectEqual(@as(i64, 2), t.rows.items[1].values[0].integer);
+}
+
+test "dropColumn survives allocation failure without partial state" {
+    const defs = [_]ast.ColumnDef{ .{ .name = "id", .typeName = "INTEGER" }, .{ .name = "gone", .typeName = "TEXT" } };
+    var schema = Schema.init(std.testing.allocator);
+    defer schema.deinit();
+    try schema.createTable("t", &defs, &.{});
+    const t = schema.find("t").?;
+    try schema.appendRow(t, &[_]Value{ .{ .integer = 1 }, .{ .text = "a" } });
+    try schema.appendRow(t, &[_]Value{ .{ .integer = 2 }, .{ .text = "b" } });
+    var succeeded = false;
+    var failAt: usize = 0;
+    while (failAt < 128) : (failAt += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = failAt });
+        schema.allocator = failing.allocator();
+        schema.dropColumn("t", "gone") catch |err| {
+            schema.allocator = std.testing.allocator;
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expectEqual(@as(usize, 2), t.columns.len);
+            for (t.rows.items) |row| try std.testing.expectEqual(@as(usize, 2), row.values.len);
+            try std.testing.expectEqual(@as(i64, 1), t.rows.items[0].values[0].integer);
+            try std.testing.expectEqualStrings("a", t.rows.items[0].values[1].text);
+            try std.testing.expectEqual(@as(i64, 2), t.rows.items[1].values[0].integer);
+            try std.testing.expectEqualStrings("b", t.rows.items[1].values[1].text);
+            continue;
+        };
+        schema.allocator = std.testing.allocator;
+        try std.testing.expectEqual(@as(usize, 1), t.columns.len);
+        succeeded = true;
+        break;
+    }
+    schema.allocator = std.testing.allocator;
+    try std.testing.expect(succeeded);
 }

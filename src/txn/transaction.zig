@@ -1,16 +1,8 @@
-//! RAII-style transaction guard over a `Connection`.
+//! Transaction guard over a connection.
 //!
-//! Purpose: begin a transaction on construction and commit/rollback it
-//! exactly once through the guard. Responsibilities: forward to
-//! `Connection.begin/commit/rollback` and track completion. Dependencies:
-//! `connection/connection.zig`, `std` (tests). Ownership/lifetime: borrows
-//! the connection (must outlive the guard); no allocation. Error behavior:
-//! double `commit`/`rollback` returns `NotInTransaction` without touching the
-//! connection; `Connection` errors (`TransactionActive`, I/O) propagate.
-//! Invariants: at most one terminal call succeeds; `active` is false after.
-//! Compatibility: maps onto the connection's snapshot-based transactions —
-//! there is no automatic rollback on drop (see TODO): leaking a guard
-//! without `commit`/`rollback` leaves the connection's transaction open.
+//! Begins on construction, ends with exactly one of `commit`, `rollback`,
+//! or `deinit` (which rolls back). Borrows the connection; double
+//! completion fails `NotInTransaction`.
 
 const std = @import("std");
 const Connection = @import("../connection/connection.zig").Connection;
@@ -46,8 +38,18 @@ pub const Transaction = struct {
         try self.connection.rollback();
         self.active = false;
     }
+
+    /// Scope-exit safety: rolls back an still-active transaction and disarms
+    /// the guard (rollback errors are swallowed — the connection stays
+    /// consistent because rollback restores the pre-transaction snapshot).
+    /// A committed/rolled-back guard is a no-op. Always pair `begin` with
+    /// exactly one of `commit`, `rollback`, or `deinit`.
+    pub fn deinit(self: *Transaction) void {
+        if (!self.active) return;
+        self.connection.rollback() catch {};
+        self.active = false;
+    }
 };
-// TODO: add rollback-on-drop (or explicit close) for Transaction. Current limitation: dropping an active guard without commit/rollback leaves the connection transaction open with no compiler warning. Expected behavior: deinit that rolls back an active transaction, or a must-consume annotation. Tests needed: scope-exit test asserting the connection is no longer in a transaction after drop.
 
 test "transaction wrapper commits a connection transaction" {
     const path = "sqlite_zig_txn_test.db";
@@ -79,6 +81,26 @@ test "transaction guard rolls back and rejects double completion" {
     // Error: nesting a second transaction while one is open is refused by
     // the connection layer (guard construction propagates it).
     var outer = try Transaction.begin(db);
-    defer outer.rollback() catch {};
+    defer outer.deinit();
     try std.testing.expectError(error.TransactionActive, Transaction.begin(db));
+}
+
+test "transaction guard rolls back on scope exit" {
+    const path = "sqlite_zig_txn_scope_test.db";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    var db = try Connection.open(std.testing.allocator, path);
+    defer db.close();
+    // Dropping an active guard (deinit without commit/rollback) rolls the
+    // connection back: no transaction stays open, and the guard disarms.
+    var leaked = try Transaction.begin(db);
+    try std.testing.expect(db.transactionActive);
+    leaked.deinit();
+    try std.testing.expect(!leaked.active);
+    try std.testing.expect(!db.transactionActive);
+    // deinit after explicit completion is a safe no-op.
+    var done = try Transaction.begin(db);
+    try done.commit();
+    done.deinit();
+    try std.testing.expect(!db.transactionActive);
 }

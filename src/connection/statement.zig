@@ -1,41 +1,7 @@
-//! Prepared statements: reusable SQL text plus bound parameters.
+//! Reusable statements with bound parameters.
 //!
-//! Purpose: hold one owned SQL string and an ordered parameter list for
-//! repeated `step()` (writes) / `query()` (reads) execution through the
-//! connection's executor hooks. Parameters are 1-based (`bind(1, ...)`), like
-//! SQLite host parameters.
-//!
-//! Responsibilities: Zig-to-`Value` conversion (`bindValue`), gap filling,
-//! in-place rebinding, `reset()` for reuse, and `finalize()` for cleanup.
-//!
-//! Dependencies: `vm/value.zig` (`Value`), `connection/result.zig` (`Result`).
-//!
-//! Ownership/lifetime (critical): the `Statement` OWNS `sql` and the
-//! `parameters` backing. The `connection` pointer and both executor hooks are
-//! BORROWED — the connection must outlive the statement. Bound text/blob
-//! `Value` payloads are BORROWED from the caller (e.g. `bind(1, "ada")` keeps
-//! pointing at the caller's bytes); keep them alive through `step()`/`query()`
-//! and do not free them via the statement. `query()` returns an OWNED `Result`
-//! the caller must `deinit`. `reset()` clears bindings but keeps capacity and
-//! leaves `sql` usable for rebinding. `finalize()` frees `sql` and the
-//! parameter list and resets both to empty, so a second `finalize` is a safe
-//! no-op; after the first `finalize` the statement (and any pointer into its
-//! `sql`/parameters) dangles and must not be stepped/queried. `Connection`
-//! hands out statements that the caller owns — always `finalize`, preferably
-//! via `defer`.
-//!
-//! Error behavior: `bind(0, ...)` fails `error.InvalidParameter`. Binding
-//! past the end fills skipped positions with NULL (like unbound parameters).
-//! `step`/`query` propagate engine errors. Type misuse (unsupported Zig type)
-//! is a `@compileError` in `bindValue`.
-//!
-//! SQLite compatibility: 1-based parameters, NULL-fill for gaps, and
-//! in-place rebinding mirror `sqlite3_bind_*` semantics. Text parameters bind
-//! as TEXT (no affinity coercion here; the engine applies column affinity).
-//!
-//! Unified pipeline note: statements carry raw SQL text plus bound values
-//! straight to the native engine — the DSL pipelines lower to native AST/IR
-//! instead, so statements never take part in a DSL->SQL-string round trip.
+//! Owns SQL text and params; borrows the connection and payloads.
+//! `query` returns an owned `Result`; `finalize` frees the statement.
 
 const std = @import("std");
 const Value = @import("../vm/value.zig").Value;

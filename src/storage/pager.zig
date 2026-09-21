@@ -1,20 +1,7 @@
-//! In-memory page cache with dirty tracking over a `DatabaseFile`.
+//! Page cache over the database file.
 //!
-//! Purpose: cache fixed-size page images by 1-based page number, hand out
-//! mutable references to them, and flush dirty pages back to the file.
-//! Responsibilities: read-through fill, page allocation/reuse via a freelist,
-//! dirty marking, write-back. Non-responsibilities: journaling, locking, and
-//! b-tree layout (owned by `storage/file.zig`, `txn/locking.zig`, and
-//! `btree/*` respectively). Dependencies: `storage/file.zig`, `std`.
-//! Ownership/lifetime: the pager borrows `file` (must outlive the pager) and
-//! owns every cached page buffer plus the freelist; `deinit` frees the cache.
-//! Returned page slices borrow the cache — they are invalidated by `deinit`
-//! and must not be freed by callers. Error behavior: page 0 is rejected
-//! (`InvalidHeader`, matching `DatabaseFile`); short file reads propagate as
-//! `InvalidHeader`; allocation failures propagate. Invariants: `pageCount`
-//! tracks the high-water page number; dirty pages are a subset of cached
-//! pages; reused freelist pages are zeroed before handout.
-//! Compatibility: page numbering and sizes follow the database image.
+//! Owns cached page buffers; slices borrow the cache until `deinit`.
+//! Dirty pages flush on demand; double free fails `AlreadyFreed`.
 
 const std = @import("std");
 const DatabaseFile = @import("file.zig").DatabaseFile;
@@ -35,6 +22,8 @@ pub const Pager = struct {
     dirty: std.AutoHashMap(u32, void),
     /// Reusable page numbers from `freePage` (LIFO).
     freelist: std.ArrayList(u32),
+    /// Freelist numbers not yet reallocated; guards against double free.
+    freed: std.AutoHashMap(u32, void),
     /// High-water page number allocated so far.
     pageCount: u32 = 1,
 
@@ -46,6 +35,7 @@ pub const Pager = struct {
             .pages = std.AutoHashMap(u32, []u8).init(allocator),
             .dirty = std.AutoHashMap(u32, void).init(allocator),
             .freelist = .empty,
+            .freed = std.AutoHashMap(u32, void).init(allocator),
             .pageCount = 1,
         };
     }
@@ -57,6 +47,7 @@ pub const Pager = struct {
         while (iterator.next()) |page| self.allocator.free(page.*);
         self.pages.deinit();
         self.dirty.deinit();
+        self.freed.deinit();
         self.freelist.deinit(self.allocator);
     }
 
@@ -83,6 +74,7 @@ pub const Pager = struct {
     pub fn allocatePage(self: *Pager) !u32 {
         if (self.freelist.items.len > 0) {
             const reused = self.freelist.pop().?;
+            _ = self.freed.remove(reused);
             if (self.pages.get(reused)) |page| {
                 @memset(page, 0);
             } else {
@@ -105,12 +97,15 @@ pub const Pager = struct {
     /// Releases `pageNumber` for reuse: zeroes any cached image, marks it
     /// dirty (the zeroing must reach disk), and pushes it on the freelist.
     /// Page 0 is rejected. Uncached pages are still tracked so a later
-    /// `allocatePage` can recycle the number. Double-free is a caller bug:
-    /// it may recycle the number twice — callers must free exactly once.
-    // TODO: detect double-free in freePage. Current limitation: the freelist is a plain list with no membership check, so freeing the same page twice recycles it twice and two live allocations could alias. Expected behavior: return an error (e.g. AlreadyFreed) on duplicates. Tests needed: free-then-free-again must error; allocate after single free still recycles once.
+    /// `allocatePage` can recycle the number. Freeing a number that is
+    /// already freed (and not yet reallocated) fails with `AlreadyFreed`
+    /// instead of recycling it twice, which would let two live pages alias.
     pub fn freePage(self: *Pager, pageNumber: u32) !void {
         if (pageNumber == 0) return error.InvalidHeader;
+        if (self.freed.contains(pageNumber)) return error.AlreadyFreed;
         try self.freelist.append(self.allocator, pageNumber);
+        errdefer _ = self.freelist.pop();
+        try self.freed.put(pageNumber, {});
         if (self.pages.get(pageNumber)) |page| {
             @memset(page, 0);
             try self.markDirty(pageNumber);
@@ -221,4 +216,27 @@ test "pager zeroes recycled pages so no stale data leaks" {
     try std.testing.expectEqual(p2, recycled);
     const fresh = try pager.get(recycled);
     for (fresh) |b| try std.testing.expectEqual(@as(u8, 0), b);
+}
+
+test "pager rejects double free instead of aliasing pages" {
+    const path = "sqlite_zig_pager_double_free_test.db";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    var file = try DatabaseFile.open(std.testing.allocator, path);
+    defer file.close();
+    var pager = Pager.init(std.testing.allocator, &file);
+    defer pager.deinit();
+    const p2 = try pager.allocatePage();
+    // Free-then-free-again errors; the number is recycled exactly once.
+    try pager.freePage(p2);
+    try std.testing.expectError(error.AlreadyFreed, pager.freePage(p2));
+    const recycled = try pager.allocatePage();
+    try std.testing.expectEqual(p2, recycled);
+    // After reallocation the number is live again: freeing works once more.
+    try pager.freePage(recycled);
+    try std.testing.expectError(error.AlreadyFreed, pager.freePage(recycled));
+    // Uncached numbers are tracked too, and also refuse a second free.
+    try pager.freePage(41);
+    try std.testing.expectError(error.AlreadyFreed, pager.freePage(41));
+    try std.testing.expectEqual(@as(u32, 41), try pager.allocatePage());
 }

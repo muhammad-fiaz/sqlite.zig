@@ -1,112 +1,22 @@
-//! Scalar SQL functions: strings, casts, blobs, misc (single dispatch leaf).
+//! Scalar SQL functions: strings, casts, blobs, misc.
 //!
-//! Purpose: authoritative implementations for every scalar function routed by
-//! `functions.zig` (`lower`, `substr`, `cast`, `hex`, `char`, `printf`, ...).
-//! Called from `expr.zig` and the VM `function` opcode via `evalScalar`.
-//!
-//! Responsibilities: SQLite-compatible NULL propagation (most functions
-//! return NULL when any required input is NULL), prefix-number parsing,
-//! UTF-8-aware `length`/`substr`, saturating float->int conversion, and
-//! caller-owned text/blob results.
-//!
-//! Dependencies: `../../vm/value.zig` (`Value`),
-//! `../../catalog/type_affinity.zig` (CAST affinity). No planner/VM imports.
-//!
-//! Ownership/lifetime: inputs borrowed; text/blob outputs heap-owned by the
-//! caller (same allocator). Integer/real/null outputs need no freeing.
-//!
-//! Error behavior: `InvalidArgumentCount` is validated by the dispatcher, not
-//! here; these helpers return `InvalidSql` for malformed escapes/hex,
-//! `IntegerOverflow` for `abs(minInt)`, `OutOfMemory` for allocations.
-//! Domain errors that SQLite maps to NULL (e.g. bad `unhex`) return `.null`.
-//!
-//! Invariants: `parseIntPrefix` saturates (never traps); `saturatingTrunc`
-//! maps NaN->0 and clamps infinities; `substr` indices are 1-based with
-//! negative-from-end semantics; `trim` defaults to `" \t\r\n"`.
-//!
-//! SQLite compatibility: `substring` is an alias of `substr`; `if` aliases
-//! `iif`; `likely`/`unlikely`/`likelihood` are identity hints; `random()`
-//! yields any i64; `randomblob(n)` clamps `n < 1` to 1.
-// TODO(sql/scalar): numeric-text coercion helpers (`parseIntPrefix`,
-// `parseFloatPrefix`, `formatReal`, `saturatingTrunc`) are duplicated in
-// spirit across scalar/math/vm/expr. Expected: one shared `coerce.zig` unit;
-// tests: cross-module matrix proving identical `' 12x'`, `NaN`, `Inf`,
-// overflow behavior. Subsystem: sql/functions.
+//! Most functions return NULL on NULL input; text/blob results are
+//! caller-owned. Numeric conversions live in `../coerce.zig` and are
+//! re-exported here for existing call sites.
 
 const std = @import("std");
 const Value = @import("../../vm/value.zig").Value;
 const affinityOf = @import("../../catalog/type_affinity.zig").fromDeclaration;
+const coerce = @import("../coerce.zig");
 
-fn trimSpaces(text: []const u8) []const u8 {
-    return std.mem.trim(u8, text, " \t\n\x0B\x0C\r");
-}
-
-/// Parse a leading integer with SQLite prefix rules; saturates on overflow, 0 if no digits.
-/// Leading/trailing spaces and a sign are allowed; parsing stops at first non-digit.
-pub fn parseIntPrefix(text: []const u8) i64 {
-    var rest = trimSpaces(text);
-    var negative = false;
-    if (rest.len != 0 and (rest[0] == '+' or rest[0] == '-')) {
-        negative = rest[0] == '-';
-        rest = rest[1..];
-    }
-    var value: i64 = 0;
-    var digits: usize = 0;
-    const limit: i64 = if (negative) std.math.minInt(i64) else std.math.maxInt(i64);
-    for (rest) |c| {
-        if (c < '0' or c > '9') break;
-        digits += 1;
-        const digit: i64 = @intCast(c - '0');
-        if (negative) {
-            if (value < @divTrunc(limit + digit, 10)) return limit;
-            value = value * 10 - digit;
-        } else {
-            if (value > @divTrunc(limit - digit, 10)) return limit;
-            value = value * 10 + digit;
-        }
-    }
-    if (digits == 0) return 0;
-    return value;
-}
-
-/// Parse a leading float with SQLite prefix rules; 0.0 if no digits.
-/// Handles optional fraction and exponent; trailing junk is ignored.
-pub fn parseFloatPrefix(text: []const u8) f64 {
-    var rest = trimSpaces(text);
-    var negative = false;
-    if (rest.len != 0 and (rest[0] == '+' or rest[0] == '-')) {
-        negative = rest[0] == '-';
-        rest = rest[1..];
-    }
-    var index: usize = 0;
-    var digits: usize = 0;
-    while (index < rest.len and rest[index] >= '0' and rest[index] <= '9') : (index += 1) digits += 1;
-    if (index < rest.len and rest[index] == '.') {
-        index += 1;
-        while (index < rest.len and rest[index] >= '0' and rest[index] <= '9') : (index += 1) digits += 1;
-    }
-    if (digits == 0) return 0.0;
-    if (index < rest.len and (rest[index] == 'e' or rest[index] == 'E')) {
-        var cursor = index + 1;
-        if (cursor < rest.len and (rest[cursor] == '+' or rest[cursor] == '-')) cursor += 1;
-        var expDigits: usize = 0;
-        while (cursor < rest.len and rest[cursor] >= '0' and rest[cursor] <= '9') : (cursor += 1) expDigits += 1;
-        if (expDigits != 0) index = cursor;
-    }
-    const magnitude = std.fmt.parseFloat(f64, rest[0..index]) catch 0.0;
-    return if (negative) -magnitude else magnitude;
-}
-
-/// Render a REAL in SQLite `%!.15G`-ish form: `{d}` plus trailing `.0` for whole numbers.
-/// Returns caller-owned memory.
-pub fn formatReal(allocator: std.mem.Allocator, number: f64) ![]u8 {
-    const rendered = try std.fmt.allocPrint(allocator, "{d}", .{number});
-    errdefer allocator.free(rendered);
-    for (rendered) |byte| if (byte == '.' or byte == 'e' or byte == 'E') return rendered;
-    const withDot = try std.fmt.allocPrint(allocator, "{s}.0", .{rendered});
-    allocator.free(rendered);
-    return withDot;
-}
+/// Longest-prefix integer scan; canonical implementation in `coerce`.
+pub const parseIntPrefix = coerce.parseIntPrefix;
+/// Longest-prefix float scan; canonical implementation in `coerce`.
+pub const parseFloatPrefix = coerce.parseFloatPrefix;
+/// `%!.15G`-ish REAL rendering; canonical implementation in `coerce`.
+pub const formatReal = coerce.formatReal;
+/// Saturating float->int; canonical implementation in `coerce`.
+pub const saturatingTrunc = coerce.saturatingTrunc;
 
 /// Truth test used by `iif`; text/blob coerce via numeric prefix (NULL -> false).
 pub fn isTruthyValue(value: Value) bool {
@@ -310,13 +220,6 @@ fn evalReplaceText(allocator: std.mem.Allocator, orig: []const u8, from: []const
     }
     try out.appendSlice(allocator, orig[offset..]);
     return .{ .text = try out.toOwnedSlice(allocator) };
-}
-
-fn saturatingTrunc(real: f64) i64 {
-    if (std.math.isNan(real)) return 0;
-    if (real >= @as(f64, @floatFromInt(std.math.maxInt(i64)))) return std.math.maxInt(i64);
-    if (real <= @as(f64, @floatFromInt(std.math.minInt(i64)))) return std.math.minInt(i64);
-    return @as(i64, @intFromFloat(@trunc(real)));
 }
 
 fn absUnsigned(value: i64) usize {
@@ -827,25 +730,11 @@ pub fn evalZeroblob(allocator: std.mem.Allocator, arg: Value) !Value {
 }
 
 /// `sign(X)`: -1/0/1 by numeric sign. NULL->NULL; blob->NULL; NaN text->NULL.
+/// `sign(X)`: -1/0/+1 of the numeric value; NULL for NULL and for text
+/// that is not wholly numeric (`'12x'` yields NULL). Blobs never convert.
 pub fn evalSign(arg: Value) Value {
-    switch (arg) {
-        .null => return .null,
-        .integer => |i| return .{ .integer = if (i < 0) -1 else if (i > 0) 1 else 0 },
-        .real => |r| return .{ .integer = if (r < 0.0) -1 else if (r > 0.0) 1 else 0 },
-        .text => |t| {
-            const trimmed = trimSpaces(t);
-            if (std.fmt.parseInt(i64, trimmed, 10)) |i| {
-                return .{ .integer = if (i < 0) -1 else if (i > 0) 1 else 0 };
-            } else |_| {
-                if (std.fmt.parseFloat(f64, trimmed)) |r| {
-                    if (std.math.isNan(r)) return .null;
-                    return .{ .integer = if (r < 0.0) -1 else if (r > 0.0) 1 else 0 };
-                } else |_| {}
-                return .null;
-            }
-        },
-        .blob => return .null,
-    }
+    const f = coerce.toFloatStrict(arg) orelse return .null;
+    return .{ .integer = if (f < 0.0) -1 else if (f > 0.0) 1 else 0 };
 }
 
 /// `iif(C,A,B)`/`if`: clone of A when C truthy, else clone of B.

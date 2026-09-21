@@ -1,16 +1,7 @@
-//! SQLite database file header (first 100 bytes of page 1).
+//! The 100-byte database file header on page 1.
 //!
-//! Purpose: encode/decode the fixed-layout header every database image
-//! starts with (magic, page size, versions, counters, encoding IDs).
-//! Responsibilities: byte-exact field placement only; validation of geometry
-//! (power-of-two page size, text encoding) belongs to callers (`storage/
-//! file.zig`, `storage/sqlite_image.zig`). Dependencies: `std` only.
-//! Ownership/lifetime: `encode` borrows a caller-owned `[size]u8` buffer and
-//! `decode` borrows one; no allocation. Error behavior: `decode` returns
-//! `error.InvalidHeader` on bad magic — never panics (fixed-size array input
-//! cannot truncate). Invariants: `size == 100`; magic is 16 bytes.
-//! Compatibility: offsets match the SQLite file-format spec; an encoded
-//! page size of 1 means 65536 (interpreted by readers, not here).
+//! Encode and decode borrow fixed buffers and never allocate.
+//! Bad magic fails with `InvalidHeader`.
 
 const std = @import("std");
 
@@ -20,11 +11,6 @@ pub const size = 100;
 pub const magic = "SQLite format 3\x00";
 
 /// In-memory view of the 100-byte database header.
-///
-/// Why defaults exist: a fresh database is created from `Header{}` with
-/// sensible geometry (4096-byte pages, legacy rollback versions 1/1, UTF-8)
-/// before any user data is written. Reserved/unused header regions read as
-/// zero and are ignored on decode, matching SQLite readers.
 pub const Header = struct {
     /// Database page size in bytes (1 encodes 65536 on disk).
     pageSize: u16 = 4096,
@@ -84,12 +70,7 @@ pub const Header = struct {
         std.mem.writeInt(u32, out[68..72], self.applicationId, .big);
     }
 
-    /// Parses a header, rejecting non-SQLite magic.
-    ///
-    /// Why only magic is checked here: geometry validation (page-size range,
-    /// power-of-two, encoding) needs context the header alone lacks, so
-    /// `storage/file.zig` and `storage/sqlite_image.zig` enforce it after
-    /// decode. Returns `error.InvalidHeader` on bad magic.
+    /// Parses a header, rejecting bad magic with `InvalidHeader`.
     pub fn decode(bytes: *const [size]u8) error{InvalidHeader}!Header {
         if (!std.mem.eql(u8, bytes[0..16], magic)) return error.InvalidHeader;
         return .{

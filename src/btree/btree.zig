@@ -1,21 +1,7 @@
-//! B-tree page framing plus a sorted in-memory `BTree` map.
+//! Page framing plus a sorted in-memory key to payload map.
 //!
-//! Purpose: encode/decode on-disk b-tree page headers and lay out leaf and
-//! interior pages for table and index trees; provide an ordered in-memory
-//! key->payload map used by cursors and index overlays. Responsibilities:
-//! page-header translation, page construction with overflow checks, sorted
-//! insert/lookup/delete. Non-responsibilities: balancing/splits (see
-//! `btree/balance.zig`), page caching (`storage/pager.zig`), SQL-level rows
-//! (`storage/sqlite_image.zig`). Dependencies: `format/varint.zig`, `std`.
-//! Ownership/lifetime: `BTree` owns its payload copies (`deinit` frees);
-//! `get` returns borrowed slices valid until the next `put`/`remove`/`deinit`.
-//! Page formatters borrow caller buffers and never allocate except for a
-//! transient offset array. Error behavior: corrupt headers fail with
-//! `InvalidHeader`; unfittable pages with `PageOverflow`; mismatched
-//! key/child counts with `InvalidParam`; short page buffers with
-//! `PageOverflow` — never panics or writes out of bounds. Invariants: pages
-//! are 1-based (page 1 reserves 100 header bytes); cell counts fit in u16.
-//! Compatibility: page-type flags and header layouts match SQLite.
+//! `BTree` owns its payload copies; `get` borrows until the next mutation.
+//! Bad headers fail `InvalidHeader`, unfittable pages `PageOverflow`.
 
 const std = @import("std");
 const varint = @import("../format/varint.zig");
@@ -40,12 +26,7 @@ pub const PageType = enum(u8) {
     leafTable = 0x0d,
 };
 
-/// Decoded 8- or 12-byte b-tree page header.
-///
-/// Interior pages carry `rightChild`; leaf pages leave it `null`.
-/// `cellContentStart == 0` on an empty page is normalized from the on-disk
-/// convention (SQLite stores the page size there when empty is impossible to
-/// represent otherwise — writers here store 0 for empty pages).
+/// Decoded 8- or 12-byte b-tree page header. Interior pages carry `rightChild`.
 pub const PageHeader = struct {
     /// Page kind (drives the 8 vs 12 byte header size).
     pageType: PageType,
@@ -73,11 +54,7 @@ pub const PageHeader = struct {
         };
     }
 
-    /// Parses and validates a page header (unknown flags -> `InvalidHeader`).
-    ///
-    /// Bounds-checked: short buffers fail closed instead of reading out of
-    /// bounds. Only the header is interpreted; cell pointers are validated
-    /// by the page walkers, not here.
+    /// Parses and validates a page header. Short buffers fail `InvalidHeader`.
     pub fn decode(page: []const u8, pageNumber: u32) !PageHeader {
         const offset = headerOffset(pageNumber);
         if (page.len < offset + 8) return error.InvalidHeader;
@@ -110,14 +87,6 @@ pub const PageHeader = struct {
     }
 
     /// Serializes the header at the page's header offset.
-    ///
-    /// Safety contract (caller bug, not disk data): `page` must hold at
-    /// least `headerOffset(pageNumber) + headerSize(pageType)` bytes, and a
-    /// leaf header must not carry `rightChild` (it would be silently
-    /// dropped). Debug builds assert the capacity; release builds rely on
-    /// the formatters below, which validate `page.len >= pageSize` first.
-    /// Kept `void` (not `!void`) so existing encode call sites are
-    /// unaffected; fallible framing lives in the `format*` functions.
     pub fn encode(self: PageHeader, page: []u8, pageNumber: u32) void {
         const offset = headerOffset(pageNumber);
         std.debug.assert(offset + headerSize(self.pageType) <= page.len);
@@ -146,12 +115,7 @@ fn putU16(bytes: []u8, offset: usize, value: u16) !void {
     bytes[offset + 1] = @truncate(value);
 }
 
-/// Builds a table-leaf page from pre-framed cells.
-///
-/// Requires `page.len >= pageSize` and a page-1-safe offset; cells that do
-/// not fit (including their 2-byte pointer slots) return `PageOverflow`.
-/// Uses checked arithmetic throughout so hostile `cells` lengths cannot
-/// underflow the free-space computation into a panic.
+/// Builds a table-leaf page from pre-framed cells. Unfittable cells fail `PageOverflow`.
 pub fn formatLeafTablePage(page: []u8, pageNumber: u32, cells: []const []const u8, pageSize: usize) !void {
     if (page.len < pageSize) return error.PageOverflow;
     const hOffset = PageHeader.headerOffset(pageNumber);
@@ -184,19 +148,8 @@ pub fn formatLeafTablePage(page: []u8, pageNumber: u32, cells: []const []const u
     }
 }
 
-/// Builds a table-interior page from child pointers + separator rowids.
-///
-/// `leftChildren`/`keys` must pair 1:1 (`InvalidParam` otherwise). The
-/// pointer-slot reservation is validated before any cell is written, and the
-/// transient offset array is heap-allocated so large (e.g. 64 KiB) pages are
-/// not capped by a fixed stack buffer.
-/// Builds a table-interior page from child pointers + separator rowids.
-///
-/// `leftChildren`/`keys` must pair 1:1 (`InvalidParam` otherwise). The
-/// pointer-slot reservation is validated before any cell is written. Offsets
-/// are regenerated by a second deterministic pass (key varints re-encode
-/// identically), so no fixed-size stack array caps large pages and no
-/// allocator is needed — the signature stays allocation-free.
+/// Builds a table-interior page from child pointers and separator rowids.
+/// Mismatched lengths fail `InvalidParam`; unfittable cells fail `PageOverflow`.
 pub fn formatInteriorTablePage(page: []u8, pageNumber: u32, leftChildren: []const u32, keys: []const u64, rightChild: u32, pageSize: usize) !void {
     if (page.len < pageSize) return error.PageOverflow;
     if (leftChildren.len != keys.len) return error.InvalidParam;
@@ -322,11 +275,7 @@ pub fn formatInteriorIndexPage(page: []u8, pageNumber: u32, leftChildren: []cons
     }
 }
 
-/// Sorted in-memory key->payload map (test/overlay structure).
-///
-/// Entries stay ordered by key for binary search. Payloads are duped on
-/// insert and freed on replace/remove/deinit — callers must not free `get`
-/// results, which borrow the map and are invalidated by mutation.
+/// Sorted in-memory key to payload map. `get` borrows; `deinit` frees payloads.
 pub const BTree = struct {
     /// Allocator for payload copies and the entry list.
     allocator: std.mem.Allocator,

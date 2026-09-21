@@ -1,41 +1,16 @@
 //! Math SQL functions (`ceil`, `sin`, `pow`, ...) — pure `Value` transforms.
 //!
-//! Purpose: authoritative math implementations behind `functions.evalScalar`.
-//! All functions take already-evaluated `Value` args (never AST) and return a
-//! fresh `Value` (never NULL except on domain errors).
-//!
-//! Dependencies: `std`, `../../vm/value.zig` only.
-//!
-//! Ownership/lifetime: inputs borrowed; outputs are integer/real/null and need
-//! no freeing. No allocation occurs here.
-//!
-//! Error behavior: infallible (`Value` return, not `!Value`); domain errors
-//! (log of non-positive, asin out of range, NaN/Inf pow) yield `.null` per
-//! SQLite. Wrong arity is rejected by the dispatcher.
-//!
-//! Invariants: text inputs coerce via trimmed `parseFloat`; blobs always yield
-//! NULL; `toFloat(NULL)` is null so NULL propagates.
-//!
-//! SQLite compatibility: `log(X)` is base-10, `log(B,X)` is base-B;
-//! `degrees`/`radians` use `std.math.pi`; `trunc` clamps decimals to ±30.
-// TODO(sql/math): `toFloat` text coercion duplicates scalar/VM parsing with
-// subtly different rules (trim+parseFloat vs prefix parse). Expected: shared
-// coerce helper; tests: `'12x'`, `'  3.5  '`, `''`, blob matrices identical
-// across math/scalar/vm. Subsystem: sql/functions.
-
+//! Infallible: domain errors (log of non-positive, asin out of range)
+//! yield NULL. Text converts only when wholly numeric; blobs never do.
+//! `log(X)` is base-10, `log(B,X)` base-B; `trunc` clamps decimals to ±30.
 const std = @import("std");
 const Value = @import("../../vm/value.zig").Value;
+const coerce = @import("../coerce.zig");
 
-/// Coerce a value to float; integers/reals convert, trimmed numeric text parses, else null.
-fn toFloat(val: Value) ?f64 {
-    return switch (val) {
-        .null => null,
-        .integer => |i| @floatFromInt(i),
-        .real => |r| r,
-        .text => |t| std.fmt.parseFloat(f64, std.mem.trim(u8, t, " \t\r\n")) catch null,
-        .blob => null,
-    };
-}
+/// Strict numeric conversion; canonical implementation in `coerce`
+/// (whole-string rule shared with `sign`). Null in, null out; text must be
+/// fully numeric; blobs yield null.
+const toFloat = coerce.toFloatStrict;
 
 /// `ceil(X)`/`ceiling`: smallest integer >= X as REAL; NULL on non-numeric.
 pub fn evalCeil(arg: Value) Value {
@@ -241,7 +216,10 @@ test "math normal behavior" {
 
 test "math null and boundary behavior" {
     try std.testing.expect(evalCeil(.null) == .null);
+    // Strict conversion: partially-numeric text is not a number.
     try std.testing.expect(evalFloor(.{ .text = "abc" }) == .null);
+    try std.testing.expect(evalFloor(.{ .text = "12x" }) == .null);
+    try std.testing.expectEqual(@as(f64, 3.0), evalFloor(.{ .text = "  3.9  " }).real);
     try std.testing.expect(evalLn(.{ .integer = 0 }) == .null);
     try std.testing.expect(evalLog10(.{ .integer = -5 }) == .null);
     try std.testing.expect(evalSqrt(.{ .integer = -1 }) == .null);

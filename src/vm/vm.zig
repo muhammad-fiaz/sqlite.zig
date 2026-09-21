@@ -1,31 +1,9 @@
 //! Bytecode virtual machine: register-based execution over table cursors.
 //!
-//! Purpose: execute `opcode.Program`s produced by `vm/compiler.zig` against
-//! in-memory schema state. Responsibilities: register file, cursor lifecycle
-//! (`TableCursor`/`EphemeralCursor`), opcode dispatch with SQLite NULL
-//! semantics, arithmetic/comparison/collation via `vm/value`, function and
-//! aggregate evaluation, and `Result` materialization.
-//!
-//! Dependencies: `vm/opcode`, `vm/value`, `catalog/schema` (borrowed tables),
-//! `connection/result` (owned output). The VM never touches the pager, WAL,
-//! or files directly — persistence is the connection/storage layers' job.
-//!
-//! Ownership/lifetime: the program and schema are borrowed for the call; the
-//! returned `Result` is owned (caller `deinit`s). Cursors borrow tables and
-//! dangle after schema mutation; registers are per-execution scratch.
-//!
-//! Error behavior: OOM, `Unsupported` for unimplemented opcodes/paths, and
-//! propagated function errors. Malformed programs are a compiler bug (fail
-//! loudly), never corrupt disk input — disk bytes are validated far below.
-//!
-//! SQLite compatibility: opcode semantics, NULL propagation, division-by-zero
-//! yielding NULL, collation-aware comparison, and cursor positioning mirror
-//! VDBE behavior; see per-opcode tests at the file bottom.
-// TODO: Implement automatic-index construction for eligible join loops.
-// Current behavior falls back to a table scan when no usable index exists.
-// Expected: SQLite-style ephemeral automatic indexes inside join execution
-// with planner cost integration. Required tests: multi-table join plans using
-// ephemeral indexes plus vacuous-scan regression coverage.
+//! Runs compiler programs against borrowed schema state into owned `Result`s.
+//! The program and tables borrow for the call; cursors dangle after schema
+//! mutation. OOM, `Unsupported` paths, and function errors propagate;
+//! malformed programs are compiler bugs (fail loudly).
 const std = @import("std");
 const Program = @import("opcode.zig").Program;
 const Instruction = @import("opcode.zig").Instruction;
@@ -36,6 +14,7 @@ const Collation = @import("value.zig").Collation;
 const Schema = @import("../catalog/schema.zig").Schema;
 const Table = @import("../catalog/schema.zig").Table;
 const Result = @import("../connection/result.zig").Result;
+const coerce = @import("../sql/coerce.zig");
 
 /// Cursor over a borrowed `Schema.Table`'s row list. Position is an index;
 /// `eof` is true when empty or past the end. Borrowed — dangles after the
@@ -207,31 +186,27 @@ pub const AggState = struct {
     maxVal: ?Value = null,
 };
 
+/// Total numeric coercions for opcode paths: longest-prefix rules from the
+/// canonical `sql/coerce.zig` unit, with null mapping to 0. Every call site
+/// below null-checks first, so the fallback only documents totality — the
+/// historical null->0 mapping is preserved if ever reached.
 fn toReal(val: Value) f64 {
-    return switch (val) {
-        .null => 0.0,
-        .integer => |i| @floatFromInt(i),
-        .real => |r| r,
-        .text => |t| std.fmt.parseFloat(f64, std.mem.trim(u8, t, " \t\r\n")) catch 0.0,
-        .blob => 0.0,
-    };
+    return coerce.toFloat(val) orelse 0.0;
 }
 
 fn toInt(val: Value) i64 {
-    return switch (val) {
-        .null => 0,
-        .integer => |i| i,
-        .real => |r| @intFromFloat(r),
-        .text => |t| std.fmt.parseInt(i64, std.mem.trim(u8, t, " \t\r\n"), 10) catch 0,
-        .blob => 0,
-    };
+    return coerce.toInt(val) orelse 0;
 }
 
 fn evalAdd(a: Value, b: Value) Value {
     if (a == .null or b == .null) return .null;
-    if (a == .integer and b == .integer) {
-        const sum = std.math.add(i64, a.integer, b.integer) catch {
-            return .{ .real = @as(f64, @floatFromInt(a.integer)) + @as(f64, @floatFromInt(b.integer)) };
+    // Integer-preserving gate (see coerce.toNumeric):
+    // integer-looking text computes as INTEGER, so '6' + '7' is 11.
+    const na = coerce.toNumeric(a);
+    const nb = coerce.toNumeric(b);
+    if (na == .int and nb == .int) {
+        const sum = std.math.add(i64, na.int, nb.int) catch {
+            return .{ .real = @as(f64, @floatFromInt(na.int)) + @as(f64, @floatFromInt(nb.int)) };
         };
         return .{ .integer = sum };
     }
@@ -240,9 +215,11 @@ fn evalAdd(a: Value, b: Value) Value {
 
 fn evalSub(a: Value, b: Value) Value {
     if (a == .null or b == .null) return .null;
-    if (a == .integer and b == .integer) {
-        const diff = std.math.sub(i64, a.integer, b.integer) catch {
-            return .{ .real = @as(f64, @floatFromInt(a.integer)) - @as(f64, @floatFromInt(b.integer)) };
+    const na = coerce.toNumeric(a);
+    const nb = coerce.toNumeric(b);
+    if (na == .int and nb == .int) {
+        const diff = std.math.sub(i64, na.int, nb.int) catch {
+            return .{ .real = @as(f64, @floatFromInt(na.int)) - @as(f64, @floatFromInt(nb.int)) };
         };
         return .{ .integer = diff };
     }
@@ -251,9 +228,11 @@ fn evalSub(a: Value, b: Value) Value {
 
 fn evalMul(a: Value, b: Value) Value {
     if (a == .null or b == .null) return .null;
-    if (a == .integer and b == .integer) {
-        const prod = std.math.mul(i64, a.integer, b.integer) catch {
-            return .{ .real = @as(f64, @floatFromInt(a.integer)) * @as(f64, @floatFromInt(b.integer)) };
+    const na = coerce.toNumeric(a);
+    const nb = coerce.toNumeric(b);
+    if (na == .int and nb == .int) {
+        const prod = std.math.mul(i64, na.int, nb.int) catch {
+            return .{ .real = @as(f64, @floatFromInt(na.int)) * @as(f64, @floatFromInt(nb.int)) };
         };
         return .{ .integer = prod };
     }
@@ -262,13 +241,18 @@ fn evalMul(a: Value, b: Value) Value {
 
 fn evalDiv(a: Value, b: Value) Value {
     if (a == .null or b == .null) return .null;
-    if (a == .integer and b == .integer) {
-        if (b.integer == 0) return .null;
-        return .{ .integer = @divTrunc(a.integer, b.integer) };
+    const na = coerce.toNumeric(a);
+    const nb = coerce.toNumeric(b);
+    if (na == .int and nb == .int) {
+        if (nb.int == 0) return .null;
+        if (nb.int == -1 and na.int == std.math.minInt(i64)) return .{ .real = 9223372036854775808.0 };
+        return .{ .integer = @divTrunc(na.int, nb.int) };
     }
     const divisor = toReal(b);
     if (divisor == 0.0) return .null;
-    return .{ .real = toReal(a) / divisor };
+    const quotient = toReal(a) / divisor;
+    if (std.math.isNan(quotient)) return .null;
+    return .{ .real = quotient };
 }
 
 fn evalRem(a: Value, b: Value) Value {
@@ -312,16 +296,12 @@ fn evalBitOr(a: Value, b: Value) Value {
 
 fn evalShiftLeft(a: Value, b: Value) Value {
     if (a == .null or b == .null) return .null;
-    const shift = toInt(b);
-    if (shift < 0 or shift >= 64) return .{ .integer = 0 };
-    return .{ .integer = toInt(a) << @as(u6, @intCast(shift)) };
+    return .{ .integer = coerce.shiftLeft(toInt(a), toInt(b)) };
 }
 
 fn evalShiftRight(a: Value, b: Value) Value {
     if (a == .null or b == .null) return .null;
-    const shift = toInt(b);
-    if (shift < 0 or shift >= 64) return .{ .integer = 0 };
-    return .{ .integer = toInt(a) >> @as(u6, @intCast(shift)) };
+    return .{ .integer = coerce.shiftRight(toInt(a), toInt(b)) };
 }
 
 fn evalBitNot(a: Value) Value {
@@ -371,6 +351,11 @@ pub const VirtualMachine = struct {
         self.arena.deinit();
     }
 
+    // TODO: Build automatic indexes for eligible join inner loops. Table
+    // scans are the fallback today when no stored index fits; an ephemeral
+    // per-execution index over the inner table would turn those into seeks.
+    // Needs planner cost integration so EXPLAIN shows the choice, plus
+    // multi-table join tests and vacuous-scan regression coverage.
     pub fn execute(self: *VirtualMachine, program: *const Program, columnNames: []const []const u8) !Result {
         var outputRows: std.ArrayList([]Value) = .empty;
         errdefer {

@@ -1,50 +1,7 @@
-//! Typed and dynamic column descriptors: the DSL's expression leaves.
+//! Typed and dynamic column descriptors that build borrowed expr values.
 //!
-//! Purpose: define `Column(table, name, FieldType)` (comptime typed columns),
-//! `DynamicColumn` (runtime columns), `ExcludedColumn` (upsert `excluded`
-//! pseudo-table), plus `CaseBuilder`/`WindowBuilder` expression handles. Every
-//! method here builds a borrowed `dsl/expr.zig` value; nothing executes.
-//!
-//! Responsibilities: Zig-to-`Value` conversion (`toValue`), dotted-name
-//! splitting (`splitRef`), column/predicate/projection/order builders, CASE
-//! and window-function handles, and explicit insert/update markers
-//! (`ExplicitValue`, `ExplicitDefault`).
-//!
-//! Dependencies: `dsl/expr.zig` (IR), `vm/value.zig` (`Value`). No allocator,
-//! no SQL text, no catalog access.
-//!
-//! Ownership/lifetime: descriptors are small copyable values holding borrowed
-//! slices (`name`, `table`, `schema`, function names). Predicates and
-//! projections borrow those slices; `ast_builder` duplicates what the native
-//! AST must own. Values passed to `toValue` with text/blob payloads stay
-//! borrowed — callers keep them alive until the built statement executes.
-//!
-//! Error behavior: type mismatches that are knowable at comptime (assigning
-//! text to an integer column via `value()`, arithmetic on text columns) are
-//! `@compileError`. Runtime misuse of CASE builders (mixing searched/simple
-//! branches, overflowing the fixed 8-branch / 4-partition / 2-order buffers)
-//! is `@panic`, matching the builder-wide fixed-capacity contract.
-//!
-//! SQLite compatibility: method names mirror SQLite operators and scalar
-//! functions (`likeEscape`, `glob`, `regexp`, `matchPattern`, `substr`,
-//! `jsonExtract`, ...). `between`/`notBetween` lower to paired comparisons in
-//! `ast_builder`, preserving SQLite NULL semantics via the native AST.
-//!
-//! Unified pipeline note: Raw SQL, the dynamic DSL, and the typed DSL all
-//! converge on native AST/IR through `ast_builder` — column descriptors never
-//! render SQL strings.
-//!
-//! Column/operation collision rule: schema fields are always plain struct
-//! fields (`User.all`, `User.count`, `User.where` are column descriptors when
-//! the table declares them; see `dsl/table.zig`). DSL operations are methods
-//! *on* those column values (`col.count()`, `col.asc()`) or calls on the table
-//! (`User.all()` only exists when no `all` column is declared), so a column
-//! named `select`/`where`/`limit`/`count` never hides an operation.
-//!
-//! AllColumns note: `.all()` (the all-columns operation) lives on the table
-//! descriptor, not here; projections built here are single-column, aggregate,
-//! scalar, CASE, or window nodes. `tableMod.AllProjection` is the only
-//! star-shaped IR and is produced by the table, never by a column.
+//! Descriptors hold borrowed names only; `ast_builder` dupes what it keeps.
+//! Type misuse is a compile error; CASE/window overflow panics.
 
 const std = @import("std");
 const dslExpr = @import("expr.zig");
@@ -530,13 +487,7 @@ fn arithOf(ref: ColumnRef, op: dslExpr.ArithOp, other: anytype) dslExpr.ArithExp
     return .{ .op = op, .left = .{ .column = ref }, .right = setOperandOf(other) };
 }
 
-/// Typed column descriptor factory. Returns a small copyable struct whose
-/// *fields* are the schema (`table`, `name`, `fieldType`) and whose *methods*
-/// are the DSL operations (`eq`, `lt`, `asc`, `count`, `lower`, `add`, ...).
-/// Because operations are methods on the column *value*, a schema field named
-/// `count`/`where`/`select`/`limit` never collides with an operation: the
-/// field stays a column, the operation stays a call. All names borrowed;
-/// `func` holds an optional scalar wrapper applied by `lower()` & friends.
+/// Typed column descriptor factory. Fields are schema, methods are operations.
 pub fn Column(comptime tableName: []const u8, comptime columnName: []const u8, comptime FieldType: type) type {
     return struct {
         const Self = @This();
@@ -797,10 +748,7 @@ pub fn Column(comptime tableName: []const u8, comptime columnName: []const u8, c
     };
 }
 
-/// Runtime column descriptor (`db.table("users").column("age")`). Same method
-/// family as `Column` but typeless: predicates accept any literal at runtime
-/// (mismatches surface as engine errors, not comptime errors). `name` may be
-/// dotted (`"users.age"`); explicit `schema`/`table` fields take precedence.
+/// Runtime column descriptor. Typeless; `name` may be dotted.
 /// All slices borrowed from the caller/table handle.
 pub const DynamicColumn = struct {
     name: []const u8,

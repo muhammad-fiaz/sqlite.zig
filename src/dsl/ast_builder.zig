@@ -1,54 +1,9 @@
-//! DSL-to-native-AST lowering: the single convergence point of all pipelines.
+//! DSL IR to native AST lowering; all query pipelines meet here.
 //!
-//! Purpose: translate borrowed DSL IR (`dsl/expr.zig`, `dsl/column.zig`
-//! builders) into owned native `sql/ast.zig` statements wrapped in a
-//! `BuiltStatement`. Raw SQL arrives already parsed; the dynamic DSL and the
-//! typed DSL both arrive here as IR — this module never renders a DSL value to
-//! an SQL string for re-parsing (no DSL->SQL-string round trip).
-//!
-//! Responsibilities: predicate/projection/CASE/window lowering, SELECT /
-//! INSERT / UPDATE / DELETE construction, CTE/compound/derived plumbing types,
-//! and ownership tracking for every duplicated identifier string and heap
-//! `ast.Expr` node.
-//!
-//! Dependencies: `sql/ast.zig` (target IR + `deinit`/`cloneOwnedExpr`/
-//! `freeOwnedExpr`), `dsl/expr.zig`, `dsl/column.zig`, `vm/value.zig`,
-//! `connection/result.zig` (executor return type).
-//!
-//! Ownership/lifetime (critical): the internal `Ctx` accumulates two things:
-//! (1) `owned` identifier strings duplicated for the AST, and (2) heap
-//! `*ast.Expr` nodes that become sub-expressions. On success the nodes are
-//! *transferred* into the returned `BuiltStatement` (their heap pointers now
-//! belong to `stmt`), and the string list moves into
-//! `BuiltStatement.ownedStrings`. The caller owns the `BuiltStatement` and
-//! must call `deinit()` exactly once; after `deinit` the `stmt` and every
-//! borrowed view of it dangle. On failure `Ctx.fail()` destroys all tracked
-//! nodes and frees all owned strings, so the caller owns nothing. `BuiltStatement`
-//! is move-only in practice: do not copy it without also transferring the
-//! `deinit` duty. Builders (`query_builder`) snapshot DSL IR by value before
-//! calling here, so mutating the builder afterwards never affects an already
-//! built statement.
-//!
-//! Error behavior: malformed IR yields `error.InvalidSql` (empty CAST target,
-//! unresolved CASE/WINDOW slot, missing JOIN predicate, bad HAVING op, LIKE
-//! ESCAPE on a non-LIKE operator, ...). Allocation failure propagates as
-//! `error.OutOfMemory`. `Ctx.fail` runs on every `errdefer` path, so failed
-//! builds leak nothing.
-//!
-//! SQLite compatibility: lowering preserves SQLite semantics — BETWEEN
-//! becomes paired comparisons, IS DISTINCT becomes NOT(IS ...), pattern
-//! operators keep their negated/glob/regexp/match flags, LIKE ESCAPE is gated
-//! to LIKE only, single-table references strip the redundant qualifier while
-//! joined references keep full qualification (ambiguity + scope are
-//! load-bearing), and window lowering rejects non-window function names.
-//!
-//! Column/operation collision rule: this layer only sees already-resolved
-//! `ColumnRef`s, so operation-named columns (`where`, `count`, ...) arrive as
-//! ordinary identifiers and need no special casing.
-//!
-//! AllColumns note: `.star` projections lower to the native `.wildcard` node
-//! (bare `*`) and `.countStar` lowers to native `COUNT(*)`; qualified
-//! `table.*` is preserved through `dotted()`/`refName()` stripping rules.
+//! Owns duped identifier strings and heap expr nodes.
+//! Success moves them into `BuiltStatement`; failure frees everything.
+//! Caller must call `BuiltStatement.deinit` exactly once.
+//! Bad IR fails with `InvalidSql`, allocation with `OutOfMemory`.
 
 const std = @import("std");
 const ast = @import("../sql/ast.zig");
@@ -137,11 +92,7 @@ pub const UpsertArgs = struct {
     caseWhens: []const CaseWhereArgs = &.{},
 };
 
-/// Owned lowered statement. `stmt` borrows every entry of `ownedStrings`
-/// (identifier spellings) and owns heap sub-expression nodes transferred from
-/// the build `Ctx`. Caller must call `deinit()` exactly once; after that both
-/// `stmt` and any pointer into it dangle. Never copy without transferring the
-/// `deinit` duty.
+/// Owned lowered statement. Caller must call `deinit` exactly once.
 pub const BuiltStatement = struct {
     stmt: ast.Statement,
     ownedStrings: std.ArrayList([]const u8),
@@ -685,11 +636,8 @@ fn stripBase(table: []const u8, schema: []const u8, alias: ?[]const u8) StripBas
     return .{ .table = table, .schema = schema, .alias = alias };
 }
 
-/// Lower borrowed SELECT inputs into an owned `BuiltStatement`. Single-table
-/// queries strip the redundant self-qualifier; joined queries keep full
-/// qualification. Caller owns the result and must `deinit` it. Fails
-/// `InvalidSql` on bad joins/HAVING/orders and `OutOfMemory` on allocation
-/// failure (no partial ownership escapes on error).
+/// Lower borrowed SELECT inputs into an owned `BuiltStatement`.
+/// Caller must `deinit` it; bad shapes fail `InvalidSql`.
 pub fn buildSelect(allocator: std.mem.Allocator, args: SelectArgs) !BuiltStatement {
     var ctx = Ctx.init(allocator);
     var projections = std.ArrayList(ast.Projection).empty;
