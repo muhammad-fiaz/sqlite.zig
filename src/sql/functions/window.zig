@@ -8,6 +8,7 @@ const Value = @import("../../vm/value.zig").Value;
 const ast = @import("../ast.zig");
 const AggState = @import("aggregate.zig").AggState;
 const AggKind = @import("aggregate.zig").AggKind;
+const scalar = @import("scalar.zig");
 
 /// Free an evalFn temp whose expression may own its payload: binary, unary,
 /// and function results clone or allocate text/blob, while identifiers,
@@ -44,6 +45,75 @@ pub const WindowContext = struct {
     /// Opaque pointer passed through to `evalFn`.
     evalCtx: *const anyopaque,
 };
+
+/// Evaluate one frame offset expression against the current row. Offsets
+/// are full expressions but must yield a non-negative integer per row —
+/// integer-valued reals (1.0) pass, anything else (NULL, text, negative,
+/// fractional) fails with `InvalidSql`, like the reference.
+fn evalFrameOffset(allocator: std.mem.Allocator, ctx: WindowContext, offsetExpr: ?*const ast.Expr, row: []const Value) !usize {
+    const node = offsetExpr orelse return 0;
+    const v = try ctx.evalFn(ctx.evalCtx, node.*, row);
+    defer freeWindowTemp(allocator, node.*, v);
+    switch (v) {
+        .integer => |i| return std.math.cast(usize, i) orelse error.InvalidSql,
+        .real => |r| {
+            if (r != @trunc(r)) return error.InvalidSql;
+            if (r < 0 or r > 9223372036854775807.0) return error.InvalidSql;
+            return std.math.cast(usize, @as(i64, @intFromFloat(r))) orelse error.InvalidSql;
+        },
+        else => return error.InvalidSql,
+    }
+}
+
+/// True when a FILTER clause keeps `row` (or there is no clause).
+fn windowRowPassesFilter(allocator: std.mem.Allocator, ctx: WindowContext, filter: ?*const ast.Expr, row: []const Value) !bool {
+    const node = filter orelse return true;
+    const v = try ctx.evalFn(ctx.evalCtx, node.*, row);
+    defer freeWindowTemp(allocator, node.*, v);
+    return scalar.isTruthyValue(v);
+}
+
+/// True for PRECEDING/FOLLOWING bounds (the ones carrying offsets).
+fn isOffsetBound(bound: ast.WindowFrameBound) bool {
+    return bound == .preceding or bound == .following;
+}
+
+/// True when position `j` is cut from row `p`'s frame by EXCLUDE:
+/// CURRENT ROW drops just `p`, GROUP drops the whole peer group,
+/// TIES drops the peers but keeps `p` itself.
+fn frameRowExcluded(exclude: ast.WindowExclude, p: usize, j: usize, peerStarts: []const usize, peerEnds: []const usize) bool {
+    return switch (exclude) {
+        .none => false,
+        .currentRow => j == p,
+        .group => j >= peerStarts[p] and j <= peerEnds[p],
+        .ties => j != p and j >= peerStarts[p] and j <= peerEnds[p],
+    };
+}
+
+/// Numeric RANGE key or bound: integers stay exact (`i128` survives any
+/// `i64` key plus `usize` offset); reals compare as `f64`.
+const RangeNum = union(enum) { int: i128, real: f64 };
+
+/// Numeric view of a RANGE order key; text/blob keys (and NULL) have none —
+/// the reference excludes non-numeric keys from value ranges.
+fn rangeNumber(key: Value) ?RangeNum {
+    return switch (key) {
+        .integer => |i| .{ .int = i },
+        .real => |r| .{ .real = r },
+        else => null,
+    };
+}
+
+/// One end of a numeric RANGE interval; infinities model UNBOUNDED bounds.
+const RangeEdge = union(enum) { negInf, num: RangeNum, posInf };
+
+/// Numeric `a <= b` across the int/real mix (exact for int/int).
+fn rangeNumLessEqual(a: RangeNum, b: RangeNum) bool {
+    if (a == .int and b == .int) return a.int <= b.int;
+    const af: f64 = if (a == .int) @floatFromInt(a.int) else a.real;
+    const bf: f64 = if (b == .int) @floatFromInt(b.int) else b.real;
+    return af <= bf;
+}
 
 /// Evaluate window expression `win` over `ctx.rows`; returns caller-owned `[]Value`.
 /// Length equals row count; each element owned (free text/blob + slice).
@@ -222,6 +292,23 @@ pub fn evaluateWindowFunction(
         }
         for (peerStartIdx..n) |k| peerEnds[k] = n - 1;
 
+        // Peer-group layout: `groupStarts` holds each group's first
+        // position, `groupOf[p]` its group index. GROUPS offsets and
+        // EXCLUDE GROUP/TIES address groups through these.
+        var groupStarts = std.ArrayList(usize).empty;
+        defer groupStarts.deinit(allocator);
+        for (0..n) |j| if (peerStarts[j] == j) try groupStarts.append(allocator, j);
+        const groupOf = try allocator.alloc(usize, n);
+        defer allocator.free(groupOf);
+        var groupScan: usize = 0;
+        for (0..n) |j| {
+            if (j != 0 and peerStarts[j] == j) groupScan += 1;
+            groupOf[j] = groupScan;
+        }
+        // Scratch frame positions for the current row, reused per row.
+        var included = std.ArrayList(usize).empty;
+        defer included.deinit(allocator);
+
         for (0..n) |p| {
             const originalRowIdx = partIndices[p];
             const name = w.funcName;
@@ -328,26 +415,132 @@ pub fn evaluateWindowFunction(
             }
 
             var frameStart: usize = 0;
-            var frameEnd: usize = n - 1;
+            var frameEnd: usize = 0;
+
+            // Scratch positions refill every row (ranking/lead/lag rows above
+            // `continue` with it empty, so no stale entries survive).
+            included.clearRetainingCapacity();
 
             if (w.frame) |fr| {
-                switch (fr.start) {
-                    .unboundedPreceding => frameStart = 0,
-                    .currentRow => frameStart = if (fr.kind == .range) peerStarts[p] else p,
-                    .preceding => frameStart = if (p < fr.startOffset) 0 else p - fr.startOffset,
-                    .following => frameStart = @min(n, p + fr.startOffset),
-                    .unboundedFollowing => frameStart = n - 1,
-                }
-                if (fr.end) |endBound| {
+                const currentValues = ctx.rows[originalRowIdx];
+                const rangeByValue = fr.kind == .range and (isOffsetBound(fr.start) or (fr.end != null and isOffsetBound(fr.end.?)));
+                if (fr.kind == .groups) {
+                    // GROUPS offsets count peer groups, not rows.
+                    const sOff = try evalFrameOffset(allocator, ctx, fr.startOffset, currentValues);
+                    const eOff = try evalFrameOffset(allocator, ctx, fr.endOffset, currentValues);
+                    const g = groupOf[p];
+                    const gCount = groupStarts.items.len;
+                    const satAdd = struct {
+                        fn run(a: usize, b: usize, cap: usize) usize {
+                            if (b >= cap or a >= cap) return cap - 1;
+                            return @min(cap - 1, a + b);
+                        }
+                    }.run;
+                    switch (fr.start) {
+                        .unboundedPreceding => frameStart = 0,
+                        .currentRow => frameStart = peerStarts[p],
+                        .preceding => frameStart = groupStarts.items[if (sOff >= g) 0 else g - sOff],
+                        .following => frameStart = groupStarts.items[satAdd(g, sOff, gCount)],
+                        .unboundedFollowing => frameStart = n - 1,
+                    }
+                    const endBound = fr.end orelse .currentRow;
+                    switch (endBound) {
+                        .unboundedPreceding => frameEnd = 0,
+                        .currentRow => frameEnd = peerEnds[p],
+                        .preceding => frameEnd = peerEnds[groupStarts.items[if (eOff >= g) 0 else g - eOff]],
+                        .following => frameEnd = peerEnds[groupStarts.items[satAdd(g, eOff, gCount)]],
+                        .unboundedFollowing => frameEnd = n - 1,
+                    }
+                } else if (rangeByValue) {
+                    // RANGE with offsets compares the single ORDER BY key by
+                    // value (`key in [K-off, K+off]`); NULL keys keep peers
+                    // only, non-numeric keys collapse offsets to CURRENT ROW.
+                    if (numOrderKeys != 1) return error.InvalidSql;
+                    const key = orderKeys.items[originalRowIdx];
+                    if (key == .null) {
+                        frameStart = peerStarts[p];
+                        frameEnd = peerEnds[p];
+                    } else if (rangeNumber(key)) |knum| {
+                        const sOff = if (isOffsetBound(fr.start)) try evalFrameOffset(allocator, ctx, fr.startOffset, currentValues) else 0;
+                        const eOff = if (fr.end != null and isOffsetBound(fr.end.?)) try evalFrameOffset(allocator, ctx, fr.endOffset, currentValues) else 0;
+                        const shift = struct {
+                            fn run(base: RangeNum, off: usize, negative: bool) RangeNum {
+                                if (base == .real) {
+                                    const delta: f64 = @floatFromInt(off);
+                                    return .{ .real = if (negative) base.real - delta else base.real + delta };
+                                }
+                                const wide: i128 = base.int;
+                                return .{ .int = if (negative) wide - off else wide + off };
+                            }
+                        }.run;
+                        const lower: RangeEdge = switch (fr.start) {
+                            .unboundedPreceding => .negInf,
+                            .currentRow => .{ .num = knum },
+                            .preceding => .{ .num = shift(knum, sOff, true) },
+                            .following => .{ .num = shift(knum, sOff, false) },
+                            .unboundedFollowing => .posInf,
+                        };
+                        const endBound = fr.end orelse .currentRow;
+                        const upper: RangeEdge = switch (endBound) {
+                            .unboundedPreceding => .negInf,
+                            .currentRow => .{ .num = knum },
+                            .preceding => .{ .num = shift(knum, eOff, true) },
+                            .following => .{ .num = shift(knum, eOff, false) },
+                            .unboundedFollowing => .posInf,
+                        };
+                        for (0..n) |j| {
+                            if (frameRowExcluded(fr.exclude, p, j, peerStarts, peerEnds)) continue;
+                            const candidate = orderKeys.items[partIndices[j]];
+                            if (candidate == .null) continue;
+                            const jnum = rangeNumber(candidate) orelse continue;
+                            const aboveLower = lower == .negInf or rangeNumLessEqual(lower.num, jnum);
+                            const belowUpper = upper == .posInf or rangeNumLessEqual(jnum, upper.num);
+                            if (aboveLower and belowUpper) try included.append(allocator, j);
+                        }
+                    } else {
+                        // Non-numeric key: still validate offsets, then treat
+                        // offset bounds as CURRENT ROW (reference behavior).
+                        if (isOffsetBound(fr.start)) _ = try evalFrameOffset(allocator, ctx, fr.startOffset, currentValues);
+                        if (fr.end != null and isOffsetBound(fr.end.?)) _ = try evalFrameOffset(allocator, ctx, fr.endOffset, currentValues);
+                        switch (fr.start) {
+                            .unboundedPreceding => frameStart = 0,
+                            .currentRow, .preceding, .following => frameStart = peerStarts[p],
+                            .unboundedFollowing => frameStart = n - 1,
+                        }
+                        const endBound = fr.end orelse .currentRow;
+                        switch (endBound) {
+                            .unboundedPreceding => frameEnd = 0,
+                            .currentRow, .preceding, .following => frameEnd = peerEnds[p],
+                            .unboundedFollowing => frameEnd = n - 1,
+                        }
+                    }
+                } else {
+                    // ROWS, or RANGE over CURRENT ROW/UNBOUNDED bounds only
+                    // (peer semantics, no value scan needed).
+                    const sOff = try evalFrameOffset(allocator, ctx, fr.startOffset, currentValues);
+                    const eOff = try evalFrameOffset(allocator, ctx, fr.endOffset, currentValues);
+                    switch (fr.start) {
+                        .unboundedPreceding => frameStart = 0,
+                        .currentRow => frameStart = if (fr.kind == .range) peerStarts[p] else p,
+                        .preceding => frameStart = if (sOff > p) 0 else p - sOff,
+                        .following => frameStart = if (sOff >= n) n else @min(n, p + sOff),
+                        .unboundedFollowing => frameStart = n - 1,
+                    }
+                    const endBound = fr.end orelse .currentRow;
                     switch (endBound) {
                         .unboundedPreceding => frameEnd = 0,
                         .currentRow => frameEnd = if (fr.kind == .range) peerEnds[p] else p,
-                        .preceding => frameEnd = if (p < fr.endOffset) 0 else p - fr.endOffset,
-                        .following => frameEnd = @min(n - 1, p + fr.endOffset),
+                        .preceding => frameEnd = if (eOff > p) 0 else p - eOff,
+                        .following => frameEnd = @min(n - 1, p + @min(eOff, n)),
                         .unboundedFollowing => frameEnd = n - 1,
                     }
-                } else {
-                    frameEnd = if (fr.kind == .range) peerEnds[p] else p;
+                }
+                if (frameStart <= frameEnd and frameStart < n) {
+                    const stop = @min(n - 1, frameEnd);
+                    var idx = frameStart;
+                    while (idx <= stop) : (idx += 1) {
+                        if (!frameRowExcluded(fr.exclude, p, idx, peerStarts, peerEnds)) try included.append(allocator, idx);
+                    }
                 }
             } else {
                 if (w.orderBy.len > 0) {
@@ -357,33 +550,41 @@ pub fn evaluateWindowFunction(
                     frameStart = 0;
                     frameEnd = n - 1;
                 }
+                if (frameStart <= frameEnd and frameStart < n) {
+                    const stop = @min(n - 1, frameEnd);
+                    var idx = frameStart;
+                    while (idx <= stop) : (idx += 1) try included.append(allocator, idx);
+                }
             }
 
             if (std.ascii.eqlIgnoreCase(name, "first_value")) {
-                if (frameStart > frameEnd or frameStart >= n or w.argument == null) {
+                if (included.items.len == 0 or w.argument == null) {
                     results[originalRowIdx] = .null;
                 } else {
-                    const targetRow = ctx.rows[partIndices[frameStart]];
+                    const targetRow = ctx.rows[partIndices[included.items[0]]];
                     const raw = try ctx.evalFn(ctx.evalCtx, w.argument.?.*, targetRow);
                     defer freeWindowTemp(allocator, w.argument.?.*, raw);
                     results[originalRowIdx] = try raw.clone(allocator);
                 }
+                included.clearRetainingCapacity();
                 continue;
             }
             if (std.ascii.eqlIgnoreCase(name, "last_value")) {
-                if (frameStart > frameEnd or frameEnd >= n or w.argument == null) {
+                if (included.items.len == 0 or w.argument == null) {
                     results[originalRowIdx] = .null;
                 } else {
-                    const targetRow = ctx.rows[partIndices[frameEnd]];
+                    const targetRow = ctx.rows[partIndices[included.items[included.items.len - 1]]];
                     const raw = try ctx.evalFn(ctx.evalCtx, w.argument.?.*, targetRow);
                     defer freeWindowTemp(allocator, w.argument.?.*, raw);
                     results[originalRowIdx] = try raw.clone(allocator);
                 }
+                included.clearRetainingCapacity();
                 continue;
             }
             if (std.ascii.eqlIgnoreCase(name, "nth_value")) {
-                if (frameStart > frameEnd or w.argument == null or w.argument2 == null) {
+                if (included.items.len == 0 or w.argument == null or w.argument2 == null) {
                     results[originalRowIdx] = .null;
+                    included.clearRetainingCapacity();
                     continue;
                 }
                 const nVal = try ctx.evalFn(ctx.evalCtx, w.argument2.?.*, ctx.rows[originalRowIdx]);
@@ -393,20 +594,16 @@ pub fn evaluateWindowFunction(
                     .real => |r| @intFromFloat(r),
                     else => 0,
                 };
-                if (nth <= 0) {
-                    results[originalRowIdx] = .null;
-                    continue;
-                }
-                const targetOffset = @as(usize, @intCast(nth - 1));
-                const targetIdx = frameStart + targetOffset;
-                if (targetIdx > frameEnd or targetIdx >= n) {
+                if (nth <= 0 or @as(usize, @intCast(nth - 1)) >= included.items.len) {
                     results[originalRowIdx] = .null;
                 } else {
-                    const targetRow = ctx.rows[partIndices[targetIdx]];
+                    const targetOffset = @as(usize, @intCast(nth - 1));
+                    const targetRow = ctx.rows[partIndices[included.items[targetOffset]]];
                     const raw = try ctx.evalFn(ctx.evalCtx, w.argument.?.*, targetRow);
                     defer freeWindowTemp(allocator, w.argument.?.*, raw);
                     results[originalRowIdx] = try raw.clone(allocator);
                 }
+                included.clearRetainingCapacity();
                 continue;
             }
 
@@ -414,25 +611,23 @@ pub fn evaluateWindowFunction(
                 var aggState = AggState.init(allocator, aggKind, ",");
                 defer aggState.deinit();
 
-                if (frameStart <= frameEnd and frameStart < n) {
-                    const endBound = @min(n - 1, frameEnd);
-                    var idx = frameStart;
-                    while (idx <= endBound) : (idx += 1) {
-                        const targetRow = ctx.rows[partIndices[idx]];
-                        if (w.argument) |arg| {
-                            if (arg.* == .wildcard) {
-                                aggState.stepWildcard();
-                            } else {
-                                const argVal = try ctx.evalFn(ctx.evalCtx, arg.*, targetRow);
-                                defer freeWindowTemp(allocator, arg.*, argVal);
-                                try aggState.step(argVal, false);
-                            }
-                        } else {
+                for (included.items) |idx| {
+                    const targetRow = ctx.rows[partIndices[idx]];
+                    if (!try windowRowPassesFilter(allocator, ctx, w.filter, targetRow)) continue;
+                    if (w.argument) |arg| {
+                        if (arg.* == .wildcard) {
                             aggState.stepWildcard();
+                        } else {
+                            const argVal = try ctx.evalFn(ctx.evalCtx, arg.*, targetRow);
+                            defer freeWindowTemp(allocator, arg.*, argVal);
+                            try aggState.step(argVal, w.distinct);
                         }
+                    } else {
+                        aggState.stepWildcard();
                     }
                 }
                 results[originalRowIdx] = try aggState.final();
+                included.clearRetainingCapacity();
                 continue;
             }
 

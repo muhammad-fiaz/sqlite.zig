@@ -23,18 +23,24 @@ pub const OrderItem = struct {
 pub const WindowFrameKind = enum { rows, range, groups };
 /// One end of a window frame.
 pub const WindowFrameBound = enum { unboundedPreceding, preceding, currentRow, following, unboundedFollowing };
+/// Rows removed from a window frame (`EXCLUDE ...`); `none` keeps everything.
+pub const WindowExclude = enum { none, currentRow, group, ties };
 /// Complete frame descriptor; `end == null` means "same as start" (single-bound form).
 pub const WindowFrame = struct {
     /// Frame unit.
     kind: WindowFrameKind = .rows,
     /// Start bound.
     start: WindowFrameBound = .unboundedPreceding,
-    /// `N` in `N PRECEDING`/`N FOLLOWING`; 0 for unbounded/current-row.
-    startOffset: usize = 0,
+    /// Expression for `N` in `N PRECEDING`/`N FOLLOWING`; null means 0.
+    /// Offsets are full expressions (literals, parameters, column refs) that
+    /// must evaluate to a non-negative integer per row, like the reference.
+    startOffset: ?*const Expr = null,
     /// End bound, or null for the single-bound shorthand.
     end: ?WindowFrameBound = null,
-    /// `N` for the end bound.
-    endOffset: usize = 0,
+    /// Expression for `N` for the end bound; null means 0.
+    endOffset: ?*const Expr = null,
+    /// Rows to remove from the frame (`EXCLUDE`); default keeps everything.
+    exclude: WindowExclude = .none,
 };
 
 /// Owned expression tree. Pointer children are heap nodes; see module docs.
@@ -43,7 +49,7 @@ pub const Expr = union(enum) {
     identifier: []const u8,
     parameter: usize,
     wildcard,
-    function: struct { name: []const u8, argument: *const Expr, argument2: ?*const Expr = null, argument3: ?*const Expr = null, extraArgs: []const Expr = &.{}, distinct: bool = false },
+    function: struct { name: []const u8, argument: *const Expr, argument2: ?*const Expr = null, argument3: ?*const Expr = null, extraArgs: []const Expr = &.{}, distinct: bool = false, filter: ?*const Expr = null },
     binary: struct { op: BinaryOp, left: *const Expr, right: *const Expr },
     unary: struct { op: UnaryOp, expr: *const Expr },
     caseExpr: struct { base: ?*const Expr, whens: []CaseWhen, otherwise: ?*const Expr = null },
@@ -53,7 +59,7 @@ pub const Expr = union(enum) {
     existsSubquery: []const u8,
     inSubquery: struct { expr: *const Expr, subquery: []const u8, negated: bool = false },
     inList: struct { expr: *const Expr, list: []const Expr, negated: bool = false },
-    window: struct { funcName: []const u8, argument: ?*const Expr = null, argument2: ?*const Expr = null, extraArgs: []const Expr = &.{}, partitionBy: []const Expr = &.{}, orderBy: []const OrderItem = &.{}, frame: ?WindowFrame = null },
+    window: struct { funcName: []const u8, argument: ?*const Expr = null, argument2: ?*const Expr = null, extraArgs: []const Expr = &.{}, partitionBy: []const Expr = &.{}, orderBy: []const OrderItem = &.{}, frame: ?WindowFrame = null, filter: ?*const Expr = null, distinct: bool = false, base: ?[]const u8 = null },
 };
 /// Binary expression operators (arithmetic, bitwise, concat, comparison, logic).
 pub const BinaryOp = enum { add, subtract, multiply, divide, modulo, concat, bitAnd, bitOr, shiftLeft, shiftRight, equal, notEqual, less, lessEqual, greater, greaterEqual, logicalAnd, logicalOr, isOp, isNotOp };
@@ -226,6 +232,7 @@ fn freeOwnedExprChildren(allocator: std.mem.Allocator, expr: Expr, stack: *std.A
                 for (call.extraArgs) |*item| try stack.append(allocator, .{ .borrowed = item });
                 try stack.append(allocator, .{ .exprs = call.extraArgs });
             }
+            if (call.filter) |filter| try stack.append(allocator, .{ .destroy = filter });
         },
         .binary => |binary| {
             try stack.append(allocator, .{ .destroy = binary.left });
@@ -269,6 +276,7 @@ fn freeOwnedExprChildren(allocator: std.mem.Allocator, expr: Expr, stack: *std.A
         .existsSubquery => |sub| allocator.free(sub),
         .window => |w| {
             allocator.free(w.funcName);
+            if (w.base) |base| allocator.free(base);
             if (w.argument) |arg| try stack.append(allocator, .{ .destroy = arg });
             if (w.argument2) |arg| try stack.append(allocator, .{ .destroy = arg });
             if (w.extraArgs.len != 0) {
@@ -283,6 +291,11 @@ fn freeOwnedExprChildren(allocator: std.mem.Allocator, expr: Expr, stack: *std.A
                 for (w.orderBy) |*item| try stack.append(allocator, .{ .borrowed = &item.expr });
                 try stack.append(allocator, .{ .orders = w.orderBy });
             }
+            if (w.frame) |fr| {
+                if (fr.startOffset) |off| try stack.append(allocator, .{ .destroy = off });
+                if (fr.endOffset) |off| try stack.append(allocator, .{ .destroy = off });
+            }
+            if (w.filter) |filter| try stack.append(allocator, .{ .destroy = filter });
         },
         else => {},
     }
@@ -303,7 +316,28 @@ pub fn cloneOwnedExpr(allocator: std.mem.Allocator, expr: Expr) !Expr {
     return cloneOwnedExprDepth(allocator, expr, 0);
 }
 
-fn cloneOwnedExprDepth(allocator: std.mem.Allocator, expr: Expr, depth: usize) !Expr {
+/// Clone one optional heap expression node (`null` stays `null`).
+fn cloneOptionalNode(allocator: std.mem.Allocator, node: ?*const Expr, depth: usize) (std.mem.Allocator.Error || error{TooDeep})!?*const Expr {
+    const src = node orelse return null;
+    const owned = try allocator.create(Expr);
+    errdefer allocator.destroy(owned);
+    owned.* = try cloneOwnedExprDepth(allocator, src.*, depth + 1);
+    return owned;
+}
+
+/// Deep-clone a window frame, duplicating any offset expressions.
+fn cloneFrame(allocator: std.mem.Allocator, frame: ?WindowFrame, depth: usize) (std.mem.Allocator.Error || error{TooDeep})!?WindowFrame {
+    var fr = frame orelse return null;
+    fr.startOffset = try cloneOptionalNode(allocator, fr.startOffset, depth);
+    errdefer if (fr.startOffset) |n| {
+        freeOwnedExpr(allocator, @constCast(n).*);
+        allocator.destroy(n);
+    };
+    fr.endOffset = try cloneOptionalNode(allocator, fr.endOffset, depth);
+    return fr;
+}
+
+fn cloneOwnedExprDepth(allocator: std.mem.Allocator, expr: Expr, depth: usize) (std.mem.Allocator.Error || error{TooDeep})!Expr {
     if (depth > max_clone_depth) return error.TooDeep;
     switch (expr) {
         .literal => |lit| return .{ .literal = switch (lit) {
@@ -357,7 +391,12 @@ fn cloneOwnedExprDepth(allocator: std.mem.Allocator, expr: Expr, depth: usize) !
                 }
                 extraArgs = list;
             }
-            return .{ .function = .{ .name = ownedName, .argument = arg1, .argument2 = arg2, .argument3 = arg3, .extraArgs = extraArgs, .distinct = call.distinct } };
+            const filter = try cloneOptionalNode(allocator, call.filter, depth);
+            errdefer if (filter) |n| {
+                freeOwnedExpr(allocator, @constCast(n).*);
+                allocator.destroy(n);
+            };
+            return .{ .function = .{ .name = ownedName, .argument = arg1, .argument2 = arg2, .argument3 = arg3, .extraArgs = extraArgs, .distinct = call.distinct, .filter = filter } };
         },
         .binary => |bin| {
             const left = try allocator.create(Expr);
@@ -543,7 +582,10 @@ fn cloneOwnedExprDepth(allocator: std.mem.Allocator, expr: Expr, depth: usize) !
                 .extraArgs = extraArgs,
                 .partitionBy = parts,
                 .orderBy = orders,
-                .frame = w.frame,
+                .frame = try cloneFrame(allocator, w.frame, depth),
+                .filter = try cloneOptionalNode(allocator, w.filter, depth),
+                .distinct = w.distinct,
+                .base = if (w.base) |b| try allocator.dupe(u8, b) else null,
             } };
         },
     }
@@ -568,6 +610,10 @@ pub fn freeExprRec(gpa: anytype, expr: Expr) void {
                 freeExprRec(gpa, argument);
             }
             if (call.extraArgs.len != 0) gpa.free(call.extraArgs);
+            if (call.filter) |filter| {
+                freeExprRec(gpa, filter.*);
+                gpa.destroy(filter);
+            }
         },
         .binary => |binary| {
             freeExprRec(gpa, binary.left.*);
@@ -635,6 +681,20 @@ pub fn freeExprRec(gpa: anytype, expr: Expr) void {
             if (w.partitionBy.len != 0) gpa.free(w.partitionBy);
             for (w.orderBy) |item| freeExprRec(gpa, item.expr);
             if (w.orderBy.len != 0) gpa.free(w.orderBy);
+            if (w.frame) |fr| {
+                if (fr.startOffset) |off| {
+                    freeExprRec(gpa, off.*);
+                    gpa.destroy(off);
+                }
+                if (fr.endOffset) |off| {
+                    freeExprRec(gpa, off.*);
+                    gpa.destroy(off);
+                }
+            }
+            if (w.filter) |filter| {
+                freeExprRec(gpa, filter.*);
+                gpa.destroy(filter);
+            }
         },
         else => {},
     }

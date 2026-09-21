@@ -284,23 +284,42 @@ fn buildCaseWhereList(ctx: *Ctx, list: *std.ArrayList(ast.Condition), cases: []c
 
 fn projectionToAst(ctx: *Ctx, proj: dslExpr.Projection, base: ?StripBase, cases: []const CaseBuilder, windows: []const WindowBuilder) !ast.Projection {
     switch (proj.kind) {
-        .star => return .{ .expr = .wildcard, .alias = proj.alias },
+        .star => {
+            if (proj.filterExpr != null) return error.InvalidSql;
+            return .{ .expr = .wildcard, .alias = proj.alias };
+        },
         .countStar => {
             const argNode = try ctx.node();
             argNode.* = .wildcard;
             const callNode = try ctx.node();
-            callNode.* = .{ .function = .{ .name = "COUNT", .argument = argNode } };
+            var filter: ?*const ast.Expr = null;
+            if (proj.filterExpr) |pred| {
+                const created = try ctx.node();
+                created.* = try predicateToBinary(ctx, pred, base);
+                filter = created;
+            }
+            callNode.* = .{ .function = .{ .name = "COUNT", .argument = argNode, .filter = filter } };
             return .{ .expr = ctx.detach(callNode), .alias = proj.alias };
         },
-        .column => return .{ .expr = .{ .identifier = try ctx.refName(proj.column, base) }, .alias = proj.alias },
+        .column => {
+            if (proj.filterExpr != null) return error.InvalidSql;
+            return .{ .expr = .{ .identifier = try ctx.refName(proj.column, base) }, .alias = proj.alias };
+        },
         .aggregate => {
             const argNode = try ctx.node();
             argNode.* = .{ .identifier = try ctx.refName(proj.column, base) };
             const callNode = try ctx.node();
-            callNode.* = .{ .function = .{ .name = proj.function, .argument = argNode, .distinct = proj.distinct } };
+            var filter: ?*const ast.Expr = null;
+            if (proj.filterExpr) |pred| {
+                const created = try ctx.node();
+                created.* = try predicateToBinary(ctx, pred, base);
+                filter = created;
+            }
+            callNode.* = .{ .function = .{ .name = proj.function, .argument = argNode, .distinct = proj.distinct, .filter = filter } };
             return .{ .expr = ctx.detach(callNode), .alias = proj.alias };
         },
         .scalar => {
+            if (proj.filterExpr != null) return error.InvalidSql;
             if (std.ascii.eqlIgnoreCase(proj.function, "CAST")) {
                 const target: []const u8 = if (proj.hasArgument and proj.argument == .text) proj.argument.text else return error.InvalidSql;
                 if (target.len == 0) return error.InvalidSql;
@@ -331,10 +350,12 @@ fn projectionToAst(ctx: *Ctx, proj: dslExpr.Projection, base: ?StripBase, cases:
             return .{ .expr = ctx.detach(callNode), .alias = proj.alias };
         },
         .caseExpr => {
+            if (proj.filterExpr != null) return error.InvalidSql;
             if (proj.caseSlot >= cases.len) return error.InvalidSql;
             return .{ .expr = try caseToExpr(ctx, cases[proj.caseSlot], base), .alias = proj.alias };
         },
         .window => {
+            if (proj.filterExpr != null) return error.InvalidSql;
             if (proj.windowSlot >= windows.len) return error.InvalidSql;
             return .{ .expr = try windowToExpr(ctx, windows[proj.windowSlot], base), .alias = proj.alias };
         },
@@ -491,19 +512,35 @@ fn caseToExpr(ctx: *Ctx, case: CaseBuilder, base: ?StripBase) !ast.Expr {
 }
 
 fn isWindowFunction(name: []const u8) bool {
-    const known = [_][]const u8{ "row_number", "rank", "dense_rank", "percent_rank", "cume_dist", "ntile", "lag", "lead", "first_value", "last_value", "nth_value" };
+    const known = [_][]const u8{ "row_number", "rank", "dense_rank", "percent_rank", "cume_dist", "ntile", "lag", "lead", "first_value", "last_value", "nth_value", "count", "sum", "total", "avg", "average", "min", "max", "group_concat", "string_agg" };
     for (known) |candidate| if (std.ascii.eqlIgnoreCase(candidate, name)) return true;
     return false;
 }
 
-fn mapWindowBound(bound: WindowBound) struct { bound: ast.WindowFrameBound, offset: usize } {
+/// True for aggregate names (the only ones allowed to carry FILTER).
+fn isAggregateWindowFunction(name: []const u8) bool {
+    const known = [_][]const u8{ "count", "sum", "total", "avg", "average", "min", "max", "group_concat", "string_agg" };
+    for (known) |candidate| if (std.ascii.eqlIgnoreCase(candidate, name)) return true;
+    return false;
+}
+
+fn mapWindowBound(ctx: *Ctx, bound: WindowBound) !struct { bound: ast.WindowFrameBound, offset: ?*const ast.Expr } {
     return switch (bound) {
-        .unboundedPreceding => .{ .bound = .unboundedPreceding, .offset = 0 },
-        .preceding => |offset| .{ .bound = .preceding, .offset = offset },
-        .currentRow => .{ .bound = .currentRow, .offset = 0 },
-        .following => |offset| .{ .bound = .following, .offset = offset },
-        .unboundedFollowing => .{ .bound = .unboundedFollowing, .offset = 0 },
+        .unboundedPreceding => .{ .bound = .unboundedPreceding, .offset = null },
+        .preceding => |offset| .{ .bound = .preceding, .offset = try boundOffsetNode(ctx, offset) },
+        .currentRow => .{ .bound = .currentRow, .offset = null },
+        .following => |offset| .{ .bound = .following, .offset = try boundOffsetNode(ctx, offset) },
+        .unboundedFollowing => .{ .bound = .unboundedFollowing, .offset = null },
     };
+}
+
+/// Heap literal node for a DSL frame offset. Offsets past `i64` fail closed
+/// (the executor only accepts non-negative integers anyway).
+fn boundOffsetNode(ctx: *Ctx, offset: usize) !*const ast.Expr {
+    if (offset > std.math.maxInt(i64)) return error.InvalidSql;
+    const created = try ctx.node();
+    created.* = .{ .literal = .{ .integer = @intCast(offset) } };
+    return created;
 }
 
 fn windowToExpr(ctx: *Ctx, window: WindowBuilder, base: ?StripBase) !ast.Expr {
@@ -551,8 +588,8 @@ fn windowToExpr(ctx: *Ctx, window: WindowBuilder, base: ?StripBase) !ast.Expr {
     }
     var frame: ?ast.WindowFrame = null;
     if (window.frame) |spec| {
-        const start = mapWindowBound(spec.start);
-        const end = mapWindowBound(spec.end);
+        const start = try mapWindowBound(ctx, spec.start);
+        const end = try mapWindowBound(ctx, spec.end);
         frame = .{
             .kind = switch (spec.kind) {
                 .rows => ast.WindowFrameKind.rows,
@@ -563,9 +600,22 @@ fn windowToExpr(ctx: *Ctx, window: WindowBuilder, base: ?StripBase) !ast.Expr {
             .startOffset = start.offset,
             .end = end.bound,
             .endOffset = end.offset,
+            .exclude = switch (spec.exclude) {
+                .none => ast.WindowExclude.none,
+                .currentRow => ast.WindowExclude.currentRow,
+                .group => ast.WindowExclude.group,
+                .ties => ast.WindowExclude.ties,
+            },
         };
     }
-    return .{ .window = .{ .funcName = window.func, .argument = argument, .argument2 = argument2, .extraArgs = extraArgs, .partitionBy = partitions, .orderBy = orderBy, .frame = frame } };
+    var filter: ?*const ast.Expr = null;
+    if (window.filterExpr) |pred| {
+        if (!isAggregateWindowFunction(window.func)) return error.InvalidSql;
+        const created = try ctx.node();
+        created.* = try predicateToBinary(ctx, pred, base);
+        filter = created;
+    }
+    return .{ .window = .{ .funcName = window.func, .argument = argument, .argument2 = argument2, .extraArgs = extraArgs, .partitionBy = partitions, .orderBy = orderBy, .frame = frame, .filter = filter, .distinct = window.distinct } };
 }
 
 fn mapJoinKind(kind: JoinKind) ast.JoinKind {

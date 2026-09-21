@@ -158,11 +158,15 @@ pub const WindowBound = union(enum) {
 /// Window frame unit (ROWS / RANGE / GROUPS).
 pub const WindowFrameKind = enum { rows, range, groups };
 
+/// Rows removed by a window frame's EXCLUDE clause; default keeps everything.
+pub const WindowExclude = enum { none, currentRow, group, ties };
+
 /// Window frame span with inclusive start/end bounds.
 pub const WindowFrameSpec = struct {
     kind: WindowFrameKind = .rows,
     start: WindowBound = .unboundedPreceding,
     end: WindowBound = .currentRow,
+    exclude: WindowExclude = .none,
 };
 
 /// `UNBOUNDED PRECEDING` frame bound.
@@ -216,6 +220,10 @@ pub const WindowBuilder = struct {
     orderCount: usize = 0,
     /// Optional frame span; null means the engine default.
     frame: ?WindowFrameSpec = null,
+    /// Optional FILTER predicate (aggregate windows only).
+    filterExpr: ?dslExpr.Expr = null,
+    /// Aggregate DISTINCT flag (`sum(DISTINCT x) OVER (...)`).
+    distinct: bool = false,
 
     fn withArg(col: anytype, func: []const u8) WindowBuilder {
         return .{ .func = func, .arg = toColumnRef(col) };
@@ -319,6 +327,49 @@ pub const WindowBuilder = struct {
     pub fn groupsFrom(self: @This(), start: WindowBound) @This() {
         return self.frameBetween(.groups, start, .currentRow);
     }
+
+    fn excludeMode(self: @This(), mode: WindowExclude) @This() {
+        var copy = self;
+        if (copy.frame) |*spec| {
+            spec.exclude = mode;
+        } else @panic("exclude() needs a frame: call rowsBetween/rangeBetween/groupsBetween first");
+        return copy;
+    }
+
+    /// `EXCLUDE CURRENT ROW`: drop just the current row from the frame.
+    pub fn excludeCurrentRow(self: @This()) @This() {
+        return self.excludeMode(.currentRow);
+    }
+
+    /// `EXCLUDE GROUP`: drop the current row plus its peers.
+    pub fn excludeGroup(self: @This()) @This() {
+        return self.excludeMode(.group);
+    }
+
+    /// `EXCLUDE TIES`: drop peers but keep the current row.
+    pub fn excludeTies(self: @This()) @This() {
+        return self.excludeMode(.ties);
+    }
+
+    /// `EXCLUDE NO OTHERS`: keep everything (the default, explicit).
+    pub fn excludeNoOthers(self: @This()) @This() {
+        return self.excludeMode(.none);
+    }
+
+    /// `FILTER (WHERE cond)` on an aggregate window; panics for
+    /// non-aggregates at build time (the engine rejects them anyway).
+    pub fn filter(self: @This(), cond: dslExpr.Expr) @This() {
+        var copy = self;
+        copy.filterExpr = cond;
+        return copy;
+    }
+
+    /// `DISTINCT` argument for aggregate windows (`sum(DISTINCT x) OVER ...`).
+    pub fn distinctArg(self: @This()) @This() {
+        var copy = self;
+        copy.distinct = true;
+        return copy;
+    }
 };
 
 /// `row_number() OVER (...)` window handle.
@@ -377,6 +428,36 @@ pub fn nthValue(col: anytype, n: i64) WindowBuilder {
     builder.argInt = n;
     builder.hasArgInt = true;
     return builder;
+}
+
+/// `sum(col) OVER (...)` aggregate window handle.
+pub fn sum(col: anytype) WindowBuilder {
+    return WindowBuilder.withArg(col, "sum");
+}
+
+/// `avg(col) OVER (...)` aggregate window handle.
+pub fn avg(col: anytype) WindowBuilder {
+    return WindowBuilder.withArg(col, "avg");
+}
+
+/// `min(col) OVER (...)` aggregate window handle.
+pub fn min(col: anytype) WindowBuilder {
+    return WindowBuilder.withArg(col, "min");
+}
+
+/// `max(col) OVER (...)` aggregate window handle.
+pub fn max(col: anytype) WindowBuilder {
+    return WindowBuilder.withArg(col, "max");
+}
+
+/// `count(col) OVER (...)` aggregate window handle.
+pub fn count(col: anytype) WindowBuilder {
+    return WindowBuilder.withArg(col, "count");
+}
+
+/// `count(*) OVER (...)` aggregate window handle.
+pub fn countStar() WindowBuilder {
+    return .{ .func = "count" };
 }
 
 fn rhsFrom(value: anytype) dslExpr.Rhs {

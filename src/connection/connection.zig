@@ -3579,6 +3579,38 @@ pub const Connection = struct {
         return false;
     }
 
+    /// True when a FILTER temp aliases live storage (row, parameters, or any
+    /// outer frame); such temps must not be freed. Function results may pass
+    /// a borrowed column through (e.g. `coalesce`), so the shape rule alone
+    /// (`binary`/`unary`/`function` own) is not sufficient.
+    fn filterTempBorrowsLiveStorage(value: Value, row: []const Value, parameters: []const Value, outer: ?*const OuterRow) bool {
+        if (valueBorrowsFrom(value, &.{ row, parameters })) return true;
+        var curr = outer;
+        while (curr) |ctx| {
+            if (valueBorrowsFrom(value, &.{ctx.values})) return true;
+            curr = ctx.prev;
+        }
+        return false;
+    }
+
+    /// True when the row passes an aggregate FILTER clause (or there is no
+    /// clause). Evaluates with `evalContext` and frees owned temps that
+    /// cannot alias live storage.
+    fn filterKeepsRow(self: *Connection, tbl: ?*const Table, row: []const Value, filter: ?*const ast.Expr, parameters: []const Value, outer: ?*const OuterRow) !bool {
+        const filterExpr = filter orelse return true;
+        const got = try self.evalContext(tbl, row, filterExpr.*, parameters, outer);
+        const owned = filterExpr.* == .binary or filterExpr.* == .unary or filterExpr.* == .function;
+        defer if (owned and !filterTempBorrowsLiveStorage(got, row, parameters, outer)) self.freeConcatText(got);
+        return functions.scalar.isTruthyValue(got);
+    }
+
+    /// Join-path FILTER check over one `JoinRow` pair (same evaluator the
+    /// aggregate argument uses: `evalJoinRowExpr`).
+    fn filterKeepsJoinRow(self: *Connection, pair: JoinRow, filter: ?*const ast.Expr, parameters: []const Value) !bool {
+        const outer: ?*const OuterRow = if (pair.frames.len == 0) null else &pair.frames[0];
+        return self.filterKeepsRow(null, &.{}, filter, parameters, outer);
+    }
+
     fn evalContext(self: *Connection, tbl: ?*const Table, row: []const Value, expr: ast.Expr, parameters: []const Value, outer: ?*const OuterRow) anyerror!Value {
         return switch (expr) {
             .literal => |value| value,
@@ -4185,10 +4217,12 @@ pub const Connection = struct {
                             var agg = functions.aggregate.AggState.init(self.allocator, kind, sep);
                             defer agg.deinit();
                             for (group.rows.items) |rowIndex| {
+                                const rowValues = tbl.rows.items[rowIndex].values;
+                                if (!try self.filterKeepsRow(tbl, rowValues, function.filter, parameters, null)) continue;
                                 if (function.argument.* == .wildcard) {
                                     agg.stepWildcard();
                                 } else {
-                                    const item = try self.eval(tbl, tbl.rows.items[rowIndex].values, function.argument.*, parameters);
+                                    const item = try self.eval(tbl, rowValues, function.argument.*, parameters);
                                     try agg.step(item, function.distinct);
                                 }
                             }
@@ -4224,10 +4258,12 @@ pub const Connection = struct {
                         var agg = functions.aggregate.AggState.init(self.allocator, kind, sep);
                         defer agg.deinit();
                         for (group.rows.items) |rowIndex| {
+                            const rowValues = tbl.rows.items[rowIndex].values;
+                            if (!try self.filterKeepsRow(tbl, rowValues, function.filter, parameters, null)) continue;
                             if (function.argument.* == .wildcard) {
                                 agg.stepWildcard();
                             } else {
-                                const item = try self.eval(tbl, tbl.rows.items[rowIndex].values, function.argument.*, parameters);
+                                const item = try self.eval(tbl, rowValues, function.argument.*, parameters);
                                 try agg.step(item, function.distinct);
                             }
                         }
@@ -4624,6 +4660,7 @@ pub const Connection = struct {
                     if (firstRow == null) firstRow = row.values;
                     for (value.projections, 0..) |p, i| {
                         if (aggStates[i]) |*agg| {
+                            if (!try self.filterKeepsRow(tbl, row.values, p.expr.function.filter, parameters, &rowOuter)) continue;
                             if (p.expr.function.argument.* == .wildcard) {
                                 agg.stepWildcard();
                             } else {
@@ -4648,6 +4685,7 @@ pub const Connection = struct {
                                 for (tbl.rows.items) |row| {
                                     const rowOuter = OuterRow{ .table = tbl, .alias = value.tableAlias, .values = row.values, .prev = outer };
                                     if (!try self.matchesContext(tbl, row.values, value.condition, parameters, &rowOuter)) continue;
+                                    if (!try self.filterKeepsRow(tbl, row.values, function.filter, parameters, &rowOuter)) continue;
                                     if (function.argument.* == .wildcard) {
                                         havingAgg.stepWildcard();
                                     } else {
@@ -5630,6 +5668,7 @@ pub const Connection = struct {
             if (firstPair == null) firstPair = pair;
             for (value.projections, 0..) |projection, index| {
                 if (aggStates[index]) |*agg| {
+                    if (!try self.filterKeepsJoinRow(pair, projection.expr.function.filter, parameters)) continue;
                     if (projection.expr.function.argument.* == .wildcard) {
                         agg.stepWildcard();
                     } else {
@@ -5735,6 +5774,7 @@ pub const Connection = struct {
                             defer agg.deinit();
                             for (group.rows.items) |pairIndex| {
                                 const pair = pairs[pairIndex];
+                                if (!try self.filterKeepsJoinRow(pair, function.filter, parameters)) continue;
                                 if (function.argument.* == .wildcard) {
                                     agg.stepWildcard();
                                 } else {
@@ -5780,6 +5820,7 @@ pub const Connection = struct {
                             defer agg.deinit();
                             for (group.rows.items) |pairIndex| {
                                 const pair = pairs[pairIndex];
+                                if (!try self.filterKeepsJoinRow(pair, function.filter, parameters)) continue;
                                 if (function.argument.* == .wildcard) {
                                     agg.stepWildcard();
                                 } else {

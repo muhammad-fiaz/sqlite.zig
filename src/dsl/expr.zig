@@ -138,11 +138,21 @@ pub const Projection = struct {
     caseSlot: u8 = 0,
     windowSlot: u8 = 0,
     alias: ?[]const u8 = null,
+    /// Optional FILTER predicate for aggregate projections.
+    filterExpr: ?Expr = null,
 
     /// Borrowed alias copy (`SELECT x AS name`). Does not allocate.
     pub fn as(self: @This(), name: []const u8) @This() {
         var copy = self;
         copy.alias = name;
+        return copy;
+    }
+
+    /// `FILTER (WHERE cond)` on an aggregate projection
+    /// (`t.col.sum().filter(t.other.gt(0))`). Non-aggregates fail at build.
+    pub fn filter(self: @This(), cond: Expr) @This() {
+        var copy = self;
+        copy.filterExpr = cond;
         return copy;
     }
 
