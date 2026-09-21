@@ -55,7 +55,7 @@ differential harness against SQLite and no fault-injection runner;
 | 5 | JOINs (INNER/LEFT, USING/NATURAL, multi-key, UPDATE..FROM) | `connection/connection.zig` (`selectJoin`, `updateFrom`, ambiguity checks), `dsl/keys.zig` | `connection.zig` join tests; `examples/11,42,59,60` | Covered | `TODO(join)`: RIGHT/FULL OUTER JOIN unsupported by design |
 | 6 | Subqueries (scalar, IN, EXISTS, derived tables) | `connection/connection.zig` (`executeWithOuter`, `materializeDerivedTable`), `dsl/ast_builder.zig` | `connection.zig` subquery tests; `examples/25,43,44,45,54,63` | Covered | `TODO(subq)`: correlated-subquery performance, derived-table pushdown |
 | 7 | CTEs incl. recursive (`WITH`, `WITH RECURSIVE`, compound) | `connection/connection.zig` (`setupCtes`, `executeWith`, `executeCompound`), `sql/parser.zig` | `connection.zig` CTE tests; `examples/24,29,32,51,61` | Covered | `TODO(cte)`: recursion-depth and cycle diagnostics |
-| 8 | Window functions (ROW_NUMBER, RANK, LAG/LEAD, PARTITION BY) | `sql/functions/window.zig`, `dsl/column.zig`, `dsl/ast_builder.zig` | `window.zig` unit tests; `examples/64` | Partial | `TODO(window)`: `ROWS`/`RANGE`/`GROUPS` frames, exclusions, `FILTER` |
+| 8 | Window functions (ROW_NUMBER, RANK, LAG/LEAD, PARTITION BY) | `sql/functions/window.zig`, `sql/parser.zig`, `dsl/column.zig`, `dsl/ast_builder.zig` | `window.zig` unit tests; `parser.zig` named-window tests; `examples/64` | Covered | `TODO(window)`: `RANGE`/`GROUPS` frame edge parity; `EXCLUDE TIES` corner cases |
 | 9 | Triggers (BEFORE/AFTER INSERT/UPDATE/DELETE, WHEN, NEW/OLD) | `catalog/schema.zig` (`Trigger`), `connection/connection.zig` (`fireTriggers`, `renderTriggerBody`) | `connection.zig` trigger tests; `examples/23,57` | Partial | `TODO(trigger)`: `INSTEAD OF` missing (`ast.zig` notes it); recursion policy |
 | 10 | Views (CREATE VIEW, read path, updatable subset) | `catalog/schema.zig` (`View`), `connection/connection.zig` (`createViewCommand`) | `connection.zig` view tests; `examples/22` | Partial | `TODO(view)`: writable views limited to `viewTargetsSingleTable`; `TEMP` scoping |
 | 11 | Indexes (UNIQUE, partial, expression, EXPLAIN QUERY PLAN) | `catalog/schema.zig` (`Index`), `btree/index_btree.zig`, `plan/planner.zig`, `connection/connection.zig` (`plannedIndices`) | source-local `btree`/`plan` tests; `examples/21,33,68` | Covered | `TODO(index)`: covering-index fast path, multi-index AND/OR planning |
@@ -89,8 +89,9 @@ differential harness against SQLite and no fault-injection runner;
 `MATCH` in `src/connection/pattern.zig` and ordering in
 `src/connection/compare.zig` (both registered in `src/sqlite.zig` tests).
 `connection.zig` keeps `NULL` propagation, allocation, and I/O; the new
-modules stay dependency-free. Window frames are the largest query
-gap: partition/order paths work (`examples/64`), frame clauses do not.
+modules stay dependency-free. Window partition/order, `ROWS`/`RANGE`/
+`GROUPS` frames, `EXCLUDE`, `FILTER`, and named `WINDOW` clauses all work
+(`examples/64`).
 
 ### Schema objects (rows 9–13, 19–23)
 

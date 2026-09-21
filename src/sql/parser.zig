@@ -484,11 +484,12 @@ pub const Parser = struct {
 
     /// Merge an OVER overlay onto a named base spec. Overlay slices are
     /// adopted (caller surrenders them); base parts are deep-copied so the
-    /// stored definition stays intact for other uses. Overriding PARTITION
-    /// BY, ORDER BY, or the frame is InvalidSql, like the reference
+    /// stored definition stays intact for other uses. An overlay PARTITION
+    /// is always InvalidSql; overlay ORDER BY or frame is InvalidSql when
+    /// the base already sets the same clause, matching the reference
     /// ("cannot override ... of window").
     fn resolveWindowBase(self: *Parser, overlay: WindowSpec, base: WindowSpec) !WindowSpec {
-        if (overlay.partitionBy.len != 0 and base.partitionBy.len != 0) return Error.InvalidSql;
+        if (overlay.partitionBy.len != 0) return Error.InvalidSql;
         if (overlay.orderBy.len != 0 and base.orderBy.len != 0) return Error.InvalidSql;
         if (overlay.frame != null and base.frame != null) return Error.InvalidSql;
         var baseParts: []ast.Expr = &.{};
@@ -2299,7 +2300,10 @@ pub const Parser = struct {
 
     fn parseSelect(self: *Parser) !ast.Statement {
         var projections = std.ArrayList(ast.Projection).empty;
-        errdefer projections.deinit(self.allocator);
+        errdefer {
+            for (projections.items) |item| freeParserExpr(self.allocator, item.expr);
+            projections.deinit(self.allocator);
+        }
         const distinct = self.acceptWord("distinct");
         if (!distinct) _ = self.acceptWord("all");
         while (true) {
@@ -2457,10 +2461,9 @@ pub const Parser = struct {
             for (namedWindows.items) |def| self.freeWindowSpec(def.spec);
             namedWindows.deinit(self.allocator);
         }
-        if (false and self.acceptWord("window")) {
+        if (self.acceptWord("window")) {
             while (true) {
                 const defName = try self.word();
-                for (namedWindows.items) |def| if (std.ascii.eqlIgnoreCase(def.name, defName)) return Error.InvalidSql;
                 try self.requireWord("as");
                 var spec = try self.parseWindowSpec();
                 errdefer self.freeWindowSpec(spec);
@@ -2472,17 +2475,16 @@ pub const Parser = struct {
                 try namedWindows.append(self.allocator, .{ .name = defName, .spec = spec });
                 if (!self.acceptTag(.comma)) break;
             }
+            if (self.acceptWord("window")) return Error.InvalidSql;
         }
         for (projections.items) |*proj| {
-            _ = proj;
-            // try self.resolveWindowRefs(&proj.expr, namedWindows.items);
+            try self.resolveWindowRefs(&proj.expr, namedWindows.items);
         }
         if (having) |*have| {
-            _ = have;
-            // try self.resolveWindowRefs(&have.left, namedWindows.items);
-            // try self.resolveWindowRefs(&have.right, namedWindows.items);
+            try self.resolveWindowRefs(&have.left, namedWindows.items);
+            try self.resolveWindowRefs(&have.right, namedWindows.items);
         }
-        // if (condition) |conds| try self.resolveWindowRefsInConditions(conds, namedWindows.items);
+        if (condition) |conds| try self.resolveWindowRefsInConditions(conds, namedWindows.items);
         var orders = std.ArrayList(ast.Order).empty;
         errdefer orders.deinit(self.allocator);
         if (self.acceptWord("order")) {
@@ -2814,6 +2816,67 @@ test "parser parses window functions with partition, order, and frame" {
     try std.testing.expectEqual(ast.WindowFrameKind.rows, winExpr.window.frame.?.kind);
     try std.testing.expectEqual(ast.WindowFrameBound.unboundedPreceding, winExpr.window.frame.?.start);
     try std.testing.expectEqual(ast.WindowFrameBound.currentRow, winExpr.window.frame.?.end.?);
+}
+
+test "parser resolves named WINDOW clause references" {
+    var p = try Parser.init(std.testing.allocator, "SELECT row_number() OVER w FROM t WINDOW w AS (PARTITION BY dept ORDER BY salary);");
+    defer p.deinit();
+    var s = try p.parse();
+    defer ast.deinit(std.testing.allocator, &s);
+    try std.testing.expect(s == .select);
+    const win = s.select.projections[0].expr;
+    try std.testing.expect(win == .window);
+    try std.testing.expectEqual(@as(?[]const u8, null), win.window.base);
+    try std.testing.expectEqual(@as(usize, 1), win.window.partitionBy.len);
+    try std.testing.expectEqual(@as(usize, 1), win.window.orderBy.len);
+
+    var p2 = try Parser.init(std.testing.allocator, "SELECT sum(x) OVER (w ORDER BY y) FROM t WINDOW w AS (PARTITION BY a);");
+    defer p2.deinit();
+    var s2 = try p2.parse();
+    defer ast.deinit(std.testing.allocator, &s2);
+    const w2 = s2.select.projections[0].expr;
+    try std.testing.expect(w2 == .window);
+    try std.testing.expectEqual(@as(?[]const u8, null), w2.window.base);
+    try std.testing.expectEqual(@as(usize, 1), w2.window.partitionBy.len);
+    try std.testing.expectEqual(@as(usize, 1), w2.window.orderBy.len);
+
+    var p3 = try Parser.init(std.testing.allocator, "SELECT row_number() OVER w2 FROM t WINDOW w AS (PARTITION BY a), w2 AS (w ORDER BY x);");
+    defer p3.deinit();
+    var s3 = try p3.parse();
+    defer ast.deinit(std.testing.allocator, &s3);
+    const w3 = s3.select.projections[0].expr;
+    try std.testing.expect(w3 == .window);
+    try std.testing.expectEqual(@as(?[]const u8, null), w3.window.base);
+    try std.testing.expectEqual(@as(usize, 1), w3.window.partitionBy.len);
+    try std.testing.expectEqual(@as(usize, 1), w3.window.orderBy.len);
+
+    var p4 = try Parser.init(std.testing.allocator, "SELECT row_number() OVER nope FROM t WINDOW w AS ();");
+    defer p4.deinit();
+    try std.testing.expectError(error.InvalidSql, p4.parse());
+
+    var p5 = try Parser.init(std.testing.allocator, "SELECT row_number() OVER (w PARTITION BY b) FROM t WINDOW w AS (PARTITION BY a);");
+    defer p5.deinit();
+    try std.testing.expectError(error.InvalidSql, p5.parse());
+
+    var p6 = try Parser.init(std.testing.allocator, "SELECT sum(x) FILTER (WHERE x > 0) OVER w FROM t WINDOW w AS (ORDER BY x);");
+    defer p6.deinit();
+    var s6 = try p6.parse();
+    defer ast.deinit(std.testing.allocator, &s6);
+    const w6 = s6.select.projections[0].expr;
+    try std.testing.expect(w6 == .window);
+    try std.testing.expect(w6.window.filter != null);
+
+    var p7 = try Parser.init(std.testing.allocator, "SELECT 1 window w AS () window v AS ();");
+    defer p7.deinit();
+    try std.testing.expectError(error.InvalidSql, p7.parse());
+
+    var p8 = try Parser.init(std.testing.allocator, "SELECT row_number() OVER w FROM t WINDOW w AS (ORDER BY x), w AS (ORDER BY y);");
+    defer p8.deinit();
+    var s8 = try p8.parse();
+    defer ast.deinit(std.testing.allocator, &s8);
+    const w8 = s8.select.projections[0].expr;
+    try std.testing.expect(w8 == .window);
+    try std.testing.expectEqual(@as(usize, 1), w8.window.orderBy.len);
 }
 
 test "parser parses returning clause for insert, update, and delete" {
