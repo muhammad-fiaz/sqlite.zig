@@ -32,6 +32,15 @@ pub fn main() !void {
     var rawFramed = try db.exec("SELECT emp, FIRST_VALUE(emp) OVER (ORDER BY salary ROWS BETWEEN 1 PRECEDING AND CURRENT ROW), NTILE(2) OVER (ORDER BY salary) FROM w_emp ORDER BY salary;");
     defer rawFramed.deinit();
     if (rawFramed.count() != 5) return error.VerificationFailed;
+    var rawNamed = try db.exec("SELECT emp, ROW_NUMBER() OVER w, RANK() OVER w FROM w_emp WINDOW w AS (PARTITION BY dept ORDER BY salary) ORDER BY dept, salary;");
+    defer rawNamed.deinit();
+    if (rawNamed.count() != 5) return error.VerificationFailed;
+    if (rawNamed.at(0)[1].integer != 1) return error.VerificationFailed;
+    const shared = sqlite.rowNumber().partitionBy(t_db_w_emp.column("dept")).orderBy(t_db_w_emp.column("salary").asc());
+    var dynShared = try t_db_w_emp.select(.{ t_db_w_emp.column("emp"), shared, sqlite.rowNumber().partitionBy(t_db_w_emp.column("dept")).orderBy(t_db_w_emp.column("salary").asc()) }).orderBy(t_db_w_emp.column("salary").asc()).fetch();
+    defer dynShared.deinit();
+    if (dynShared.count() != rawNamed.count()) return error.VerificationFailed;
+    if (dynShared.at(0)[1].integer != rawNamed.at(0)[1].integer) return error.VerificationFailed;
     var dynFramed = try t_db_w_emp.select(.{ t_db_w_emp.column("emp"), sqlite.firstValue(t_db_w_emp.column("emp")).orderBy(t_db_w_emp.column("salary").asc()).rowsBetween(sqlite.preceding(1), sqlite.currentRow()), sqlite.ntile(2).orderBy(t_db_w_emp.column("salary").asc()) }).orderBy(t_db_w_emp.column("salary").asc()).fetch();
     defer dynFramed.deinit();
     if (dynFramed.count() != 5) return error.VerificationFailed;

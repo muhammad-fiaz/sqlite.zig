@@ -9376,6 +9376,27 @@ test "Phase 7: window functions" {
     try std.testing.expectEqual(@as(usize, 5), res3.count());
     try std.testing.expectEqual(@as(i64, 1000), res3.rows[0][2].integer);
     try std.testing.expectEqual(@as(i64, 2500), res3.rows[1][2].integer);
+
+    var named1 = try db.exec("SELECT emp, ROW_NUMBER() OVER w, RANK() OVER w FROM win_tbl WINDOW w AS (PARTITION BY dept ORDER BY salary) ORDER BY dept, salary;");
+    defer named1.deinit();
+    try std.testing.expectEqual(@as(usize, 5), named1.count());
+    try std.testing.expectEqual(@as(i64, 1), named1.at(0)[1].integer);
+    try std.testing.expectEqual(@as(i64, 1), named1.at(0)[2].integer);
+    try std.testing.expectEqual(@as(i64, 2), named1.at(1)[1].integer);
+
+    var named2 = try db.exec("SELECT emp, SUM(salary) OVER (w ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM win_tbl WINDOW w AS (ORDER BY salary) ORDER BY salary;");
+    defer named2.deinit();
+    try std.testing.expectEqual(@as(usize, 5), named2.count());
+    try std.testing.expectEqual(@as(i64, 1000), named2.at(0)[1].integer);
+    try std.testing.expectEqual(@as(i64, 2500), named2.at(1)[1].integer);
+
+    var chained = try db.exec("SELECT emp, ROW_NUMBER() OVER w2 FROM win_tbl WINDOW w AS (PARTITION BY dept), w2 AS (w ORDER BY salary) ORDER BY dept, salary;");
+    defer chained.deinit();
+    try std.testing.expectEqual(@as(usize, 5), chained.count());
+    try std.testing.expectEqual(@as(i64, 1), chained.at(0)[1].integer);
+
+    try std.testing.expectError(error.InvalidSql, db.exec("SELECT ROW_NUMBER() OVER nope FROM win_tbl;"));
+    try std.testing.expectError(error.InvalidSql, db.exec("SELECT ROW_NUMBER() OVER (w PARTITION BY dept) FROM win_tbl WINDOW w AS (PARTITION BY emp);"));
 }
 
 test "dynamic DSL executes through direct AST without SQL round-trip" {
