@@ -18,7 +18,11 @@ const col = table.columns[0]; // .name, .typeName, .primaryKey, .notNull,
 // .onDelete, .onUpdate
 ```
 
-`TableDef.column(name)` resolves a column case-insensitively.
+Column lookup on a live table is case-insensitive:
+
+```zig
+const found = schema.find("USERS"); // same table as "users"
+```
 
 ## Schema Management
 
@@ -53,16 +57,15 @@ Zig mapping: `int`/`bool` to `INTEGER`, `float` to `REAL`,
 ## Index Definitions
 
 ```zig
-const indexDef = IndexDef{
-    .name = "idx_users_email",
-    .table = "users",
-    .columns = &.{"email"},
-    .unique = true,
-};
+// Stored index over a table's columns, with optional partial predicate
+// and expression keys:
+const index = schema.findIndex("idx_users_email").?;
+// .name, .table, .columns, .keyExprs, .unique, .whereExpr, .whereSql
 ```
 
-Only plain and unique column indexes exist (no partial or expression
-indexes). Use `db.createIndex(Table, name, cols, unique)`.
+Plain, unique, partial (`WHERE`), and expression indexes are supported.
+Use `db.createIndex(Table, name, cols, unique)`,
+`db.createIndexWhere(...)`, or `db.createIndexExpr(...)`.
 
 ## Key Definitions
 

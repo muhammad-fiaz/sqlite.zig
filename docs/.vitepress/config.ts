@@ -331,6 +331,7 @@ export default defineConfig({
             { text: "Migration", link: "/api/migration" },
             { text: "Errors", link: "/api/errors" },
             { text: "Version", link: "/api/version" },
+            { text: "Compatibility", link: "/api/compatibility" },
           ],
         },
       ],

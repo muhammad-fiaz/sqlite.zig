@@ -16,6 +16,7 @@ Error values returned by the sqlite.zig engine. The full set lives in
 | `UnexpectedToken` | Parser encountered an unexpected token |
 | `UnknownTable` | Referenced table does not exist in the schema |
 | `UnknownColumn` | Referenced column does not exist in the table |
+| `AmbiguousColumn` | Column reference matches more than one table |
 | `ColumnExists` | Column already exists |
 | `TableExists` | Table already exists |
 | `IndexExists` | Index already exists |
@@ -28,8 +29,13 @@ Error values returned by the sqlite.zig engine. The full set lives in
 | `ConstraintViolation` | UNIQUE, NOT NULL, CHECK, or FOREIGN KEY constraint violated |
 | `NotInTransaction` | Commit/rollback attempted without an active transaction |
 | `TransactionActive` | Operation (e.g. `VACUUM`, nested `BEGIN`) rejected while a transaction is active |
+| `UnknownDatabase` | No attached database with that name |
+| `IntegerOverflow` | Integer arithmetic overflowed |
 | `Unsupported` | Feature is explicitly unsupported (never silently faked) |
 | `SchemaMismatch` | Database schema does not match the declared table |
+| `TriggerDepthExceeded` | Triggers nested too deep |
+| `NoRows` | Query returned no rows where exactly one was required |
+| `TooManyRows` | Query returned more than one row where exactly one was required |
 | `InvalidHeader` | Database file header is invalid |
 | `InvalidPageSize` | Database page size is invalid |
 | `InvalidRecord` | Database record encoding is invalid |
@@ -68,8 +74,9 @@ Invalid SQL returns a syntax error rather than succeeding:
 try std.testing.expectError(error.UnexpectedToken, db.exec("SELECT FROM users;"));
 ```
 
-Unsupported statements (for example `ATTACH`) return `error.Unsupported`
-instead of pretending to work.
+Unsupported statements (for example an unknown `PRAGMA`, or a
+`CREATE VIRTUAL TABLE` module other than `generate_series`) return
+`error.Unsupported` instead of pretending to work.
 
 ## Error Recovery
 

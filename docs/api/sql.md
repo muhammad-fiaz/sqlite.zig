@@ -23,6 +23,9 @@ defer rows.deinit();
 of the final statement. For `?` placeholders with bound values, use prepared
 statements below.
 
+Single quotes inside string literals are escaped by doubling them, as in
+SQLite: `'o''brien'` stores `o'brien`.
+
 ## Prepared statements
 
 ```zig
