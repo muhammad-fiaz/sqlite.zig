@@ -93,7 +93,7 @@ jobs:
   cross-check:
     name: Cross Check (${{ matrix.name }})
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -165,14 +165,18 @@ jobs:
               ;;
           esac
 
-      - name: Build (Debug)
-        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=Debug
+      # Compile-only checks: `zig build` would install all 70 example
+      # binaries per target/mode and exceeds job time limits, so verify the
+      # library and test suite compile instead. Native `test` jobs above
+      # already build and run everything, including examples.
+      - name: Check (Debug)
+        run: zig build check -Dtarget=${{ matrix.target }} -Doptimize=Debug
         env:
           ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
           ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
 
-      - name: Build (ReleaseFast)
-        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast
+      - name: Check (ReleaseFast)
+        run: zig build check -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast
         env:
           ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
           ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache

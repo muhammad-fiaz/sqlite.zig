@@ -41,6 +41,18 @@ pub fn build(b: *std.Build) void {
     );
     testStep.dependOn(&runTests.step);
 
+    // Compile-only verification: builds the library and the test binary
+    // without installing the 70 example executables and without executing
+    // anything. Cross-check CI jobs use this so one target costs two
+    // compilations instead of 140+; use `test` or the default install step
+    // when examples or execution are needed.
+    const checkStep = b.step(
+        "check",
+        "Compile the library and test suite without running",
+    );
+    checkStep.dependOn(&library.step);
+    checkStep.dependOn(&tests.step);
+
     const buildExamples = b.step(
         "examples",
         "Build all sqlite.zig examples",
