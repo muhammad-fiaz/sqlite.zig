@@ -11,6 +11,7 @@ const ast = @import("ast.zig");
 const Value = @import("../vm/value.zig").Value;
 const functions = @import("functions.zig");
 const coerce = @import("coerce.zig");
+const compareLib = @import("../connection/compare.zig");
 
 /// Hard cap on nested-expression depth; hostile `((((...))))` fails closed.
 pub const max_eval_depth: usize = 200;
@@ -87,6 +88,20 @@ fn compareValues(left: Value, op: ast.CompareOp, right: Value) bool {
         .greaterEqual => cmpResult >= 0,
         else => false,
     };
+}
+
+/// Expression-position `IS` equality: NULL-safe, numerics across
+/// int/real (via `compareValues`), text-vs-text with an explicit COLLATE
+/// name (`NOCASE` folds ASCII). Used by `isOp`/`isNotOp`, which also cover
+/// `IS [NOT] DISTINCT FROM` lowered from expression position.
+fn isEqual(left: Value, right: Value, collate: ?[]const u8) bool {
+    if (left == .null or right == .null) return left == .null and right == .null;
+    if (collate) |name| if (std.ascii.eqlIgnoreCase(name, "nocase") and left == .text and right == .text) {
+        if (left.text.len != right.text.len) return false;
+        for (left.text, right.text) |a, b| if (std.ascii.toLower(a) != std.ascii.toLower(b)) return false;
+        return true;
+    };
+    return compareValues(left, .equal, right);
 }
 
 /// SQLite storage-class rank: NULL(0) < numeric(1) < text(2) < blob(3).
@@ -245,11 +260,13 @@ fn evalDepth(allocator: std.mem.Allocator, columnNames: []const []const u8, row:
                 const combined = try std.fmt.allocPrint(allocator, "{s}{s}", .{ leftStr, rightStr });
                 return .{ .text = combined };
             }
-            if (bin.op == .isOp) {
-                return .{ .integer = if (left.sameValue(right)) 1 else 0 };
-            }
-            if (bin.op == .isNotOp) {
-                return .{ .integer = if (!left.sameValue(right)) 1 else 0 };
+            if (bin.op == .isOp or bin.op == .isNotOp) {
+                // `IS [NOT] [DISTINCT FROM]` lowers here with an explicit
+                // COLLATE wrapped around either side; the collation applies
+                // to the (null-safe, numeric-folding) equality.
+                const collation = if (bin.left.* == .collate) bin.left.*.collate.name else if (bin.right.* == .collate) bin.right.*.collate.name else null;
+                const eq = isEqual(left, right, collation);
+                return .{ .integer = if ((bin.op == .isOp) == eq) 1 else 0 };
             }
             if (bin.op == .equal or bin.op == .notEqual or bin.op == .less or bin.op == .lessEqual or bin.op == .greater or bin.op == .greaterEqual) {
                 const cmpOp: ast.CompareOp = switch (bin.op) {
@@ -262,6 +279,14 @@ fn evalDepth(allocator: std.mem.Allocator, columnNames: []const []const u8, row:
                     else => unreachable,
                 };
                 if (left == .null or right == .null) return .null;
+                // An explicit COLLATE on either operand selects the
+                // comparison collation; without one the local binary
+                // ordering applies (it keeps numeric < text < blob ranks,
+                // which the shared helper inverts for text-vs-numeric).
+                // RTRIM and outer `(a = b) COLLATE name` wrappers still
+                // evaluate binary (see the row-2 matrix TODO).
+                const collation = if (bin.left.* == .collate) bin.left.*.collate.name else if (bin.right.* == .collate) bin.right.*.collate.name else null;
+                if (collation) |_| return .{ .integer = if (compareLib.compareCollated(left, cmpOp, right, collation)) 1 else 0 };
                 return .{ .integer = if (compareValues(left, cmpOp, right)) 1 else 0 };
             }
             if (left == .null or right == .null) return .null;

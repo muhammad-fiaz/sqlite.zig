@@ -151,7 +151,10 @@ Standard comparison operators: `=`, `!=`, `<>`, `<`, `>`, `<=`, `>=`, `LIKE`, `N
 same rule applies to bare `HAVING` expressions. `HAVING` accepts compound
 `AND`/`OR` arms (for example `HAVING COUNT(*) > 1 OR SUM(amount) > 25`)
 with the same precedence as `WHERE`; the DSL mirrors this with
-`.having(...).andHaving(...).orHaving(...)`.
+`.having(...).andHaving(...).orHaving(...)`. `HAVING` also accepts the
+`IS [NOT] NULL`, `IS [NOT] <value>`, and `IS [NOT] DISTINCT FROM` arms,
+and bare `NULL`/`TRUE`/`FALSE` in `WHERE` are literals (so
+`WHERE NOT nullable_col` drops nulls instead of keeping them).
 
 Connection write counters are readable with `LAST_INSERT_ROWID()`,
 `CHANGES()`, and `TOTAL_CHANGES()`.

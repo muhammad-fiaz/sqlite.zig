@@ -105,6 +105,15 @@ pub fn compareCollated(left: Value, op: ast.CompareOp, right: Value, collate: ?[
     };
 }
 
+/// Null-safe equality for `IS` / `IS NOT DISTINCT FROM`: two `NULL`s are
+/// equal, a `NULL` against anything else is not, numerics compare across
+/// `integer`/`real`, and text-vs-text honors `COLLATE` (`NOCASE` folds
+/// ASCII). Matches the reference, unlike strict `sameValue` identity.
+pub fn nullSafeEqual(left: Value, right: Value, collate: ?[]const u8) bool {
+    if (left == .null or right == .null) return left == .null and right == .null;
+    return compareCollated(left, .equal, right, collate);
+}
+
 /// Strict value identity: same storage type and equal payload.
 ///
 /// Unlike `compare` (which folds numerics across `integer`/`real`),
@@ -199,6 +208,18 @@ test "compareCollated folds ascii case for text under nocase" {
     try std.testing.expect(compareCollated(lower, .less, later, "nocase"));
     try std.testing.expect(compareCollated(later, .greater, lower, "NOCASE"));
     try std.testing.expect(!compareCollated(lower, .like, upper, "NOCASE"));
+}
+
+test "nullSafeEqual is null safe numeric folding and collated" {
+    try std.testing.expect(nullSafeEqual(.null, .null, null));
+    try std.testing.expect(!nullSafeEqual(.null, .{ .integer = 0 }, null));
+    try std.testing.expect(!nullSafeEqual(.{ .integer = 0 }, .null, null));
+    try std.testing.expect(nullSafeEqual(.{ .integer = 1 }, .{ .real = 1.0 }, null));
+    try std.testing.expect(nullSafeEqual(.{ .text = "a" }, .{ .text = "a" }, null));
+    try std.testing.expect(!nullSafeEqual(.{ .text = "a" }, .{ .text = "A" }, null));
+    try std.testing.expect(nullSafeEqual(.{ .text = "a" }, .{ .text = "A" }, "NOCASE"));
+    try std.testing.expect(!nullSafeEqual(.{ .text = "a" }, .{ .text = "b" }, "NOCASE"));
+    try std.testing.expect(!nullSafeEqual(.{ .integer = 1 }, .{ .text = "1" }, null));
 }
 
 test "sameValue is strict across storage types" {

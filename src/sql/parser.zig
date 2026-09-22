@@ -1821,7 +1821,12 @@ pub const Parser = struct {
             else
                 null;
             if (op == null) return left;
-            left = try self.binaryNode(op.?, left, try self.parseBitOr());
+            // A trailing COLLATE binds to the right operand (matching the
+            // `IS` branch below), so evaluators see it on the operand
+            // instead of wrapped around the whole comparison.
+            var right = try self.parseBitOr();
+            right = try self.parseCollateSuffix(right);
+            left = try self.binaryNode(op.?, left, right);
         }
     }
 
@@ -2166,6 +2171,11 @@ pub const Parser = struct {
                 } else if (self.current().tag == .number or self.current().tag == .string) {
                     leftExpr = try self.parseLiteral();
                     column = "";
+                } else if (self.current().tag == .word and !self.current().quoted and (std.ascii.eqlIgnoreCase(self.current().text, "null") or std.ascii.eqlIgnoreCase(self.current().text, "true") or std.ascii.eqlIgnoreCase(self.current().text, "false"))) {
+                    // Bare NULL/TRUE/FALSE are literals, never column names.
+                    const keyword = self.advance().text;
+                    leftExpr = if (std.ascii.eqlIgnoreCase(keyword, "null")) .{ .literal = .null } else if (std.ascii.eqlIgnoreCase(keyword, "true")) .{ .literal = .{ .integer = 1 } } else .{ .literal = .{ .integer = 0 } };
+                    column = "";
                 } else {
                     const qualified = try self.qualifiedName();
                     column = if (qualified.table.len == 0) qualified.column else blk: {
@@ -2499,6 +2509,18 @@ pub const Parser = struct {
                 } else if (self.acceptTag(.greaterEqual)) {
                     op = .greaterEqual;
                     right = try self.parseBitOr();
+                } else if (self.acceptWord("is")) {
+                    const isNot = self.acceptWord("not");
+                    if (self.acceptWord("null")) {
+                        op = if (isNot) .isNotNull else .isNull;
+                    } else if (self.acceptWord("distinct")) {
+                        try self.requireWord("from");
+                        op = if (isNot) .isNotDistinct else .isDistinct;
+                        right = try self.parseBitOr();
+                    } else {
+                        op = if (isNot) .isNotValue else .isValue;
+                        right = try self.parseBitOr();
+                    }
                 }
                 try havingItems.append(self.allocator, .{ .left = left, .op = op, .right = right, .joinOr = joinOr });
                 if (self.acceptWord("or")) {

@@ -3507,6 +3507,29 @@ pub const Connection = struct {
         return compareBridge.compareCollated(left, op, right, collate);
     }
 
+    /// Collation carried by a `.collate` operand wrapper, if any.
+    fn collateOfExpr(expr: ast.Expr) ?[]const u8 {
+        return if (expr == .collate) expr.collate.name else null;
+    }
+
+    fn nullSafeEqual(left: Value, right: Value, collate: ?[]const u8) bool {
+        return compareBridge.nullSafeEqual(left, right, collate);
+    }
+
+    /// HAVING arm comparison: null checks and null-safe equality for the
+    /// IS family (which plain `compare` reports false for), ordering
+    /// comparison otherwise. HAVING arms carry no COLLATE, so the binary
+    /// default applies.
+    fn havingCompare(leftValue: Value, op: ast.CompareOp, rightValue: Value) bool {
+        return switch (op) {
+            .isNull => leftValue == .null,
+            .isNotNull => leftValue != .null,
+            .isValue, .isNotDistinct => compareBridge.nullSafeEqual(leftValue, rightValue, null),
+            .isNotValue, .isDistinct => !compareBridge.nullSafeEqual(leftValue, rightValue, null),
+            else => compareBridge.compare(leftValue, op, rightValue),
+        };
+    }
+
     fn matches(self: *Connection, tbl: *const Table, row: []const Value, condition: ?ast.Conditions, parameters: []const Value) anyerror!bool {
         return self.matchesContext(tbl, row, condition, parameters, null);
     }
@@ -3571,7 +3594,7 @@ pub const Connection = struct {
                     defer if (item.leftExpr) |left| {
                         if (left == .binary or left == .unary or left == .function) self.freeConcatText(current);
                     };
-                    const base: bool = if (item.op == .isTrue) functions.scalar.isTruthyValue(current) else if (item.op == .isNull) current == .null else if (item.op == .isNotNull) current != .null else if (item.op == .isValue) sameValue(current, try self.evalContext(tbl, row, item.value, parameters, outer)) else if (item.op == .isNotValue) !sameValue(current, try self.evalContext(tbl, row, item.value, parameters, outer)) else if (item.op == .isDistinct) !sameValue(current, try self.evalContext(tbl, row, item.value, parameters, outer)) else if (item.op == .isNotDistinct) sameValue(current, try self.evalContext(tbl, row, item.value, parameters, outer)) else if (item.op == .in and item.subquery != null) inSubquery: {
+                    const base: bool = if (item.op == .isTrue) functions.scalar.isTruthyValue(current) else if (item.op == .isNull) current == .null else if (item.op == .isNotNull) current != .null else if (item.op == .isValue) nullSafeEqual(current, try self.evalContext(tbl, row, item.value, parameters, outer), item.collate) else if (item.op == .isNotValue) !nullSafeEqual(current, try self.evalContext(tbl, row, item.value, parameters, outer), item.collate) else if (item.op == .isDistinct) !nullSafeEqual(current, try self.evalContext(tbl, row, item.value, parameters, outer), item.collate) else if (item.op == .isNotDistinct) nullSafeEqual(current, try self.evalContext(tbl, row, item.value, parameters, outer), item.collate) else if (item.op == .in and item.subquery != null) inSubquery: {
                         const sql = item.subquery orelse return error.InvalidSql;
                         const currentOuter = OuterRow{ .table = tbl, .alias = if (outer) |o| (if (o.table == tbl) o.alias else null) else null, .values = row, .prev = if (outer != null and outer.?.table == tbl) outer.?.prev else outer };
                         var subquery = try self.executeWithOuter(sql, parameters, &currentOuter);
@@ -3636,10 +3659,20 @@ pub const Connection = struct {
                         const pattern = try self.evalContext(tbl, row, item.value, parameters, outer);
                         const tri = try self.evalMatch(current, pattern);
                         break :matchPattern if (tri) |matched| (if (item.op == .match) matched else !matched) else false;
-                    } else compareCollated(current, item.op, try self.evalContext(tbl, row, item.value, parameters, outer), item.collate);
+                    } else collatedCompare: {
+                        // The clause COLLATE wins; otherwise an operand
+                        // wrapper left by the parser selects the collation
+                        // (e.g. `x = 'A' COLLATE NOCASE`), else binary.
+                        const collation = item.collate orelse collateOfExpr(item.value) orelse if (item.leftExpr) |left| collateOfExpr(left) else null;
+                        break :collatedCompare compareCollated(current, item.op, try self.evalContext(tbl, row, item.value, parameters, outer), collation);
+                    };
                     if (item.negated) {
                         if (base) break :blk false;
-                        const nullSafe = item.op == .isNull or item.op == .isNotNull or item.op == .isValue or item.op == .isNotValue or item.op == .isDistinct or item.op == .isNotDistinct or item.op == .isTrue;
+                        // Bare `NOT <expr>` stays three-valued: a NULL input
+                        // is NULL (dropped), never negated to true. The other
+                        // null-safe ops already produced a proper boolean.
+                        if (item.op == .isTrue) break :blk current != .null;
+                        const nullSafe = item.op == .isNull or item.op == .isNotNull or item.op == .isValue or item.op == .isNotValue or item.op == .isDistinct or item.op == .isNotDistinct;
                         if (!nullSafe) {
                             if (current == .null) break :blk false;
                             const v = try self.evalContext(tbl, row, item.value, parameters, outer);
@@ -3793,11 +3826,10 @@ pub const Connection = struct {
             self.freeConcatText(rightText);
             return if (leftText == .blob or rightText == .blob) .{ .blob = output } else .{ .text = output };
         }
-        if (binary.op == .isOp) {
-            return .{ .integer = if (sameValue(left, right)) 1 else 0 };
-        }
-        if (binary.op == .isNotOp) {
-            return .{ .integer = if (!sameValue(left, right)) 1 else 0 };
+        if (binary.op == .isOp or binary.op == .isNotOp) {
+            const collation = if (binary.left.* == .collate) binary.left.*.collate.name else if (binary.right.* == .collate) binary.right.*.collate.name else null;
+            const eq = nullSafeEqual(left, right, collation);
+            return .{ .integer = if ((binary.op == .isOp) == eq) 1 else 0 };
         }
         if (left == .null or right == .null) return .null;
         if (binary.op == .equal or binary.op == .notEqual or binary.op == .less or binary.op == .lessEqual or binary.op == .greater or binary.op == .greaterEqual) {
@@ -3810,7 +3842,10 @@ pub const Connection = struct {
                 .greaterEqual => .greaterEqual,
                 else => return error.InvalidSql,
             };
-            return .{ .integer = if (compare(left, op, right)) 1 else 0 };
+            // An explicit COLLATE on either operand selects the comparison
+            // collation; without one the binary default applies.
+            const collation = if (binary.left.* == .collate) binary.left.*.collate.name else if (binary.right.* == .collate) binary.right.*.collate.name else null;
+            return .{ .integer = if (compareCollated(left, op, right, collation)) 1 else 0 };
         }
         const leftNum = numericValue(left).?;
         const rightNum = numericValue(right).?;
@@ -4651,7 +4686,7 @@ pub const Connection = struct {
                         const rightValue = try self.resolve(having.right, parameters);
                         const rightOwned = having.right == .binary or having.right == .unary;
                         defer if (rightOwned) self.freeConcatText(rightValue);
-                        itemResult = compare(leftValue, having.op, rightValue);
+                        itemResult = havingCompare(leftValue, having.op, rightValue);
                     }
                     if (!started) {
                         groupOk = itemResult;
@@ -5137,7 +5172,7 @@ pub const Connection = struct {
                             const rightValue = try self.resolve(having.right, parameters);
                             const rightOwned = having.right == .binary or having.right == .unary;
                             defer if (rightOwned) self.freeConcatText(rightValue);
-                            itemResult = compare(leftValue, having.op, rightValue);
+                            itemResult = havingCompare(leftValue, having.op, rightValue);
                         }
                         if (!started) {
                             groupOk = itemResult;
@@ -5348,10 +5383,13 @@ pub const Connection = struct {
         }
         const resultRow = try self.allocator.alloc(Value, value.projections.len);
         var done: usize = 0;
-        errdefer {
+        // `live` disarms the row cleanup once an empty path frees the row
+        // itself, so a later OOM cannot free it twice.
+        var live = true;
+        errdefer if (live) {
             for (resultRow[0..done]) |item| self.freeConcatText(item);
             self.allocator.free(resultRow);
-        }
+        };
         for (value.projections, 0..) |projection, index| {
             const raw = try self.evalContext(null, &.{}, projection.expr, parameters, outer);
             resultRow[index] = switch (projection.expr) {
@@ -5360,10 +5398,67 @@ pub const Connection = struct {
             };
             done = index + 1;
         }
+        for (value.projections) |projection| try columns.append(self.allocator, projection.alias orelse "?column?");
+        // A FROM-less SELECT still filters its single row: only a true
+        // WHERE keeps it (NULL/false drop it, like the reference), unknown
+        // columns fail, and LIMIT 0 / OFFSET past the row empties it.
+        const dropRow = (value.condition != null and !try self.matchesConstantRow(resultRow, value.condition.?, parameters, outer)) or
+            (value.limit != null and value.limit.? == 0) or
+            (value.offset != null and value.offset.? > 0) or
+            (value.having != null and !try self.matchesConstantHaving(&columns, resultRow, value.having.?, parameters));
+        if (dropRow) {
+            for (resultRow) |item| self.freeConcatText(item);
+            self.allocator.free(resultRow);
+            live = false;
+            return .{ .allocator = self.allocator, .columns = try self.ownedColumns(columns.items), .rows = try self.allocator.alloc([]Value, 0) };
+        }
         var rows = try self.allocator.alloc([]Value, 1);
         rows[0] = resultRow;
-        for (value.projections) |projection| _ = try columns.append(self.allocator, projection.alias orelse "?column?");
         return .{ .allocator = self.allocator, .columns = try self.ownedColumns(columns.items), .rows = rows };
+    }
+
+    /// Evaluates a WHERE clause against one FROM-less constant row. An empty
+    /// shape stands in for the missing table: literals, parameters, and
+    /// outer references resolve, unknown columns fail like the reference.
+    fn matchesConstantRow(self: *Connection, row: []const Value, conditions: ast.Conditions, parameters: []const Value, outer: ?*const OuterRow) !bool {
+        var emptyName: [1]u8 = .{0};
+        var emptyTable = Table{ .name = &emptyName, .columns = &.{}, .constraints = &.{}, .rows = .empty };
+        return self.matchesContext(&emptyTable, row, conditions, parameters, outer);
+    }
+
+    /// Evaluates HAVING over the implicit single group of a FROM-less
+    /// SELECT. Identifiers resolve to projection aliases; anything else
+    /// evaluates row-less. Unknown names fail like the reference.
+    fn matchesConstantHaving(self: *Connection, columnNames: *const std.ArrayList([]const u8), row: []const Value, arms: ast.Having, parameters: []const Value) !bool {
+        var emptyName: [1]u8 = .{0};
+        var emptyTable = Table{ .name = &emptyName, .columns = &.{}, .constraints = &.{}, .rows = .empty };
+        var total = false;
+        var groupOk = true;
+        var started = false;
+        for (arms) |having| {
+            const leftValue: Value = switch (having.left) {
+                .identifier => |name| blk: {
+                    for (columnNames.items, 0..) |colName, index| if (std.ascii.eqlIgnoreCase(colName, name)) break :blk try self.copyValue(row[index]);
+                    return error.UnknownColumn;
+                },
+                else => try self.evalViewValue(&emptyTable, row, having.left, parameters),
+            };
+            defer self.freeConcatText(leftValue);
+            const rightValue = try self.resolve(having.right, parameters);
+            const rightOwned = having.right == .binary or having.right == .unary;
+            defer if (rightOwned) self.freeConcatText(rightValue);
+            const itemResult = havingCompare(leftValue, having.op, rightValue);
+            if (!started) {
+                groupOk = itemResult;
+                started = true;
+            } else if (having.joinOr) {
+                total = total or groupOk;
+                groupOk = itemResult;
+            } else {
+                groupOk = groupOk and itemResult;
+            }
+        }
+        return total or groupOk;
     }
 
     fn plannedIndices(self: *Connection, tbl: *const Table, condition: ?ast.Conditions, parameters: []const Value) ![]usize {
@@ -6245,7 +6340,7 @@ pub const Connection = struct {
                         const rightValue = try self.resolve(having.right, parameters);
                         const rightOwned = having.right == .binary or having.right == .unary;
                         defer if (rightOwned) self.freeConcatText(rightValue);
-                        itemResult = compare(leftValue, having.op, rightValue);
+                        itemResult = havingCompare(leftValue, having.op, rightValue);
                     }
                     if (!started) {
                         groupOk = itemResult;
@@ -14930,4 +15025,71 @@ test "instead of triggers reject bad targets and columns" {
     var check = try db.exec("SELECT count(*) FROM ib_t;");
     defer check.deinit();
     try std.testing.expectEqual(@as(i64, 2), check.rows[0][0].integer);
+}
+
+test "probe distinct order and compound limit corners" {
+    var db = try freshDb("sqlite_zig_probe_corners_test.db");
+    defer dropDb(db, "sqlite_zig_probe_corners_test.db");
+    var setup = try db.exec("CREATE TABLE pc_t (id INTEGER, label TEXT); INSERT INTO pc_t VALUES (1, 'b'), (2, 'a'), (3, 'b');");
+    setup.deinit();
+    var distinctOrder = try db.exec("SELECT DISTINCT label FROM pc_t ORDER BY label;");
+    defer distinctOrder.deinit();
+    try std.testing.expectEqual(@as(usize, 2), distinctOrder.count());
+    var distinctHidden = try db.exec("SELECT DISTINCT label FROM pc_t ORDER BY id;");
+    defer distinctHidden.deinit();
+    try std.testing.expectEqual(@as(usize, 2), distinctHidden.count());
+    // Bare per-arm LIMIT is rejected like the reference ("LIMIT clause
+    // should come after UNION not before"); parenthesized arms keep theirs.
+    try std.testing.expectError(error.UnexpectedToken, db.exec("SELECT id FROM pc_t LIMIT 2 UNION ALL SELECT id FROM pc_t LIMIT 1;"));
+    var armLimit = try db.exec("SELECT id FROM (SELECT id FROM pc_t LIMIT 2) UNION ALL SELECT id FROM (SELECT id FROM pc_t LIMIT 1);");
+    defer armLimit.deinit();
+    try std.testing.expectEqual(@as(usize, 3), armLimit.count());
+    var outerLimit = try db.exec("SELECT id FROM pc_t UNION ALL SELECT id FROM pc_t ORDER BY 1 LIMIT 2 OFFSET 1;");
+    defer outerLimit.deinit();
+    try std.testing.expectEqual(@as(usize, 2), outerLimit.count());
+    try std.testing.expectEqual(@as(i64, 1), outerLimit.rows[0][0].integer);
+}
+
+test "probe cast edges and three valued logic" {
+    var db = try freshDb("sqlite_zig_probe_cast_test.db");
+    defer dropDb(db, "sqlite_zig_probe_cast_test.db");
+    var casts = try db.exec("SELECT CAST('abc' AS INTEGER), CAST('12x' AS INTEGER), CAST(1.9 AS INTEGER), CAST(1 AS TEXT), CAST(NULL AS TEXT), CAST(1e30 AS INTEGER);");
+    defer casts.deinit();
+    try std.testing.expectEqual(@as(i64, 0), casts.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 12), casts.rows[0][1].integer);
+    try std.testing.expectEqual(@as(i64, 1), casts.rows[0][2].integer);
+    try std.testing.expectEqualStrings("1", casts.rows[0][3].text);
+    try std.testing.expect(casts.rows[0][4] == .null);
+    try std.testing.expectEqual(std.math.maxInt(i64), casts.rows[0][5].integer);
+    var nullWhere = try db.exec("SELECT 1 WHERE NULL;");
+    defer nullWhere.deinit();
+    try std.testing.expectEqual(@as(usize, 0), nullWhere.count());
+    var notNullWhere = try db.exec("SELECT 1 WHERE NOT NULL;");
+    defer notNullWhere.deinit();
+    try std.testing.expectEqual(@as(usize, 0), notNullWhere.count());
+    var nullCase = try db.exec("SELECT CASE WHEN NULL THEN 1 ELSE 0 END;");
+    defer nullCase.deinit();
+    try std.testing.expectEqual(@as(i64, 0), nullCase.rows[0][0].integer);
+    var distinctCollate = try db.exec("SELECT 'a' IS DISTINCT FROM 'A' COLLATE NOCASE;");
+    defer distinctCollate.deinit();
+    try std.testing.expectEqual(@as(i64, 0), distinctCollate.rows[0][0].integer);
+    var overflow = try db.exec("SELECT 9223372036854775807 + 1, -9223372036854775808 - 1;");
+    defer overflow.deinit();
+    try std.testing.expectEqual(@as(f64, 9223372036854775808.0), overflow.rows[0][0].real);
+    try std.testing.expectEqual(@as(f64, -9223372036854775808.0), overflow.rows[0][1].real);
+    var exprCollate = try db.exec("SELECT 'a' = 'A' COLLATE NOCASE;");
+    defer exprCollate.deinit();
+    try std.testing.expectEqual(@as(i64, 1), exprCollate.rows[0][0].integer);
+    var isNumeric = try db.exec("SELECT 1 IS 1.0, 1 IS DISTINCT FROM 1.0, 'a' IS 'A', 'a' IS NOT DISTINCT FROM 'a';");
+    defer isNumeric.deinit();
+    try std.testing.expectEqual(@as(i64, 1), isNumeric.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 0), isNumeric.rows[0][1].integer);
+    try std.testing.expectEqual(@as(i64, 0), isNumeric.rows[0][2].integer);
+    try std.testing.expectEqual(@as(i64, 1), isNumeric.rows[0][3].integer);
+    var havingDistinct = try db.exec("SELECT CAST(1 AS INTEGER) AS one GROUP BY one HAVING one IS NOT DISTINCT FROM 1.0;");
+    defer havingDistinct.deinit();
+    try std.testing.expectEqual(@as(usize, 1), havingDistinct.count());
+    var havingFiltered = try db.exec("SELECT CAST(1 AS INTEGER) AS one GROUP BY one HAVING one IS DISTINCT FROM 1;");
+    defer havingFiltered.deinit();
+    try std.testing.expectEqual(@as(usize, 0), havingFiltered.count());
 }
