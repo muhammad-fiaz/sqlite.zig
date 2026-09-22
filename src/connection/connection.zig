@@ -801,6 +801,8 @@ pub const Connection = struct {
                         .column = fk.refCols[0],
                         .onDelete = fk.onDelete,
                         .onUpdate = fk.onUpdate,
+                        .deferrable = fk.deferrable,
+                        .initiallyDeferred = fk.initiallyDeferred,
                     };
                 } else {
                     try constraints.append(self.allocator, .{ .foreignKey = .{
@@ -809,6 +811,8 @@ pub const Connection = struct {
                         .referencedColumns = fk.refCols[0..fk.refCount],
                         .onDelete = fk.onDelete,
                         .onUpdate = fk.onUpdate,
+                        .deferrable = fk.deferrable,
+                        .initiallyDeferred = fk.initiallyDeferred,
                     } });
                 }
             }
@@ -1059,13 +1063,38 @@ pub const Connection = struct {
         try self.begin();
     }
     /// COMMITs the transaction (validates deferred FKs); `NotInTransaction`
-    /// outside one. Persists the image.
+    /// outside one. A deferred FK violation fails `ConstraintViolation` and
+    /// rolls the transaction back, like the reference. Persists the image.
     pub fn commit(self: *Connection) !void {
         if (!self.transactionActive) return error.NotInTransaction;
+        self.enforceAllDeferredForeignKeys() catch {
+            self.rollback() catch {};
+            return error.ConstraintViolation;
+        };
         try self.persist();
         self.clearSchemaBackups();
         self.clearSavepoints();
         self.transactionActive = false;
+    }
+
+    /// Runs postponed FK checks over main, temp, and attached stores.
+    /// Read-only; fails `ConstraintViolation` on the first orphan row.
+    fn enforceAllDeferredForeignKeys(self: *Connection) !void {
+        try self.enforceDeferredForeignKeys(&self.store);
+        try self.enforceDeferredForeignKeys(&self.tempStore);
+        for (self.attached.items) |*db| try self.enforceDeferredForeignKeys(&db.store);
+    }
+
+    /// Autocommit statement-end deferred check: each top-level DML statement
+    /// outside an explicit transaction is its own transaction, so postponed
+    /// FKs verify here. Deferred violations are never swallowed by
+    /// `OR IGNORE`; the statement aborts and fails `ConstraintViolation`.
+    fn checkAutocommitDeferred(self: *Connection) !void {
+        if (self.transactionActive) return;
+        self.enforceAllDeferredForeignKeys() catch |err| {
+            self.abortStatementAtomic();
+            return err;
+        };
     }
     /// ROLLBACKs to the pre-transaction snapshot; `NotInTransaction` outside one.
     pub fn rollback(self: *Connection) !void {
@@ -1114,7 +1143,10 @@ pub const Connection = struct {
             if (!nested) self.resolveStatementError(value.conflict);
             return err;
         };
-        if (!nested) self.endStatementAtomic();
+        if (!nested) {
+            try self.checkAutocommitDeferred();
+            self.endStatementAtomic();
+        }
         return result;
     }
 
@@ -1125,7 +1157,10 @@ pub const Connection = struct {
             if (!nested) self.resolveStatementError(value.conflict);
             return err;
         };
-        if (!nested) self.endStatementAtomic();
+        if (!nested) {
+            try self.checkAutocommitDeferred();
+            self.endStatementAtomic();
+        }
         return result;
     }
 
@@ -1136,7 +1171,10 @@ pub const Connection = struct {
             if (!nested) self.abortStatementAtomic();
             return err;
         };
-        if (!nested) self.endStatementAtomic();
+        if (!nested) {
+            try self.checkAutocommitDeferred();
+            self.endStatementAtomic();
+        }
         return result;
     }
 
@@ -1397,6 +1435,21 @@ pub const Connection = struct {
             const rows = try self.allocator.alloc([]Value, 1);
             rows[0] = try self.allocator.alloc(Value, 1);
             rows[0][0] = .{ .integer = if (self.store.foreignKeysEnabled) 1 else 0 };
+            return .{ .allocator = self.allocator, .columns = columns, .rows = rows };
+        }
+        if (std.ascii.eqlIgnoreCase(value.name, "defer_foreign_keys")) {
+            if (value.value) |setting| {
+                if (std.ascii.eqlIgnoreCase(setting, "on") or std.mem.eql(u8, setting, "1")) {
+                    self.store.deferForeignKeys = true;
+                } else if (std.ascii.eqlIgnoreCase(setting, "off") or std.mem.eql(u8, setting, "0")) {
+                    self.store.deferForeignKeys = false;
+                } else return error.InvalidSql;
+            }
+            const names = [_][]const u8{"defer_foreign_keys"};
+            const columns = try self.ownedColumns(&names);
+            const rows = try self.allocator.alloc([]Value, 1);
+            rows[0] = try self.allocator.alloc(Value, 1);
+            rows[0][0] = .{ .integer = if (self.store.deferForeignKeys) 1 else 0 };
             return .{ .allocator = self.allocator, .columns = columns, .rows = rows };
         }
         if (std.ascii.eqlIgnoreCase(value.name, "user_version")) {
@@ -2472,6 +2525,83 @@ pub const Connection = struct {
         }
         const rows = try rowList.toOwnedSlice(self.allocator);
         return .{ .allocator = self.allocator, .columns = columns, .rows = rows };
+    }
+
+    /// True when `store` holds any FK whose check may have been postponed:
+    /// a `DEFERRABLE INITIALLY DEFERRED` constraint, or anything at all
+    /// while `defer_foreign_keys` is on. Read-only scan, never fails.
+    fn storeNeedsDeferredCheck(_: *const Connection, store: *const Schema) bool {
+        if (store.deferForeignKeys) {
+            for (store.tables.items) |tbl| {
+                for (tbl.columns) |column| if (column.foreignTable != null) return true;
+                for (tbl.constraints) |constraint| if (constraint.kind == .foreignKey) return true;
+            }
+            return false;
+        }
+        for (store.tables.items) |tbl| {
+            for (tbl.columns) |column| if (column.foreignTable != null and column.fkDeferrable and column.fkInitiallyDeferred) return true;
+            for (tbl.constraints) |constraint| if (constraint.kind == .foreignKey and constraint.deferrable and constraint.initiallyDeferred) return true;
+        }
+        return false;
+    }
+
+    /// Deferred FK enforcement for COMMIT and autocommit statement ends.
+    /// Re-scans postponed constraints (skipped by `validateConstraints`);
+    /// the first orphan row fails `ConstraintViolation`. Respects
+    /// `foreignKeysEnabled`; immediate-only constraints were already checked.
+    fn enforceDeferredForeignKeys(self: *Connection, store: *const Schema) !void {
+        if (!store.foreignKeysEnabled) return;
+        if (!self.storeNeedsDeferredCheck(store)) return;
+        for (store.tables.items) |tbl| {
+            if (tbl.virtualModule != null) continue;
+            for (tbl.rows.items) |row| {
+                if (row.values.len != tbl.columns.len) continue;
+                for (tbl.columns, 0..) |column, childIndex| {
+                    const foreignTableName = column.foreignTable orelse continue;
+                    if (!store.fkCheckDeferred(column.fkDeferrable, column.fkInitiallyDeferred)) continue;
+                    const parent = store.findConst(foreignTableName) orelse return error.ConstraintViolation;
+                    const foreignColumnName = column.foreignColumn orelse return error.ConstraintViolation;
+                    const parentIndex = columnIndex(parent, foreignColumnName) catch return error.ConstraintViolation;
+                    if (row.values[childIndex] == .null) continue;
+                    var found = false;
+                    for (parent.rows.items) |parentRow| {
+                        if (parentRow.values.len != parent.columns.len) continue;
+                        if (@import("../catalog/schema.zig").valuesEqual(parentRow.values[parentIndex], row.values[childIndex])) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) return error.ConstraintViolation;
+                }
+                for (tbl.constraints) |constraint| {
+                    if (constraint.kind != .foreignKey) continue;
+                    if (!store.fkCheckDeferred(constraint.deferrable, constraint.initiallyDeferred)) continue;
+                    const foreignTableName = constraint.foreignTable orelse return error.ConstraintViolation;
+                    const parent = store.findConst(foreignTableName) orelse return error.ConstraintViolation;
+                    var hasNull = false;
+                    for (constraint.columns) |childName| {
+                        const childIndex = columnIndex(tbl, childName) catch return error.ConstraintViolation;
+                        if (row.values[childIndex] == .null) hasNull = true;
+                    }
+                    if (hasNull) continue;
+                    var found = false;
+                    for (parent.rows.items) |parentRow| {
+                        if (parentRow.values.len != parent.columns.len) continue;
+                        var matched = true;
+                        for (constraint.columns, constraint.referencedColumns) |childName, parentName| {
+                            const childIndex = columnIndex(tbl, childName) catch return error.ConstraintViolation;
+                            const parentIndex = columnIndex(parent, parentName) catch return error.ConstraintViolation;
+                            if (!@import("../catalog/schema.zig").valuesEqual(row.values[childIndex], parentRow.values[parentIndex])) matched = false;
+                        }
+                        if (matched) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) return error.ConstraintViolation;
+                }
+            }
+        }
     }
 
     fn foreignKeyViolation(self: *Connection, rows: *std.ArrayList([]Value), tbl: *const Table, rowIndex: usize, parentName: []const u8, fkid: i64) !void {
@@ -6148,7 +6278,7 @@ pub const Connection = struct {
                     }
                     if (!changed or !try self.compositeMatches(childTable, childTable.rows.items[childRowIndex].values, parent, oldValues, constraint)) continue;
                     switch (constraint.onUpdate) {
-                        .restrict, .noAction => return error.ConstraintViolation,
+                        .restrict, .noAction => if (store.fkCheckDeferred(constraint.deferrable, constraint.initiallyDeferred)) continue else return error.ConstraintViolation,
                         .setNull => {
                             for (constraint.columns) |childColumn| {
                                 const childIndex = try columnIndex(childTable, childColumn);
@@ -6207,7 +6337,7 @@ pub const Connection = struct {
                     if (constraint.kind != .foreignKey or !std.ascii.eqlIgnoreCase(constraint.foreignTable.?, parentName)) continue;
                     if (!try self.compositeMatches(childTable, childTable.rows.items[childRowIndex].values, parent, parentValues, constraint)) continue;
                     switch (constraint.onDelete) {
-                        .restrict, .noAction => return error.ConstraintViolation,
+                        .restrict, .noAction => if (store.fkCheckDeferred(constraint.deferrable, constraint.initiallyDeferred)) continue else return error.ConstraintViolation,
                         .setNull => {
                             for (constraint.columns) |childColumn| {
                                 const childIndex = try columnIndex(childTable, childColumn);
@@ -6268,7 +6398,7 @@ pub const Connection = struct {
                     const childRow = &childTable.rows.items[childRowIndex];
                     if (!sameValue(oldValues[parentColumnIndex], childRow.values[childColumnIndex])) continue;
                     switch (childColumn.onUpdate) {
-                        .restrict, .noAction => return error.ConstraintViolation,
+                        .restrict, .noAction => if (store.fkCheckDeferred(childColumn.fkDeferrable, childColumn.fkInitiallyDeferred)) continue else return error.ConstraintViolation,
                         .setNull => {
                             if (childColumn.notNull) return error.ConstraintViolation;
                             const old = childRow.values[childColumnIndex];
@@ -6328,7 +6458,11 @@ pub const Connection = struct {
                 };
                 if (action == null or !compare(parentValues[parentColumnIndex], .equal, childTable.rows.items[childRowIndex].values[childColumnIndex])) continue;
                 switch (action.?) {
-                    .restrict, .noAction => return error.ConstraintViolation,
+                    .restrict, .noAction => {
+                        const childColumn = childTable.columns[childColumnIndex];
+                        if (store.fkCheckDeferred(childColumn.fkDeferrable, childColumn.fkInitiallyDeferred)) continue;
+                        return error.ConstraintViolation;
+                    },
                     .setNull => {
                         if (childTable.columns[childColumnIndex].notNull) return error.ConstraintViolation;
                         const old = childTable.rows.items[childRowIndex].values[childColumnIndex];
@@ -14317,4 +14451,111 @@ test "single-condition column equality scans instead of seeking null" {
     try std.testing.expectEqual(@as(usize, 2), rows.count());
     try std.testing.expectEqual(@as(i64, 1), rows.rows[0][0].integer);
     try std.testing.expectEqual(@as(i64, 4), rows.rows[1][0].integer);
+}
+
+test "deferrable foreign keys postpone enforcement to commit" {
+    var db = try freshDb("sqlite_zig_deferrable_fk_test.db");
+    defer dropDb(db, "sqlite_zig_deferrable_fk_test.db");
+    var setup = try db.exec("CREATE TABLE dp (id INTEGER PRIMARY KEY); CREATE TABLE dc (id INTEGER, pid INTEGER REFERENCES dp(id) DEFERRABLE INITIALLY DEFERRED); INSERT INTO dp VALUES (1);");
+    setup.deinit();
+
+    // Orphan insert succeeds inside a transaction and commits cleanly once
+    // the parent arrives before COMMIT.
+    try db.begin();
+    var orphan = try db.exec("INSERT INTO dc VALUES (10, 2);");
+    orphan.deinit();
+    var parent = try db.exec("INSERT INTO dp VALUES (2);");
+    parent.deinit();
+    try db.commit();
+    var check = try db.exec("SELECT count(*) FROM dc;");
+    defer check.deinit();
+    try std.testing.expectEqual(@as(i64, 1), check.rows[0][0].integer);
+
+    // An orphan still present at COMMIT fails and rolls the transaction back.
+    try db.begin();
+    var bad = try db.exec("INSERT INTO dc VALUES (11, 99);");
+    bad.deinit();
+    try std.testing.expectError(error.ConstraintViolation, db.commit());
+    var rolled = try db.exec("SELECT count(*) FROM dc WHERE id = 11;");
+    defer rolled.deinit();
+    try std.testing.expectEqual(@as(i64, 0), rolled.rows[0][0].integer);
+
+    // Immediate constraints still fail at statement time, even in a txn.
+    var setupImmediate = try db.exec("CREATE TABLE ic (id INTEGER, pid INTEGER REFERENCES dp(id));");
+    setupImmediate.deinit();
+    try db.begin();
+    try std.testing.expectError(error.ConstraintViolation, db.exec("INSERT INTO ic VALUES (20, 99);"));
+    try db.rollback();
+}
+
+test "deferrable restrict defers parent delete violations to commit" {
+    var db = try freshDb("sqlite_zig_deferrable_delete_test.db");
+    defer dropDb(db, "sqlite_zig_deferrable_delete_test.db");
+    var setup = try db.exec("CREATE TABLE dp (id INTEGER PRIMARY KEY); CREATE TABLE dc (id INTEGER, pid INTEGER REFERENCES dp(id) ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED); INSERT INTO dp VALUES (1); INSERT INTO dc VALUES (10, 1);");
+    setup.deinit();
+
+    // Deleting the parent is allowed mid-transaction but fails at COMMIT;
+    // re-adding the parent first lets the COMMIT succeed.
+    try db.begin();
+    var del = try db.exec("DELETE FROM dp WHERE id = 1;");
+    del.deinit();
+    var reparent = try db.exec("INSERT INTO dp VALUES (1);");
+    reparent.deinit();
+    try db.commit();
+
+    try db.begin();
+    var delAgain = try db.exec("DELETE FROM dp WHERE id = 1;");
+    delAgain.deinit();
+    try std.testing.expectError(error.ConstraintViolation, db.commit());
+    var restored = try db.exec("SELECT count(*) FROM dp;");
+    defer restored.deinit();
+    try std.testing.expectEqual(@as(i64, 1), restored.rows[0][0].integer);
+}
+
+test "defer foreign keys pragma and initially immediate stay immediate" {
+    var db = try freshDb("sqlite_zig_defer_pragma_test.db");
+    defer dropDb(db, "sqlite_zig_defer_pragma_test.db");
+    var setup = try db.exec("CREATE TABLE pp (id INTEGER PRIMARY KEY); CREATE TABLE pc (id INTEGER, pid INTEGER REFERENCES pp(id)); CREATE TABLE pi (id INTEGER, pid INTEGER REFERENCES pp(id) DEFERRABLE INITIALLY IMMEDIATE); INSERT INTO pp VALUES (1);");
+    setup.deinit();
+
+    // DEFERRABLE INITIALLY IMMEDIATE behaves like an immediate constraint.
+    try std.testing.expectError(error.ConstraintViolation, db.exec("INSERT INTO pi VALUES (30, 99);"));
+
+    // defer_foreign_keys postpones even NOT DEFERRABLE constraints.
+    var pragma = try db.exec("PRAGMA defer_foreign_keys = ON;");
+    defer pragma.deinit();
+    try std.testing.expectEqual(@as(i64, 1), pragma.rows[0][0].integer);
+    try db.begin();
+    var orphan = try db.exec("INSERT INTO pc VALUES (31, 99);");
+    orphan.deinit();
+    var parent = try db.exec("INSERT INTO pp VALUES (99);");
+    parent.deinit();
+    try db.commit();
+
+    // Autocommit statements verify postponed FKs at statement end.
+    var stmtBad = try db.exec("PRAGMA defer_foreign_keys = OFF;");
+    stmtBad.deinit();
+    try std.testing.expectError(error.ConstraintViolation, db.exec("INSERT INTO pc VALUES (32, 100);"));
+    var missing = try db.exec("SELECT count(*) FROM pc WHERE id = 32;");
+    defer missing.deinit();
+    try std.testing.expectEqual(@as(i64, 0), missing.rows[0][0].integer);
+}
+
+test "self referential deferrable insert commits in one statement" {
+    var db = try freshDb("sqlite_zig_selfref_defer_test.db");
+    defer dropDb(db, "sqlite_zig_selfref_defer_test.db");
+    var setup = try db.exec("CREATE TABLE emp (id INTEGER PRIMARY KEY, mgr INTEGER REFERENCES emp(id) DEFERRABLE INITIALLY DEFERRED);");
+    setup.deinit();
+    // Forward reference inside one multi-row statement: immediate mode
+    // would fail on the first row, deferred mode verifies at statement end.
+    var inserted = try db.exec("INSERT INTO emp VALUES (1, 2), (2, NULL);");
+    inserted.deinit();
+    var check = try db.exec("SELECT count(*) FROM emp;");
+    defer check.deinit();
+    try std.testing.expectEqual(@as(i64, 2), check.rows[0][0].integer);
+    // An orphan that survives statement end fails and leaves no row behind.
+    try std.testing.expectError(error.ConstraintViolation, db.exec("INSERT INTO emp VALUES (3, 99);"));
+    var absent = try db.exec("SELECT count(*) FROM emp WHERE id = 3;");
+    defer absent.deinit();
+    try std.testing.expectEqual(@as(i64, 0), absent.rows[0][0].integer);
 }

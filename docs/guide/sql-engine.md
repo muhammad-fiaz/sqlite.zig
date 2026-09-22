@@ -207,7 +207,10 @@ Table definitions support declared types with full SQLite type names
 - `NOT NULL`, `DEFAULT <literal>`
 - `CHECK (...)` enforced on `INSERT`/`UPDATE` with SQLite `NULL` semantics
 - `FOREIGN KEY` (column- and table-level, incl. composite) with `CASCADE`,
-  `SET NULL`, `SET DEFAULT`, `RESTRICT`, and `NO ACTION`
+  `SET NULL`, `SET DEFAULT`, `RESTRICT`, and `NO ACTION`, plus
+  `[NOT] DEFERRABLE [INITIALLY DEFERRED|IMMEDIATE]`; deferred checks run at
+  `COMMIT` (rolling back on violation) or at statement end in autocommit.
+  `PRAGMA defer_foreign_keys` postpones every foreign key the same way
 - Generated columns: `GENERATED ALWAYS AS (...) VIRTUAL` / `STORED`
 - `STRICT` tables (values outside the declared type are rejected) and
   `WITHOUT ROWID` tables (keyed by primary key)

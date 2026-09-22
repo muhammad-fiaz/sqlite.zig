@@ -511,6 +511,9 @@ fn createSql(allocator: std.mem.Allocator, table: anytype) ![]u8 {
                 .setNull => try sql.appendSlice(allocator, " ON UPDATE SET NULL"),
                 .setDefault => try sql.appendSlice(allocator, " ON UPDATE SET DEFAULT"),
             }
+            if (column.fkDeferrable) {
+                if (column.fkInitiallyDeferred) try sql.appendSlice(allocator, " DEFERRABLE INITIALLY DEFERRED") else try sql.appendSlice(allocator, " DEFERRABLE INITIALLY IMMEDIATE");
+            }
         }
     }
     for (table.constraints) |constraint| {
@@ -548,6 +551,9 @@ fn createSql(allocator: std.mem.Allocator, table: anytype) ![]u8 {
                 .cascade => try sql.appendSlice(allocator, " ON UPDATE CASCADE"),
                 .setNull => try sql.appendSlice(allocator, " ON UPDATE SET NULL"),
                 .setDefault => try sql.appendSlice(allocator, " ON UPDATE SET DEFAULT"),
+            }
+            if (constraint.deferrable) {
+                if (constraint.initiallyDeferred) try sql.appendSlice(allocator, " DEFERRABLE INITIALLY DEFERRED") else try sql.appendSlice(allocator, " DEFERRABLE INITIALLY IMMEDIATE");
             }
         }
     }

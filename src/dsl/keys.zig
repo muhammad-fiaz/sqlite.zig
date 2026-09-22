@@ -135,6 +135,8 @@ pub const ForeignKeySpec = struct {
     refCount: usize = 0,
     onDelete: ast.ReferentialAction = .noAction,
     onUpdate: ast.ReferentialAction = .noAction,
+    deferrable: bool = false,
+    initiallyDeferred: bool = false,
 };
 
 /// Normalize `.{ .table, .column/.columns }`-style reference inputs plus
@@ -193,10 +195,12 @@ fn normalizeRefList(ref: anytype, outTable: *[]const u8, outCols: *[16][]const u
     return count;
 }
 
-/// Parse `.{ .column/.columns, .references, .onDelete?, .onUpdate? }` into a
-/// `ForeignKeySpec`. `references` may be a typed column, a `DynamicColumn`
-/// with `table` set, a `.{ .table, .column/.columns }` struct, or a tuple of
-/// same-table typed columns. Borrowed; fails `InvalidSql` on count mismatch.
+/// Parse `.{ .column/.columns, .references, .onDelete?, .onUpdate?,
+/// .deferrable?, .initiallyDeferred? }` into a `ForeignKeySpec`.
+/// `references` may be a typed column, a `DynamicColumn` with `table` set, a
+/// `.{ .table, .column/.columns }` struct, or a tuple of same-table typed
+/// columns. Borrowed; fails `InvalidSql` on count mismatch.
+/// `initiallyDeferred` without `deferrable` is a compile error.
 pub fn parseFkSpec(fk: anytype, expectedTable: []const u8) !ForeignKeySpec {
     const F = @TypeOf(fk);
     const info = @typeInfo(F);
@@ -211,6 +215,10 @@ pub fn parseFkSpec(fk: anytype, expectedTable: []const u8) !ForeignKeySpec {
     spec.refCount = try normalizeRefList(fk.references, &spec.refTable, &spec.refCols);
     if (@hasField(F, "onDelete")) spec.onDelete = fk.onDelete;
     if (@hasField(F, "onUpdate")) spec.onUpdate = fk.onUpdate;
+    if (@hasField(F, "deferrable")) spec.deferrable = fk.deferrable;
+    if (@hasField(F, "initiallyDeferred")) spec.initiallyDeferred = fk.initiallyDeferred;
+    if (@hasField(F, "initiallyDeferred") and !@hasField(F, "deferrable")) @compileError("initiallyDeferred needs deferrable");
+    if (spec.initiallyDeferred and !spec.deferrable) return error.InvalidSql;
     if (spec.localCount != spec.refCount) return error.InvalidSql;
     return spec;
 }
@@ -472,12 +480,12 @@ pub fn validateKeys(table: *const schemaMod.Table, expected: *const ExpectedKeys
         for (table.columns) |*col| {
             if (col.foreignTable == null) continue;
             actualCount += 1;
-            if (!matchFk(expected, &matched, &.{col.name}, col.foreignTable.?, &.{col.foreignColumn.?}, col.onDelete, col.onUpdate)) return error.SchemaMismatch;
+            if (!matchFk(expected, &matched, &.{col.name}, col.foreignTable.?, &.{col.foreignColumn.?}, col.onDelete, col.onUpdate, col.fkDeferrable, col.fkInitiallyDeferred)) return error.SchemaMismatch;
         }
         for (table.constraints) |*c| {
             if (c.kind != .foreignKey) continue;
             actualCount += 1;
-            if (!matchFk(expected, &matched, c.columns, c.foreignTable.?, c.referencedColumns, c.onDelete, c.onUpdate)) return error.SchemaMismatch;
+            if (!matchFk(expected, &matched, c.columns, c.foreignTable.?, c.referencedColumns, c.onDelete, c.onUpdate, c.deferrable, c.initiallyDeferred)) return error.SchemaMismatch;
         }
         if (actualCount != expected.fkCount) return error.SchemaMismatch;
     }
@@ -485,13 +493,14 @@ pub fn validateKeys(table: *const schemaMod.Table, expected: *const ExpectedKeys
 
 /// One-shot bipartite match of an actual FK against unmatched expectations.
 /// Marks the slot on success so each expectation matches at most once.
-fn matchFk(expected: *const ExpectedKeys, matched: *[8]bool, local: []const []const u8, refTable: []const u8, refCols: []const []const u8, onDelete: ast.ReferentialAction, onUpdate: ast.ReferentialAction) bool {
+fn matchFk(expected: *const ExpectedKeys, matched: *[8]bool, local: []const []const u8, refTable: []const u8, refCols: []const []const u8, onDelete: ast.ReferentialAction, onUpdate: ast.ReferentialAction, deferrable: bool, initiallyDeferred: bool) bool {
     for (expected.fks[0..expected.fkCount], 0..) |*fk, i| {
         if (matched[i]) continue;
         if (!namesEqual(fk.local[0..fk.localCount], local)) continue;
         if (!eqlName(fk.refTable, refTable)) continue;
         if (!namesEqual(fk.refCols[0..fk.refCount], refCols)) continue;
         if (fk.onDelete != onDelete or fk.onUpdate != onUpdate) continue;
+        if (fk.deferrable != deferrable or fk.initiallyDeferred != initiallyDeferred) continue;
         matched[i] = true;
         return true;
     }

@@ -59,7 +59,7 @@ differential harness against SQLite and no fault-injection runner;
 | 9 | Triggers (BEFORE/AFTER INSERT/UPDATE/DELETE, WHEN, NEW/OLD) | `catalog/schema.zig` (`Trigger`), `connection/connection.zig` (`fireTriggers`, `renderTriggerBody`) | `connection.zig` trigger tests; `examples/23,57` | Partial | `TODO(trigger)`: `INSTEAD OF` missing (`ast.zig` notes it); recursion policy |
 | 10 | Views (CREATE VIEW, read path, updatable subset) | `catalog/schema.zig` (`View`), `connection/connection.zig` (`createViewCommand`) | `connection.zig` view tests; `examples/22` | Partial | `TODO(view)`: writable views limited to `viewTargetsSingleTable`; `TEMP` scoping |
 | 11 | Indexes (UNIQUE, partial, expression, EXPLAIN QUERY PLAN) | `catalog/schema.zig` (`Index`), `storage/sqlite_image.zig` (index root pages), `plan/planner.zig`, `connection/connection.zig` (`plannedIndices`) | source-local `plan` tests; `examples/21,33,68` | Covered | `TODO(index)`: covering-index fast path, multi-index AND/OR planning |
-| 12 | Foreign keys (CASCADE/SET NULL/SET DEFAULT/RESTRICT, composite) | `catalog/schema.zig` (FK constraints), `connection/connection.zig` (`apply*Actions`, `pragmaForeignKey*`) | `connection.zig` FK tests; `examples/26,28,31,62` | Partial | `TODO(fk)`: `DEFERRABLE INITIALLY DEFERRED` missing |
+| 12 | Foreign keys (CASCADE/SET NULL/SET DEFAULT/RESTRICT, composite, DEFERRABLE) | `catalog/schema.zig` (FK constraints, `fkCheckDeferred`), `connection/connection.zig` (`apply*Actions`, `pragmaForeignKey*`, `enforceDeferredForeignKeys`) | `connection.zig` FK + deferrable tests; `examples/26,28,31,62` | Covered | none: immediate, `INITIALLY DEFERRED/IMMEDIATE`, and `defer_foreign_keys` verified |
 | 13 | Transactions and savepoints (BEGIN/COMMIT/ROLLBACK, SAVEPOINT) | `connection/connection.zig` (`begin*`, `savepoint*`, statement atomicity), `txn/transaction.zig`, `txn/locking.zig` | `connection.zig` txn tests; `examples/03` | Covered | `TODO(txn)`: cross-process lock coordination untested |
 | 14 | Pager / B-tree (page cache, balancing, cursors) | `storage/pager.zig`, `btree/btree.zig`, `btree/cursor.zig`, `btree/balance.zig`, `storage/file.zig` | source-local `btree`/`pager` tests; `examples/07,17` | Partial | `TODO(pager)`: in-memory first; cache-spill, overflow, freelist incomplete |
 | 15 | Journal / WAL (rollback journal header, WAL apply, checkpoint) | `storage/journal.zig` (header codec only), `storage/wal.zig`, `storage/file.zig` (`journalMode`, `checkpointWal`) | `journal.zig`/`wal.zig` unit tests; `examples/35` | Partial | `TODO(wal)`: no page-record journal writes yet; crash-recovery replay and cross-process locking untested |
@@ -102,7 +102,7 @@ conditions directly.
 `strict`, `withoutRowid`, and `generatedExpr` flags; `src/sql/parser.zig`
 owns DDL parsing (`CREATE`, `ALTER`, `ATTACH`, `VACUUM`, `ANALYZE`,
 `PRAGMA`). Documented gaps are load-bearing: no `INSTEAD OF` triggers
-(`src/sql/ast.zig`), no `DEFERRABLE` FKs, writable views limited to
+(`src/sql/ast.zig`), writable views limited to
 `viewTargetsSingleTable`, and `txn/locking.zig` as a stub. `UPSERT` and
 `RETURNING` are the most complete recent features
 (`examples/38–41,55,56`).
@@ -146,7 +146,7 @@ property tests, then page-image hostile inputs.
 
 ## Coverage summary
 
-Thirteen of twenty-nine families are `Covered`; fifteen are `Partial`;
+Fourteen of twenty-nine families are `Covered`; fourteen are `Partial`;
 one (fuzz/fault/stress/concurrency) is `Out of Scope`. The `Partial`
 rows name their gaps, so check the row before relying on a corner —
 particularly around storage durability and the admin surface.

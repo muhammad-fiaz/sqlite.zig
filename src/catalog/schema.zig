@@ -16,13 +16,13 @@ const functions = @import("../sql/functions.zig");
 /// dupes; `defaultValue` owns its text/blob payload; `checkExpr`/
 /// `generatedExpr` are schema-owned cloned ASTs. Borrowed views dangle after
 /// drop/rename/deinit.
-pub const Column = struct { name: []u8, typeName: []u8, primaryKey: bool, notNull: bool, unique: bool = false, autoincrement: bool = false, defaultValue: ?Value = null, foreignTable: ?[]u8 = null, foreignColumn: ?[]u8 = null, onDelete: ast.ReferentialAction = .restrict, onUpdate: ast.ReferentialAction = .restrict, checkExpr: ?ast.Expr = null, generatedExpr: ?ast.Expr = null, generatedStored: bool = false };
+pub const Column = struct { name: []u8, typeName: []u8, primaryKey: bool, notNull: bool, unique: bool = false, autoincrement: bool = false, defaultValue: ?Value = null, foreignTable: ?[]u8 = null, foreignColumn: ?[]u8 = null, onDelete: ast.ReferentialAction = .restrict, onUpdate: ast.ReferentialAction = .restrict, fkDeferrable: bool = false, fkInitiallyDeferred: bool = false, checkExpr: ?ast.Expr = null, generatedExpr: ?ast.Expr = null, generatedStored: bool = false };
 /// Owned row: `values` has one entry per column and owns text/blob payloads.
 /// Freed by schema lifecycle ops; never retain after drop/truncate/deinit.
 pub const Row = struct { values: []Value };
 /// Owned table-level constraint. Name lists and FK strings are schema-owned
 /// dupes; `checkExpr` is a schema-owned cloned AST.
-pub const Constraint = struct { kind: enum { primaryKey, unique, foreignKey, check }, columns: [][]u8, foreignTable: ?[]u8 = null, referencedColumns: [][]u8 = &.{}, onDelete: ast.ReferentialAction = .restrict, onUpdate: ast.ReferentialAction = .restrict, checkExpr: ?ast.Expr = null };
+pub const Constraint = struct { kind: enum { primaryKey, unique, foreignKey, check }, columns: [][]u8, foreignTable: ?[]u8 = null, referencedColumns: [][]u8 = &.{}, onDelete: ast.ReferentialAction = .restrict, onUpdate: ast.ReferentialAction = .restrict, deferrable: bool = false, initiallyDeferred: bool = false, checkExpr: ?ast.Expr = null };
 /// Owned table: heap-allocated by the schema (`tables` holds `*Table`).
 /// `name`/columns/constraints/rows/virtual strings are schema-owned. A `*Table`
 /// from `find` borrows the schema and dangles after drop/remove/deinit.
@@ -80,6 +80,9 @@ pub const Schema = struct {
     views: std.ArrayList(View),
     triggers: std.ArrayList(Trigger),
     foreignKeysEnabled: bool = true,
+    /// `PRAGMA defer_foreign_keys`: every FK check postpones to COMMIT (or
+    /// statement end in autocommit), including NOT DEFERRABLE constraints.
+    deferForeignKeys: bool = false,
 
     /// Borrow an empty catalog over `allocator`. Owns nothing yet; `deinit`
     /// releases whatever is created afterwards. Never fails.
@@ -556,6 +559,8 @@ pub const Schema = struct {
                     .foreignColumn = ownedColForeignColumn,
                     .onDelete = if (definition.foreignKey) |foreignKey| foreignKey.onDelete else .restrict,
                     .onUpdate = if (definition.foreignKey) |foreignKey| foreignKey.onUpdate else .restrict,
+                    .fkDeferrable = if (definition.foreignKey) |foreignKey| foreignKey.deferrable else false,
+                    .fkInitiallyDeferred = if (definition.foreignKey) |foreignKey| foreignKey.initiallyDeferred else false,
                     .checkExpr = clonedCheck,
                     .generatedExpr = clonedGen,
                     .generatedStored = definition.generatedStored,
@@ -616,6 +621,8 @@ pub const Schema = struct {
                     constraints[index].referencedColumns = referencedColumns;
                     constraints[index].onDelete = foreignKey.onDelete;
                     constraints[index].onUpdate = foreignKey.onUpdate;
+                    constraints[index].deferrable = foreignKey.deferrable;
+                    constraints[index].initiallyDeferred = foreignKey.initiallyDeferred;
                 },
                 else => {},
             }
@@ -1111,6 +1118,8 @@ pub const Schema = struct {
                 .foreignColumn = ownedForeignColumn,
                 .onDelete = if (definition.foreignKey) |foreignKey| foreignKey.onDelete else .noAction,
                 .onUpdate = if (definition.foreignKey) |foreignKey| foreignKey.onUpdate else .noAction,
+                .fkDeferrable = if (definition.foreignKey) |foreignKey| foreignKey.deferrable else false,
+                .fkInitiallyDeferred = if (definition.foreignKey) |foreignKey| foreignKey.initiallyDeferred else false,
                 .checkExpr = clonedCheck,
                 .generatedExpr = clonedGen,
                 .generatedStored = definition.generatedStored,
@@ -1512,6 +1521,13 @@ pub const Schema = struct {
         try self.validateConstraints(table, row.values, rowIndex);
     }
 
+    /// True when an FK check postpones to COMMIT/statement end: the
+    /// `defer_foreign_keys` pragma defers everything, otherwise only
+    /// `DEFERRABLE INITIALLY DEFERRED` constraints defer.
+    pub fn fkCheckDeferred(self: *const Schema, deferrable: bool, initiallyDeferred: bool) bool {
+        return self.deferForeignKeys or (deferrable and initiallyDeferred);
+    }
+
     fn validateConstraints(self: *const Schema, table: *const Table, values: []const Value, ignoredRow: ?usize) !void {
         var colNames = try self.allocator.alloc([]const u8, table.columns.len);
         defer self.allocator.free(colNames);
@@ -1531,7 +1547,7 @@ pub const Schema = struct {
                     if (valuesEqual(existing.values[index], values[index])) return error.ConstraintViolation;
                 };
             }
-            if (self.foreignKeysEnabled) {
+            if (self.foreignKeysEnabled and !self.fkCheckDeferred(column.fkDeferrable, column.fkInitiallyDeferred)) {
                 if (column.foreignTable) |foreignTableName| {
                     const foreignTable = self.findConst(foreignTableName) orelse return error.ConstraintViolation;
                     const foreignColumnName = column.foreignColumn orelse return error.ConstraintViolation;
@@ -1564,6 +1580,7 @@ pub const Schema = struct {
             if (constraint.kind == .unique and hasNull) continue;
             if (constraint.kind == .foreignKey) {
                 if (!self.foreignKeysEnabled) continue;
+                if (self.fkCheckDeferred(constraint.deferrable, constraint.initiallyDeferred)) continue;
                 if (hasNull) continue;
                 const foreignTable = self.findConst(constraint.foreignTable orelse return error.ConstraintViolation) orelse return error.ConstraintViolation;
                 for (foreignTable.rows.items) |foreignRow| {
@@ -1848,7 +1865,7 @@ pub const Schema = struct {
                 .unique = column.unique,
                 .autoincrement = column.autoincrement,
                 .defaultValue = column.defaultValue,
-                .foreignKey = if (column.foreignTable != null) .{ .table = column.foreignTable.?, .column = column.foreignColumn.?, .onDelete = column.onDelete, .onUpdate = column.onUpdate } else null,
+                .foreignKey = if (column.foreignTable != null) .{ .table = column.foreignTable.?, .column = column.foreignColumn.?, .onDelete = column.onDelete, .onUpdate = column.onUpdate, .deferrable = column.fkDeferrable, .initiallyDeferred = column.fkInitiallyDeferred } else null,
                 .checkExpr = column.checkExpr,
                 .generatedExpr = column.generatedExpr,
                 .generatedStored = column.generatedStored,
@@ -1858,7 +1875,7 @@ pub const Schema = struct {
             for (table.constraints, 0..) |constraint, index| constraintDefinitions[index] = switch (constraint.kind) {
                 .primaryKey => .{ .primaryKey = constraint.columns },
                 .unique => .{ .unique = constraint.columns },
-                .foreignKey => .{ .foreignKey = .{ .columns = constraint.columns, .table = constraint.foreignTable.?, .referencedColumns = constraint.referencedColumns, .onDelete = constraint.onDelete, .onUpdate = constraint.onUpdate } },
+                .foreignKey => .{ .foreignKey = .{ .columns = constraint.columns, .table = constraint.foreignTable.?, .referencedColumns = constraint.referencedColumns, .onDelete = constraint.onDelete, .onUpdate = constraint.onUpdate, .deferrable = constraint.deferrable, .initiallyDeferred = constraint.initiallyDeferred } },
                 .check => .{ .check = constraint.checkExpr orelse .{ .literal = .null } },
             };
             try result.createTableWithOptions(table.name, definitions, constraintDefinitions, .{ .strict = table.strict, .withoutRowid = table.withoutRowid });
@@ -1881,6 +1898,7 @@ pub const Schema = struct {
         for (self.views.items) |view| try result.createView(view.name, view.sql);
         for (self.triggers.items) |trigger| try result.createTrigger(.{ .name = trigger.name, .table = trigger.table, .timing = trigger.timing, .event = trigger.event, .updateOf = trigger.updateOf, .whenSql = trigger.whenSql, .body = trigger.body });
         result.foreignKeysEnabled = self.foreignKeysEnabled;
+        result.deferForeignKeys = self.deferForeignKeys;
         return result;
     }
 };

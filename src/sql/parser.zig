@@ -876,6 +876,38 @@ pub const Parser = struct {
         return self.copy(names);
     }
 
+    /// Parses `[NOT] DEFERRABLE [INITIALLY DEFERRED|IMMEDIATE]` after a
+    /// REFERENCES clause. Bare `DEFERRABLE` means initially deferred;
+    /// `NOT DEFERRABLE INITIALLY DEFERRED` and a lone `INITIALLY` fail.
+    /// Peeks before consuming: a bare `NOT` may start a following column
+    /// constraint (`REFERENCES t(c) NOT NULL`), which is left untouched.
+    const DeferralClause = struct { deferrable: bool = false, initiallyDeferred: bool = false };
+    fn parseDeferralClause(self: *Parser) !DeferralClause {
+        const first = self.current();
+        if (first.tag != .word or first.quoted) return .{};
+        if (std.ascii.eqlIgnoreCase(first.text, "deferrable")) {
+            self.index += 1;
+            if (self.acceptWord("initially")) {
+                if (self.acceptWord("deferred")) return .{ .deferrable = true, .initiallyDeferred = true };
+                try self.requireWord("immediate");
+                return .{ .deferrable = true, .initiallyDeferred = false };
+            }
+            return .{ .deferrable = true, .initiallyDeferred = true };
+        }
+        if (std.ascii.eqlIgnoreCase(first.text, "not")) {
+            if (self.index + 1 >= self.tokens.len) return .{};
+            const second = self.tokens[self.index + 1];
+            if (second.tag != .word or second.quoted or !std.ascii.eqlIgnoreCase(second.text, "deferrable")) return .{};
+            self.index += 2;
+            if (self.acceptWord("initially")) {
+                if (self.acceptWord("deferred")) return Error.InvalidSql;
+                try self.requireWord("immediate");
+            }
+            return .{};
+        }
+        return .{};
+    }
+
     fn parseColumnDef(self: *Parser) !ast.ColumnDef {
         const columnName = try self.word();
         const typeName = try self.parseColumnTypeName();
@@ -949,7 +981,8 @@ pub const Parser = struct {
                         break :blk .noAction;
                     } else return Error.UnexpectedToken;
                 }
-                foreignKey = .{ .table = foreignTable, .column = foreignColumn, .onDelete = onDelete, .onUpdate = onUpdate };
+                const deferral = try self.parseDeferralClause();
+                foreignKey = .{ .table = foreignTable, .column = foreignColumn, .onDelete = onDelete, .onUpdate = onUpdate, .deferrable = deferral.deferrable, .initiallyDeferred = deferral.initiallyDeferred };
             } else break;
         }
         return .{ .name = columnName, .typeName = typeName, .primaryKey = primaryKey, .notNull = notNull, .unique = unique, .autoincrement = autoincrement, .foreignKey = foreignKey, .defaultValue = defaultValue, .checkExpr = checkExpr, .generatedExpr = generatedExpr, .generatedStored = generatedStored };
@@ -1078,7 +1111,8 @@ pub const Parser = struct {
                             break :blk .noAction;
                         } else return Error.UnexpectedToken;
                     }
-                    try constraints.append(self.allocator, .{ .foreignKey = .{ .columns = try childColumns.toOwnedSlice(self.allocator), .table = foreignTable, .referencedColumns = try parentColumns.toOwnedSlice(self.allocator), .onDelete = onDelete, .onUpdate = onUpdate } });
+                    const deferral = try self.parseDeferralClause();
+                    try constraints.append(self.allocator, .{ .foreignKey = .{ .columns = try childColumns.toOwnedSlice(self.allocator), .table = foreignTable, .referencedColumns = try parentColumns.toOwnedSlice(self.allocator), .onDelete = onDelete, .onUpdate = onUpdate, .deferrable = deferral.deferrable, .initiallyDeferred = deferral.initiallyDeferred } });
                 } else {
                     const kind: enum { primaryKey, unique } = if (self.acceptWord("primary")) blk: {
                         try self.requireWord("key");
@@ -3099,6 +3133,48 @@ test "parser parses table constraints, generated columns, strict, and without ro
     try std.testing.expect(statement.createTable.columns[2].generatedStored);
     try std.testing.expectEqual(@as(usize, 1), statement.createTable.constraints.len);
     try std.testing.expect(statement.createTable.constraints[0] == .check);
+}
+
+test "parser parses deferrable foreign key clauses" {
+    var p1 = try Parser.init(std.testing.allocator, "CREATE TABLE c (id INTEGER, pid INTEGER REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);");
+    defer p1.deinit();
+    var s1 = try p1.parse();
+    defer ast.deinit(std.testing.allocator, &s1);
+    try std.testing.expect(s1.createTable.columns[1].foreignKey.?.deferrable);
+    try std.testing.expect(s1.createTable.columns[1].foreignKey.?.initiallyDeferred);
+
+    var p2 = try Parser.init(std.testing.allocator, "CREATE TABLE c (id INTEGER, pid INTEGER REFERENCES p(id) DEFERRABLE INITIALLY IMMEDIATE);");
+    defer p2.deinit();
+    var s2 = try p2.parse();
+    defer ast.deinit(std.testing.allocator, &s2);
+    try std.testing.expect(s2.createTable.columns[1].foreignKey.?.deferrable);
+    try std.testing.expect(!s2.createTable.columns[1].foreignKey.?.initiallyDeferred);
+
+    var p3 = try Parser.init(std.testing.allocator, "CREATE TABLE c (id INTEGER, pid INTEGER REFERENCES p(id) NOT NULL, FOREIGN KEY (pid) REFERENCES p(id) NOT DEFERRABLE);");
+    defer p3.deinit();
+    var s3 = try p3.parse();
+    defer ast.deinit(std.testing.allocator, &s3);
+    try std.testing.expect(!s3.createTable.columns[1].foreignKey.?.deferrable);
+    try std.testing.expect(s3.createTable.constraints[0] == .foreignKey);
+    try std.testing.expect(!s3.createTable.constraints[0].foreignKey.deferrable);
+
+    var p4 = try Parser.init(std.testing.allocator, "CREATE TABLE c (id INTEGER, FOREIGN KEY (id) REFERENCES p(id) DEFERRABLE);");
+    defer p4.deinit();
+    var s4 = try p4.parse();
+    defer ast.deinit(std.testing.allocator, &s4);
+    try std.testing.expect(s4.createTable.constraints[0].foreignKey.deferrable);
+    try std.testing.expect(s4.createTable.constraints[0].foreignKey.initiallyDeferred);
+
+    var p5 = try Parser.init(std.testing.allocator, "CREATE TABLE c (id INTEGER REFERENCES p(id) NOT DEFERRABLE INITIALLY DEFERRED);");
+    defer p5.deinit();
+    try std.testing.expectError(error.InvalidSql, p5.parse());
+
+    var p6 = try Parser.init(std.testing.allocator, "CREATE TABLE c (id INTEGER REFERENCES p(id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED);");
+    defer p6.deinit();
+    var s6 = try p6.parse();
+    defer ast.deinit(std.testing.allocator, &s6);
+    try std.testing.expect(s6.createTable.columns[0].foreignKey.?.onDelete == .cascade);
+    try std.testing.expect(s6.createTable.columns[0].foreignKey.?.initiallyDeferred);
 }
 
 test "parser parses attach, detach, and vacuum statements" {

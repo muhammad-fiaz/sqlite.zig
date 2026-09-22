@@ -263,7 +263,11 @@ try db.createTable(Member, .{ .primaryKey = &.{ Member.tenant_id, Member.user_id
 try db.createTable(User, .{ .unique = &.{User.email} });
 try db.createTable(Order, .{ .foreignKeys = &.{
     .{ .column = Order.user_id, .references = User.id, .onDelete = .cascade },
+    // Deferred variant: enforced at COMMIT instead of per statement.
+    .{ .column = Order.coupon_id, .references = Coupon.id, .deferrable = true, .initiallyDeferred = true },
 } });
+// Foreign keys also accept `.onUpdate`, `.deferrable`, and
+// `.initiallyDeferred` (the latter needs `.deferrable = true`).
 
 // Dynamic: explicit columns plus string keys.
 try db.createTable("users", .{

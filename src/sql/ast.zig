@@ -87,14 +87,17 @@ pub const JoinKind = enum { inner, left, right, full, cross };
 pub const Join = struct { kind: JoinKind, table: []const u8, tableAlias: ?[]const u8 = null, leftTable: []const u8, leftColumn: []const u8, rightTable: []const u8, rightColumn: []const u8, mergeOutput: bool = false, usingColumns: []const []const u8 = &.{} };
 /// SELECT output item with optional alias.
 pub const Projection = struct { expr: Expr, alias: ?[]const u8 = null };
-/// Inline `REFERENCES t(c)` column constraint.
-pub const ForeignKeyDef = struct { table: []const u8, column: []const u8, onDelete: ReferentialAction = .restrict, onUpdate: ReferentialAction = .restrict };
+/// Inline `REFERENCES t(c)` column constraint. `deferrable` with
+/// `initiallyDeferred` postpones enforcement to COMMIT (or statement end in
+/// autocommit); otherwise the constraint is immediate.
+pub const ForeignKeyDef = struct { table: []const u8, column: []const u8, onDelete: ReferentialAction = .restrict, onUpdate: ReferentialAction = .restrict, deferrable: bool = false, initiallyDeferred: bool = false };
 /// FK referential actions; default `.restrict` matches the parser default.
 pub const ReferentialAction = enum { restrict, cascade, setNull, setDefault, noAction };
 /// Column definition; `typeName` may be "" (untyped affinity) or multi-word.
 pub const ColumnDef = struct { name: []const u8, typeName: []const u8, primaryKey: bool = false, notNull: bool = false, unique: bool = false, autoincrement: bool = false, foreignKey: ?ForeignKeyDef = null, defaultValue: ?Value = null, checkExpr: ?Expr = null, generatedExpr: ?Expr = null, generatedStored: bool = false };
 /// Table-level `FOREIGN KEY (cols) REFERENCES t(cols)` constraint.
-pub const TableForeignKeyDef = struct { columns: []const []const u8, table: []const u8, referencedColumns: []const []const u8, onDelete: ReferentialAction = .restrict, onUpdate: ReferentialAction = .restrict };
+/// Deferral semantics match `ForeignKeyDef`.
+pub const TableForeignKeyDef = struct { columns: []const []const u8, table: []const u8, referencedColumns: []const []const u8, onDelete: ReferentialAction = .restrict, onUpdate: ReferentialAction = .restrict, deferrable: bool = false, initiallyDeferred: bool = false };
 /// Table-level constraints (PK/UNIQUE/FK/CHECK).
 pub const TableConstraint = union(enum) { primaryKey: []const []const u8, unique: []const []const u8, foreignKey: TableForeignKeyDef, check: Expr };
 /// CREATE INDEX payload; `keyExprs` parallels `columns` (null = plain column).
