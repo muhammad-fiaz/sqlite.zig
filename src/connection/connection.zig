@@ -4520,6 +4520,10 @@ pub const Connection = struct {
         const store = self.storeFor(resolved.ref);
         const tbl = resolved.table;
         try validateReturningColumns(tbl, value.returning);
+        // Explicit ON CONFLICT targets must resolve to a real unique
+        // constraint (partial indexes need a matching WHERE); anything
+        // else fails before any row is written, like the reference.
+        try self.checkConflictTarget(store, tbl, value);
         var nonGenCount: usize = 0;
         for (tbl.columns) |c| if (c.generatedExpr == null) {
             nonGenCount += 1;
@@ -4892,6 +4896,80 @@ pub const Connection = struct {
             };
         }
         return null;
+    }
+
+    /// True when two column lists hold the same names regardless of order
+    /// (ASCII case-insensitive); the reference requires equal cardinality
+    /// between conflict targets and index keys, so lengths must agree.
+    fn conflictColumnsMatch(left: []const []const u8, right: []const []const u8) bool {
+        if (left.len != right.len) return false;
+        for (left) |a| {
+            var found = false;
+            for (right) |b| if (std.ascii.eqlIgnoreCase(a, b)) {
+                found = true;
+                break;
+            };
+            if (!found) return false;
+        }
+        return true;
+    }
+
+    /// Validates an explicit `ON CONFLICT(target)` clause against the
+    /// table's unique constraints, mirroring the reference inference
+    /// (`sqlite3UpsertAnalyzeTarget`): the target set must match the rowid,
+    /// a PRIMARY KEY/UNIQUE group, or a UNIQUE index — and a partial index
+    /// additionally needs a WHERE implying its predicate. Anything else
+    /// fails `InvalidSql` instead of silently inserting.
+    fn checkConflictTarget(self: *Connection, store: *const Schema, tbl: *const Table, value: anytype) !void {
+        if (value.conflictTargetColumns.len == 0) return;
+        if (value.conflict != .update and value.conflict != .ignore) return;
+        const target = value.conflictTargetColumns;
+        if (target.len == 1 and !tbl.withoutRowid) {
+            if (std.ascii.eqlIgnoreCase(target[0], "rowid") or std.ascii.eqlIgnoreCase(target[0], "_rowid_") or std.ascii.eqlIgnoreCase(target[0], "oid")) return;
+        }
+        if (target.len == 1) {
+            if (Schema.rowidAliasColumn(tbl)) |alias| {
+                if (std.ascii.eqlIgnoreCase(tbl.columns[alias].name, target[0])) return;
+            }
+            for (tbl.columns) |column| {
+                if (!column.unique or !std.ascii.eqlIgnoreCase(column.name, target[0])) continue;
+                if (self.inCompositePk(tbl, column.name)) continue;
+                return;
+            }
+        }
+        for (tbl.constraints) |constraint| {
+            if (constraint.kind == .foreignKey or constraint.kind == .check) continue;
+            if (conflictColumnsMatch(constraint.columns, target)) return;
+        }
+        for (store.indexes.items) |index| {
+            if (!index.unique or !std.ascii.eqlIgnoreCase(index.table, tbl.name)) continue;
+            // Expression indexes need expression targets, which the
+            // word-only target list cannot name; keep looking.
+            var hasExpr = false;
+            for (index.columns, 0..) |_, position| if (index.keyExpr(position) != null) {
+                hasExpr = true;
+                break;
+            };
+            if (hasExpr) continue;
+            if (!conflictColumnsMatch(index.columns, target)) continue;
+            if (index.whereExpr) |predicate| {
+                const whereConds = value.conflictTargetWhere orelse return error.InvalidSql;
+                if (!exprEvaluator.partialPredicateImpliedBy(predicate, whereConds)) continue;
+            }
+            return;
+        }
+        return error.InvalidSql;
+    }
+
+    /// True when `column` belongs to a composite (multi-column) table-level
+    /// PRIMARY KEY group (single-column members match on their own).
+    fn inCompositePk(self: *Connection, tbl: *const Table, column: []const u8) bool {
+        _ = self;
+        for (tbl.constraints) |constraint| {
+            if (constraint.kind != .primaryKey or constraint.columns.len < 2) continue;
+            for (constraint.columns) |name| if (std.ascii.eqlIgnoreCase(name, column)) return true;
+        }
+        return false;
     }
 
     fn conflictRowTarget(self: *Connection, store: *Schema, tbl: *const Table, values: []const Value, targetColumns: []const []const u8, targetWhere: ?ast.Conditions, parameters: []const Value) anyerror!?usize {
@@ -12121,7 +12199,10 @@ test "partial unique index interacts with conflict handling" {
     ignored.deinit();
     var inserted = try db.exec("INSERT OR IGNORE INTO subs VALUES (3, 'a@test', 0);");
     inserted.deinit();
-    var upserted = try db.exec("INSERT INTO subs VALUES (4, 'a@test', 1) ON CONFLICT(email) DO UPDATE SET id = excluded.id;");
+    // A partial-index target needs a matching WHERE (reference inference
+    // rule); without one the statement fails before writing anything.
+    try std.testing.expectError(error.InvalidSql, db.exec("INSERT INTO subs VALUES (4, 'a@test', 1) ON CONFLICT(email) DO UPDATE SET id = excluded.id;"));
+    var upserted = try db.exec("INSERT INTO subs VALUES (4, 'a@test', 1) ON CONFLICT(email) WHERE active = 1 DO UPDATE SET id = excluded.id;");
     upserted.deinit();
     var rows = try db.exec("SELECT id, active FROM subs ORDER BY id;");
     defer rows.deinit();
@@ -15295,6 +15376,33 @@ test "probe without rowid rowid alias behavior" {
     defer plan.deinit();
     try std.testing.expectEqual(@as(usize, 1), plan.count());
     try std.testing.expectEqualStrings("SEARCH wr_t USING PRIMARY KEY (id=?)", plan.rows[0][0].text);
+}
+
+test "probe upsert partial index and excluded corners" {
+    var db = try freshDb("sqlite_zig_probe_upsert_test.db");
+    defer dropDb(db, "sqlite_zig_probe_upsert_test.db");
+    var setup = try db.exec("CREATE TABLE pu_t (id INTEGER PRIMARY KEY, email TEXT, active INTEGER); CREATE UNIQUE INDEX pu_email ON pu_t(email) WHERE active = 1; INSERT INTO pu_t VALUES (1, 'a@x', 1);");
+    setup.deinit();
+    // Inactive rows are outside the partial index: no conflict, plain insert.
+    var inactive = try db.exec("INSERT INTO pu_t VALUES (2, 'a@x', 0);");
+    inactive.deinit();
+    var count = try db.exec("SELECT count(*) FROM pu_t;");
+    defer count.deinit();
+    try std.testing.expectEqual(@as(i64, 2), count.rows[0][0].integer);
+    // A partial index needs a matching WHERE in the target (reference
+    // inference rule); without one the statement fails up front.
+    try std.testing.expectError(error.InvalidSql, db.exec("INSERT INTO pu_t VALUES (3, 'a@x', 1) ON CONFLICT(email) DO UPDATE SET id = excluded.id;"));
+    // With the matching WHERE the active duplicate routes to DO UPDATE.
+    var up = try db.exec("INSERT INTO pu_t VALUES (3, 'a@x', 1) ON CONFLICT(email) WHERE active = 1 DO UPDATE SET id = excluded.id;");
+    up.deinit();
+    // excluded.* usable in the DO UPDATE where clause.
+    var upWhere = try db.exec("INSERT INTO pu_t VALUES (4, 'a@x', 1) ON CONFLICT(email) WHERE active = 1 DO UPDATE SET active = 0 WHERE excluded.id = 4;");
+    upWhere.deinit();
+    var check = try db.exec("SELECT id, active FROM pu_t WHERE email = 'a@x' AND active = 1;");
+    defer check.deinit();
+    try std.testing.expectEqual(@as(usize, 1), check.count());
+    // A target matching nothing at all fails the same way.
+    try std.testing.expectError(error.InvalidSql, db.exec("INSERT INTO pu_t VALUES (5, 'b@x', 1) ON CONFLICT(active) DO UPDATE SET id = excluded.id;"));
 }
 
 test "case sensitive like pragma toggles operator and function forms" {

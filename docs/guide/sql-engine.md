@@ -29,7 +29,7 @@ of SQLite's SQL dialect.
 | **CREATE TRIGGER** | `CREATE [TEMP] TRIGGER [IF NOT EXISTS] name [BEFORE\|AFTER] INSERT\|UPDATE\|DELETE ON table [WHEN ...] ...`, plus `INSTEAD OF` triggers on views (multi-statement bodies allowed everywhere) |
 | **CREATE INDEX** | `CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (columns)` |
 | **ALTER TABLE** | `ADD COLUMN`, `RENAME TO`, `RENAME COLUMN ... TO`, and `DROP COLUMN`; renames follow indexes, triggers (including `UPDATE OF` and `NEW`/`OLD` body references), views, `CHECK`/generated/index expressions, foreign keys, and `sqlite_sequence`; drops are refused while a column backs a key, index, or foreign key |
-| **UPSERT** | `INSERT ... ON CONFLICT [(cols)] [WHERE ...] DO NOTHING` / `DO UPDATE SET ...` with `excluded` |
+| **UPSERT** | `INSERT ... ON CONFLICT [(cols)] [WHERE ...] DO NOTHING` / `DO UPDATE SET ...` with `excluded`; explicit targets must match a real unique constraint, and partial-index targets additionally need a matching `WHERE` (otherwise `InvalidSql`, like the reference) |
 | **RETURNING** | `INSERT/UPDATE/DELETE ... RETURNING ...` |
 | **Compound SELECT** | `UNION [ALL]`, `INTERSECT`, `EXCEPT` with `ORDER BY` / `LIMIT` / `OFFSET` |
 | **CTE** | `WITH ...` / `WITH RECURSIVE ...` |
