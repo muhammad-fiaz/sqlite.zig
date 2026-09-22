@@ -15027,7 +15027,7 @@ test "multi-argument min and max evaluate scalar in aggregate context" {
     // Routing regression: 2+ args must take the row-wise scalar path even
     // with FROM present (the aggregate branch would silently keep only the
     // first argument and collapse to one row).
-    const path = "sqlite_zig_scalar_minmax_test.db";
+    const path = "sqlite_zig_scalar_minmax_agg_test.db";
     var db = try freshDb(path);
     defer dropDb(db, path);
     var setup = try db.exec("CREATE TABLE m (a INTEGER, b INTEGER); INSERT INTO m VALUES (3, 1), (10, 20);");
@@ -15425,6 +15425,45 @@ test "json pretty and patch run as raw sql" {
     defer patched.deinit();
     try std.testing.expectEqualStrings("{\"a\":1,\"c\":3}", patched.rows[0][0].text);
     try std.testing.expectEqualStrings("{\"a\":[]}", patched.rows[0][1].text);
+}
+
+test "probe window exclude ties groups and ranges" {
+    var db = try freshDb("sqlite_zig_probe_window_test.db");
+    defer dropDb(db, "sqlite_zig_probe_window_test.db");
+    var setup = try db.exec("CREATE TABLE wf_t (g INTEGER, v INTEGER); INSERT INTO wf_t VALUES (1, 10), (1, 20), (2, 30), (2, 40);");
+    setup.deinit();
+    var noCur = try db.exec("SELECT sum(v) OVER (ORDER BY g ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE CURRENT ROW) FROM wf_t ORDER BY g, v;");
+    defer noCur.deinit();
+    try std.testing.expect(noCur.rows[0][0] == .null);
+    try std.testing.expectEqual(@as(i64, 10), noCur.rows[1][0].integer);
+    try std.testing.expectEqual(@as(i64, 30), noCur.rows[2][0].integer);
+    try std.testing.expectEqual(@as(i64, 60), noCur.rows[3][0].integer);
+    var noGroup = try db.exec("SELECT sum(v) OVER (ORDER BY g ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE GROUP) FROM wf_t ORDER BY g, v;");
+    defer noGroup.deinit();
+    try std.testing.expect(noGroup.rows[0][0] == .null);
+    try std.testing.expect(noGroup.rows[1][0] == .null);
+    try std.testing.expectEqual(@as(i64, 30), noGroup.rows[2][0].integer);
+    try std.testing.expectEqual(@as(i64, 30), noGroup.rows[3][0].integer);
+    var noTies = try db.exec("SELECT sum(v) OVER (ORDER BY g ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING EXCLUDE TIES) FROM wf_t ORDER BY g, v;");
+    defer noTies.deinit();
+    try std.testing.expectEqual(@as(i64, 10), noTies.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 50), noTies.rows[1][0].integer);
+    try std.testing.expectEqual(@as(i64, 50), noTies.rows[2][0].integer);
+    try std.testing.expectEqual(@as(i64, 40), noTies.rows[3][0].integer);
+    var range = try db.exec("SELECT sum(v) OVER (ORDER BY g RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM wf_t ORDER BY g, v;");
+    defer range.deinit();
+    try std.testing.expectEqual(@as(i64, 100), range.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 100), range.rows[1][0].integer);
+    try std.testing.expectEqual(@as(i64, 100), range.rows[2][0].integer);
+    try std.testing.expectEqual(@as(i64, 100), range.rows[3][0].integer);
+    var groups = try db.exec("SELECT sum(v) OVER (ORDER BY g GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM wf_t ORDER BY g, v;");
+    defer groups.deinit();
+    try std.testing.expectEqual(@as(i64, 100), groups.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 100), groups.rows[3][0].integer);
+    var groupsEx = try db.exec("SELECT sum(v) OVER (ORDER BY g GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING EXCLUDE GROUP) FROM wf_t ORDER BY g, v;");
+    defer groupsEx.deinit();
+    try std.testing.expectEqual(@as(i64, 70), groupsEx.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 30), groupsEx.rows[2][0].integer);
 }
 
 test "case sensitive like pragma toggles operator and function forms" {

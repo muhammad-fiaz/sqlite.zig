@@ -535,7 +535,11 @@ pub fn evaluateWindowFunction(
                         .unboundedFollowing => frameEnd = n - 1,
                     }
                 }
-                if (frameStart <= frameEnd and frameStart < n) {
+                // The value-scan RANGE branch above fills `included`
+                // directly (with EXCLUDE already applied); only the
+                // positional GROUPS/ROWS branches need this index sweep
+                // (otherwise stale frameStart/frameEnd re-add row 0).
+                if (!rangeByValue and frameStart <= frameEnd and frameStart < n) {
                     const stop = @min(n - 1, frameEnd);
                     var idx = frameStart;
                     while (idx <= stop) : (idx += 1) {

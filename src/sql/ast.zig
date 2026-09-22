@@ -955,25 +955,43 @@ test "ast clone/free round-trips owned expressions" {
     freeOwnedExpr(alloc, owned);
 }
 
-test "ast frees deep trees iteratively and refuses to clone them" {
-    // 10k-deep left-leaning chain: freeing must not touch the call stack
-    // (iterative work list), while cloning fails closed past the cap.
-    const alloc = std.testing.allocator;
+/// Builds a left-leaning `op` chain of `depth` heap nodes over integer
+/// literals; the caller frees the root with `freeOwnedExpr`. Shared by the
+/// deep-tree tests so clone-cap and iterative-free coverage stay isolated
+/// (a hang or fault attributes to exactly one phase).
+fn buildDeepChain(allocator: std.mem.Allocator, depth: usize) !Expr {
     var root: Expr = .{ .literal = .{ .integer = 0 } };
-    var depth: usize = 0;
-    while (depth < 10000) : (depth += 1) {
-        const left = try alloc.create(Expr);
+    // Iterative free handles any partial chain, so OOM teardown cannot
+    // recurse either; `root` reads latest on unwind.
+    errdefer freeOwnedExpr(allocator, root);
+    var built: usize = 0;
+    while (built < depth) : (built += 1) {
+        const left = try allocator.create(Expr);
         left.* = root;
-        errdefer {
-            freeOwnedExpr(alloc, left.*);
-            alloc.destroy(left);
-        }
-        const one = try alloc.create(Expr);
+        errdefer allocator.destroy(left);
+        const one = try allocator.create(Expr);
+        errdefer allocator.destroy(one);
         one.* = .{ .literal = .{ .integer = 1 } };
-        errdefer alloc.destroy(one);
         root = .{ .binary = .{ .op = .add, .left = left, .right = one } };
     }
+    return root;
+}
+
+test "ast frees deep trees iteratively" {
+    // 10k-deep left-leaning chain: freeing must not touch the call stack
+    // (iterative work list). Cloning is covered separately below.
+    const alloc = std.testing.allocator;
+    const root = try buildDeepChain(alloc, 10000);
+    freeOwnedExpr(alloc, root);
+}
+
+test "ast refuses to clone past the depth cap" {
+    // Just past max_clone_depth: cloning fails closed with TooDeep, and
+    // the untouched tree still frees cleanly afterwards.
+    const alloc = std.testing.allocator;
+    const root = try buildDeepChain(alloc, max_clone_depth + 100);
     try std.testing.expectError(error.TooDeep, cloneOwnedExpr(alloc, root));
+    try std.testing.expectError(error.TooDeep, cloneBorrowedExpr(alloc, root));
     freeOwnedExpr(alloc, root);
 }
 
