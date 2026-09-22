@@ -31,7 +31,47 @@ pub const IndexMatch = struct {
     rangeOp2: ?ast.CompareOp = null,
     isCovering: bool = false,
     satisfiesOrderBy: bool = false,
+    /// The matched index IS the WITHOUT ROWID primary key: `explain`
+    /// renders `USING PRIMARY KEY (...)` with no index name, like the
+    /// reference (`IsPrimaryKeyIndex` in EXPLAIN output).
+    isPrimaryKey: bool = false,
 };
+
+/// Order-insensitive column-set equality (ASCII case-insensitive); the
+/// reference requires equal cardinality between targets and index keys.
+fn columnsMatchSet(left: []const []const u8, right: []const []const u8) bool {
+    if (left.len != right.len) return false;
+    for (left) |a| {
+        var found = false;
+        for (right) |b| if (std.ascii.eqlIgnoreCase(a, b)) {
+            found = true;
+            break;
+        };
+        if (!found) return false;
+    }
+    return true;
+}
+
+/// True when `index` is the PRIMARY KEY index of a WITHOUT ROWID table:
+/// unique with exactly the PK column set (table-level group preferred,
+/// else the single flagged column). Rowid tables keep the INTEGER
+/// PRIMARY KEY wording through the rowidLookup path instead.
+fn isPrimaryKeyIndex(table: *const Table, index: Index) bool {
+    if (!table.withoutRowid or !index.unique) return false;
+    for (index.columns, 0..) |_, position| if (index.keyExpr(position) != null) return false;
+    for (table.constraints) |constraint| {
+        if (constraint.kind != .primaryKey) continue;
+        return columnsMatchSet(constraint.columns, index.columns);
+    }
+    var pkCount: usize = 0;
+    var pkName: ?[]const u8 = null;
+    for (table.columns) |col| if (col.primaryKey) {
+        pkCount += 1;
+        pkName = col.name;
+    };
+    if (pkCount != 1) return false;
+    return index.columns.len == 1 and std.ascii.eqlIgnoreCase(index.columns[0], pkName.?);
+}
 
 /// Owned plan for one table reference plus an optional chained join plan.
 /// Caller `deinit`s; `explain` renders owned SQLite-style plan text.
@@ -80,7 +120,12 @@ pub const QueryPlan = struct {
             },
             .indexScan => {
                 if (self.indexMatch) |im| {
-                    if (im.isCovering) {
+                    // A full WITHOUT ROWID primary-key scan names no index,
+                    // like the reference (which only appends USING for
+                    // searches, never for scans).
+                    if (im.isPrimaryKey) {
+                        baseText = try std.fmt.allocPrint(allocator, "SCAN {s}", .{self.tableName});
+                    } else if (im.isCovering) {
                         baseText = try std.fmt.allocPrint(allocator, "SCAN {s} USING COVERING INDEX {s}", .{ self.tableName, im.indexName });
                     } else {
                         baseText = try std.fmt.allocPrint(allocator, "SCAN {s} USING INDEX {s}", .{ self.tableName, im.indexName });
@@ -94,7 +139,9 @@ pub const QueryPlan = struct {
                     var buf = std.ArrayList(u8).empty;
                     errdefer buf.deinit(allocator);
 
-                    const formattedPrefix = if (im.isCovering)
+                    const formattedPrefix = if (im.isPrimaryKey)
+                        try std.fmt.allocPrint(allocator, "SEARCH {s} USING PRIMARY KEY (", .{self.tableName})
+                    else if (im.isCovering)
                         try std.fmt.allocPrint(allocator, "SEARCH {s} USING COVERING INDEX {s} (", .{ self.tableName, im.indexName })
                     else
                         try std.fmt.allocPrint(allocator, "SEARCH {s} USING INDEX {s} (", .{ self.tableName, im.indexName });
@@ -485,6 +532,7 @@ pub fn planSelect(allocator: std.mem.Allocator, schema: *const Schema, selectStm
                             .rangeOp2 = rangeOp2,
                             .isCovering = isCovering,
                             .satisfiesOrderBy = satisfiesOrder,
+                            .isPrimaryKey = isPrimaryKeyIndex(table, index),
                         },
                         .cost = idxCost,
                         .needsTempSort = idxNeedsSort,
@@ -559,6 +607,7 @@ pub fn planSelect(allocator: std.mem.Allocator, schema: *const Schema, selectStm
                             .rangeColumn = null,
                             .isCovering = isCovering,
                             .satisfiesOrderBy = true,
+                            .isPrimaryKey = isPrimaryKeyIndex(table, index),
                         },
                         .cost = scanCost,
                         .needsTempSort = false,
@@ -600,6 +649,7 @@ pub fn planSelect(allocator: std.mem.Allocator, schema: *const Schema, selectStm
                             .eqColumns = innerEq,
                             .isCovering = false,
                             .satisfiesOrderBy = false,
+                            .isPrimaryKey = isPrimaryKeyIndex(innerTable, idx),
                         },
                         .cost = innerIdxCost,
                         .needsTempSort = false,
@@ -776,6 +826,67 @@ test "planner names the pk column for without rowid lookups" {
     const explained = try plan.explain(std.testing.allocator);
     defer std.testing.allocator.free(explained);
     try std.testing.expectEqualStrings("SEARCH widgets USING PRIMARY KEY (id=?)", explained);
+}
+
+test "planner renders composite without rowid pk without index name" {
+    var schema = Schema.init(std.testing.allocator);
+    defer schema.deinit();
+
+    const cols = [_]ast.ColumnDef{
+        .{ .name = "a", .typeName = "INTEGER" },
+        .{ .name = "b", .typeName = "TEXT" },
+        .{ .name = "v", .typeName = "INTEGER" },
+    };
+    const pkCols = [_][]const u8{ "a", "b" };
+    const constraints = [_]ast.TableConstraint{
+        .{ .primaryKey = &pkCols },
+    };
+    try schema.createTableWithOptions("pairs", &cols, &constraints, .{ .withoutRowid = true });
+
+    const conds = [_]ast.Condition{
+        .{ .column = "a", .op = .equal, .value = .{ .literal = .{ .integer = 1 } } },
+        .{ .column = "b", .op = .equal, .value = .{ .literal = .{ .text = "x" } } },
+    };
+    var plan = try planSelect(std.testing.allocator, &schema, .{
+        .table = @as(?[]const u8, "pairs"),
+        .condition = @as(?ast.Conditions, &conds),
+        .orders = @as([]const ast.Order, &.{}),
+        .projections = @as([]const ast.Projection, &.{}),
+        .joins = @as([]const ast.Join, &.{}),
+    });
+    defer plan.deinit();
+
+    const explained = try plan.explain(std.testing.allocator);
+    defer std.testing.allocator.free(explained);
+    try std.testing.expectEqualStrings("SEARCH pairs USING PRIMARY KEY (a=? AND b=?)", explained);
+}
+
+test "planner keeps index name for ordinary unique seeks" {
+    var schema = Schema.init(std.testing.allocator);
+    defer schema.deinit();
+
+    const cols = [_]ast.ColumnDef{
+        .{ .name = "id", .typeName = "INTEGER", .primaryKey = true },
+        .{ .name = "email", .typeName = "TEXT", .unique = true },
+    };
+    try schema.createTable("accounts", &cols, &.{});
+
+    const conds = [_]ast.Condition{
+        .{ .column = "email", .op = .equal, .value = .{ .literal = .{ .text = "a@x" } } },
+    };
+    var plan = try planSelect(std.testing.allocator, &schema, .{
+        .table = @as(?[]const u8, "accounts"),
+        .condition = @as(?ast.Conditions, &conds),
+        .orders = @as([]const ast.Order, &.{}),
+        .projections = @as([]const ast.Projection, &.{}),
+        .joins = @as([]const ast.Join, &.{}),
+    });
+    defer plan.deinit();
+
+    const explained = try plan.explain(std.testing.allocator);
+    defer std.testing.allocator.free(explained);
+    // Rowid tables never render PRIMARY KEY for plain unique indexes.
+    try std.testing.expect(std.mem.indexOf(u8, explained, "USING INDEX ") != null);
 }
 
 test "planner uses index for order by to elide temp sort" {

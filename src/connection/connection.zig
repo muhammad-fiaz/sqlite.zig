@@ -15376,6 +15376,19 @@ test "probe without rowid rowid alias behavior" {
     defer plan.deinit();
     try std.testing.expectEqual(@as(usize, 1), plan.count());
     try std.testing.expectEqualStrings("SEARCH wr_t USING PRIMARY KEY (id=?)", plan.rows[0][0].text);
+    var setupC = try db.exec("CREATE TABLE wr_c (a INTEGER, b TEXT, v INTEGER, PRIMARY KEY (a, b)) WITHOUT ROWID; INSERT INTO wr_c VALUES (1, 'x', 9);");
+    setupC.deinit();
+    var planC = try db.exec("EXPLAIN QUERY PLAN SELECT * FROM wr_c WHERE a = 1 AND b = 'x';");
+    defer planC.deinit();
+    try std.testing.expectEqual(@as(usize, 1), planC.count());
+    try std.testing.expectEqualStrings("SEARCH wr_c USING PRIMARY KEY (a=? AND b=?)", planC.rows[0][0].text);
+    var gotC = try db.exec("SELECT v FROM wr_c WHERE a = 1 AND b = 'x';");
+    defer gotC.deinit();
+    try std.testing.expectEqual(@as(i64, 9), gotC.rows[0][0].integer);
+    var planScan = try db.exec("EXPLAIN QUERY PLAN SELECT * FROM wr_c ORDER BY a, b;");
+    defer planScan.deinit();
+    try std.testing.expectEqual(@as(usize, 1), planScan.count());
+    try std.testing.expectEqualStrings("SCAN wr_c", planScan.rows[0][0].text);
 }
 
 test "probe upsert partial index and excluded corners" {

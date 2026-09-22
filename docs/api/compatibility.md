@@ -68,7 +68,7 @@ differential harness against SQLite and no fault-injection runner;
 | 18 | Varint / record encoding | `format/varint.zig`, `format/record.zig` | source-local `varint`/`record` tests | Covered | none: 9-byte extremes and short-buffer errors covered |
 | 19 | Type affinity and collations (NUMERIC/TEXT/BLOB, NOCASE/RTRIM) | `catalog/type_affinity.zig`, `vm/value.zig`, `connection/compare.zig` | `type_affinity` + `value` + `compare` tests; `examples/47,66` | Covered | `TODO(affinity)`: one consolidated `COLLATE` propagation test |
 | 20 | STRICT tables | `catalog/schema.zig` (`strict`, `coerceStrict`), `sql/coerce.zig` (`affinityNumeric`, `realAffinityInt`), `connection/connection.zig` (typed create paths) | `schema.zig` coercion tests; `connection.zig` strict tests; `examples/66` | Partial | `TODO(strict)`: VIRTUAL generated columns skip the check in the reference (`OP_TypeCheck`); affinity matrix itself verified |
-| 21 | WITHOUT ROWID tables | `catalog/schema.zig` (`withoutRowid`), `storage/sqlite_image.zig` (DDL round-trip), `plan/planner.zig` (PK lookup text) | `plan` PK text test; `connection.zig` alias-error probes; `examples/67` | Partial | `TODO(worowid)`: composite-PK `EXPLAIN` text still renders the single-column form |
+| 21 | WITHOUT ROWID tables | `catalog/schema.zig` (`withoutRowid`), `storage/sqlite_image.zig` (DDL round-trip), `plan/planner.zig` (PK lookup text) | `plan` PK text tests; `connection.zig` alias-error and composite probes; `examples/67` | Covered | none: PK routing, `rowid` alias errors, and single/composite/scan `EXPLAIN` text verified |
 | 22 | Generated columns (STORED recompute, VIRTUAL guards) | `catalog/schema.zig` (`generatedExpr`), `connection/connection.zig` (`recomputeGeneratedColumns`) | `connection.zig` generated tests; `examples/65` | Partial | `TODO(gencol)`: VIRTUAL-vs-STORED persistence parity |
 | 23 | UPSERT (`ON CONFLICT`) and `RETURNING` | `connection/connection.zig` (`applyUpsert`, `conflictRowTarget`, `checkConflictTarget`, `evaluateReturning`) | `connection.zig` tests incl. partial-index inference; `examples/38,39,40,41,55,56` | Covered | none: target inference, partial-index `WHERE` rule, and `excluded.*` corners verified |
 | 24 | VACUUM (`VACUUM`, `VACUUM INTO`) | `connection/connection.zig` (`vacuumCommand`), `migration/runner.zig` (txn guard) | parser `VACUUM main INTO` tests; `VACUUM INTO` command tests | Partial | `TODO(vacuum)`: auto-vacuum stubs |
@@ -146,7 +146,7 @@ property tests, then page-image hostile inputs.
 
 ## Coverage summary
 
-Fourteen of twenty-nine families are `Covered`; fourteen are `Partial`;
+Fifteen of twenty-nine families are `Covered`; thirteen are `Partial`;
 one (fuzz/fault/stress/concurrency) is `Out of Scope`. The `Partial`
 rows name their gaps, so check the row before relying on a corner —
 particularly around storage durability and the admin surface.
