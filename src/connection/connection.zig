@@ -8954,16 +8954,16 @@ test "scoped and explicit typed writes and reads agree" {
     }
     try std.testing.expectEqual(@as(i64, 1), scoped.rows[0][0].integer);
     try std.testing.expectEqualStrings("beta", scoped.rows[1][2].text);
-    // Scoped predicates via the columns value match explicit predicates.
+    // Predicates use explicit qualified columns.
     const q = db.from(Membership);
-    var one = try q.where(q.c().user_id.eq(1)).select(.{.label}).fetch();
+    var one = try q.where(Membership.user_id.eq(1)).select(.{.label}).fetch();
     defer one.deinit();
     try std.testing.expectEqual(@as(usize, 1), one.count());
     try std.testing.expectEqualStrings("alpha", one.rows[0][0].text);
-    // Explicit updates (literal + arithmetic expression) match scoped ones.
+    // Explicit updates (literal + arithmetic expression).
     var updA = try (try db.from(Membership).update(.{Membership.label.set("ALPHA")})).where(Membership.user_id.eq(1)).execute();
     updA.deinit();
-    var updB = try (try db.from(Membership).update(.{ .group_id = 99 })).where(q.c().group_id.eq(20)).execute();
+    var updB = try (try db.from(Membership).update(.{ .group_id = 99 })).where(Membership.group_id.eq(20)).execute();
     updB.deinit();
     var updC = try (try db.from(Membership).update(.{Membership.user_id.set(Membership.user_id.add(100))})).where(Membership.label.eq("ALPHA")).execute();
     updC.deinit();
@@ -8974,9 +8974,9 @@ test "scoped and explicit typed writes and reads agree" {
     try std.testing.expectEqual(@as(i64, 99), check.at(0).group_id);
     try std.testing.expectEqual(@as(i64, 101), check.at(1).user_id);
     try std.testing.expectEqualStrings("ALPHA", check.at(1).label);
-    // Scoped GROUP BY + HAVING through the columns value.
+    // GROUP BY scoped with an explicit HAVING aggregate.
     const gq = db.from(Membership);
-    var grouped = try gq.groupBy(.group_id).having(gq.c().group_id.count().gt(0)).select(.{.group_id}).fetch();
+    var grouped = try gq.groupBy(.group_id).having(Membership.group_id.count().gt(0)).select(.{.group_id}).fetch();
     defer grouped.deinit();
     try std.testing.expectEqual(@as(usize, 2), grouped.count());
 }
@@ -9089,7 +9089,7 @@ test "scoped schema objects resolve against their target" {
     var s = try db.from(Thing).insert(.{ .id = 1, .email = "a@x.y", .nick = "al" });
     s.deinit();
     const q = db.from(Thing);
-    var got = try q.where(q.c().email.eq("a@x.y")).select(.{ .id, .nick }).fetch();
+    var got = try q.where(Thing.email.eq("a@x.y")).select(.{ .id, .nick }).fetch();
     defer got.deinit();
     try std.testing.expectEqual(@as(usize, 1), got.count());
     try std.testing.expectEqualStrings("al", got.rows[0][1].text);
@@ -9106,9 +9106,9 @@ test "predicates staged before update delete and upsert carry over" {
     a.deinit();
     var b = try db.from(Carry).insert(.{ .id = 2, .name = "b" });
     b.deinit();
-    // where() before update() narrows the mutation (scoped form too).
+    // where() before update() narrows the mutation.
     const q = db.from(Carry);
-    var u = try (try q.where(q.c().id.eq(1)).update(.{ .name = "a2" })).execute();
+    var u = try (try q.where(Carry.id.eq(1)).update(.{ .name = "a2" })).execute();
     u.deinit();
     var got = try db.from(Carry).select(Carry.all()).where(Carry.id.eq(2)).fetchOne();
     defer db.from(Carry).freeRow(&got);
@@ -9329,9 +9329,9 @@ test "chained multi-join resolves three tables in order" {
     defer arows.deinit();
     try std.testing.expectEqual(@as(usize, 1), arows.count());
     try std.testing.expectEqualStrings("ann", arows.rows[0][0].text);
-    // Scoped predicate on the chained root still binds the root table.
+    // Explicit predicate on the chained root binds the root table.
     const q = db.from(U);
-    var srows = try q.where(q.c().id.eq(1)).join(M, .inner, U.id.eq(M.user_id)).join(G, .inner, M.group_id.eq(G.id)).select(.{.id}).fetch();
+    var srows = try q.where(U.id.eq(1)).join(M, .inner, U.id.eq(M.user_id)).join(G, .inner, M.group_id.eq(G.id)).select(.{.id}).fetch();
     defer srows.deinit();
     try std.testing.expectEqual(@as(usize, 1), srows.count());
 }
@@ -9378,11 +9378,11 @@ test "scoped assigns and aliases flow through writes" {
     try db.createTable(T, .{ .overWrite = true, .primaryKey = T.id });
     var ins = try db.from(T).insert(.{ .id = 1, .name = "a" });
     ins.deinit();
-    // Scoped assign through the columns value, incl. arithmetic on itself.
+    // Explicit assign through qualified columns, incl. arithmetic on itself.
     const q = db.from(T);
-    var uw = try (try q.update(.{q.c().name.set("b")})).where(q.c().id.eq(1)).execute();
+    var uw = try (try q.update(.{T.name.set("b")})).where(T.id.eq(1)).execute();
     uw.deinit();
-    var ux = try (try db.from(T).update(.{q.c().id.set(q.c().id.add(10))})).where(T.name.eq("b")).execute();
+    var ux = try (try db.from(T).update(.{T.id.set(T.id.add(10))})).where(T.name.eq("b")).execute();
     ux.deinit();
     var got = try db.from(T).select(T.all()).fetchOne();
     defer db.from(T).freeRow(&got);
@@ -9546,9 +9546,9 @@ test "bare scoped foreign-key references resolve to the defining table" {
     selfRef.deinit();
     var delSelf = try db.from(Emp).where(Emp.id.eq(3)).delete().execute();
     delSelf.deinit();
-    // Scoped predicate via the builder's scoped columns: same scope, no guessing.
+    // Explicit predicate on the root table: same scope, no guessing.
     const emp = db.from(Emp);
-    var delMgr = try emp.where(emp.c().id.eq(1)).delete().execute();
+    var delMgr = try emp.where(Emp.id.eq(1)).delete().execute();
     delMgr.deinit();
     var orphan = try db.from(Emp).select(Emp.all()).fetchOne();
     defer db.from(Emp).freeRow(&orphan);
@@ -9606,9 +9606,9 @@ test "qualified all() projects exactly one join side" {
     defer leftMapped.deinit();
     try std.testing.expectEqual(@as(usize, 1), leftMapped.count());
     try std.testing.expectEqual(@as(i64, 1), leftMapped.at(0).id);
-    // Builder-scoped join predicate resolves against the root scope.
+    // Explicit join predicate on the root table resolves the root scope.
     const aq = db.from(A);
-    var scopedJoin = try aq.join(B, .inner, aq.c().id.eq(B.id)).select(B.all()).fetch();
+    var scopedJoin = try aq.join(B, .inner, A.id.eq(B.id)).select(B.all()).fetch();
     defer scopedJoin.deinit();
     try std.testing.expectEqual(@as(usize, 1), scopedJoin.count());
     try std.testing.expectEqualStrings("x", scopedJoin.rows[0][1].text);
@@ -16693,11 +16693,11 @@ test "strict and without rowid tables serve typed dual forms" {
     var w = try db.from(W).insert(.{ W.id.set(1), W.v.set("b") });
     w.deinit();
     const q = db.from(S);
-    var rs = try q.where(q.c().id.eq(1)).select(.{.v}).fetch();
+    var rs = try q.where(S.id.eq(1)).select(.{.v}).fetch();
     defer rs.deinit();
     try std.testing.expectEqualStrings("a", rs.rows[0][0].text);
     const qw = db.from(W);
-    var rw = try qw.where(qw.c().id.eq(1)).select(.{W.v}).fetch();
+    var rw = try qw.where(W.id.eq(1)).select(.{W.v}).fetch();
     defer rw.deinit();
     try std.testing.expectEqualStrings("b", rw.rows[0][0].text);
     // Wrong-affinity writes still fail on STRICT tables.

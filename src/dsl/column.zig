@@ -623,10 +623,9 @@ pub fn Column(comptime tableName: []const u8, comptime columnName: []const u8, c
         pub const fieldType = FieldType;
 
         func: ?FuncCall = null,
-        /// Runtime scope override for the table qualifier, set by scoped
-        /// `c()` columns on aliased queries (`q.c().id` qualifies with the
-        /// alias). Null means the type-level table identity. Never set by
-        /// hand; table values always carry null here.
+        /// Runtime scope override for the table qualifier (an alias).
+        /// Null means the type-level table identity. Never set by hand;
+        /// table values always carry null here.
         qualifier: ?[]const u8 = null,
 
         fn ref(self: Self) ColumnRef {

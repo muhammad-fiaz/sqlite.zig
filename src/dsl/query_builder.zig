@@ -548,26 +548,6 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
             return .{ .name = name };
         }
 
-        /// Scoped columns value for this query's root table
-        /// (`q.c().id.eq(1)`, `q.c().name`). Each field is the table's
-        /// typed column bound to the current scope: the builder's alias when
-        /// set, else its table name. The valid-Zig form of scoped `.id`
-        /// references for predicate positions (`where`, `having`, `join`
-        /// conditions), where a bare `.id` cannot carry an operator. Only
-        /// available on typed builders; dynamic queries use `column(name)`.
-        pub fn c(self: Self) Columns {
-            if (Columns == void) return {};
-            var scoped: Columns = undefined;
-            inline for (@typeInfo(Columns).@"struct".fields) |field| {
-                // Stamp the runtime scope: the alias when set, else null
-                // (which keeps the type-level table identity).
-                var col: field.type = .{};
-                col.qualifier = self.tableAlias;
-                @field(scoped, field.name) = col;
-            }
-            return scoped;
-        }
-
         /// Rebind this query to `alias` (borrowed slice must outlive use),
         /// the builder-level form of `sqlite.aliased(Table, "alias")`.
         /// Scoped references (`col()`, `.{ .id }` lists) qualify with the
@@ -2324,19 +2304,6 @@ pub fn UpsertBuilder(comptime Row: type, comptime Columns: type) type {
         returningCols: [16]Projection = undefined,
         returningCount: usize = 0,
 
-        /// Scoped columns value for the upsert target table (`up.c().id`).
-        /// See `Builder.c` for the scoping contract.
-        pub fn c(self: Self) Columns {
-            if (Columns == void) return {};
-            var scoped: Columns = undefined;
-            inline for (@typeInfo(Columns).@"struct".fields) |field| {
-                var col: field.type = .{};
-                col.qualifier = self.tableAlias;
-                @field(scoped, field.name) = col;
-            }
-            return scoped;
-        }
-
         pub fn onConflictWhere(self: Self, condition: Expr) Self {
             var copy = self;
             copy.targetWhere = condition;
@@ -2822,11 +2789,12 @@ test "scoped references follow the builder alias" {
     try std.testing.expectEqualStrings("u", scoped.projections[0].column.table);
     const explicit = aliased.select(.{T.id});
     try std.testing.expectEqualStrings("scope_users", explicit.projections[0].column.table);
-    // The scoped columns value binds predicates to the alias too.
-    const pred = aliased.c().id.eq(1);
+    // Explicit alias columns bind predicates to the alias too.
+    const u = @import("table.zig").aliased(T, "u");
+    const pred = u.id.eq(1);
     try std.testing.expectEqualStrings("u", pred.column.table);
     try std.testing.expectEqualStrings("id", pred.column.name);
-    const plain = base.c().name.eq("x");
+    const plain = T.name.eq("x");
     try std.testing.expectEqualStrings("scope_users", plain.column.table);
 }
 
@@ -2854,7 +2822,7 @@ test "scoped order group returning and join keys resolve" {
     try std.testing.expectEqualStrings("id", joined.joins[0].usingCols[0]);
     // Chained joins append legs in call order (ON stays a single equality;
     // wider conjunctions belong in WHERE, where AND binds correctly).
-    const chained = base.joinUsing(Other, .id).innerJoin(Other, Other.id.eq(base.c().id));
+    const chained = base.joinUsing(Other, .id).innerJoin(Other, Other.id.eq(T.id));
     try std.testing.expectEqual(@as(usize, 2), chained.joinCount);
     try std.testing.expect(chained.joins[1].on != null);
     const conflicted = base.onConflict(.id);

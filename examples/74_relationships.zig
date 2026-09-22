@@ -5,8 +5,8 @@
 //! cross-table parents stay explicit (`RUser.id`). Both self-reference
 //! forms resolve to the same native foreign-key metadata.
 //! Predicate positions cannot call operators on bare literals (Zig has no
-//! syntax for it), so scoped predicates go through the builder's scoped
-//! columns (`emp.c().id.eq(1)`) or explicit paths (`Employee.id.eq(1)`).
+//! syntax for it), so predicates use explicit qualified paths
+//! (`Employee.id.eq(1)`) or dynamic columns.
 const std = @import("std");
 const sqlite = @import("sqlite");
 
@@ -31,7 +31,7 @@ pub fn main() !void {
     var dev = try db.from(Employee).insert(.{ .id = 2, .manager_id = 1 });
     dev.deinit();
     const emp = db.from(Employee);
-    var delMgr = try emp.where(emp.c().id.eq(1)).delete().execute();
+    var delMgr = try emp.where(Employee.id.eq(1)).delete().execute();
     delMgr.deinit();
     var orphan = try db.from(Employee).select(Employee.all()).fetchOne();
     defer db.from(Employee).freeRow(&orphan);

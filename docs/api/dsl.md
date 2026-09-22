@@ -176,20 +176,22 @@ db.from(User).join(Membership, .inner, User.id.eq(Membership.user_id))
     .select(.{ .id, Membership.group_id });
 ```
 
-Predicate positions (`where`, `having`, join `ON`) cannot take a
-bare `.id` receiver — Zig itself rejects method calls on enum literals
-(`.id.eq(1)` fails with `no field or member function named 'eq' in
-'@EnumLiteral()'` before any library code runs) — so the query exposes
-its scoped columns as a value:
+Predicate positions (`where`, `having`, join `ON`) take explicit
+qualified columns or dynamic columns — never a bare `.id` receiver, which
+Zig itself rejects (method calls on enum literals fail with `no field or
+member function named 'eq' in '@EnumLiteral()'` before any library code
+runs). There is no scoped-columns value: scoped `.id` lives in
+column-list positions (select, orderBy, groupBy, keys), while predicates
+always name their table:
 
 ```zig
 const q = db.from(User);
-q.where(q.c().id.eq(1)).select(.{.name});
-q.join(Profile, .inner, q.c().id.eq(Profile.user_id));
+q.where(User.id.eq(1)).select(.{.name});
+q.join(Profile, .inner, User.id.eq(Profile.user_id));
 ```
 
-`q.c().id` is the scoped spelling of the root table's `id`; `User.id`
-is the explicit spelling. Both converge on the same native predicate.
+Aliased predicates use the alias value (`u.id.eq(1)`); dynamic ones use
+`users.column("id").eq(1)`. All converge on the same native predicate.
 
 Writes accept scoped row structs and explicit qualified assignments:
 
@@ -301,10 +303,9 @@ Impossible syntax is never documented as supported: `.where(.id.eq(1))`,
 `User.id = 1` cannot compile in Zig (method calls on enum literals,
 methods on comptime structs, and assignment through struct literals are
 all rejected by the language). The canonical forms are
-`q.c().id.eq(1)`, `q.c().id.eq(P.x)`, `q.c().id.set(1)`,
-`User.id.asc()`, `q.c().x.count().gt(1)`,
-`sqlite.aliased(User, "u")`, `select(.all)`, and
-`User.id.set(1)`/`User.id.eq(1)`. See
+`User.id.eq(1)`, `User.id.eq(P.x)`, `User.id.set(1)`,
+`User.id.asc()`, `User.x.count().gt(1)`,
+`sqlite.aliased(User, "u")`, `select(.all)`. See
 `examples/73_dual_form_matrix.zig` and `examples/74_relationships.zig`.
 
 ## Queries

@@ -1,7 +1,7 @@
 //! Full dual-form matrix: every scoped/explicit combination, verified live.
 //!
 //! Each case prints `ok <name>` after asserting. Scoped means root-table
-//! scope (`.id` lists, `q.c().id` predicates); explicit means qualified
+//! scope (`.id` lists); explicit means qualified
 //! paths (`User.id`, `u.id`, `t.column("id")`, `.set(...)` assigns).
 //! Sections run as small functions so no single frame grows large.
 //! Run with `zig build run-73_dual_form_matrix`.
@@ -38,8 +38,8 @@ fn schemaPart(db: *sqlite.Connection) !void {
     try db.createTable(Group, .{ .overWrite = true, .primaryKey = .id });
     try db.createTable(Membership, .{
         .overWrite = true,
-        .primaryKey = &.{ Membership.user_id, Membership.group_id },
-        .unique = &.{&.{ Membership.group_id, Membership.label }},
+        .primaryKey = &.{ .user_id, .group_id },
+        .unique = &.{&.{ .group_id, .label }},
         .foreignKeys = &.{
             .{ .column = Membership.user_id, .references = User.id },
             .{ .column = .group_id, .references = Group.id },
@@ -95,20 +95,20 @@ fn readPart(db: *sqlite.Connection) !void {
     ok("select-single-scoped");
 
     const q = db.from(User);
-    var wScoped = try q.where(q.c().name.eq("bob")).select(.{.id}).fetch();
+    var wScoped = try q.where(User.name.eq("bob")).select(.{.id}).fetch();
     defer wScoped.deinit();
     var wExplicit = try db.from(User).where(User.name.eq("bob")).select(.{User.id}).fetch();
     defer wExplicit.deinit();
     std.debug.assert(wScoped.count() == 1 and wExplicit.count() == 1);
     std.debug.assert(wScoped.rows[0][0].integer == wExplicit.rows[0][0].integer);
-    ok("where-scoped-equals-explicit");
+    ok("where-select-scoped-equals-explicit");
 
     var oMix = try db.from(User).orderBy(.{ .name, User.id.desc() }).select(.{.id}).fetch();
     defer oMix.deinit();
     std.debug.assert(oMix.count() == 4 and oMix.rows[0][0].integer == 1);
     ok("order-mixed");
     const gq = db.from(Membership);
-    var grouped = try gq.groupBy(.group_id).having(gq.c().group_id.count().gt(0)).select(.{.group_id}).fetch();
+    var grouped = try gq.groupBy(.group_id).having(Membership.group_id.count().gt(0)).select(.{.group_id}).fetch();
     defer grouped.deinit();
     std.debug.assert(grouped.count() == 1 and grouped.rows[0][0].integer == 7);
     ok("group-having-scoped");
@@ -135,7 +135,7 @@ fn joinPart(db: *sqlite.Connection) !void {
     std.debug.assert(j.count() == 2 and j.rows[0][2].integer == 7);
     ok("join-aliased-explicit");
     const qa = db.from(u);
-    var ja = try qa.where(qa.c().id.eq(1)).join(m, .inner, u.id.eq(m.user_id)).select(.{.id}).fetch();
+    var ja = try qa.where(u.id.eq(1)).join(m, .inner, u.id.eq(m.user_id)).select(.{.id}).fetch();
     defer ja.deinit();
     std.debug.assert(ja.count() == 1);
     ok("join-aliased-scoped-where");
@@ -212,7 +212,7 @@ fn tailPart(db: *sqlite.Connection) !void {
     ok("insert-from-scoped");
 
     const qd = db.from(User);
-    var d1 = try qd.where(qd.c().id.eq(103)).delete().execute();
+    var d1 = try qd.where(User.id.eq(103)).delete().execute();
     d1.deinit();
     var d2 = try db.from(User).where(User.id.eq(4)).delete().execute();
     d2.deinit();

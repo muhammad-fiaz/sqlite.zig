@@ -45,9 +45,8 @@
 //! One Zig-expressible boundary: operators and method calls cannot hang off
 //! a bare literal (`.id.eq(1)` is rejected by the Zig compiler itself, with
 //! `no field or member function named 'eq' in '@EnumLiteral()'`), so scoped
-//! predicates spell through the builder's scoped columns (`q.c().id.eq(1)`)
-//! or explicit paths (`User.id.eq(1)`). The scope rule itself is unchanged:
-//! `q.c().id` still means the current/root table's `id`.
+//! `.id` lives in column-list positions while predicates always name their
+//! table explicitly (`User.id.eq(1)`, `u.id.eq(1)`) or use dynamic columns.
 
 const std = @import("std");
 const dslExpr = @import("expr.zig");

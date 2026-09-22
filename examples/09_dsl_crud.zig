@@ -20,9 +20,9 @@ pub fn main() !void {
     // Scoped select list resolves against the root table like User.id does.
     var selected = try db.from(User).select(.{ .id, .name }).where(User.id.eq(1)).fetch();
     selected.deinit();
-    // Scoped predicate through the query's columns value.
+    // Explicit predicate on the root table.
     const q = db.from(User);
-    var scoped = try q.where(q.c().name.eq("second")).select(.{.id}).fetch();
+    var scoped = try q.where(User.name.eq("second")).select(.{.id}).fetch();
     defer scoped.deinit();
     std.debug.assert(scoped.count() == 1);
     var deleted = try db.from(User).delete().where(User.id.eq(1)).execute();

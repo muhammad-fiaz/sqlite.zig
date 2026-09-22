@@ -1,10 +1,10 @@
 //! Typed DSL scoping: scoped fields and explicit table paths are one model.
 //!
 //! `db.from(User)` establishes User as the root scope: `.id` in column
-//! lists resolves against it, and `q.c().id` exposes scoped columns for
-//! predicate positions. Explicit paths (`User.id`, `u.id`) carry their own
-//! table identity and never depend on scope. Both forms converge on the
-//! same native AST; this example asserts they return identical data.
+//! lists resolves against it. Predicate positions always name their table
+//! explicitly (`User.id`, `u.id`), since Zig forbids operators on bare
+//! literals. Both forms converge on the same native AST; this example
+//! asserts they return identical data.
 //! Aliases come from `sqlite.aliased` (Zig comptime structs cannot carry
 //! methods, so `User.as("u")` is not expressible; the free function is the
 //! alias API and never mutates the schema).
@@ -49,9 +49,9 @@ pub fn main() !void {
         std.debug.assert(scoped.rows[i][1].integer == explicit.rows[i][1].integer);
         std.debug.assert(std.mem.eql(u8, scoped.rows[i][2].text, explicit.rows[i][2].text));
     }
-    // Scoped predicates through the columns value.
+    // Predicates use explicit qualified columns.
     const q = db.from(User);
-    var one = try q.where(q.c().id.eq(1)).select(.{.name}).fetch();
+    var one = try q.where(User.id.eq(1)).select(.{.name}).fetch();
     defer one.deinit();
     std.debug.assert(one.count() == 1 and std.mem.eql(u8, one.rows[0][0].text, "ann"));
     // Aliased join: every reference keeps its alias identity.
