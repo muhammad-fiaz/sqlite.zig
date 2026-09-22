@@ -80,7 +80,9 @@ pub const Having = []const HavingItem;
 /// WHERE condition list; `joinOr == true` on element i joins i to i+1 with OR.
 pub const Conditions = []const Condition;
 /// Legacy ORDER BY entry (column-name form; `OrderItem` is the expression form).
-pub const Order = struct { column: []const u8, descending: bool };
+/// `collate` borrows parser text like `Condition.collate` (never freed by
+/// tree deinit); DSL-built orders leave it null for binary comparison.
+pub const Order = struct { column: []const u8, descending: bool, collate: ?[]const u8 = null };
 /// Join flavor; `cross` and bare `natural` carry empty join keys.
 pub const JoinKind = enum { inner, left, right, full, cross };
 /// One JOIN arm; USING(single-col) lowers to left/right column pair.

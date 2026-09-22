@@ -1507,6 +1507,9 @@ pub const Schema = struct {
         }
         if (table.strict) {
             for (table.columns, 0..) |col, index| {
+                // VIRTUAL generated columns skip the check (like the
+                // reference OP_TypeCheck); STORED ones are checked.
+                if (col.generatedExpr != null and !col.generatedStored) continue;
                 const old = owned[index];
                 const coerced = try coerceStrict(self.allocator, col.typeName, old);
                 // Affinity rendering allocates a replacement (numbers to
@@ -1537,6 +1540,7 @@ pub const Schema = struct {
         try assignRowidAlias(table, values);
         if (table.strict) {
             for (table.columns, 0..) |col, index| {
+                if (col.generatedExpr != null and !col.generatedStored) continue;
                 _ = try coerceStrict(self.allocator, col.typeName, values[index]);
             }
         }

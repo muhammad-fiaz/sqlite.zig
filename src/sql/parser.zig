@@ -2599,9 +2599,14 @@ pub const Parser = struct {
                     defer self.allocator.free(combined);
                     orderColumn = try self.copy(combined);
                 }
-                const descending = self.acceptWord("desc");
-                _ = self.acceptWord("asc");
-                try orders.append(self.allocator, .{ .column = orderColumn, .descending = descending });
+                // Reference order is COLLATE then direction; also accept the
+                // swapped form so hand-written queries are not brittle.
+                var descending = self.acceptWord("desc");
+                if (!descending) _ = self.acceptWord("asc");
+                const orderCollate: ?[]const u8 = if (self.acceptWord("collate")) try self.word() else null;
+                if (!descending) descending = self.acceptWord("desc");
+                if (!descending) _ = self.acceptWord("asc");
+                try orders.append(self.allocator, .{ .column = orderColumn, .descending = descending, .collate = orderCollate });
                 if (!self.acceptTag(.comma)) break;
             }
         }

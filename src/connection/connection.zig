@@ -3278,7 +3278,7 @@ pub const Connection = struct {
                         }
                     }
                 }
-                sortKeys[keyIndex] = .{ .colIdx = sortIdx orelse return error.UnknownColumn, .descending = ord.descending };
+                sortKeys[keyIndex] = .{ .colIdx = sortIdx orelse return error.UnknownColumn, .descending = ord.descending, .collate = ord.collate };
             }
             const SortCtx = struct {
                 keys: []const ResolvedSortKey,
@@ -5896,7 +5896,7 @@ pub const Connection = struct {
         const sortKeys = try self.allocator.alloc(ResolvedSortKey, value.orders.len);
         defer self.allocator.free(sortKeys);
         for (value.orders, 0..) |keyOrder, keyIndex| {
-            sortKeys[keyIndex] = .{ .colIdx = resolveOrderColumnIndex(tbl, value.projections, keyOrder.column) orelse try columnIndex(tbl, keyOrder.column), .descending = keyOrder.descending };
+            sortKeys[keyIndex] = .{ .colIdx = resolveOrderColumnIndex(tbl, value.projections, keyOrder.column) orelse try columnIndex(tbl, keyOrder.column), .descending = keyOrder.descending, .collate = keyOrder.collate };
         }
         var i: usize = 0;
         while (i < orderedIndices.len) : (i += 1) {
@@ -5913,7 +5913,7 @@ pub const Connection = struct {
         const sortKeys = try self.allocator.alloc(ResolvedSortKey, orders.len);
         defer self.allocator.free(sortKeys);
         for (orders, 0..) |ord, keyIndex| {
-            sortKeys[keyIndex] = .{ .colIdx = resolveSortOutputIndex(columns, projections, ord.column) orelse return error.Unsupported, .descending = ord.descending };
+            sortKeys[keyIndex] = .{ .colIdx = resolveSortOutputIndex(columns, projections, ord.column) orelse return error.Unsupported, .descending = ord.descending, .collate = ord.collate };
         }
         var i: usize = 0;
         while (i < rows.items.len) : (i += 1) {
@@ -9828,6 +9828,15 @@ test "STRICT tables enforce SQLite strict type affinity and coercion" {
     try std.testing.expectError(error.ConstraintViolation, db.exec("INSERT INTO strict_ok (i, r, t, b, a) VALUES (1, 1.0, 'x', 999, 1);"));
     try std.testing.expectError(error.ConstraintViolation, db.exec("INSERT INTO strict_ok (i, r, t, b, a) VALUES (1e30, 1.0, 'x', X'00', 1);"));
     try std.testing.expectError(error.ConstraintViolation, db.exec("INSERT INTO strict_ok (i, r, t, b, a) VALUES ('12x', 1.0, 'x', X'00', 1);"));
+    // VIRTUAL generated columns skip the STRICT check (reference
+    // OP_TypeCheck); STORED ones are still checked.
+    var virt = try db.exec("CREATE TABLE strict_virt (i INT, v INT GENERATED ALWAYS AS ('x') VIRTUAL, s INT GENERATED ALWAYS AS (i + 1) STORED) STRICT; INSERT INTO strict_virt (i) VALUES (7);");
+    virt.deinit();
+    var gotV = try db.exec("SELECT i, v, s FROM strict_virt;");
+    defer gotV.deinit();
+    try std.testing.expectEqual(@as(i64, 7), gotV.rows[0][0].integer);
+    try std.testing.expectEqualStrings("x", gotV.rows[0][1].text);
+    try std.testing.expectEqual(@as(i64, 8), gotV.rows[0][2].integer);
 
     try std.testing.expectError(error.ConstraintViolation, db.exec("ALTER TABLE strict_ok ADD COLUMN bad_col VARCHAR;"));
     var addOk = try db.exec("ALTER TABLE strict_ok ADD COLUMN good_col TEXT;");
@@ -15477,6 +15486,54 @@ test "probe window exclude ties groups and ranges" {
     defer groupsEx.deinit();
     try std.testing.expectEqual(@as(i64, 70), groupsEx.rows[0][0].integer);
     try std.testing.expectEqual(@as(i64, 30), groupsEx.rows[2][0].integer);
+}
+
+test "collate propagates through every supported surface" {
+    // One consolidated sweep: explicit COLLATE must reach WHERE
+    // comparisons (both operand slots), IN lists, BETWEEN bounds, the IS
+    // family, bare expressions, and ORDER BY keys — while LIKE keeps
+    // ignoring it, exactly like the reference.
+    var db = try freshDb("sqlite_zig_collate_sweep_test.db");
+    defer dropDb(db, "sqlite_zig_collate_sweep_test.db");
+    var setup = try db.exec("CREATE TABLE co_t (name TEXT); INSERT INTO co_t VALUES ('banana'), ('Apple'), ('cherry'), ('apple');");
+    setup.deinit();
+    var whereEq = try db.exec("SELECT name FROM co_t WHERE name = 'APPLE' COLLATE NOCASE ORDER BY name;");
+    defer whereEq.deinit();
+    try std.testing.expectEqual(@as(usize, 2), whereEq.count());
+    var whereLeft = try db.exec("SELECT name FROM co_t WHERE 'APPLE' = name COLLATE NOCASE ORDER BY name;");
+    defer whereLeft.deinit();
+    try std.testing.expectEqual(@as(usize, 2), whereLeft.count());
+    var whereNe = try db.exec("SELECT count(*) FROM co_t WHERE name <> 'APPLE' COLLATE NOCASE;");
+    defer whereNe.deinit();
+    try std.testing.expectEqual(@as(i64, 2), whereNe.rows[0][0].integer);
+    var ordered = try db.exec("SELECT name FROM co_t ORDER BY name COLLATE NOCASE;");
+    defer ordered.deinit();
+    try std.testing.expectEqualStrings("Apple", ordered.rows[0][0].text);
+    try std.testing.expectEqualStrings("apple", ordered.rows[1][0].text);
+    try std.testing.expectEqualStrings("banana", ordered.rows[2][0].text);
+    try std.testing.expectEqualStrings("cherry", ordered.rows[3][0].text);
+    var orderedDesc = try db.exec("SELECT name FROM co_t ORDER BY name COLLATE NOCASE DESC;");
+    defer orderedDesc.deinit();
+    try std.testing.expectEqualStrings("cherry", orderedDesc.rows[0][0].text);
+    try std.testing.expectEqualStrings("banana", orderedDesc.rows[1][0].text);
+    var expr = try db.exec("SELECT 'a' = 'A' COLLATE NOCASE, 'a' < 'B' COLLATE NOCASE, 'a' IS DISTINCT FROM 'A' COLLATE NOCASE, 'a' = 'a ' COLLATE RTRIM;");
+    defer expr.deinit();
+    try std.testing.expectEqual(@as(i64, 1), expr.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 1), expr.rows[0][1].integer);
+    try std.testing.expectEqual(@as(i64, 0), expr.rows[0][2].integer);
+    try std.testing.expectEqual(@as(i64, 1), expr.rows[0][3].integer);
+    var inList = try db.exec("SELECT 'a' IN ('A' COLLATE NOCASE, 'q');");
+    defer inList.deinit();
+    try std.testing.expectEqual(@as(i64, 1), inList.rows[0][0].integer);
+    var between = try db.exec("SELECT 'B' BETWEEN 'a' COLLATE NOCASE AND 'c';");
+    defer between.deinit();
+    try std.testing.expectEqual(@as(i64, 1), between.rows[0][0].integer);
+    var likeIgnores = try db.exec("SELECT 'abc' LIKE 'A%' COLLATE BINARY;");
+    defer likeIgnores.deinit();
+    try std.testing.expectEqual(@as(i64, 1), likeIgnores.rows[0][0].integer);
+    var distinctStays = try db.exec("SELECT DISTINCT name FROM co_t ORDER BY name COLLATE NOCASE;");
+    defer distinctStays.deinit();
+    try std.testing.expectEqual(@as(usize, 4), distinctStays.count());
 }
 
 test "case sensitive like pragma toggles operator and function forms" {

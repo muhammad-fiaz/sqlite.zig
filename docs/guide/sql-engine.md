@@ -89,6 +89,11 @@ NULL-safe comparisons are available with `IS DISTINCT FROM` and
 `IS NOT DISTINCT FROM`; the typed equivalents are `isDistinctFrom` and
 `isNotDistinctFrom`.
 
+`ORDER BY` keys accept an explicit collation (`ORDER BY name COLLATE NOCASE
+DESC`); named collations also apply to comparison predicates, `IN`/`BETWEEN`
+bounds, the `IS` family, and bare expressions. `LIKE` ignores explicit
+`COLLATE`, matching the reference.
+
 Case-sensitive Unix-style matching is also available with `GLOB` in raw SQL and
 `column.glob(pattern)` in the typed DSL. `NOT GLOB` and `column.notGlob(pattern)`
 are also supported. Patterns support `*`, `?`, and simple character classes such

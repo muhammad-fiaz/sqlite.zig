@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const Value = @import("../vm/value.zig").Value;
+const Collation = @import("../vm/value.zig").Collation;
 const ast = @import("../sql/ast.zig");
 
 /// Reports whether a `COLLATE` name selects case-insensitive comparison.
@@ -71,6 +72,26 @@ pub fn compareCollated(left: Value, op: ast.CompareOp, right: Value, collate: ?[
                 else => false,
             };
         }
+    }
+    // Named collations other than NOCASE (RTRIM today) route text-vs-text
+    // through `Value.order`, which honors every `Collation` variant; other
+    // type pairs are collation-independent and use the generic path below.
+    if (left == .text and right == .text) {
+        const textOrd = left.order(right, Collation.fromName(collate));
+        const textResult: i8 = switch (textOrd) {
+            .lt => -1,
+            .eq => 0,
+            .gt => 1,
+        };
+        return switch (op) {
+            .equal => textResult == 0,
+            .notEqual => textResult != 0,
+            .less => textResult < 0,
+            .lessEqual => textResult <= 0,
+            .greater => textResult > 0,
+            .greaterEqual => textResult >= 0,
+            else => false,
+        };
     }
     if (left == .null or right == .null) return false;
     const result: i8 = switch (left) {
@@ -154,20 +175,23 @@ pub fn rowsEqual(left: []const Value, right: []const Value) bool {
     return true;
 }
 
-/// One resolved sort key: which output column to compare and its direction.
+/// One resolved sort key: which output column to compare, its direction,
+/// and its collation (null selects binary, like the reference default).
 pub const SortKey = struct {
     colIdx: usize,
     descending: bool = false,
+    collate: ?[]const u8 = null,
 };
 
-/// Multi-key row ordering over already-materialized rows (binary collation).
+/// Multi-key row ordering over already-materialized rows.
 ///
-/// Compares `a`/`b` key by key with `Value.order(..., .binary)`; the first
-/// non-equal key decides (inverted when `descending`). Returns `.eq` when all
-/// keys tie. Callers must guarantee every `colIdx` is in bounds.
+/// Compares `a`/`b` key by key with `Value.order` under each key's
+/// collation; the first non-equal key decides (inverted when
+/// `descending`). Returns `.eq` when all keys tie. Callers must guarantee
+/// every `colIdx` is in bounds.
 pub fn compareRowsByKeys(a: []const Value, b: []const Value, sortKeys: []const SortKey) std.math.Order {
     for (sortKeys) |key| {
-        const ord = a[key.colIdx].order(b[key.colIdx], .binary);
+        const ord = a[key.colIdx].order(b[key.colIdx], Collation.fromName(key.collate));
         if (ord == .eq) continue;
         return if (key.descending) ord.invert() else ord;
     }
