@@ -40,18 +40,18 @@ pub const FuncClass = enum {
 /// drift test at the file bottom fails if an arm is added without its name).
 /// `min`/`max` are absent on purpose: their class depends on arity.
 const scalarNames = [_][]const u8{
-    "abs",         "lower",      "upper",        "length",       "round",          "typeof",            "coalesce",     "ifnull",
-    "nullif",      "instr",      "replace",      "substr",       "substring",      "trim",              "ltrim",        "rtrim",
-    "cast",        "hex",        "unhex",        "quote",        "char",           "unicode",           "printf",       "format",
-    "concat",      "concat_ws",  "octet_length", "zeroblob",     "sign",           "iif",               "if",           "unlikely",
-    "likely",      "likelihood", "random",       "randomblob",   "sqlite_version", "sqlite_source_id",  "json_quote",   "unistr",
-    "ceil",        "ceiling",    "floor",        "trunc",        "ln",             "log",               "log10",        "log2",
-    "pow",         "power",      "sqrt",         "sin",          "cos",            "tan",               "asin",         "acos",
-    "atan",        "atan2",      "degrees",      "radians",      "pi",             "exp",               "mod",          "cosh",
-    "sinh",        "tanh",       "acosh",        "asinh",        "atanh",          "date",              "time",         "datetime",
-    "julianday",   "unixepoch",  "strftime",     "json",         "json_valid",     "json_type",         "json_extract", "json_array",
-    "json_object", "json_set",   "json_insert",  "json_replace", "json_remove",    "json_array_length", "soundex",      "like",
-    "glob",
+    "abs",        "lower",       "upper",        "length",      "round",          "typeof",           "coalesce",          "ifnull",
+    "nullif",     "instr",       "replace",      "substr",      "substring",      "trim",             "ltrim",             "rtrim",
+    "cast",       "hex",         "unhex",        "quote",       "char",           "unicode",          "printf",            "format",
+    "concat",     "concat_ws",   "octet_length", "zeroblob",    "sign",           "iif",              "if",                "unlikely",
+    "likely",     "likelihood",  "random",       "randomblob",  "sqlite_version", "sqlite_source_id", "json_quote",        "unistr",
+    "ceil",       "ceiling",     "floor",        "trunc",       "ln",             "log",              "log10",             "log2",
+    "pow",        "power",       "sqrt",         "sin",         "cos",            "tan",              "asin",              "acos",
+    "atan",       "atan2",       "degrees",      "radians",     "pi",             "exp",              "mod",               "cosh",
+    "sinh",       "tanh",        "acosh",        "asinh",       "atanh",          "date",             "time",              "datetime",
+    "julianday",  "unixepoch",   "strftime",     "timediff",    "json",           "json_valid",       "json_type",         "json_extract",
+    "json_array", "json_object", "json_set",     "json_insert", "json_replace",   "json_remove",      "json_array_length", "soundex",
+    "like",       "glob",        "json_pretty",  "json_patch",
 };
 
 /// Classify one call for routing: window names first (arity-independent),
@@ -394,6 +394,9 @@ pub fn evalScalar(allocator: std.mem.Allocator, name: []const u8, args: []const 
     if (std.ascii.eqlIgnoreCase(name, "strftime")) {
         return datetime.evalStrftime(allocator, args);
     }
+    if (std.ascii.eqlIgnoreCase(name, "timediff")) {
+        return datetime.evalTimediff(allocator, args);
+    }
 
     if (std.ascii.eqlIgnoreCase(name, "json")) {
         if (args.len != 1) return error.InvalidArgumentCount;
@@ -426,6 +429,12 @@ pub fn evalScalar(allocator: std.mem.Allocator, name: []const u8, args: []const 
     }
     if (std.ascii.eqlIgnoreCase(name, "json_remove")) {
         return json.evalJsonRemove(allocator, args);
+    }
+    if (std.ascii.eqlIgnoreCase(name, "json_pretty")) {
+        return json.evalJsonPretty(allocator, args);
+    }
+    if (std.ascii.eqlIgnoreCase(name, "json_patch")) {
+        return json.evalJsonPatch(allocator, args);
     }
     if (std.ascii.eqlIgnoreCase(name, "json_array_length")) {
         return json.evalJsonArrayLength(allocator, args);

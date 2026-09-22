@@ -472,6 +472,157 @@ pub fn evalUnixepoch(args: []const Value) Value {
     return .{ .integer = dt.toUnixEpoch() };
 }
 
+/// Days since 1970-01-01 (proleptic Gregorian); inverts `civilFromDays`.
+/// Integer-exact, so calendar borrowing never drifts on float rounding.
+fn daysFromCivil(year: i64, month: i64, day: i64) i64 {
+    const yAdj = if (month <= 2) year - 1 else year;
+    const era = @divFloor(yAdj, 400);
+    const yoe = yAdj - era * 400;
+    const mp = @mod(month - 3, 12);
+    const doy = @divFloor(153 * mp + 2, 5) + day - 1;
+    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+    return era * 146097 + doe - 719468;
+}
+
+/// Inverse of `daysFromCivil`: proleptic Gregorian Y/M/D for a day count.
+fn civilFromDays(z: i64) struct { y: i64, m: i64, d: i64 } {
+    const zz = z + 719468;
+    const era = @divFloor(zz, 146097);
+    const doe = zz - era * 146097;
+    const yoe = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36524) - @divFloor(doe, 146096), 365);
+    const y = yoe + era * 400;
+    const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
+    const mp = @divFloor(5 * doy + 2, 153);
+    const d = doy - @divFloor(153 * mp + 2, 5) + 1;
+    const m = if (mp < 10) mp + 3 else mp - 9;
+    return .{ .y = if (m <= 2) y + 1 else y, .m = m, .d = d };
+}
+
+/// Milliseconds from the Julian-day epoch (matches the reference integer
+/// `iJD` scale). Rounds sub-millisecond fractions once, up front.
+fn dateTimeToMs(dt: DateTime) i64 {
+    const msFrac: i64 = @intFromFloat(@round(dt.fraction * 1000.0));
+    return 210866760000000 + daysFromCivil(dt.year, dt.month, dt.day) * 86400000 +
+        (@as(i64, dt.hour) * 3600 + @as(i64, dt.minute) * 60 + @as(i64, dt.second)) * 1000 + msFrac;
+}
+
+/// One timediff operand: a Julian-day number or an ISO-8601 string (never a
+/// unix timestamp, like the reference). No modifiers apply.
+fn parseTimediffArg(val: Value) ?DateTime {
+    return switch (val) {
+        .null => null,
+        .integer => |i| DateTime.fromJulianDay(@as(f64, @floatFromInt(i))),
+        .real => |r| DateTime.fromJulianDay(r),
+        .text => |t| parseDateTimeString(t),
+        .blob => |b| parseDateTimeString(b),
+    };
+}
+
+/// `timediff(A,B)`: `+YYYY-MM-DD HH:MM:SS.SSS` to add to B for A (leading
+/// `-` when A precedes B), mirroring the reference calendar-borrowing
+/// algorithm including its bias constant. NULL on bad input or
+/// out-of-range years; exactly two arguments required.
+pub fn evalTimediff(allocator: std.mem.Allocator, args: []const Value) !Value {
+    if (args.len != 2) return error.InvalidArgumentCount;
+    const d1 = parseTimediffArg(args[0]) orelse return .null;
+    const d2 = parseTimediffArg(args[1]) orelse return .null;
+    if (d1.year < -4713 or d1.year > 9999 or d2.year < -4713 or d2.year > 9999) return .null;
+    const y1: i64 = d1.year;
+    const m1: i64 = d1.month;
+    const ms1 = dateTimeToMs(d1);
+    var y2: i64 = d2.year;
+    var m2: i64 = d2.month;
+    var ms2 = dateTimeToMs(d2);
+    var sign: u8 = '+';
+    var y: i64 = undefined;
+    var m: i64 = undefined;
+    if (ms1 >= ms2) {
+        y = y1 - y2;
+        if (y != 0) {
+            y2 = y1;
+            ms2 = dateTimeToMs(.{ .year = @intCast(y2), .month = @intCast(m2), .day = d2.day, .hour = d2.hour, .minute = d2.minute, .second = d2.second, .fraction = d2.fraction });
+        }
+        m = m1 - m2;
+        if (m < 0) {
+            y -= 1;
+            m += 12;
+        }
+        if (m != 0) {
+            m2 = m1;
+            ms2 = dateTimeToMs(.{ .year = @intCast(y2), .month = @intCast(m2), .day = d2.day, .hour = d2.hour, .minute = d2.minute, .second = d2.second, .fraction = d2.fraction });
+        }
+        while (ms1 < ms2) {
+            m -= 1;
+            if (m < 0) {
+                m = 11;
+                y -= 1;
+            }
+            m2 -= 1;
+            if (m2 < 1) {
+                m2 = 12;
+                y2 -= 1;
+            }
+            ms2 = dateTimeToMs(.{ .year = @intCast(y2), .month = @intCast(m2), .day = d2.day, .hour = d2.hour, .minute = d2.minute, .second = d2.second, .fraction = d2.fraction });
+        }
+        ms2 = ms1 - ms2;
+    } else {
+        sign = '-';
+        y = y2 - y1;
+        if (y != 0) {
+            y2 = y1;
+            ms2 = dateTimeToMs(.{ .year = @intCast(y2), .month = @intCast(m2), .day = d2.day, .hour = d2.hour, .minute = d2.minute, .second = d2.second, .fraction = d2.fraction });
+        }
+        m = m2 - m1;
+        if (m < 0) {
+            y -= 1;
+            m += 12;
+        }
+        if (m != 0) {
+            m2 = m1;
+            ms2 = dateTimeToMs(.{ .year = @intCast(y2), .month = @intCast(m2), .day = d2.day, .hour = d2.hour, .minute = d2.minute, .second = d2.second, .fraction = d2.fraction });
+        }
+        while (ms1 > ms2) {
+            m -= 1;
+            if (m < 0) {
+                m = 11;
+                y -= 1;
+            }
+            m2 += 1;
+            if (m2 > 12) {
+                m2 = 1;
+                y2 += 1;
+            }
+            ms2 = dateTimeToMs(.{ .year = @intCast(y2), .month = @intCast(m2), .day = d2.day, .hour = d2.hour, .minute = d2.minute, .second = d2.second, .fraction = d2.fraction });
+        }
+        ms2 = ms2 - ms1;
+    }
+    // Bias shifts the remainder onto a representable date; the printed day
+    // is zero-based (D-1), exactly like the reference. Julian days start at
+    // noon, so the day number rounds half up (floor(JD + 0.5)), not down.
+    ms2 += 148699540800000;
+    const totalDays = @divFloor(ms2 + 43200000, 86400000);
+    const dayMs = ms2 + 43200000 - totalDays * 86400000;
+    const civil = civilFromDays(totalDays - 2440588);
+    const hh: i64 = @divFloor(dayMs, 3600000);
+    const mm: i64 = @divFloor(@mod(dayMs, 3600000), 60000);
+    const ss: i64 = @divFloor(@mod(dayMs, 60000), 1000);
+    const mss: i64 = @mod(dayMs, 1000);
+    // Unsigned casts: fill/align formatting misrenders signed integers on
+    // this toolchain, and every field here is non-negative by construction
+    // (a negative would panic fail-closed instead of printing garbage).
+    const res = try std.fmt.allocPrint(allocator, "{c}{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}", .{
+        sign,
+        @as(u32, @intCast(y)),
+        @as(u32, @intCast(m)),
+        @as(u32, @intCast(civil.d - 1)),
+        @as(u32, @intCast(hh)),
+        @as(u32, @intCast(mm)),
+        @as(u32, @intCast(ss)),
+        @as(u32, @intCast(mss)),
+    });
+    return .{ .text = res };
+}
+
 /// `strftime(fmt,...)`: format subset (`%Y %m %d %H %M %S %f %s %j %J %w %W %%`).
 /// NULL when fmt is not text, args < 2, or the timestamp is unparseable.
 pub fn evalStrftime(allocator: std.mem.Allocator, args: []const Value) !Value {
@@ -674,6 +825,34 @@ test "datetime parses timezone suffixes into UTC" {
     const frac = try evalStrftime(alloc, &.{ .{ .text = "%Y-%m-%d %H:%M:%f" }, .{ .text = "2024-03-04T05:06:07.5+02:00" } });
     defer frac.free(alloc);
     try std.testing.expectEqualStrings("2024-03-04 03:06:07.500", frac.text);
+}
+
+test "timediff formats calendar differences like the reference" {
+    const alloc = std.testing.allocator;
+    const day = try evalTimediff(alloc, &.{ .{ .text = "2024-03-15 12:00:00" }, .{ .text = "2024-03-14 11:00:00" } });
+    defer day.free(alloc);
+    try std.testing.expectEqualStrings("+0000-00-01 01:00:00.000", day.text);
+    const neg = try evalTimediff(alloc, &.{ .{ .text = "2024-03-14 11:00:00" }, .{ .text = "2024-03-15 12:00:00" } });
+    defer neg.free(alloc);
+    try std.testing.expectEqualStrings("-0000-00-01 01:00:00.000", neg.text);
+    const same = try evalTimediff(alloc, &.{ .{ .text = "2024-01-01" }, .{ .text = "2024-01-01" } });
+    defer same.free(alloc);
+    try std.testing.expectEqualStrings("+0000-00-00 00:00:00.000", same.text);
+    const months = try evalTimediff(alloc, &.{ .{ .text = "2024-03-15" }, .{ .text = "2024-01-20" } });
+    defer months.free(alloc);
+    try std.testing.expectEqualStrings("+0000-01-24 00:00:00.000", months.text);
+    const years = try evalTimediff(alloc, &.{ .{ .text = "2024-02-15" }, .{ .text = "2023-03-20" } });
+    defer years.free(alloc);
+    try std.testing.expectEqualStrings("+0000-10-26 00:00:00.000", years.text);
+    const frac = try evalTimediff(alloc, &.{ .{ .text = "2024-01-01 00:00:01.500" }, .{ .text = "2024-01-01" } });
+    defer frac.free(alloc);
+    try std.testing.expectEqualStrings("+0000-00-00 00:00:01.500", frac.text);
+    const jd = try evalTimediff(alloc, &.{ .{ .real = 2460500.5 }, .{ .real = 2460500.0 } });
+    defer jd.free(alloc);
+    try std.testing.expectEqualStrings("+0000-00-00 12:00:00.000", jd.text);
+    try std.testing.expect((try evalTimediff(alloc, &.{ .null, .{ .text = "2024-01-01" } })) == .null);
+    try std.testing.expect((try evalTimediff(alloc, &.{ .{ .text = "nope" }, .{ .text = "2024-01-01" } })) == .null);
+    try std.testing.expectError(error.InvalidArgumentCount, evalTimediff(alloc, &.{.{ .text = "2024-01-01" }}));
 }
 
 test "datetime frozen clock pins now deterministically" {

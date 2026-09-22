@@ -448,6 +448,145 @@ pub fn evalJsonModify(allocator: std.mem.Allocator, args: []const Value, mode: M
     return .{ .text = resStr };
 }
 
+/// Renders a JSON function input to text like value_text (numbers render,
+/// blobs contribute bytes); NULL stays NULL for the caller to reject.
+/// Older entry points in this module keep strict text-only inputs; new
+/// ones coerce like the reference.
+fn jsonArgText(allocator: std.mem.Allocator, val: Value) !?[]u8 {
+    return switch (val) {
+        .null => null,
+        .text => |t| try allocator.dupe(u8, t),
+        .blob => |b| try allocator.dupe(u8, b),
+        .integer => |i| try std.fmt.allocPrint(allocator, "{d}", .{i}),
+        .real => |r| try std.fmt.allocPrint(allocator, "{d}", .{r}),
+    };
+}
+
+/// RFC 7396 merge step: non-object patches replace wholesale; object
+/// patches merge key by key (null deletes, missing keys start empty).
+/// Everything lives in `arena`; depth-guarded like the reference.
+fn mergePatch(arena: std.mem.Allocator, target: ?std.json.Value, patch: std.json.Value, depth: usize) !std.json.Value {
+    if (depth > max_json_depth) return error.TooDeep;
+    if (patch != .object) return try cloneJson(arena, patch);
+    var obj: std.json.ObjectMap = if (target) |t| (if (t == .object) t.object else .empty) else .empty;
+    var it = patch.object.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.* == .null) {
+            _ = obj.swapRemove(entry.key_ptr.*);
+        } else {
+            const current = obj.get(entry.key_ptr.*);
+            const merged = try mergePatch(arena, current, entry.value_ptr.*, depth + 1);
+            try obj.put(arena, try arena.dupe(u8, entry.key_ptr.*), merged);
+        }
+    }
+    return .{ .object = obj };
+}
+
+/// `json_patch(TARGET,PATCH)`: RFC 7396 merge-patch text. Bad JSON or
+/// non-text input yields NULL; depth overflow fails `TooDeep`.
+pub fn evalJsonPatch(allocator: std.mem.Allocator, args: []const Value) !Value {
+    if (args.len != 2) return error.InvalidArgumentCount;
+    const targetText = try jsonArgText(allocator, args[0]) orelse return .null;
+    defer allocator.free(targetText);
+    const patchText = try jsonArgText(allocator, args[1]) orelse return .null;
+    defer allocator.free(patchText);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arenaAlloc = arena.allocator();
+    const parsedTarget = parseJsonDocument(arenaAlloc, targetText) catch return .null;
+    const parsedPatch = parseJsonDocument(arenaAlloc, patchText) catch return .null;
+    const merged = try mergePatch(arenaAlloc, parsedTarget.value, parsedPatch.value, 0);
+    const resStr = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(merged, .{})});
+    return .{ .text = resStr };
+}
+
+/// Emits one value in pretty form: containers break lines with per-level
+/// indentation, scalars render compactly. Mirrors the reference layout
+/// (`": "` after keys, `[]`/`{}` when empty).
+fn renderPretty(allocator: std.mem.Allocator, out: *std.ArrayList(u8), val: std.json.Value, indent: []const u8, level: usize) !void {
+    switch (val) {
+        .array => |arr| {
+            if (arr.items.len == 0) {
+                try out.appendSlice(allocator, "[]");
+                return;
+            }
+            try out.append(allocator, '[');
+            for (arr.items, 0..) |item, i| {
+                if (i > 0) try out.appendSlice(allocator, ",");
+                try out.append(allocator, '\n');
+                var l: usize = 0;
+                while (l <= level) : (l += 1) try out.appendSlice(allocator, indent);
+                try renderPretty(allocator, out, item, indent, level + 1);
+            }
+            try out.append(allocator, '\n');
+            var l: usize = 0;
+            while (l < level) : (l += 1) try out.appendSlice(allocator, indent);
+            try out.append(allocator, ']');
+        },
+        .object => |obj| {
+            if (obj.count() == 0) {
+                try out.appendSlice(allocator, "{}");
+                return;
+            }
+            try out.append(allocator, '{');
+            var it = obj.iterator();
+            var first = true;
+            while (it.next()) |entry| {
+                if (!first) try out.appendSlice(allocator, ",");
+                first = false;
+                try out.append(allocator, '\n');
+                var l: usize = 0;
+                while (l <= level) : (l += 1) try out.appendSlice(allocator, indent);
+                const keyStr = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(std.json.Value{ .string = entry.key_ptr.* }, .{})});
+                defer allocator.free(keyStr);
+                try out.appendSlice(allocator, keyStr);
+                try out.appendSlice(allocator, ": ");
+                try renderPretty(allocator, out, entry.value_ptr.*, indent, level + 1);
+            }
+            try out.append(allocator, '\n');
+            var l: usize = 0;
+            while (l < level) : (l += 1) try out.appendSlice(allocator, indent);
+            try out.append(allocator, '}');
+        },
+        else => {
+            const leaf = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(val, .{})});
+            defer allocator.free(leaf);
+            try out.appendSlice(allocator, leaf);
+        },
+    }
+}
+
+/// `json_pretty(X[,indent])`: human-readable JSON text (4-space default;
+/// NULL indent selects the default, like the reference). Bad JSON or
+/// non-text input yields NULL.
+pub fn evalJsonPretty(allocator: std.mem.Allocator, args: []const Value) !Value {
+    if (args.len == 0 or args.len > 2) return error.InvalidArgumentCount;
+    const docText = try jsonArgText(allocator, args[0]) orelse return .null;
+    defer allocator.free(docText);
+    // NULL indent selects the default; numbers render like value_text.
+    var ownedIndent: ?[]u8 = null;
+    defer if (ownedIndent) |bytes| allocator.free(bytes);
+    const indentSlice: []const u8 = if (args.len < 2 or args[1] == .null) "    " else switch (args[1]) {
+        .text => |t| t,
+        .blob => |b| b,
+        .integer => |i| blk: {
+            ownedIndent = try std.fmt.allocPrint(allocator, "{d}", .{i});
+            break :blk ownedIndent.?;
+        },
+        .real => |r| blk: {
+            ownedIndent = try std.fmt.allocPrint(allocator, "{d}", .{r});
+            break :blk ownedIndent.?;
+        },
+        else => return .null,
+    };
+    const parsed = parseJsonDocument(allocator, docText) catch return .null;
+    defer parsed.deinit();
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try renderPretty(allocator, &out, parsed.value, indentSlice, 0);
+    return .{ .text = try out.toOwnedSlice(allocator) };
+}
+
 /// `json_remove(X,paths...)`: JSON text with pointed values deleted.
 /// NULL/non-text base or bad JSON yields NULL; bad paths skipped.
 pub fn evalJsonRemove(allocator: std.mem.Allocator, args: []const Value) !Value {
@@ -532,6 +671,39 @@ test "json array length counts arrays and paths" {
     try std.testing.expect((try evalJsonArrayLength(alloc, &.{ .{ .text = "{\"a\":1}" }, .{ .text = "$.missing" } })) == .null);
     try std.testing.expect((try evalJsonArrayLength(alloc, &.{.null})) == .null);
     try std.testing.expect((try evalJsonArrayLength(alloc, &.{})) == .null);
+}
+
+test "json pretty renders indented blocks" {
+    const alloc = std.testing.allocator;
+    const pretty = try evalJsonPretty(alloc, &.{.{ .text = "{\"b\":[1,2],\"a\":{}}" }});
+    defer pretty.free(alloc);
+    try std.testing.expectEqualStrings("{\n    \"b\": [\n        1,\n        2\n    ],\n    \"a\": {}\n}", pretty.text);
+    const custom = try evalJsonPretty(alloc, &.{ .{ .text = "[1]" }, .{ .text = "  " } });
+    defer custom.free(alloc);
+    try std.testing.expectEqualStrings("[\n  1\n]", custom.text);
+    const scalar = try evalJsonPretty(alloc, &.{.{ .text = "42" }});
+    defer scalar.free(alloc);
+    try std.testing.expectEqualStrings("42", scalar.text);
+    try std.testing.expect((try evalJsonPretty(alloc, &.{.{ .text = "{bad" }})) == .null);
+    try std.testing.expectError(error.InvalidArgumentCount, evalJsonPretty(alloc, &.{}));
+}
+
+test "json patch merges per RFC 7396" {
+    const alloc = std.testing.allocator;
+    const merged = try evalJsonPatch(alloc, &.{ .{ .text = "{\"a\":1,\"b\":2}" }, .{ .text = "{\"b\":null,\"c\":3}" } });
+    defer merged.free(alloc);
+    try std.testing.expectEqualStrings("{\"a\":1,\"c\":3}", merged.text);
+    const nested = try evalJsonPatch(alloc, &.{ .{ .text = "{\"a\":{\"x\":1,\"y\":2}}" }, .{ .text = "{\"a\":{\"y\":null,\"z\":9}}" } });
+    defer nested.free(alloc);
+    try std.testing.expectEqualStrings("{\"a\":{\"x\":1,\"z\":9}}", nested.text);
+    const replace = try evalJsonPatch(alloc, &.{ .{ .text = "{\"a\":1}" }, .{ .text = "[1,2]" } });
+    defer replace.free(alloc);
+    try std.testing.expectEqualStrings("[1,2]", replace.text);
+    const fresh = try evalJsonPatch(alloc, &.{ .{ .integer = 1 }, .{ .text = "{\"a\":1}" } });
+    defer fresh.free(alloc);
+    try std.testing.expectEqualStrings("{\"a\":1}", fresh.text);
+    try std.testing.expect((try evalJsonPatch(alloc, &.{ .{ .text = "{bad" }, .{ .text = "{}" } })) == .null);
+    try std.testing.expectError(error.InvalidArgumentCount, evalJsonPatch(alloc, &.{.{ .text = "{}" }}));
 }
 
 test "json error behavior" {

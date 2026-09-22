@@ -133,7 +133,9 @@ The JSON1 family includes `json`, `json_extract`, `json_set`,
 `json_insert`, `json_replace`, `json_remove`, `json_array`, `json_object`,
 `json_type`, `json_valid`, and `json_array_length(X[, path])` over nested
 objects and arrays with `$.a[0]` style paths, exposed in the DSL as
-`.jsonExtract(path)` / `.jsonSet(path, value)`.
+`.jsonExtract(path)` / `.jsonSet(path, value)`. `json_pretty(X[,
+indent])` pretty-prints and `json_patch(TARGET, PATCH)` applies RFC 7396
+merge patches.
 
 Function expressions such as `WHERE LOWER(name) = 'alice'` and
 `WHERE TRIM(name) = 'alice'` are supported on the left side of comparison
@@ -171,9 +173,11 @@ Connection write counters are readable with `LAST_INSERT_ROWID()`,
 (`COUNT(DISTINCT col)`, `SUM(DISTINCT col)`, …) in bare, grouped, joined,
 and subquery selects.
 Date/time (`date`, `time`, `datetime`, `julianday`, `unixepoch`,
-`strftime`), math (`ceil`, `floor`, `sqrt`, `log`, `pow`, `sin`, `cos`,
-…), and window functions (`ROW_NUMBER`, `RANK`, `LAG`, `LEAD`, …) are
-supported in Raw SQL. The DSL provides column wrappers for scalar helpers
+`strftime`, `timediff`), math (`ceil`, `floor`, `sqrt`, `log`, `pow`,
+`sin`, `cos`, …), and window functions (`ROW_NUMBER`, `RANK`, `LAG`,
+`LEAD`, …) are supported in Raw SQL. `timediff(A, B)` renders the
+calendar difference as `+YYYY-MM-DD HH:MM:SS.SSS` so that
+`datetime(B, timediff(A, B))` equals `datetime(A)`. The DSL provides column wrappers for scalar helpers
 (`abs`, `length`, `upper`, `lower`, `jsonExtract`, `jsonSet`), aggregates,
 and window functions; date/time and math functions have no DSL wrappers yet
 so call them through Raw SQL, and named `WINDOW` clauses are also Raw SQL

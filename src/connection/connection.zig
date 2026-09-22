@@ -15405,6 +15405,28 @@ test "probe upsert partial index and excluded corners" {
     try std.testing.expectError(error.InvalidSql, db.exec("INSERT INTO pu_t VALUES (5, 'b@x', 1) ON CONFLICT(active) DO UPDATE SET id = excluded.id;"));
 }
 
+test "timediff renders calendar differences as raw sql" {
+    var db = try freshDb("sqlite_zig_timediff_test.db");
+    defer dropDb(db, "sqlite_zig_timediff_test.db");
+    var rows = try db.exec("SELECT timediff('2024-03-15 12:00:00', '2024-03-14 11:00:00'), timediff('2024-03-14', '2024-03-15'), timediff('2024-01-01', '2024-01-01');");
+    defer rows.deinit();
+    try std.testing.expectEqualStrings("+0000-00-01 01:00:00.000", rows.rows[0][0].text);
+    try std.testing.expectEqualStrings("-0000-00-01 00:00:00.000", rows.rows[0][1].text);
+    try std.testing.expectEqualStrings("+0000-00-00 00:00:00.000", rows.rows[0][2].text);
+}
+
+test "json pretty and patch run as raw sql" {
+    var db = try freshDb("sqlite_zig_json_pp_test.db");
+    defer dropDb(db, "sqlite_zig_json_pp_test.db");
+    var pretty = try db.exec("SELECT json_pretty('{\"b\":[1,2]}');");
+    defer pretty.deinit();
+    try std.testing.expectEqualStrings("{\n    \"b\": [\n        1,\n        2\n    ]\n}", pretty.rows[0][0].text);
+    var patched = try db.exec("SELECT json_patch('{\"a\":1,\"b\":2}', '{\"b\":null,\"c\":3}'), json_patch('1', '{\"a\":[]}');");
+    defer patched.deinit();
+    try std.testing.expectEqualStrings("{\"a\":1,\"c\":3}", patched.rows[0][0].text);
+    try std.testing.expectEqualStrings("{\"a\":[]}", patched.rows[0][1].text);
+}
+
 test "case sensitive like pragma toggles operator and function forms" {
     var db = try freshDb("sqlite_zig_case_like_test.db");
     defer dropDb(db, "sqlite_zig_case_like_test.db");
