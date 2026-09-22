@@ -653,6 +653,44 @@ test "zig type mapping documents the storage contract" {
     }
 }
 
+test "scoped key fields resolve against the target table" {
+    const Row = struct { id: i64, userName: []const u8, age: i64 };
+    const A = dslColumn.Column("t", "id", i64);
+    const B = dslColumn.Column("t", "user_name", []const u8);
+    const C = dslColumn.Column("t", "age", i64);
+    const Cols = struct { id: A, userName: B, age: C };
+    const S = scopeMod.TypeScope(Row, Cols);
+    var buf: [16][]const u8 = undefined;
+    // Bare fields map zig names onto sql names under the target scope.
+    try std.testing.expect(try normalizeKeyScoped(.id, "t", S, &buf) == 1);
+    try std.testing.expectEqualStrings("id", buf[0]);
+    try std.testing.expect(try normalizeKeyScoped(.userName, "t", S, &buf) == 1);
+    try std.testing.expectEqualStrings("user_name", buf[0]);
+    // Scoped and explicit items mix in one composite key.
+    const mixed = .{ .age, B{} };
+    try std.testing.expect(try normalizeKeyScoped(mixed, "t", S, &buf) == 2);
+    try std.testing.expectEqualStrings("age", buf[0]);
+    try std.testing.expectEqualStrings("user_name", buf[1]);
+    // PK / UNIQUE / autoincrement accept the same scoped shapes.
+    var expected = ExpectedKeys{};
+    try parsePkIntoScoped(.id, "t", S, &expected);
+    try std.testing.expect(expected.hasPk and expected.pkCount == 1);
+    try std.testing.expectEqualStrings("id", expected.pk[0]);
+    try parseUniqueIntoScoped(.{ .userName, .{.age} }, "t", S, &expected);
+    try std.testing.expectEqual(@as(usize, 1), expected.uniqueSingleCount);
+    try std.testing.expectEqual(@as(usize, 1), expected.uniqueGroupCount);
+    // Local FK sides accept scoped fields; references stay explicit.
+    const Uid = dslColumn.Column("users", "id", i64);
+    const Oid = dslColumn.Column("orders", "user_id", i64);
+    const OCols = struct { user_id: Oid };
+    const ORow = struct { user_id: i64 };
+    const OS = scopeMod.TypeScope(ORow, OCols);
+    const fk = try parseFkSpecScoped(.{ .column = .user_id, .references = Uid{} }, "orders", OS);
+    try std.testing.expectEqualStrings("user_id", fk.local[0]);
+    try std.testing.expectEqualStrings("users", fk.refTable);
+    try std.testing.expectEqualStrings("id", fk.refCols[0]);
+}
+
 test "collision-free key items accept operation-named columns" {
     const All = dslColumn.Column("t", "all", []const u8);
     const Count = dslColumn.Column("t", "count", i64);

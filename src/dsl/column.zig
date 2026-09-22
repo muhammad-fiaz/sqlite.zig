@@ -75,8 +75,19 @@ pub fn toRhs(value: anytype) dslExpr.Rhs {
 pub fn toColumnRef(col: anytype) dslExpr.ColumnRef {
     const T = @TypeOf(col);
     if (T == DynamicColumn) return dynRef(col);
-    if (comptime isTypedColumn(T)) return .{ .table = T.dslTable, .name = T.dslName };
+    if (comptime isTypedColumn(T)) return .{ .table = qualifiedTable(col), .name = T.dslName };
     @compileError("expected a column descriptor (User.id or table.column(\"x\"))");
+}
+
+/// Effective table qualifier of a typed column *value*: the runtime
+/// `qualifier` override when set (scoped `c()` columns on aliased queries),
+/// else the type-level table identity (`User.id` keeps `users`). This is
+/// the single choke point through which every value-level reference must
+/// resolve its table, so scope overrides propagate uniformly.
+pub fn qualifiedTable(col: anytype) []const u8 {
+    const T = @TypeOf(col);
+    if (comptime !isTypedColumn(T)) @compileError("expected a typed column descriptor");
+    return col.qualifier orelse T.dslTable;
 }
 
 /// One CASE branch: searched (`cond` set) or simple (`operand` set).
@@ -141,7 +152,7 @@ pub fn caseValue(col: anytype) CaseBuilder {
         return .{ .base = ref, .baseFunc = col.func };
     }
     if (comptime isTypedColumn(T)) {
-        return .{ .base = .{ .table = T.dslTable, .name = T.dslName }, .baseFunc = col.func };
+        return .{ .base = .{ .table = qualifiedTable(col), .name = T.dslName }, .baseFunc = col.func };
     }
     @compileError("caseValue() needs a column descriptor");
 }
@@ -239,7 +250,7 @@ pub const WindowBuilder = struct {
             copy.partitionCount += 1;
         } else if (comptime isTypedColumn(T)) {
             if (copy.partitionCount >= copy.partitions.len) @panic("too many window partition columns");
-            copy.partitions[copy.partitionCount] = .{ .table = T.dslTable, .name = T.dslName };
+            copy.partitions[copy.partitionCount] = .{ .table = qualifiedTable(cols), .name = T.dslName };
             copy.partitionCount += 1;
         } else if (comptime @typeInfo(T) == .@"struct" and @typeInfo(T).@"struct".is_tuple) {
             inline for (cols) |item| {
@@ -463,7 +474,7 @@ pub fn countStar() WindowBuilder {
 fn rhsFrom(value: anytype) dslExpr.Rhs {
     const T = @TypeOf(value);
     if (T == DynamicColumn) return .{ .column = dynRef(value) };
-    if (comptime isTypedColumn(T)) return .{ .column = .{ .table = T.dslTable, .name = T.dslName } };
+    if (comptime isTypedColumn(T)) return .{ .column = .{ .table = qualifiedTable(value), .name = T.dslName } };
     return .{ .value = toValue(value) };
 }
 
@@ -504,6 +515,16 @@ pub fn Assign(comptime Col: type, comptime V: type) type {
 pub fn isAssignValue(comptime T: type) bool {
     if (@typeInfo(T) != .@"struct") return false;
     return @hasDecl(T, "isAssign") and T.isAssign and @hasDecl(T, "assignColumn") and isTypedColumn(T.assignColumn);
+}
+
+/// Stored payload type for `Column.set`: references, arithmetic, markers,
+/// and `Value`s pass through untouched; plain literals are stored as the
+/// column's `FieldType` (never `comptime_int`), so assigns stay runtime
+/// values with row-struct coercion semantics (ranges included).
+fn StoredPayload(comptime FieldType: type, comptime V: type) type {
+    if (V == Value or V == DynamicColumn or V == ExcludedColumn or isTypedColumn(V)) return V;
+    if (@typeInfo(V) == .@"struct" and (@hasDecl(V, "isExplicitValue") or @hasDecl(V, "isExplicitDefault") or @hasDecl(V, "isArithExpr"))) return V;
+    return FieldType;
 }
 
 fn checkExplicitValue(comptime FieldType: type, comptime V: type) void {
@@ -569,7 +590,7 @@ fn checkExplicitValueOptional(comptime FieldType: type, comptime Child: type) vo
 
 fn setOperandOf(value: anytype) dslExpr.SetOperand {
     const T = @TypeOf(value);
-    if (comptime isTypedColumn(T)) return .{ .column = .{ .table = T.dslTable, .name = T.dslName } };
+    if (comptime isTypedColumn(T)) return .{ .column = .{ .table = qualifiedTable(value), .name = T.dslName } };
     if (T == DynamicColumn) return .{ .column = dynRef(value) };
     if (comptime @typeInfo(T) == .@"struct" and @hasDecl(T, "isExplicitValue")) {
         return .{ .literal = value.value };
@@ -602,10 +623,14 @@ pub fn Column(comptime tableName: []const u8, comptime columnName: []const u8, c
         pub const fieldType = FieldType;
 
         func: ?FuncCall = null,
+        /// Runtime scope override for the table qualifier, set by scoped
+        /// `c()` columns on aliased queries (`q.c().id` qualifies with the
+        /// alias). Null means the type-level table identity. Never set by
+        /// hand; table values always carry null here.
+        qualifier: ?[]const u8 = null,
 
         fn ref(self: Self) ColumnRef {
-            _ = self;
-            return .{ .table = tableName, .name = columnName };
+            return .{ .table = self.qualifier orelse tableName, .name = columnName };
         }
 
         fn pred(self: Self, op: Operator, val: anytype) Expr {
@@ -833,13 +858,15 @@ pub fn Column(comptime tableName: []const u8, comptime columnName: []const u8, c
         /// Use inside assign tuples: `update(.{ User.name.set("Alice") })`.
         /// Literals are checked against the column type; references,
         /// arithmetic, `excluded()`, and explicit markers pass through.
-        pub fn set(_: Self, payload: anytype) Assign(Self, @TypeOf(payload)) {
+        pub fn set(_: Self, payload: anytype) Assign(Self, StoredPayload(FieldType, @TypeOf(payload))) {
             const V = @TypeOf(payload);
-            if (V == DynamicColumn or comptime isTypedColumn(V)) return .{ .value = payload };
-            if (V == ExcludedColumn) return .{ .value = payload };
+            if (V == Value or V == DynamicColumn or V == ExcludedColumn or comptime isTypedColumn(V)) return .{ .value = payload };
             if (comptime @typeInfo(V) == .@"struct" and (@hasDecl(V, "isExplicitValue") or @hasDecl(V, "isExplicitDefault") or @hasDecl(V, "isArithExpr"))) return .{ .value = payload };
-            checkExplicitValue(FieldType, V);
-            return .{ .value = payload };
+            // Plain literal: coerce to the declared field type, exactly like
+            // row-struct initialization (`insert(.{ .id = 1 })`), so
+            // mismatches and out-of-range values fail at compile time.
+            const coerced: FieldType = payload;
+            return .{ .value = coerced };
         }
 
         pub fn add(self: Self, other: anytype) dslExpr.ArithExpr {
@@ -882,7 +909,7 @@ pub const DynamicColumn = struct {
         const rhs: dslExpr.Rhs = if (T == DynamicColumn)
             .{ .column = dynRef(val) }
         else if (comptime isTypedColumn(T))
-            .{ .column = .{ .table = T.dslTable, .name = T.dslName } }
+            .{ .column = .{ .table = qualifiedTable(val), .name = T.dslName } }
         else
             .{ .value = toValue(val) };
         return .{ .column = self.ref(), .operator = op, .rhs = rhs, .function = self.func };
@@ -1252,6 +1279,53 @@ test "typed predicates compare columns without string lookup" {
     try std.testing.expectEqualStrings("users", join.column.table);
     try std.testing.expectEqualStrings("orders", join.rhs.column.table);
     try std.testing.expectEqualStrings("user_id", join.rhs.column.name);
+}
+
+test "set stores typed payloads with row struct coercion" {
+    const Id = Column("users", "id", i64);
+    const Name = Column("users", "name", []const u8);
+    const Nick = Column("users", "nick", ?[]const u8);
+    // comptime_int literal coerces to the declared field type, so assigns
+    // stay runtime values exactly like row-struct fields.
+    const a = (Id{}).set(1);
+    try std.testing.expect(@TypeOf(a.value) == i64);
+    try std.testing.expect(a.value == 1);
+    try std.testing.expect(@TypeOf(a).assignColumn == Id);
+    const b = (Name{}).set("x");
+    try std.testing.expectEqualStrings("x", b.value);
+    const n = (Nick{}).set(null);
+    try std.testing.expect(n.value == null);
+    // References, arithmetic, and markers pass through untouched.
+    const Oid = Column("orders", "user_id", i64);
+    const ref = (Oid{}).set(Id{});
+    try std.testing.expect(@TypeOf(ref.value) == Id);
+    const arith = (Id{}).set((Id{}).add(1));
+    try std.testing.expect(@TypeOf(arith.value) == dslExpr.ArithExpr);
+    const exc = (Name{}).set(ExcludedColumn{ .name = "name" });
+    try std.testing.expectEqualStrings("name", exc.value.name);
+    const def = (Name{}).set((Name{}).defaultValue());
+    try std.testing.expect(@TypeOf(def.value) == ExplicitDefault);
+}
+
+test "qualifier overrides follow scoped values through expressions" {
+    const Id = Column("users", "id", i64);
+    var scoped = Id{};
+    scoped.qualifier = "u";
+    try std.testing.expectEqualStrings("u", qualifiedTable(scoped));
+    try std.testing.expectEqualStrings("users", qualifiedTable(Id{}));
+    // Predicates, orders, and RHS positions all honor the override.
+    const pred = scoped.eq(1);
+    try std.testing.expectEqualStrings("u", pred.column.table);
+    const ord = scoped.desc();
+    try std.testing.expectEqualStrings("u", ord.column.table);
+    const Oid = Column("orders", "user_id", i64);
+    const join = (Oid{}).eq(scoped);
+    try std.testing.expectEqualStrings("u", join.rhs.column.table);
+    const proj = scoped.projection();
+    try std.testing.expectEqualStrings("u", proj.column.table);
+    // Function wrappers copy the override with the column value.
+    const upper = scoped.upper();
+    try std.testing.expectEqualStrings("u", upper.projection().column.table);
 }
 
 test "typed columns build orders aggregates and wrappers" {

@@ -33,7 +33,7 @@ pub const DynamicQuery = Builder(void, void, false);
 
 const ConditionEntry = astBuilder.CondEntry;
 
-const JoinKind = astBuilder.JoinKind;
+pub const JoinKind = astBuilder.JoinKind;
 
 const InQuery = astBuilder.InQueryArgs;
 
@@ -70,7 +70,7 @@ fn toProjection(item: anytype) Projection {
 fn toRef(item: anytype) ColumnRef {
     const T = @TypeOf(item);
     if (T == columnMod.DynamicColumn) return columnMod.dynRef(item);
-    if (comptime isTypedColumnInstance(T)) return .{ .table = T.dslTable, .name = T.dslName };
+    if (comptime isTypedColumnInstance(T)) return .{ .table = columnMod.qualifiedTable(item), .name = T.dslName };
     @compileError("expected a column descriptor (User.id or table.column(\"x\"))");
 }
 
@@ -78,7 +78,7 @@ fn toOrder(item: anytype) Order {
     const T = @TypeOf(item);
     if (T == Order) return item;
     if (T == columnMod.DynamicColumn) return .{ .column = columnMod.dynRef(item) };
-    if (comptime isTypedColumnInstance(T)) return .{ .column = .{ .table = T.dslTable, .name = T.dslName } };
+    if (comptime isTypedColumnInstance(T)) return .{ .column = .{ .table = columnMod.qualifiedTable(item), .name = T.dslName } };
     @compileError("orderBy() takes a column order such as col.asc()/col.desc(), a bare column, or a scoped field such as .name");
 }
 
@@ -95,15 +95,28 @@ fn isAssignList(comptime T: type) bool {
     return true;
 }
 
-/// Comptime membership check for one explicit assignment: its SQL name must
+/// Comptime membership test for one explicit assignment: its SQL name must
 /// be a column of the statement target. Cross-table assigns with disjoint
-/// names fail here at compile time.
-fn checkAssignColumn(comptime Col: type, comptime Columns: type) void {
-    if (Columns == void) return;
+/// names fail at the call site. NOTE: callers must gate on
+/// `if (comptime ...)` explicitly — a runtime `if (eql) return` does not
+/// prune a trailing `@compileError` during analysis.
+fn hasAssignColumn(comptime Col: type, comptime Columns: type) bool {
+    if (Columns == void) return true;
     inline for (@typeInfo(Columns).@"struct".fields) |field| {
-        if (std.mem.eql(u8, field.type.dslName, Col.dslName)) return;
+        if (std.mem.eql(u8, field.type.dslName, Col.dslName)) return true;
     }
-    @compileError("assignment column is not a column of the statement target table");
+    return false;
+}
+
+/// Comptime duplicate test for assign tuple element `index`: true when an
+/// earlier element targets the same SQL column. Callers gate explicitly.
+fn hasDuplicateAssign(comptime Tuple: type, comptime index: usize) bool {
+    const needle = @typeInfo(Tuple).@"struct".fields[index].type.assignColumn.dslName;
+    inline for (0..index) |prev| {
+        const cand = @typeInfo(Tuple).@"struct".fields[prev].type.assignColumn.dslName;
+        if (std.mem.eql(u8, cand, needle)) return true;
+    }
+    return false;
 }
 
 /// Runtime scope check for one explicit assignment: its table identity must
@@ -142,7 +155,7 @@ fn setValueOf(value: anytype) dslExpr.SetValue {
         return value.toSetValue();
     }
     if (T == columnMod.DynamicColumn) return .{ .column = columnMod.dynRef(value) };
-    if (comptime isTypedColumnInstance(T)) return .{ .column = .{ .table = T.dslTable, .name = T.dslName } };
+    if (comptime isTypedColumnInstance(T)) return .{ .column = .{ .table = columnMod.qualifiedTable(value), .name = T.dslName } };
     return .{ .literal = columnMod.toValue(value) };
 }
 
@@ -347,11 +360,14 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
         /// conditions), where a bare `.id` cannot carry an operator. Only
         /// available on typed builders; dynamic queries use `column(name)`.
         pub fn c(self: Self) Columns {
-            _ = self;
             if (Columns == void) return {};
             var scoped: Columns = undefined;
             inline for (@typeInfo(Columns).@"struct".fields) |field| {
-                @field(scoped, field.name) = .{};
+                // Stamp the runtime scope: the alias when set, else null
+                // (which keeps the type-level table identity).
+                var col: field.type = .{};
+                col.qualifier = self.tableAlias;
+                @field(scoped, field.name) = col;
             }
             return scoped;
         }
@@ -768,6 +784,11 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
             return copy;
         }
 
+        /// Join with an explicit kind (`db.from(u).join(m, .inner, on)`).
+        /// Forwards to the dedicated `innerJoin`/`leftJoin`/… variants.
+        pub fn join(self: Self, other: anytype, kind: JoinKind, on: Expr) Self {
+            return self.joinAs(other, on, kind);
+        }
         pub fn innerJoin(self: Self, other: anytype, on: Expr) Self {
             return self.joinAs(other, on, .inner);
         }
@@ -1143,14 +1164,13 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
             var names: [16][]const u8 = undefined;
             var vals: [16]dslExpr.SetValue = undefined;
             var count: usize = 0;
+            const AssignsType = @TypeOf(assigns);
             inline for (assigns, 0..) |item, index| {
                 const Col = @TypeOf(item).assignColumn;
-                checkAssignColumn(Col, Columns);
+                if (comptime !hasAssignColumn(Col, Columns)) @compileError("assignment column is not a column of the statement target table");
                 // Same column twice is most likely a copy/paste slip; SQL
                 // rejects duplicate targets, so fail loudly here too.
-                inline for (0..index) |prev| {
-                    if (std.mem.eql(u8, @TypeOf(assigns[prev]).assignColumn.dslName, Col.dslName)) @compileError("duplicate assignment to one column in an explicit assign list");
-                }
+                if (comptime hasDuplicateAssign(AssignsType, index)) @compileError("duplicate assignment to one column in an explicit assign list");
                 try checkAssignScope(Col, self.table, self.tableAlias);
                 if (comptime isExplicitDefault(@TypeOf(item.value))) continue;
                 if (@TypeOf(item.value) == columnMod.ExcludedColumn) @compileError("excluded() is only valid in UPSERT assignments");
@@ -1227,10 +1247,8 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
             if (comptime isAssignList(RowType)) {
                 inline for (assignments, 0..) |item, index| {
                     const Col = @TypeOf(item).assignColumn;
-                    checkAssignColumn(Col, Columns);
-                    inline for (0..index) |prev| {
-                        if (std.mem.eql(u8, @TypeOf(assignments[prev]).assignColumn.dslName, Col.dslName)) @compileError("duplicate assignment to one column in an explicit assign list");
-                    }
+                    if (comptime !hasAssignColumn(Col, Columns)) @compileError("assignment column is not a column of the statement target table");
+                    if (comptime hasDuplicateAssign(RowType, index)) @compileError("duplicate assignment to one column in an explicit assign list");
                     try checkAssignScope(Col, self.table, self.tableAlias);
                     if (comptime isExplicitDefault(@TypeOf(item.value))) continue;
                     if (@TypeOf(item.value) == columnMod.ExcludedColumn) @compileError("excluded() is only valid in UPSERT assignments");
@@ -2016,11 +2034,12 @@ pub fn UpsertBuilder(comptime Row: type, comptime Columns: type) type {
         /// Scoped columns value for the upsert target table (`up.c().id`).
         /// See `Builder.c` for the scoping contract.
         pub fn c(self: Self) Columns {
-            _ = self;
             if (Columns == void) return {};
             var scoped: Columns = undefined;
             inline for (@typeInfo(Columns).@"struct".fields) |field| {
-                @field(scoped, field.name) = .{};
+                var col: field.type = .{};
+                col.qualifier = self.tableAlias;
+                @field(scoped, field.name) = col;
             }
             return scoped;
         }
@@ -2132,10 +2151,8 @@ pub fn UpsertBuilder(comptime Row: type, comptime Columns: type) type {
                 self.setCount = 0;
                 inline for (assignments, 0..) |item, index| {
                     const Col = @TypeOf(item).assignColumn;
-                    checkAssignColumn(Col, Columns);
-                    inline for (0..index) |prev| {
-                        if (std.mem.eql(u8, @TypeOf(assignments[prev]).assignColumn.dslName, Col.dslName)) @compileError("duplicate assignment to one column in an explicit assign list");
-                    }
+                    if (comptime !hasAssignColumn(Col, Columns)) @compileError("assignment column is not a column of the statement target table");
+                    if (comptime hasDuplicateAssign(RowType, index)) @compileError("duplicate assignment to one column in an explicit assign list");
                     try checkAssignScope(Col, self.table, self.tableAlias);
                     if (comptime isExplicitDefault(@TypeOf(item.value))) continue;
                     if (self.setCount >= self.sets.len) return error.InvalidSql;
@@ -2242,7 +2259,7 @@ fn upsertValueOf(value: anytype) astBuilder.UpsertValue {
     }
     if (comptime @typeInfo(T) == .@"struct" and @hasDecl(T, "isArithExpr")) return .{ .set = value.toSetValue() };
     if (T == columnMod.DynamicColumn) return .{ .set = .{ .column = columnMod.dynRef(value) } };
-    if (comptime isTypedColumnInstance(T)) return .{ .set = .{ .column = .{ .table = T.dslTable, .name = T.dslName } } };
+    if (comptime isTypedColumnInstance(T)) return .{ .set = .{ .column = .{ .table = columnMod.qualifiedTable(value), .name = T.dslName } } };
     return .{ .literal = columnMod.toValue(value) };
 }
 
@@ -2420,4 +2437,96 @@ test "select preserves projection order and AllColumns routing" {
     try std.testing.expect(all.allColumns);
     try std.testing.expectEqual(@as(usize, 0), all.projectionCount);
     _ = T;
+}
+
+test "scoped and explicit selects converge on one projection" {
+    const conn = @as(*anyopaque, @ptrFromInt(0x1000));
+    const T = @import("table.zig").table("scope_users", struct { id: i64, name: []const u8 });
+    const base = Query(@TypeOf(T)).initRaw(std.testing.allocator, conn, "scope_users", undefined, undefined, undefined);
+    const scoped = base.select(.{ .id, .name });
+    const explicit = base.select(.{ T.id, T.name });
+    try std.testing.expectEqual(@as(usize, 2), scoped.projectionCount);
+    try std.testing.expectEqual(@as(usize, 2), explicit.projectionCount);
+    // Same native shape: column kind, scope table, and sql name agree.
+    for ([_]usize{ 0, 1 }) |i| {
+        try std.testing.expect(scoped.projections[i].kind == .column);
+        try std.testing.expectEqualStrings(explicit.projections[i].column.table, scoped.projections[i].column.table);
+        try std.testing.expectEqualStrings(explicit.projections[i].column.name, scoped.projections[i].column.name);
+    }
+    try std.testing.expectEqualStrings("scope_users", scoped.projections[0].column.table);
+    try std.testing.expectEqualStrings("id", scoped.projections[0].column.name);
+    // Single scoped field behaves like a one element list.
+    const one = base.select(.id);
+    try std.testing.expectEqual(@as(usize, 1), one.projectionCount);
+    try std.testing.expectEqualStrings("id", one.projections[0].column.name);
+    // Mixed scoped + explicit items keep position and identity.
+    const mixed = base.select(.{ .id, T.name });
+    try std.testing.expectEqualStrings("scope_users", mixed.projections[0].column.table);
+    try std.testing.expectEqualStrings("scope_users", mixed.projections[1].column.table);
+}
+
+test "scoped references follow the builder alias" {
+    const conn = @as(*anyopaque, @ptrFromInt(0x1000));
+    const T = @import("table.zig").table("scope_users", struct { id: i64, name: []const u8 });
+    const base = Query(@TypeOf(T)).initRaw(std.testing.allocator, conn, "scope_users", undefined, undefined, undefined);
+    const aliased = base.as("u");
+    try std.testing.expectEqualStrings("u", aliased.tableAlias.?);
+    try std.testing.expectEqualStrings("scope_users", aliased.table);
+    // Scoped list qualifies with the alias; explicit keeps the table name.
+    const scoped = aliased.select(.{.id});
+    try std.testing.expectEqualStrings("u", scoped.projections[0].column.table);
+    const explicit = aliased.select(.{T.id});
+    try std.testing.expectEqualStrings("scope_users", explicit.projections[0].column.table);
+    // The scoped columns value binds predicates to the alias too.
+    const pred = aliased.c().id.eq(1);
+    try std.testing.expectEqualStrings("u", pred.column.table);
+    try std.testing.expectEqualStrings("id", pred.column.name);
+    const plain = base.c().name.eq("x");
+    try std.testing.expectEqualStrings("scope_users", plain.column.table);
+}
+
+test "scoped order group returning and join keys resolve" {
+    const conn = @as(*anyopaque, @ptrFromInt(0x1000));
+    const T = @import("table.zig").table("scope_users", struct { id: i64, name: []const u8 });
+    const base = Query(@TypeOf(T)).initRaw(std.testing.allocator, conn, "scope_users", undefined, undefined, undefined);
+    const ordered = base.orderBy(.{ .name, T.id.desc() });
+    try std.testing.expectEqual(@as(usize, 2), ordered.orderCount);
+    try std.testing.expectEqualStrings("name", ordered.orders[0].column.name);
+    try std.testing.expect(!ordered.orders[0].descending);
+    try std.testing.expect(ordered.orders[1].descending);
+    const single = base.orderBy(.id);
+    try std.testing.expectEqualStrings("id", single.orders[0].column.name);
+    const grouped = base.groupBy(.{.id});
+    try std.testing.expectEqualStrings("id", grouped.groupByColumn.?.name);
+    try std.testing.expectEqualStrings("scope_users", grouped.groupByColumn.?.table);
+    const ret = base.returning(.{ .id, T.name });
+    try std.testing.expectEqual(@as(usize, 2), ret.returningCount);
+    try std.testing.expectEqualStrings("id", ret.returningCols[0].column.name);
+    const Other = @import("table.zig").table("scope_groups", struct { id: i64 });
+    const joined = base.joinUsing(Other, .id);
+    try std.testing.expectEqual(@as(usize, 1), joined.joinUsingCount);
+    try std.testing.expectEqualStrings("id", joined.joinUsingCols[0]);
+    const conflicted = base.onConflict(.id);
+    try std.testing.expectEqual(@as(usize, 1), conflicted.targetCount);
+    try std.testing.expectEqualStrings("id", conflicted.targetCols[0]);
+    const inListed = base.whereInValues(.id, &[_]i64{ 1, 2 });
+    try std.testing.expectEqualStrings("id", inListed.literalIn.?.column.name);
+    try std.testing.expectEqualStrings("scope_users", inListed.literalIn.?.column.table);
+}
+
+test "explicit assigns carry table identity for writes" {
+    const T = @import("table.zig").table("scope_users", struct { id: i64, name: []const u8 });
+    const a = T.id.set(1);
+    try std.testing.expect(columnMod.isAssignValue(@TypeOf(a)));
+    try std.testing.expectEqualStrings("scope_users", @TypeOf(a).assignColumn.dslTable);
+    try std.testing.expectEqualStrings("id", @TypeOf(a).assignColumn.dslName);
+    try std.testing.expect(a.value == 1);
+    const b = T.name.set("x");
+    try std.testing.expectEqualStrings("x", b.value);
+    // Arithmetic and column payloads pass through for expression updates.
+    const arith = T.id.set(T.id.add(1));
+    try std.testing.expect(@TypeOf(arith.value) == dslExpr.ArithExpr);
+    // Plain values are not assigns; row structs stay the scoped write form.
+    try std.testing.expect(!columnMod.isAssignValue(@TypeOf(1)));
+    try std.testing.expect(!columnMod.isAssignValue(@TypeOf(.{ .id = 1 })));
 }

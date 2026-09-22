@@ -118,6 +118,10 @@ pub const DynamicTable = struct {
         return self.qb().withRecursive(name, base, recursive);
     }
 
+    /// JOIN with an explicit kind pass-through; `on` is a borrowed predicate.
+    pub fn join(self: Self, other: anytype, kind: queryBuilder.JoinKind, on: dslExpr.Expr) DynamicQuery {
+        return self.qb().join(other, kind, on);
+    }
     /// INNER JOIN pass-through; `on` is a borrowed column predicate.
     pub fn innerJoin(self: Self, other: anytype, on: dslExpr.Expr) DynamicQuery {
         return self.qb().innerJoin(other, on);

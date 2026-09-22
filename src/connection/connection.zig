@@ -8903,6 +8903,215 @@ test "explicit values and expression assignments share native DML semantics" {
     try std.testing.expectEqual(@as(i64, 115), after.stock);
 }
 
+test "scoped and explicit typed writes and reads agree" {
+    const tableMod = @import("../dsl/table.zig");
+    const MembershipRow = struct { user_id: i64, group_id: i64, label: []const u8 };
+    const Membership = tableMod.table("typed_dual_memberships", MembershipRow);
+    const path = "sqlite_zig_dual_form_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    // Explicit composite keys: PK pair plus a UNIQUE group.
+    try db.createTable(Membership, .{
+        .overWrite = true,
+        .primaryKey = &.{ Membership.user_id, Membership.group_id },
+        .unique = &.{&.{ Membership.group_id, Membership.label }},
+    });
+    // Scoped insert...
+    var s = try db.from(Membership).insert(.{ .user_id = 1, .group_id = 10, .label = "alpha" });
+    s.deinit();
+    // ...and the explicit qualified form write the same native row.
+    var e = try db.from(Membership).insert(.{
+        Membership.user_id.set(2),
+        Membership.group_id.set(20),
+        Membership.label.set("beta"),
+    });
+    e.deinit();
+    // Scoped and explicit selects return identical result sets.
+    var scoped = try db.from(Membership).select(.{ .user_id, .group_id, .label }).orderBy(.user_id).fetch();
+    defer scoped.deinit();
+    var explicit = try db.from(Membership).select(.{ Membership.user_id, Membership.group_id, Membership.label }).orderBy(Membership.user_id.asc()).fetch();
+    defer explicit.deinit();
+    try std.testing.expectEqual(scoped.count(), explicit.count());
+    try std.testing.expectEqual(@as(usize, 2), scoped.count());
+    for (0..scoped.count()) |i| {
+        try std.testing.expectEqual(scoped.rows[i][0].integer, explicit.rows[i][0].integer);
+        try std.testing.expectEqual(scoped.rows[i][1].integer, explicit.rows[i][1].integer);
+        try std.testing.expectEqualStrings(scoped.rows[i][2].text, explicit.rows[i][2].text);
+    }
+    try std.testing.expectEqual(@as(i64, 1), scoped.rows[0][0].integer);
+    try std.testing.expectEqualStrings("beta", scoped.rows[1][2].text);
+    // Scoped predicates via the columns value match explicit predicates.
+    const q = db.from(Membership);
+    var one = try q.where(q.c().user_id.eq(1)).select(.{.label}).fetch();
+    defer one.deinit();
+    try std.testing.expectEqual(@as(usize, 1), one.count());
+    try std.testing.expectEqualStrings("alpha", one.rows[0][0].text);
+    // Explicit updates (literal + arithmetic expression) match scoped ones.
+    var updA = try (try db.from(Membership).update(.{Membership.label.set("ALPHA")})).where(Membership.user_id.eq(1)).execute();
+    updA.deinit();
+    var updB = try (try db.from(Membership).update(.{ .group_id = 99 })).where(q.c().group_id.eq(20)).execute();
+    updB.deinit();
+    var updC = try (try db.from(Membership).update(.{Membership.user_id.set(Membership.user_id.add(100))})).where(Membership.label.eq("ALPHA")).execute();
+    updC.deinit();
+    var check = try db.from(Membership).select(Membership.all()).orderBy(Membership.user_id.asc()).fetch();
+    defer check.deinit();
+    try std.testing.expectEqual(@as(i64, 2), check.at(0).user_id);
+    try std.testing.expectEqualStrings("beta", check.at(0).label);
+    try std.testing.expectEqual(@as(i64, 99), check.at(0).group_id);
+    try std.testing.expectEqual(@as(i64, 101), check.at(1).user_id);
+    try std.testing.expectEqualStrings("ALPHA", check.at(1).label);
+    // Scoped GROUP BY + HAVING through the columns value.
+    const gq = db.from(Membership);
+    var grouped = try gq.groupBy(.group_id).having(gq.c().group_id.count().gt(0)).select(.{.group_id}).fetch();
+    defer grouped.deinit();
+    try std.testing.expectEqual(@as(usize, 2), grouped.count());
+}
+
+test "aliased joins keep table scope for both forms" {
+    const tableMod = @import("../dsl/table.zig");
+    const User = tableMod.table("dual_users", struct { id: i64, name: []const u8 });
+    const Membership = tableMod.table("dual_memberships", struct { user_id: i64, group_id: i64 });
+    const path = "sqlite_zig_dual_join_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    try db.createTable(User, .{ .overWrite = true, .primaryKey = User.id });
+    try db.createTable(Membership, .{ .overWrite = true });
+    var a = try db.from(User).insert(.{ .id = 1, .name = "ann" });
+    a.deinit();
+    var b = try db.from(User).insert(.{ .id = 2, .name = "bob" });
+    b.deinit();
+    var m = try db.from(Membership).insert(.{ .user_id = 1, .group_id = 7 });
+    m.deinit();
+    const u = tableMod.aliased(User, "u");
+    const mem = tableMod.aliased(Membership, "m");
+    // Fully explicit aliased join: every reference keeps alias identity.
+    var rows = try db.from(u).join(mem, .inner, u.id.eq(mem.user_id)).select(.{ u.id, u.name, mem.group_id }).fetch();
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(usize, 1), rows.count());
+    try std.testing.expectEqual(@as(i64, 1), rows.rows[0][0].integer);
+    try std.testing.expectEqualStrings("ann", rows.rows[0][1].text);
+    try std.testing.expectEqual(@as(i64, 7), rows.rows[0][2].integer);
+    // Root-scoped fields on the aliased query qualify with the alias.
+    var scoped = try db.from(u).select(.{.id}).fetch();
+    defer scoped.deinit();
+    try std.testing.expectEqual(@as(usize, 2), scoped.count());
+    // Mixed root scope + explicit other-table references in one query.
+    var mixed = try db.from(User).join(Membership, .inner, User.id.eq(Membership.user_id)).where(User.id.eq(1)).select(.{ .id, Membership.group_id }).fetch();
+    defer mixed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), mixed.count());
+    try std.testing.expectEqual(@as(i64, 7), mixed.rows[0][1].integer);
+    // USING with a scoped field resolves the shared column name.
+    const Pair = tableMod.table("dual_pairs", struct { id: i64, tag: []const u8 });
+    const PairMeta = tableMod.table("dual_pair_meta", struct { id: i64, note: []const u8 });
+    try db.createTable(Pair, .{ .overWrite = true, .primaryKey = Pair.id });
+    try db.createTable(PairMeta, .{ .overWrite = true, .primaryKey = PairMeta.id });
+    var p = try db.from(Pair).insert(.{ .id = 1, .tag = "x" });
+    p.deinit();
+    var pm = try db.from(PairMeta).insert(.{ .id = 1, .note = "y" });
+    pm.deinit();
+    var using = try db.from(Pair).joinUsing(PairMeta, .id).select(.{ Pair.id, Pair.tag }).fetch();
+    defer using.deinit();
+    try std.testing.expectEqual(@as(usize, 1), using.count());
+}
+
+test "subqueries keep their own scope and correlate explicitly" {
+    const tableMod = @import("../dsl/table.zig");
+    const User = tableMod.table("sub_users", struct { id: i64, name: []const u8 });
+    const Membership = tableMod.table("sub_memberships", struct { user_id: i64, group_id: i64 });
+    const path = "sqlite_zig_dual_subquery_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    try db.createTable(User, .{ .overWrite = true, .primaryKey = User.id });
+    try db.createTable(Membership, .{ .overWrite = true });
+    var a = try db.from(User).insert(.{ .id = 1, .name = "ann" });
+    a.deinit();
+    var bb = try db.from(User).insert(.{ .id = 2, .name = "bob" });
+    bb.deinit();
+    var m = try db.from(Membership).insert(.{ .user_id = 1, .group_id = 7 });
+    m.deinit();
+    // IN-subquery: the outer scoped field binds to User...
+    var inRows = try db.from(User).whereInQuery(.id, Membership, Membership.user_id).select(.{.id}).fetch();
+    defer inRows.deinit();
+    try std.testing.expectEqual(@as(usize, 1), inRows.count());
+    try std.testing.expectEqual(@as(i64, 1), inRows.rows[0][0].integer);
+    // ...exactly like the explicit outer reference.
+    var inRowsExplicit = try db.from(User).whereInQuery(User.id, Membership, Membership.user_id).select(.{User.id}).fetch();
+    defer inRowsExplicit.deinit();
+    try std.testing.expectEqual(inRows.count(), inRowsExplicit.count());
+    // Correlated EXISTS: inner Membership scope plus explicit outer User id.
+    var ex = try db.from(User).whereExists(Membership, Membership.user_id.eq(User.id)).select(.{.name}).fetch();
+    defer ex.deinit();
+    try std.testing.expectEqual(@as(usize, 1), ex.count());
+    try std.testing.expectEqualStrings("ann", ex.rows[0][0].text);
+    // A typed CTE reference establishes its own scope like a table.
+    const Lite = tableMod.table("lite", struct { id: i64 });
+    var cte = try db.from(Lite).with("lite", "SELECT id FROM sub_users WHERE id = 2").select(.{.id}).fetch();
+    defer cte.deinit();
+    try std.testing.expectEqual(@as(usize, 1), cte.count());
+    try std.testing.expectEqual(@as(i64, 2), cte.rows[0][0].integer);
+}
+
+test "scoped schema objects resolve against their target" {
+    const tableMod = @import("../dsl/table.zig");
+    // Base revision known to the database...
+    const ThingBase = tableMod.table("dual_things", struct { id: i64, email: []const u8 });
+    // ...and the evolved descriptor carrying the new migration column.
+    const Thing = tableMod.table("dual_things", struct { id: i64, email: []const u8, nick: ?[]const u8 = null });
+    const Other = tableMod.table("dual_others", struct { id: i64, thing_id: i64 });
+    const path = "sqlite_zig_dual_ddl_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    // Scoped primary key, scoped unique group, scoped local FK side.
+    try db.createTable(ThingBase, .{ .overWrite = true, .primaryKey = .id, .unique = &.{.email} });
+    try db.createTable(Other, .{
+        .overWrite = true,
+        .primaryKey = Other.id,
+        .foreignKeys = &.{.{ .column = .thing_id, .references = ThingBase.id }},
+    });
+    try std.testing.expect(db.tableExists(Thing));
+    // Scoped index columns and scoped ADD COLUMN (migration scenario).
+    try db.createIndex(Thing, "idx_dual_things_email", .{.email}, false);
+    try db.addColumn(Thing, .nick, ?[]const u8);
+    var s = try db.from(Thing).insert(.{ .id = 1, .email = "a@x.y", .nick = "al" });
+    s.deinit();
+    const q = db.from(Thing);
+    var got = try q.where(q.c().email.eq("a@x.y")).select(.{ .id, .nick }).fetch();
+    defer got.deinit();
+    try std.testing.expectEqual(@as(usize, 1), got.count());
+    try std.testing.expectEqualStrings("al", got.rows[0][1].text);
+}
+
+test "scoped upsert returning and delete share one model" {
+    const tableMod = @import("../dsl/table.zig");
+    const Stock = tableMod.table("dual_stock", struct { id: i64, qty: i64 });
+    const path = "sqlite_zig_dual_upsert_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    try db.createTable(Stock, .{ .overWrite = true, .primaryKey = Stock.id });
+    // Scoped conflict target plus explicit assigns incl. excluded().
+    var up = try (try db.from(Stock).onConflict(.id).doUpdate(.{
+        Stock.qty.set(Stock.qty.add(10)),
+    })).insert(.{ .id = 1, .qty = 5 });
+    up.deinit();
+    var up2 = try (try db.from(Stock).onConflict(Stock.id).doUpdate(.{
+        Stock.qty.set(db.excluded("qty")),
+    })).insert(.{ .id = 1, .qty = 42 });
+    up2.deinit();
+    var got = try db.from(Stock).select(Stock.all()).fetchOne();
+    defer db.from(Stock).freeRow(&got);
+    try std.testing.expectEqual(@as(i64, 42), got.qty);
+    // Scoped RETURNING on update and scoped DELETE agree with explicit.
+    var ret = try (try db.from(Stock).returning(.{.qty}).update(.{ .qty = 7 })).where(Stock.id.eq(1)).execute();
+    defer ret.deinit();
+    try std.testing.expectEqual(@as(usize, 1), ret.count());
+    var del = try db.from(Stock).where(Stock.id.eq(1)).delete().returning(.{Stock.qty}).execute();
+    defer del.deinit();
+    try std.testing.expectEqual(@as(usize, 1), del.count());
+    var left = try db.exec("SELECT count(*) FROM dual_stock;");
+    defer left.deinit();
+    try std.testing.expectEqual(@as(i64, 0), left.rows[0][0].integer);
+}
+
 test "insertFrom maps source columns onto destination fields" {
     const Parent = @import("../dsl/table.zig").table("map_parent", struct { id: i64, label: []const u8 });
     const Child = @import("../dsl/table.zig").table("map_child", struct { id: i64, parent_id: i64, name: []const u8 });
