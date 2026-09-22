@@ -8,6 +8,8 @@ const std = @import("std");
 const Value = @import("../../vm/value.zig").Value;
 const affinityOf = @import("../../catalog/type_affinity.zig").fromDeclaration;
 const coerce = @import("../coerce.zig");
+const patternLib = @import("../../connection/pattern.zig");
+const limits = @import("../limits.zig");
 
 /// Longest-prefix integer scan; canonical implementation in `coerce`.
 pub const parseIntPrefix = coerce.parseIntPrefix;
@@ -908,6 +910,108 @@ pub fn evalUnistr(allocator: std.mem.Allocator, arg: Value) !Value {
     return .{ .text = try out.toOwnedSlice(allocator) };
 }
 
+/// Soundex letter code: BFPV=1, CGJKQSXZ=2, DT=3, L=4, MN=5, R=6, else 0
+/// (vowels and H/W/Y). ASCII only; other bytes score 0.
+fn soundexCode(byte: u8) u8 {
+    const upper = std.ascii.toUpper(byte);
+    return switch (upper) {
+        'B', 'F', 'P', 'V' => 1,
+        'C', 'G', 'J', 'K', 'Q', 'S', 'X', 'Z' => 2,
+        'D', 'T' => 3,
+        'L' => 4,
+        'M', 'N' => 5,
+        'R' => 6,
+        else => 0,
+    };
+}
+
+/// `soundex(X)`: four-character code (uppercased first letter plus three
+/// digits, zero-padded), mirroring `soundexFunc` in the C reference:
+/// leading non-letters are skipped, any zero-code letter (vowels and H/W/Y
+/// alike) resets adjacency, codes index the byte masked to 7 bits, and
+/// NULL/empty/no-letter input yields `"?000"`. Numbers render to text
+/// first, like `sqlite3_value_text`.
+pub fn evalSoundex(allocator: std.mem.Allocator, arg: Value) !Value {
+    const owned: ?[]u8 = switch (arg) {
+        .null => null,
+        .text => null,
+        .blob => null,
+        .integer => |i| try std.fmt.allocPrint(allocator, "{d}", .{i}),
+        .real => |r| try formatReal(allocator, r),
+    };
+    defer if (owned) |bytes| allocator.free(bytes);
+    const input: []const u8 = owned orelse switch (arg) {
+        .text => |t| t,
+        .blob => |b| b,
+        .null => "",
+        else => unreachable,
+    };
+    var start: usize = 0;
+    while (start < input.len and !std.ascii.isAlphabetic(input[start])) : (start += 1) {}
+    if (start >= input.len) return .{ .text = try allocator.dupe(u8, "?000") };
+    var out = [_]u8{ '0', '0', '0', '0' };
+    out[0] = std.ascii.toUpper(input[start]);
+    var prev: u8 = soundexCode(input[start] & 0x7f);
+    var count: usize = 1;
+    for (input[start + 1 ..]) |byte| {
+        if (count >= 4) break;
+        const code = soundexCode(byte & 0x7f);
+        if (code == 0) {
+            prev = 0;
+        } else if (code != prev) {
+            out[count] = '0' + code;
+            count += 1;
+            prev = code;
+        }
+    }
+    return .{ .text = try allocator.dupe(u8, &out) };
+}
+
+/// Renders a `LIKE`/`GLOB` function operand to text (numbers render,
+/// blobs contribute raw bytes); NULL stays NULL.
+fn patternOperand(allocator: std.mem.Allocator, arg: Value) !Value {
+    return switch (arg) {
+        .null => .null,
+        .text => |t| .{ .text = try allocator.dupe(u8, t) },
+        .blob => |b| .{ .text = try allocator.dupe(u8, b) },
+        .integer => |i| .{ .text = try std.fmt.allocPrint(allocator, "{d}", .{i}) },
+        .real => |r| .{ .text = try formatReal(allocator, r) },
+    };
+}
+
+/// `like(pattern, X[, escape])`: function form of the operator (note the
+/// pattern-first order, mirroring `likeFunc` in the C reference). NULL
+/// in/out yields NULL; a missing or multi-character escape fails
+/// `InvalidSql` like the operator path; overlong patterns fail `SqlTooBig`.
+pub fn evalLike(allocator: std.mem.Allocator, pattern: Value, input: Value, escape: ?Value) !Value {
+    const ownedPattern = try patternOperand(allocator, pattern);
+    defer if (ownedPattern != .null) allocator.free(ownedPattern.text);
+    const ownedInput = try patternOperand(allocator, input);
+    defer if (ownedInput != .null) allocator.free(ownedInput.text);
+    if (ownedPattern == .null or ownedInput == .null) return .null;
+    if (ownedPattern.text.len > limits.max_like_pattern_length) return error.SqlTooBig;
+    var escapeChar: ?u8 = null;
+    if (escape) |esc| {
+        const ownedEscape = try patternOperand(allocator, esc);
+        defer if (ownedEscape != .null) allocator.free(ownedEscape.text);
+        if (ownedEscape == .null or ownedEscape.text.len != 1) return error.InvalidSql;
+        escapeChar = ownedEscape.text[0];
+    }
+    return .{ .integer = if (patternLib.likeWithEscape(ownedInput.text, ownedPattern.text, escapeChar)) 1 else 0 };
+}
+
+/// `glob(pattern, X)`: function form of the operator (pattern first).
+/// NULL in/out yields NULL; overlong patterns fail `SqlTooBig`.
+pub fn evalGlob(allocator: std.mem.Allocator, pattern: Value, input: Value) !Value {
+    const ownedPattern = try patternOperand(allocator, pattern);
+    defer if (ownedPattern != .null) allocator.free(ownedPattern.text);
+    const ownedInput = try patternOperand(allocator, input);
+    defer if (ownedInput != .null) allocator.free(ownedInput.text);
+    if (ownedPattern == .null or ownedInput == .null) return .null;
+    if (ownedPattern.text.len > limits.max_like_pattern_length) return error.SqlTooBig;
+    return .{ .integer = if (patternLib.glob(ownedInput.text, ownedPattern.text)) 1 else 0 };
+}
+
 test "scalar normal behavior matrix" {
     const alloc = std.testing.allocator;
     const lower = try evalLower(alloc, .{ .text = "AbC" });
@@ -992,6 +1096,44 @@ test "scalar null empty and edge boundaries" {
     defer olen.free(alloc);
     try std.testing.expectEqual(@as(i64, 1), ulen.integer);
     try std.testing.expectEqual(@as(i64, 2), olen.integer);
+}
+
+test "soundex like glob edges" {
+    const alloc = std.testing.allocator;
+    // Zero-code letters (vowels and H/W/Y alike) reset adjacency, so
+    // Ashcraft is A226 here, not the classic A261; leading non-letters
+    // are skipped and letterless input yields "?000" (all per the C
+    // reference `soundexFunc`).
+    const ash = try evalSoundex(alloc, .{ .text = "Ashcraft" });
+    defer ash.free(alloc);
+    try std.testing.expectEqualStrings("A226", ash.text);
+    const pfister = try evalSoundex(alloc, .{ .text = "Pfister" });
+    defer pfister.free(alloc);
+    try std.testing.expectEqualStrings("P236", pfister.text);
+    const empty = try evalSoundex(alloc, .{ .text = "" });
+    defer empty.free(alloc);
+    try std.testing.expectEqualStrings("?000", empty.text);
+    const null_in = try evalSoundex(alloc, .null);
+    defer null_in.free(alloc);
+    try std.testing.expectEqualStrings("?000", null_in.text);
+    const num = try evalSoundex(alloc, .{ .integer = 123 });
+    defer num.free(alloc);
+    try std.testing.expectEqualStrings("?000", num.text);
+    const padded = try evalSoundex(alloc, .{ .text = "123Euler" });
+    defer padded.free(alloc);
+    try std.testing.expectEqualStrings("E460", padded.text);
+    const like_num = try evalLike(alloc, .{ .text = "1%" }, .{ .integer = 123 }, null);
+    defer like_num.free(alloc);
+    try std.testing.expectEqual(@as(i64, 1), like_num.integer);
+    const like_null = try evalLike(alloc, .null, .{ .text = "x" }, null);
+    defer like_null.free(alloc);
+    try std.testing.expect(like_null == .null);
+    const glob_q = try evalGlob(alloc, .{ .text = "a?c" }, .{ .text = "abc" });
+    defer glob_q.free(alloc);
+    try std.testing.expectEqual(@as(i64, 1), glob_q.integer);
+    const glob_case = try evalGlob(alloc, .{ .text = "A*" }, .{ .text = "abc" });
+    defer glob_case.free(alloc);
+    try std.testing.expectEqual(@as(i64, 0), glob_case.integer);
 }
 
 test "scalar error behavior" {

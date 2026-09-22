@@ -89,7 +89,9 @@ NULL-safe comparisons are available with `IS DISTINCT FROM` and
 Case-sensitive Unix-style matching is also available with `GLOB` in raw SQL and
 `column.glob(pattern)` in the typed DSL. `NOT GLOB` and `column.notGlob(pattern)`
 are also supported. Patterns support `*`, `?`, and simple character classes such
-as `[A-Z]`.
+as `[A-Z]`. The function forms `like(pattern, X[, escape])` and
+`glob(pattern, X)` (pattern first) work too, as does `soundex(X)` with the
+reference encoding (`?000` for letterless input).
 
 The text projection functions `TRIM`, `LTRIM`, and `RTRIM` are supported in raw
 SQL and as column wrappers (`.trim()`, `.ltrim()`, `.rtrim()`) usable in both
@@ -126,9 +128,9 @@ type name (affinity-routed, so `BIGINT`, `VARCHAR(10)`, `DOUBLE PRECISION`,
 
 The JSON1 family includes `json`, `json_extract`, `json_set`,
 `json_insert`, `json_replace`, `json_remove`, `json_array`, `json_object`,
-`json_type`, and `json_valid` over nested objects and arrays with `$.a[0]`
-style paths, exposed in the DSL as `.jsonExtract(path)` /
-`.jsonSet(path, value)`.
+`json_type`, `json_valid`, and `json_array_length(X[, path])` over nested
+objects and arrays with `$.a[0]` style paths, exposed in the DSL as
+`.jsonExtract(path)` / `.jsonSet(path, value)`.
 
 Function expressions such as `WHERE LOWER(name) = 'alice'` and
 `WHERE TRIM(name) = 'alice'` are supported on the left side of comparison

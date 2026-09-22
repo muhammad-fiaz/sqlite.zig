@@ -40,17 +40,18 @@ pub const FuncClass = enum {
 /// drift test at the file bottom fails if an arm is added without its name).
 /// `min`/`max` are absent on purpose: their class depends on arity.
 const scalarNames = [_][]const u8{
-    "abs",         "lower",      "upper",        "length",       "round",          "typeof",           "coalesce",     "ifnull",
-    "nullif",      "instr",      "replace",      "substr",       "substring",      "trim",             "ltrim",        "rtrim",
-    "cast",        "hex",        "unhex",        "quote",        "char",           "unicode",          "printf",       "format",
-    "concat",      "concat_ws",  "octet_length", "zeroblob",     "sign",           "iif",              "if",           "unlikely",
-    "likely",      "likelihood", "random",       "randomblob",   "sqlite_version", "sqlite_source_id", "json_quote",   "unistr",
-    "ceil",        "ceiling",    "floor",        "trunc",        "ln",             "log",              "log10",        "log2",
-    "pow",         "power",      "sqrt",         "sin",          "cos",            "tan",              "asin",         "acos",
-    "atan",        "atan2",      "degrees",      "radians",      "pi",             "exp",              "mod",          "cosh",
-    "sinh",        "tanh",       "acosh",        "asinh",        "atanh",          "date",             "time",         "datetime",
-    "julianday",   "unixepoch",  "strftime",     "json",         "json_valid",     "json_type",        "json_extract", "json_array",
-    "json_object", "json_set",   "json_insert",  "json_replace", "json_remove",
+    "abs",         "lower",      "upper",        "length",       "round",          "typeof",            "coalesce",     "ifnull",
+    "nullif",      "instr",      "replace",      "substr",       "substring",      "trim",              "ltrim",        "rtrim",
+    "cast",        "hex",        "unhex",        "quote",        "char",           "unicode",           "printf",       "format",
+    "concat",      "concat_ws",  "octet_length", "zeroblob",     "sign",           "iif",               "if",           "unlikely",
+    "likely",      "likelihood", "random",       "randomblob",   "sqlite_version", "sqlite_source_id",  "json_quote",   "unistr",
+    "ceil",        "ceiling",    "floor",        "trunc",        "ln",             "log",               "log10",        "log2",
+    "pow",         "power",      "sqrt",         "sin",          "cos",            "tan",               "asin",         "acos",
+    "atan",        "atan2",      "degrees",      "radians",      "pi",             "exp",               "mod",          "cosh",
+    "sinh",        "tanh",       "acosh",        "asinh",        "atanh",          "date",              "time",         "datetime",
+    "julianday",   "unixepoch",  "strftime",     "json",         "json_valid",     "json_type",         "json_extract", "json_array",
+    "json_object", "json_set",   "json_insert",  "json_replace", "json_remove",    "json_array_length", "soundex",      "like",
+    "glob",
 };
 
 /// Classify one call for routing: window names first (arity-independent),
@@ -426,6 +427,21 @@ pub fn evalScalar(allocator: std.mem.Allocator, name: []const u8, args: []const 
     if (std.ascii.eqlIgnoreCase(name, "json_remove")) {
         return json.evalJsonRemove(allocator, args);
     }
+    if (std.ascii.eqlIgnoreCase(name, "json_array_length")) {
+        return json.evalJsonArrayLength(allocator, args);
+    }
+    if (std.ascii.eqlIgnoreCase(name, "soundex")) {
+        if (args.len != 1) return error.InvalidArgumentCount;
+        return scalar.evalSoundex(allocator, args[0]);
+    }
+    if (std.ascii.eqlIgnoreCase(name, "like")) {
+        if (args.len != 2 and args.len != 3) return error.InvalidArgumentCount;
+        return scalar.evalLike(allocator, args[0], args[1], if (args.len == 3) args[2] else null);
+    }
+    if (std.ascii.eqlIgnoreCase(name, "glob")) {
+        if (args.len != 2) return error.InvalidArgumentCount;
+        return scalar.evalGlob(allocator, args[0], args[1]);
+    }
 
     return error.Unsupported;
 }
@@ -467,6 +483,51 @@ test "functions registry null and boundary behavior" {
     const null_min = try evalScalar(alloc, "max", &.{ .{ .integer = 1 }, .null });
     defer null_min.free(alloc);
     try std.testing.expect(null_min == .null);
+}
+
+test "functions registry covers soundex like glob and json_array_length" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(classify("soundex", 1) == .scalar);
+    try std.testing.expect(classify("like", 2) == .scalar);
+    try std.testing.expect(classify("glob", 2) == .scalar);
+    try std.testing.expect(classify("json_array_length", 1) == .scalar);
+
+    const euler = try evalScalar(alloc, "soundex", &.{.{ .text = "Euler" }});
+    defer euler.free(alloc);
+    try std.testing.expectEqualStrings("E460", euler.text);
+    const ashcraft = try evalScalar(alloc, "soundex", &.{.{ .text = "Ashcraft" }});
+    defer ashcraft.free(alloc);
+    try std.testing.expectEqualStrings("A226", ashcraft.text);
+    const null_soundex = try evalScalar(alloc, "soundex", &.{.null});
+    defer null_soundex.free(alloc);
+    try std.testing.expectEqualStrings("?000", null_soundex.text);
+
+    const like_hit = try evalScalar(alloc, "like", &.{ .{ .text = "a%" }, .{ .text = "abc" } });
+    defer like_hit.free(alloc);
+    try std.testing.expectEqual(@as(i64, 1), like_hit.integer);
+    const like_miss = try evalScalar(alloc, "like", &.{ .{ .text = "b%" }, .{ .text = "abc" } });
+    defer like_miss.free(alloc);
+    try std.testing.expectEqual(@as(i64, 0), like_miss.integer);
+    const like_escape = try evalScalar(alloc, "like", &.{ .{ .text = "a!%" }, .{ .text = "a%" }, .{ .text = "!" } });
+    defer like_escape.free(alloc);
+    try std.testing.expectEqual(@as(i64, 1), like_escape.integer);
+    try std.testing.expectError(error.InvalidSql, evalScalar(alloc, "like", &.{ .{ .text = "a%" }, .{ .text = "abc" }, .{ .text = "!!" } }));
+    const glob_hit = try evalScalar(alloc, "glob", &.{ .{ .text = "a*" }, .{ .text = "abc" } });
+    defer glob_hit.free(alloc);
+    try std.testing.expectEqual(@as(i64, 1), glob_hit.integer);
+
+    const arr_len = try evalScalar(alloc, "json_array_length", &.{.{ .text = "[1,2,3]" }});
+    defer arr_len.free(alloc);
+    try std.testing.expectEqual(@as(i64, 3), arr_len.integer);
+    const obj_len = try evalScalar(alloc, "json_array_length", &.{.{ .text = "{\"a\":1}" }});
+    defer obj_len.free(alloc);
+    try std.testing.expectEqual(@as(i64, 0), obj_len.integer);
+    const path_len = try evalScalar(alloc, "json_array_length", &.{ .{ .text = "{\"a\":[1,2]}" }, .{ .text = "$.a" } });
+    defer path_len.free(alloc);
+    try std.testing.expectEqual(@as(i64, 2), path_len.integer);
+    const bad_json = try evalScalar(alloc, "json_array_length", &.{.{ .text = "nope" }});
+    defer bad_json.free(alloc);
+    try std.testing.expect(bad_json == .null);
 }
 
 test "functions registry rejects bad arity and unknown names" {

@@ -2904,21 +2904,23 @@ pub const Connection = struct {
     }
 
     /// Resolves a row-independent INSERT expression into an owned value:
-    /// complex results already own their payload, borrowed literals and
-    /// parameters are duped.
+    /// binary/unary/scalar-call results already own their payload, anything
+    /// else (literals, parameters, `CASE`, subqueries) is duped. `CASE` must
+    /// copy because its branches pass borrowed values straight through.
     fn resolveViewValue(self: *Connection, expr: ast.Expr, parameters: []const Value) !Value {
         const resolved = try self.resolve(expr, parameters);
         return switch (expr) {
-            .binary, .unary, .function, .caseExpr => resolved,
+            .binary, .unary, .function => resolved,
             else => try self.copyValue(resolved),
         };
     }
 
-    /// Resolves an UPDATE SET expression over a view row into an owned value.
+    /// Resolves an UPDATE SET expression over a view row into an owned value
+    /// (same ownership rule as `resolveViewValue`).
     fn evalViewValue(self: *Connection, shape: *const Table, row: []const Value, expr: ast.Expr, parameters: []const Value) !Value {
         const resolved = try self.eval(shape, row, expr, parameters);
         return switch (expr) {
-            .binary, .unary, .function, .caseExpr => resolved,
+            .binary, .unary, .function => resolved,
             else => try self.copyValue(resolved),
         };
     }
@@ -3512,6 +3514,21 @@ pub const Connection = struct {
         return if (expr == .collate) expr.collate.name else null;
     }
 
+    /// True when `evalContext` on `expr` always yields an owned text/blob
+    /// the caller must release with `freeConcatText`. Binary/unary ops and
+    /// scalar calls allocate (or return scalars, which free ignores);
+    /// literals, parameters, and column references borrow. `CASE` is
+    /// excluded on purpose: its branches pass borrowed values straight
+    /// through, so freeing a `caseExpr` result can free borrowed memory.
+    /// A `.collate` wrapper inherits its inner expression's ownership.
+    fn evalOwnsResult(expr: ast.Expr) bool {
+        return switch (expr) {
+            .binary, .unary, .function => true,
+            .collate => |node| evalOwnsResult(node.expr.*),
+            else => false,
+        };
+    }
+
     fn nullSafeEqual(left: Value, right: Value, collate: ?[]const u8) bool {
         return compareBridge.nullSafeEqual(left, right, collate);
     }
@@ -3592,9 +3609,14 @@ pub const Connection = struct {
                         break :currentColumn row[try columnIndex(tbl, item.column)];
                     };
                     defer if (item.leftExpr) |left| {
-                        if (left == .binary or left == .unary or left == .function) self.freeConcatText(current);
+                        if (evalOwnsResult(left)) self.freeConcatText(current);
                     };
-                    const base: bool = if (item.op == .isTrue) functions.scalar.isTruthyValue(current) else if (item.op == .isNull) current == .null else if (item.op == .isNotNull) current != .null else if (item.op == .isValue) nullSafeEqual(current, try self.evalContext(tbl, row, item.value, parameters, outer), item.collate) else if (item.op == .isNotValue) !nullSafeEqual(current, try self.evalContext(tbl, row, item.value, parameters, outer), item.collate) else if (item.op == .isDistinct) !nullSafeEqual(current, try self.evalContext(tbl, row, item.value, parameters, outer), item.collate) else if (item.op == .isNotDistinct) nullSafeEqual(current, try self.evalContext(tbl, row, item.value, parameters, outer), item.collate) else if (item.op == .in and item.subquery != null) inSubquery: {
+                    const base: bool = if (item.op == .isTrue) functions.scalar.isTruthyValue(current) else if (item.op == .isNull) current == .null else if (item.op == .isNotNull) current != .null else if (item.op == .isValue or item.op == .isNotValue or item.op == .isDistinct or item.op == .isNotDistinct) nullSafeBlk: {
+                        const rhs = try self.evalContext(tbl, row, item.value, parameters, outer);
+                        defer if (evalOwnsResult(item.value)) self.freeConcatText(rhs);
+                        const eq = nullSafeEqual(current, rhs, item.collate);
+                        break :nullSafeBlk if (item.op == .isValue or item.op == .isNotDistinct) eq else !eq;
+                    } else if (item.op == .in and item.subquery != null) inSubquery: {
                         const sql = item.subquery orelse return error.InvalidSql;
                         const currentOuter = OuterRow{ .table = tbl, .alias = if (outer) |o| (if (o.table == tbl) o.alias else null) else null, .values = row, .prev = if (outer != null and outer.?.table == tbl) outer.?.prev else outer };
                         var subquery = try self.executeWithOuter(sql, parameters, &currentOuter);
@@ -3632,31 +3654,47 @@ pub const Connection = struct {
                     } else if ((item.op == .in or item.op == .notIn) and item.listValues.len != 0) listValues: {
                         if (current == .null) break :listValues false;
                         var found = false;
-                        for (item.listValues) |candidate| if (compareCollated(current, .equal, try self.evalContext(tbl, row, candidate, parameters, outer), item.collate)) {
-                            found = true;
-                            break;
-                        };
+                        for (item.listValues) |candidate| {
+                            const candVal = try self.evalContext(tbl, row, candidate, parameters, outer);
+                            defer if (evalOwnsResult(candidate)) self.freeConcatText(candVal);
+                            if (compareCollated(current, .equal, candVal, item.collate)) {
+                                found = true;
+                                break;
+                            }
+                        }
                         break :listValues if (item.op == .in) found else !found;
                     } else if (item.op == .between or item.op == .notBetween) betweenPattern: {
                         if (current == .null) break :betweenPattern false;
-                        const inRange = compareCollated(current, .greaterEqual, try self.evalContext(tbl, row, item.value, parameters, outer), item.collate) and compareCollated(current, .lessEqual, try self.evalContext(tbl, row, item.value2 orelse return error.InvalidSql, parameters, outer), item.collate);
+                        const lower = try self.evalContext(tbl, row, item.value, parameters, outer);
+                        defer if (evalOwnsResult(item.value)) self.freeConcatText(lower);
+                        const upperSrc = item.value2 orelse return error.InvalidSql;
+                        const upper = try self.evalContext(tbl, row, upperSrc, parameters, outer);
+                        defer if (evalOwnsResult(upperSrc)) self.freeConcatText(upper);
+                        const inRange = compareCollated(current, .greaterEqual, lower, item.collate) and compareCollated(current, .lessEqual, upper, item.collate);
                         break :betweenPattern if (item.op == .between) inRange else !inRange;
                     } else if (item.op == .like or item.op == .notLike) likePattern: {
                         const pattern = try self.evalContext(tbl, row, item.value, parameters, outer);
+                        defer if (evalOwnsResult(item.value)) self.freeConcatText(pattern);
                         var escapeValue: ?Value = null;
                         if (item.escape) |escapeExpr| escapeValue = try self.evalContext(tbl, row, escapeExpr, parameters, outer);
+                        defer if (item.escape) |escapeExpr| {
+                            if (escapeValue) |escapeVal| if (evalOwnsResult(escapeExpr)) self.freeConcatText(escapeVal);
+                        };
                         const tri = try self.evalPattern(current, pattern, escapeValue, false);
                         break :likePattern if (tri) |matched| (if (item.op == .like) matched else !matched) else false;
                     } else if (item.op == .glob or item.op == .notGlob) globPattern: {
                         const pattern = try self.evalContext(tbl, row, item.value, parameters, outer);
+                        defer if (evalOwnsResult(item.value)) self.freeConcatText(pattern);
                         const tri = try self.evalPattern(current, pattern, null, true);
                         break :globPattern if (tri) |matched| (if (item.op == .glob) matched else !matched) else false;
                     } else if (item.op == .regexp or item.op == .notRegexp) regexpPattern: {
                         const pattern = try self.evalContext(tbl, row, item.value, parameters, outer);
+                        defer if (evalOwnsResult(item.value)) self.freeConcatText(pattern);
                         const tri = try self.evalRegexp(current, pattern);
                         break :regexpPattern if (tri) |matched| (if (item.op == .regexp) matched else !matched) else false;
                     } else if (item.op == .match or item.op == .notMatch) matchPattern: {
                         const pattern = try self.evalContext(tbl, row, item.value, parameters, outer);
+                        defer if (evalOwnsResult(item.value)) self.freeConcatText(pattern);
                         const tri = try self.evalMatch(current, pattern);
                         break :matchPattern if (tri) |matched| (if (item.op == .match) matched else !matched) else false;
                     } else collatedCompare: {
@@ -3664,7 +3702,9 @@ pub const Connection = struct {
                         // wrapper left by the parser selects the collation
                         // (e.g. `x = 'A' COLLATE NOCASE`), else binary.
                         const collation = item.collate orelse collateOfExpr(item.value) orelse if (item.leftExpr) |left| collateOfExpr(left) else null;
-                        break :collatedCompare compareCollated(current, item.op, try self.evalContext(tbl, row, item.value, parameters, outer), collation);
+                        const rhs = try self.evalContext(tbl, row, item.value, parameters, outer);
+                        defer if (evalOwnsResult(item.value)) self.freeConcatText(rhs);
+                        break :collatedCompare compareCollated(current, item.op, rhs, collation);
                     };
                     if (item.negated) {
                         if (base) break :blk false;
@@ -3676,9 +3716,11 @@ pub const Connection = struct {
                         if (!nullSafe) {
                             if (current == .null) break :blk false;
                             const v = try self.evalContext(tbl, row, item.value, parameters, outer);
+                            defer if (evalOwnsResult(item.value)) self.freeConcatText(v);
                             if (v == .null) break :blk false;
                             if (item.value2) |second| {
                                 const w = try self.evalContext(tbl, row, second, parameters, outer);
+                                defer if (evalOwnsResult(second)) self.freeConcatText(w);
                                 if (w == .null) break :blk false;
                             }
                         }
@@ -4684,7 +4726,7 @@ pub const Connection = struct {
                         itemResult = functions.scalar.isTruthyValue(leftValue);
                     } else {
                         const rightValue = try self.resolve(having.right, parameters);
-                        const rightOwned = having.right == .binary or having.right == .unary;
+                        const rightOwned = evalOwnsResult(having.right);
                         defer if (rightOwned) self.freeConcatText(rightValue);
                         itemResult = havingCompare(leftValue, having.op, rightValue);
                     }
@@ -5170,7 +5212,7 @@ pub const Connection = struct {
                             itemResult = functions.scalar.isTruthyValue(leftValue);
                         } else {
                             const rightValue = try self.resolve(having.right, parameters);
-                            const rightOwned = having.right == .binary or having.right == .unary;
+                            const rightOwned = evalOwnsResult(having.right);
                             defer if (rightOwned) self.freeConcatText(rightValue);
                             itemResult = havingCompare(leftValue, having.op, rightValue);
                         }
@@ -5445,7 +5487,7 @@ pub const Connection = struct {
             };
             defer self.freeConcatText(leftValue);
             const rightValue = try self.resolve(having.right, parameters);
-            const rightOwned = having.right == .binary or having.right == .unary;
+            const rightOwned = evalOwnsResult(having.right);
             defer if (rightOwned) self.freeConcatText(rightValue);
             const itemResult = havingCompare(leftValue, having.op, rightValue);
             if (!started) {
@@ -6338,7 +6380,7 @@ pub const Connection = struct {
                         itemResult = functions.scalar.isTruthyValue(leftValue);
                     } else {
                         const rightValue = try self.resolve(having.right, parameters);
-                        const rightOwned = having.right == .binary or having.right == .unary;
+                        const rightOwned = evalOwnsResult(having.right);
                         defer if (rightOwned) self.freeConcatText(rightValue);
                         itemResult = havingCompare(leftValue, having.op, rightValue);
                     }
@@ -15092,4 +15134,24 @@ test "probe cast edges and three valued logic" {
     var havingFiltered = try db.exec("SELECT CAST(1 AS INTEGER) AS one GROUP BY one HAVING one IS DISTINCT FROM 1;");
     defer havingFiltered.deinit();
     try std.testing.expectEqual(@as(usize, 0), havingFiltered.count());
+}
+
+test "soundex like glob and json_array_length run as raw sql" {
+    var db = try freshDb("sqlite_zig_scalar_gap_test.db");
+    defer dropDb(db, "sqlite_zig_scalar_gap_test.db");
+    var rows = try db.exec("SELECT soundex('Euler'), soundex('Ashcraft'), like('a%', 'abc'), like('a!%', 'a%', '!'), glob('a*', 'abc'), json_array_length('[1,2,3]'), json_array_length('{\"a\":[1]}', '$.a');");
+    defer rows.deinit();
+    try std.testing.expectEqualStrings("E460", rows.rows[0][0].text);
+    try std.testing.expectEqualStrings("A226", rows.rows[0][1].text);
+    try std.testing.expectEqual(@as(i64, 1), rows.rows[0][2].integer);
+    try std.testing.expectEqual(@as(i64, 1), rows.rows[0][3].integer);
+    try std.testing.expectEqual(@as(i64, 1), rows.rows[0][4].integer);
+    try std.testing.expectEqual(@as(i64, 3), rows.rows[0][5].integer);
+    try std.testing.expectEqual(@as(i64, 1), rows.rows[0][6].integer);
+    var setup = try db.exec("CREATE TABLE sg_t (name TEXT, payload TEXT); INSERT INTO sg_t VALUES ('Euler', '[1,2]'), ('Smith', '{}');");
+    setup.deinit();
+    var filtered = try db.exec("SELECT name FROM sg_t WHERE soundex(name) = soundex('Ellery') AND json_array_length(payload) = 2;");
+    defer filtered.deinit();
+    try std.testing.expectEqual(@as(usize, 1), filtered.count());
+    try std.testing.expectEqualStrings("Euler", filtered.rows[0][0].text);
 }

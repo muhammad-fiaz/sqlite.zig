@@ -372,6 +372,25 @@ pub fn evalJsonExtract(allocator: std.mem.Allocator, args: []const Value) !Value
     return .{ .text = resStr };
 }
 
+/// `json_array_length(X[,P])`: element count of the array at path P (or
+/// the root); non-array JSON yields 0, bad JSON/NULL/missing paths yield NULL.
+pub fn evalJsonArrayLength(allocator: std.mem.Allocator, args: []const Value) !Value {
+    if (args.len == 0 or args.len > 2 or args[0] == .null or args[0] != .text) return .null;
+    const parsed = parseJsonDocument(allocator, args[0].text) catch return .null;
+    defer parsed.deinit();
+    var node = parsed.value;
+    if (args.len == 2) {
+        if (args[1] == .null or args[1] != .text) return .null;
+        const steps = try parsePath(allocator, args[1].text);
+        defer allocator.free(steps);
+        node = getPath(parsed.value, steps) orelse return .null;
+    }
+    return switch (node) {
+        .array => |arr| .{ .integer = @intCast(arr.items.len) },
+        else => .{ .integer = 0 },
+    };
+}
+
 /// `json_array(v...)`: JSON array text; SQL values convert (text tries JSON parse first).
 pub fn evalJsonArray(allocator: std.mem.Allocator, args: []const Value) !Value {
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -494,6 +513,25 @@ test "json null empty and boundary" {
     const rem = try evalJsonRemove(alloc, &.{ base, .{ .text = "$.a" } });
     defer rem.free(alloc);
     try std.testing.expectEqualStrings("{}", rem.text);
+}
+
+test "json array length counts arrays and paths" {
+    const alloc = std.testing.allocator;
+    const root = try evalJsonArrayLength(alloc, &.{.{ .text = "[1,[2],{\"a\":3}]" }});
+    defer root.free(alloc);
+    try std.testing.expectEqual(@as(i64, 3), root.integer);
+    const empty = try evalJsonArrayLength(alloc, &.{.{ .text = "[]" }});
+    defer empty.free(alloc);
+    try std.testing.expectEqual(@as(i64, 0), empty.integer);
+    const scalar = try evalJsonArrayLength(alloc, &.{.{ .text = "42" }});
+    defer scalar.free(alloc);
+    try std.testing.expectEqual(@as(i64, 0), scalar.integer);
+    const nested = try evalJsonArrayLength(alloc, &.{ .{ .text = "{\"a\":{\"b\":[1]}}" }, .{ .text = "$.a.b" } });
+    defer nested.free(alloc);
+    try std.testing.expectEqual(@as(i64, 1), nested.integer);
+    try std.testing.expect((try evalJsonArrayLength(alloc, &.{ .{ .text = "{\"a\":1}" }, .{ .text = "$.missing" } })) == .null);
+    try std.testing.expect((try evalJsonArrayLength(alloc, &.{.null})) == .null);
+    try std.testing.expect((try evalJsonArrayLength(alloc, &.{})) == .null);
 }
 
 test "json error behavior" {
