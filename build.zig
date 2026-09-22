@@ -136,6 +136,7 @@ pub fn build(b: *std.Build) void {
         "70_collision_free_dsl",
         "71_instead_of_triggers",
         "72_scoped_and_explicit_typed",
+        "73_dual_form_matrix",
     };
 
     inline for (examples) |name| {

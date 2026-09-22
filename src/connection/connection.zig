@@ -9210,6 +9210,36 @@ test "insertFrom accepts scoped source fields" {
     try std.testing.expectEqualStrings("leaf", rows.at(1).name);
 }
 
+test "autoincrement accepts scoped and explicit keys" {
+    const tableMod = @import("../dsl/table.zig");
+    const A = tableMod.table("auto_a", struct { id: i64, v: []const u8 });
+    const B = tableMod.table("auto_b", struct { id: i64, v: []const u8 });
+    const path = "sqlite_zig_autoincrement_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    try db.createTable(A, .{ .overWrite = true, .primaryKey = A.id, .autoincrement = A.id });
+    try db.createTable(B, .{ .overWrite = true, .primaryKey = .id, .autoincrement = .id });
+    try db.schema(A).validate();
+    try db.schema(B).validate();
+    // Omitted ids fill from the autoincrement sequence on both tables.
+    var a1 = try db.from(A).insert(.{ .v = "x" });
+    a1.deinit();
+    var a2 = try db.from(A).insert(A.v.set("y"));
+    a2.deinit();
+    var b1 = try db.from(B).insert(.{ .v = "p" });
+    b1.deinit();
+    var b2 = try db.from(B).insert(.{B.v.set("q")});
+    b2.deinit();
+    var ra = try db.from(A).select(A.all()).orderBy(A.id.asc()).fetch();
+    defer ra.deinit();
+    try std.testing.expectEqual(@as(i64, 1), ra.at(0).id);
+    try std.testing.expectEqual(@as(i64, 2), ra.at(1).id);
+    var rb = try db.from(B).select(B.all()).orderBy(B.id.asc()).fetch();
+    defer rb.deinit();
+    try std.testing.expectEqual(@as(i64, 1), rb.at(0).id);
+    try std.testing.expectEqual(@as(i64, 2), rb.at(1).id);
+}
+
 test "scoped upsert returning and delete share one model" {
     const tableMod = @import("../dsl/table.zig");
     const Stock = tableMod.table("dual_stock", struct { id: i64, qty: i64 });

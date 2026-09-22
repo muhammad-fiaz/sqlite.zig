@@ -1264,6 +1264,9 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
             const conflict: ast.ConflictPolicy = if (comptime std.mem.eql(u8, mode, "")) .none else if (comptime std.mem.eql(u8, mode, "OR IGNORE")) .ignore else if (comptime std.mem.eql(u8, mode, "OR REPLACE")) .replace else if (comptime std.mem.eql(u8, mode, "OR ABORT")) .abort else if (comptime std.mem.eql(u8, mode, "OR FAIL")) .fail else if (comptime std.mem.eql(u8, mode, "OR ROLLBACK")) .rollback else @compileError("unknown insert mode");
             const RowType = @TypeOf(row);
             if (comptime isAssignList(RowType)) return self.insertAssigns(row, conflict);
+            // Bare single assign (`insert(User.name.set("x"))`) behaves
+            // like a one element tuple, mirroring select(.id).
+            if (comptime isAssignItem(RowType)) return self.insertAssigns(.{row}, conflict);
             validateRow(RowType);
             if (Columns == void) {
                 const fields = @typeInfo(RowType).@"struct".fields;
@@ -1321,6 +1324,8 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
             // Explicit assignments (`update(.{ User.name.set("x"),
             // User.age.set(User.age.add(1)) })`): targets carry table
             // identity; expressions distinguish target from value natively.
+            // Bare singles (`update(User.name.set("x"))`) act as 1-tuples.
+            if (comptime isAssignItem(RowType)) return self.update(.{assignments});
             if (comptime isAssignList(RowType)) {
                 inline for (assignments, 0..) |item, index| {
                     if (comptime columnMod.isDynAssignValue(@TypeOf(item))) {
@@ -2243,6 +2248,11 @@ pub fn UpsertBuilder(comptime Row: type, comptime Columns: type) type {
             // Explicit UPSERT assignments (`doUpdate(.{ User.name.set("x"),
             // User.age.set(db.excluded("age")) })`): `excluded()` markers,
             // arithmetic, and column references all pass through natively.
+            // Bare singles act as 1-tuples, mirroring insert/update.
+            if (comptime isAssignItem(RowType)) {
+                try self.extractSets(.{assignments});
+                return;
+            }
             if (comptime isAssignList(RowType)) {
                 self.setCount = 0;
                 inline for (assignments, 0..) |item, index| {
