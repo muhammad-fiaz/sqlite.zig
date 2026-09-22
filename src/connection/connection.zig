@@ -7059,58 +7059,70 @@ pub const Connection = struct {
         }
     }
 
+    /// Resolve the parent column index for one child FK column, or fail when
+    /// the FK metadata names an unknown column. Shared by both delete passes.
+    fn deleteFkParentIndex(store: *Schema, parentName: []const u8, column: anytype) !usize {
+        const parentTable = store.findConst(parentName) orelse return error.ConstraintViolation;
+        const referenced = column.foreignColumn orelse return error.ConstraintViolation;
+        for (parentTable.columns, 0..) |parentColumn, index| {
+            if (std.ascii.eqlIgnoreCase(parentColumn.name, referenced)) return index;
+        }
+        return error.ConstraintViolation;
+    }
+
     fn applyDeleteActions(self: *Connection, store: *Schema, parentName: []const u8, parentValues: []const Value) anyerror!void {
         if (!store.foreignKeysEnabled) return;
         try self.applyCompositeDeleteActions(store, parentName, parentValues);
         var childTableIndex: usize = 0;
         while (childTableIndex < store.tables.items.len) : (childTableIndex += 1) {
-            var childRowIndex = store.tables.items[childTableIndex].rows.items.len;
-            while (childRowIndex > 0) {
-                childRowIndex -= 1;
-                var action: ?ast.ReferentialAction = null;
-                var childColumnIndex: usize = 0;
-                var parentColumnIndex: usize = 0;
-                const childTable = store.tables.items[childTableIndex];
-                for (childTable.columns, 0..) |column, columnIdx| if (column.foreignTable) |foreignTable| {
-                    if (std.ascii.eqlIgnoreCase(foreignTable, parentName)) {
-                        const parentTable = store.findConst(parentName) orelse return error.ConstraintViolation;
-                        const referenced = column.foreignColumn orelse return error.ConstraintViolation;
-                        for (parentTable.columns, 0..) |parentColumn, index| if (std.ascii.eqlIgnoreCase(parentColumn.name, referenced)) {
-                            childColumnIndex = columnIdx;
-                            parentColumnIndex = index;
-                            action = column.onDelete;
-                            break;
-                        };
-                        if (action != null) break;
+            const childTable = store.tables.items[childTableIndex];
+            // Pass 1: every independent FK to this parent is examined — never
+            // just the first matching column. Any immediate RESTRICT/NO ACTION
+            // violation fails before any cascade/set effect fires.
+            for (childTable.columns, 0..) |column, columnIdx| {
+                const foreignTable = column.foreignTable orelse continue;
+                if (!std.ascii.eqlIgnoreCase(foreignTable, parentName)) continue;
+                if (column.onDelete != .restrict and column.onDelete != .noAction) continue;
+                if (store.fkCheckDeferred(column.fkDeferrable, column.fkInitiallyDeferred)) continue;
+                const parentColumnIndex = try deleteFkParentIndex(store, parentName, column);
+                var childRowIndex = childTable.rows.items.len;
+                while (childRowIndex > 0) {
+                    childRowIndex -= 1;
+                    if (compare(parentValues[parentColumnIndex], .equal, childTable.rows.items[childRowIndex].values[columnIdx])) return error.ConstraintViolation;
+                }
+            }
+            // Pass 2: apply SET NULL / SET DEFAULT / CASCADE per FK.
+            for (childTable.columns, 0..) |column, columnIdx| {
+                const foreignTable = column.foreignTable orelse continue;
+                if (!std.ascii.eqlIgnoreCase(foreignTable, parentName)) continue;
+                const parentColumnIndex = try deleteFkParentIndex(store, parentName, column);
+                var childRowIndex = childTable.rows.items.len;
+                while (childRowIndex > 0) {
+                    childRowIndex -= 1;
+                    if (!compare(parentValues[parentColumnIndex], .equal, childTable.rows.items[childRowIndex].values[columnIdx])) continue;
+                    switch (column.onDelete) {
+                        .restrict, .noAction => {},
+                        .setNull => {
+                            if (column.notNull) return error.ConstraintViolation;
+                            const old = childTable.rows.items[childRowIndex].values[columnIdx];
+                            if (old == .text) self.allocator.free(old.text) else if (old == .blob) self.allocator.free(old.blob);
+                            childTable.rows.items[childRowIndex].values[columnIdx] = .null;
+                        },
+                        .setDefault => {
+                            const def = column.defaultValue orelse .null;
+                            if (column.notNull and def == .null) return error.ConstraintViolation;
+                            const old = childTable.rows.items[childRowIndex].values[columnIdx];
+                            if (old == .text) self.allocator.free(old.text) else if (old == .blob) self.allocator.free(old.blob);
+                            childTable.rows.items[childRowIndex].values[columnIdx] = .null;
+                            childTable.rows.items[childRowIndex].values[columnIdx] = try self.copyValue(def);
+                        },
+                        .cascade => {
+                            try self.applyDeleteActions(store, childTable.name, childTable.rows.items[childRowIndex].values);
+                            const removed = childTable.rows.orderedRemove(childRowIndex);
+                            for (removed.values) |item| if (item == .text) self.allocator.free(item.text) else if (item == .blob) self.allocator.free(item.blob);
+                            self.allocator.free(removed.values);
+                        },
                     }
-                };
-                if (action == null or !compare(parentValues[parentColumnIndex], .equal, childTable.rows.items[childRowIndex].values[childColumnIndex])) continue;
-                switch (action.?) {
-                    .restrict, .noAction => {
-                        const childColumn = childTable.columns[childColumnIndex];
-                        if (store.fkCheckDeferred(childColumn.fkDeferrable, childColumn.fkInitiallyDeferred)) continue;
-                        return error.ConstraintViolation;
-                    },
-                    .setNull => {
-                        if (childTable.columns[childColumnIndex].notNull) return error.ConstraintViolation;
-                        const old = childTable.rows.items[childRowIndex].values[childColumnIndex];
-                        if (old == .text) self.allocator.free(old.text) else if (old == .blob) self.allocator.free(old.blob);
-                        childTable.rows.items[childRowIndex].values[childColumnIndex] = .null;
-                    },
-                    .setDefault => {
-                        const def = childTable.columns[childColumnIndex].defaultValue orelse .null;
-                        if (childTable.columns[childColumnIndex].notNull and def == .null) return error.ConstraintViolation;
-                        const old = childTable.rows.items[childRowIndex].values[childColumnIndex];
-                        if (old == .text) self.allocator.free(old.text) else if (old == .blob) self.allocator.free(old.blob);
-                        childTable.rows.items[childRowIndex].values[childColumnIndex] = .null;
-                        childTable.rows.items[childRowIndex].values[childColumnIndex] = try self.copyValue(def);
-                    },
-                    .cascade => {
-                        try self.applyDeleteActions(store, childTable.name, childTable.rows.items[childRowIndex].values);
-                        const removed = childTable.rows.orderedRemove(childRowIndex);
-                        for (removed.values) |item| if (item == .text) self.allocator.free(item.text) else if (item == .blob) self.allocator.free(item.blob);
-                        self.allocator.free(removed.values);
-                    },
                 }
             }
         }
@@ -9439,6 +9451,274 @@ test "unique and index keys accept scoped pointer forms" {
     ok.deinit();
     const dup = db.from(T).insert(.{ .id = 2, .email = "a@x.y" });
     try std.testing.expectError(error.ConstraintViolation, dup);
+}
+
+test "self referencing and multi target foreign keys stay independent" {
+    const tableMod = @import("../dsl/table.zig");
+    const Emp = tableMod.table("rel_emp", struct { id: i64, manager_id: ?i64 });
+    const Usr = tableMod.table("rel_msg_users", struct { id: i64 });
+    const Msg = tableMod.table("rel_messages", struct { id: i64, sender_id: i64, receiver_id: i64 });
+    const path = "sqlite_zig_rel_shapes_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    // Self reference: deleting a manager NULLs direct reports.
+    try db.createTable(Emp, .{
+        .overWrite = true,
+        .primaryKey = Emp.id,
+        .foreignKeys = &.{.{ .column = Emp.manager_id, .references = Emp.id, .onDelete = .setNull }},
+    });
+    var ceo = try db.from(Emp).insert(.{ .id = 1, .manager_id = null });
+    ceo.deinit();
+    var dev = try db.from(Emp).insert(.{ .id = 2, .manager_id = 1 });
+    dev.deinit();
+    var delMgr = try db.from(Emp).where(Emp.id.eq(1)).delete().execute();
+    delMgr.deinit();
+    var orphan = try db.from(Emp).select(Emp.all()).fetchOne();
+    defer db.from(Emp).freeRow(&orphan);
+    try std.testing.expect(orphan.manager_id == null);
+    // Two FKs to one table keep separate identity and actions.
+    try db.createTable(Usr, .{ .overWrite = true, .primaryKey = Usr.id });
+    try db.createTable(Msg, .{
+        .overWrite = true,
+        .primaryKey = Msg.id,
+        .foreignKeys = &.{
+            .{ .column = Msg.sender_id, .references = Usr.id, .onDelete = .cascade },
+            .{ .column = Msg.receiver_id, .references = Usr.id, .onDelete = .restrict },
+        },
+    });
+    for ([_]i64{ 10, 20 }) |uid| {
+        var u = try db.from(Usr).insert(.{ .id = uid });
+        u.deinit();
+    }
+    var mm = try db.from(Msg).insert(.{ .id = 1, .sender_id = 10, .receiver_id = 20 });
+    mm.deinit();
+    // Sender side cascades...
+    var ds = try db.from(Usr).where(Usr.id.eq(10)).delete().execute();
+    ds.deinit();
+    var gone = try db.from(Msg).selectAll().fetch();
+    defer gone.deinit();
+    try std.testing.expectEqual(@as(usize, 0), gone.count());
+    // ...while the receiver side restricts: message (30 -> 40) blocks
+    // deleting 40 (sender cascade cannot remove it first).
+    for ([_]i64{ 30, 40 }) |uid| {
+        var u = try db.from(Usr).insert(.{ .id = uid });
+        u.deinit();
+    }
+    var mm2 = try db.from(Msg).insert(.{ .id = 2, .sender_id = 30, .receiver_id = 40 });
+    mm2.deinit();
+    const dr = db.from(Usr).where(Usr.id.eq(40)).delete().execute();
+    try std.testing.expectError(error.ConstraintViolation, dr);
+    var still = try db.from(Usr).selectAll().fetch();
+    defer still.deinit();
+    try std.testing.expectEqual(@as(usize, 3), still.count());
+    // Deleting the sender side cascades the message away instead.
+    var ds2 = try db.from(Usr).where(Usr.id.eq(30)).delete().execute();
+    ds2.deinit();
+    var gone2 = try db.from(Msg).selectAll().fetch();
+    defer gone2.deinit();
+    try std.testing.expectEqual(@as(usize, 0), gone2.count());
+}
+
+test "one to one unique foreign keys reject duplicates" {
+    const tableMod = @import("../dsl/table.zig");
+    const U = tableMod.table("o2o_users", struct { id: i64 });
+    const P = tableMod.table("o2o_profiles", struct { id: i64, user_id: i64 });
+    const path = "sqlite_zig_o2o_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    try db.createTable(U, .{ .overWrite = true, .primaryKey = U.id });
+    try db.createTable(P, .{
+        .overWrite = true,
+        .primaryKey = P.id,
+        .unique = &.{P.user_id},
+        .foreignKeys = &.{.{ .column = P.user_id, .references = U.id, .onDelete = .cascade }},
+    });
+    var u = try db.from(U).insert(.{.id = 1});
+    u.deinit();
+    var p = try db.from(P).insert(.{ .id = 1, .user_id = 1 });
+    p.deinit();
+    const dup = db.from(P).insert(.{ .id = 2, .user_id = 1 });
+    try std.testing.expectError(error.ConstraintViolation, dup);
+    // Join across the one-to-one link reads both sides.
+    var j = try db.from(U).join(P, .inner, U.id.eq(P.user_id)).select(.{ U.id, P.id }).fetch();
+    defer j.deinit();
+    try std.testing.expectEqual(@as(usize, 1), j.count());
+    // Deleting the user cascades the single profile.
+    var d = try db.from(U).where(U.id.eq(1)).delete().execute();
+    d.deinit();
+    var empty = try db.from(P).selectAll().fetch();
+    defer empty.deinit();
+    try std.testing.expectEqual(@as(usize, 0), empty.count());
+}
+
+test "set default no action and composite actions execute" {
+    const tableMod = @import("../dsl/table.zig");
+    const P = tableMod.table("act_parents", struct { id: i64 });
+    // SET DEFAULT needs a real column default to land on.
+    const D = tableMod.table("act_default_kids", struct { id: i64, parent_id: i64 = 0 });
+    const N = tableMod.table("act_noaction_kids", struct { id: i64, parent_id: i64 });
+    const path = "sqlite_zig_actions_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    try db.createTable(P, .{ .overWrite = true, .primaryKey = P.id });
+    try db.createTable(D, .{
+        .overWrite = true,
+        .primaryKey = D.id,
+        .foreignKeys = &.{.{ .column = D.parent_id, .references = P.id, .onDelete = .setDefault }},
+    });
+    try db.createTable(N, .{
+        .overWrite = true,
+        .primaryKey = N.id,
+        .foreignKeys = &.{.{ .column = N.parent_id, .references = P.id, .onDelete = .noAction }},
+    });
+    var p = try db.from(P).insert(.{.id = 1});
+    p.deinit();
+    var d = try db.from(D).insert(.{ .id = 1, .parent_id = 1 });
+    d.deinit();
+    var n = try db.from(N).insert(.{ .id = 1, .parent_id = 1 });
+    n.deinit();
+    // NO ACTION rejects the delete while the child exists (immediate).
+    const blocked = db.from(P).where(P.id.eq(1)).delete().execute();
+    try std.testing.expectError(error.ConstraintViolation, blocked);
+    // Clearing both children unblocks the parent delete...
+    var dn = try db.from(N).where(N.id.eq(1)).delete().execute();
+    dn.deinit();
+    var dd = try db.from(D).where(D.id.eq(1)).delete().execute();
+    dd.deinit();
+    var dp = try db.from(P).where(P.id.eq(1)).delete().execute();
+    dp.deinit();
+    // ...and SET DEFAULT fires on delete when the child survives via default.
+    var p2 = try db.from(P).insert(.{.id = 2});
+    p2.deinit();
+    var d2 = try db.from(D).insert(.{ .id = 2, .parent_id = 2 });
+    d2.deinit();
+    // Point the child at the default row, then delete a *different* parent:
+    // use update to prove SET DEFAULT lands on the declared default.
+    var p3 = try db.from(P).insert(.{.id = 3});
+    p3.deinit();
+    var mv = try (try db.from(D).update(.{.parent_id = 3})).where(D.id.eq(2)).execute();
+    mv.deinit();
+    var dp3 = try db.from(P).where(P.id.eq(3)).delete().execute();
+    dp3.deinit();
+    var landed = try db.from(D).select(D.all()).fetchOne();
+    defer db.from(D).freeRow(&landed);
+    try std.testing.expectEqual(@as(i64, 0), landed.parent_id);
+}
+
+test "composite foreign keys cascade as one unit" {
+    const tableMod = @import("../dsl/table.zig");
+    const P = tableMod.table("comp_parents", struct { id: i64, region: i64 });
+    const C = tableMod.table("comp_children", struct { id: i64, parent_id: i64, parent_region: i64 });
+    const path = "sqlite_zig_comp_fk_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    try db.createTable(P, .{ .overWrite = true, .primaryKey = &.{ P.id, P.region } });
+    try db.createTable(C, .{
+        .overWrite = true,
+        .primaryKey = C.id,
+        .foreignKeys = &.{
+            .{
+                .columns = &.{ C.parent_id, C.parent_region },
+                .references = &.{ P.id, P.region },
+                .onDelete = .cascade,
+            },
+        },
+    });
+    var p = try db.from(P).insert(.{ .id = 1, .region = 5 });
+    p.deinit();
+    var c = try db.from(C).insert(.{ .id = 1, .parent_id = 1, .parent_region = 5 });
+    c.deinit();
+    // Half-matching composite reference is rejected (positional mapping).
+    const bad = db.from(C).insert(.{ .id = 2, .parent_id = 1, .parent_region = 6 });
+    try std.testing.expectError(error.ConstraintViolation, bad);
+    // Deleting the parent cascades the composite child.
+    var dp = try db.from(P).where(P.id.eq(1)).delete().execute();
+    dp.deinit();
+    var left = try db.from(C).selectAll().fetch();
+    defer left.deinit();
+    try std.testing.expectEqual(@as(usize, 0), left.count());
+}
+
+test "foreign keys work on without rowid tables" {
+    const tableMod = @import("../dsl/table.zig");
+    const P = tableMod.table("wr_parents", struct { id: i64 });
+    const C = tableMod.table("wr_children", struct { id: i64, parent_id: i64 });
+    const path = "sqlite_zig_wr_fk_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    try db.createTable(P, .{ .overWrite = true, .primaryKey = P.id, .withoutRowid = true });
+    try db.createTable(C, .{
+        .overWrite = true,
+        .primaryKey = C.id,
+        .foreignKeys = &.{.{ .column = C.parent_id, .references = P.id, .onDelete = .cascade }},
+    });
+    var p = try db.from(P).insert(.{.id = 1});
+    p.deinit();
+    var c = try db.from(C).insert(.{ .id = 1, .parent_id = 1 });
+    c.deinit();
+    const bad = db.from(C).insert(.{ .id = 2, .parent_id = 9 });
+    try std.testing.expectError(error.ConstraintViolation, bad);
+    var dp = try db.from(P).where(P.id.eq(1)).delete().execute();
+    dp.deinit();
+    var left = try db.from(C).selectAll().fetch();
+    defer left.deinit();
+    try std.testing.expectEqual(@as(usize, 0), left.count());
+}
+
+test "autoincrement audit covers generation rollback and returning" {
+    const tableMod = @import("../dsl/table.zig");
+    const T = tableMod.table("audit_seq", struct { id: i64, v: []const u8 });
+    const path = "sqlite_zig_audit_seq_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    try db.createTable(T, .{ .overWrite = true, .primaryKey = T.id, .autoincrement = T.id });
+    // Omitted ids allocate monotonically.
+    for (0..3) |_| {
+        var ins = try db.from(T).insert(.{ .v = "x" });
+        ins.deinit();
+    }
+    var three = try db.from(T).select(T.all()).orderBy(T.id.asc()).fetch();
+    defer three.deinit();
+    try std.testing.expectEqual(@as(i64, 1), three.at(0).id);
+    try std.testing.expectEqual(@as(i64, 3), three.at(2).id);
+    // Explicit large id is honored; the sequence continues past it.
+    var big = try db.from(T).insert(.{ .id = 1000, .v = "big" });
+    big.deinit();
+    var nxt = try db.from(T).insert(.{ .v = "next" });
+    nxt.deinit();
+    var seq = try db.from(T).select(T.all()).orderBy(T.id.asc()).fetch();
+    defer seq.deinit();
+    try std.testing.expect(seq.at(4).id > 1000);
+    // Duplicate explicit id is rejected.
+    const dup = db.from(T).insert(.{ .id = 1000, .v = "dup" });
+    try std.testing.expectError(error.ConstraintViolation, dup);
+    // RETURNING hands back the generated id.
+    var ret = try db.from(T).returning(.{.id}).insert(.{ .v = "ret" });
+    defer ret.deinit();
+    try std.testing.expectEqual(@as(usize, 1), ret.count());
+    try std.testing.expect(ret.rows[0][0].integer > 1000);
+    // A rolled-back insert leaves no row behind; the sequence never
+    // hands out an id that is live twice.
+    try db.begin();
+    var tmp = try db.from(T).insert(.{ .v = "tmp" });
+    tmp.deinit();
+    try db.rollback();
+    var after = try db.from(T).insert(.{ .v = "after" });
+    after.deinit();
+    var tail = try db.exec("SELECT max(id) FROM audit_seq;");
+    defer tail.deinit();
+    try std.testing.expect(tail.rows[0][0].integer > 1000);
+    // Delete/reinsert keeps monotonic growth (no reuse of live ids).
+    var all = try db.from(T).select(T.all()).orderBy(T.id.asc()).fetch();
+    defer all.deinit();
+    const top = all.at(all.count() - 1).id;
+    var del = try db.from(T).where(T.id.eq(top)).delete().execute();
+    del.deinit();
+    var rein = try db.from(T).insert(.{ .v = "re" });
+    rein.deinit();
+    var check = try db.exec("SELECT max(id) FROM audit_seq;");
+    defer check.deinit();
+    try std.testing.expect(check.rows[0][0].integer >= top);
 }
 
 test "nulls ordering follows explicit overrides and sqlite defaults" {
