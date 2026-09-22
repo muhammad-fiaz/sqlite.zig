@@ -130,6 +130,45 @@ pub fn toFloatStrict(val: Value) ?f64 {
     };
 }
 
+/// Lossless float-to-int for affinity conversions, mirroring the reference
+/// `alsoAnInt` half of text affinity: true only on bit-identical roundtrip
+/// strictly inside 2**51 (`4503599627370496.0` and beyond stay REAL even
+/// when integral). NaN/infinities never convert; called only after a
+/// whole-string float parse, so no UB on out-of-range input.
+fn textFloatIsInt(r: f64) ?i64 {
+    if (r == 0.0) return 0;
+    if (!std.math.isFinite(r) or @abs(r) >= 2251799813685248.0) return null;
+    const ix: i64 = @intFromFloat(r);
+    if (@as(f64, @floatFromInt(ix)) == r) return ix;
+    return null;
+}
+
+/// Lossless float-to-int for REAL values under INTEGER affinity, mirroring
+/// `sqlite3VdbeIntegerAffinity`: exact roundtrip with both i64 endpoints
+/// excluded (they signal saturation, not real integers).
+pub fn realAffinityInt(r: f64) ?i64 {
+    if (std.math.isNan(r) or std.math.isInf(r)) return null;
+    const ix = saturatingTrunc(r);
+    if (ix <= std.math.minInt(i64) or ix >= std.math.maxInt(i64)) return null;
+    if (@as(f64, @floatFromInt(ix)) == r) return ix;
+    return null;
+}
+
+/// Well-formed whole-string numeric for INTEGER/REAL affinity, mirroring
+/// the reference `applyNumericAffinity`: optional spaces/sign, digits with
+/// optional fraction/exponent, optional trailing spaces. No hex, no
+/// prefixes, no trailing junk (those stay TEXT). Whole integers yield
+/// `.int` (via the `alsoAnInt` rule above, then direct i64 parse);
+/// anything else numeric yields `.real`.
+pub fn affinityNumeric(text: []const u8) ?Numeric {
+    const trimmed = trimSpaces(text);
+    if (trimmed.len == 0) return null;
+    const r = strictTextToFloat(trimmed) orelse return null;
+    if (textFloatIsInt(r)) |i| return .{ .int = i };
+    if (std.fmt.parseInt(i64, trimmed, 10)) |n| return .{ .int = n } else |_| {}
+    return .{ .real = r };
+}
+
 /// Integer-preserving numeric view for arithmetic: the integer path is
 /// tried first. Integer-looking
 /// text/blobs (`'6'`, `'  -7  '`) yield `.int`, so `'6' * '7'` is INTEGER 42;

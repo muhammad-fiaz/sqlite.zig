@@ -11,6 +11,7 @@ const Value = @import("../vm/value.zig").Value;
 const ast = @import("../sql/ast.zig");
 const exprEvaluator = @import("../sql/expr.zig");
 const functions = @import("../sql/functions.zig");
+const coerce = @import("../sql/coerce.zig");
 
 /// Owned column descriptor. `name`/`typeName`/FK strings are schema-owned
 /// dupes; `defaultValue` owns its text/blob payload; `checkExpr`/
@@ -428,30 +429,45 @@ pub const Schema = struct {
     /// Coerce a borrowed `Value` to a STRICT type, passing NULL through.
     /// INT/INTEGER accept ints and integral reals; REAL widens ints; TEXT/BLOB
     /// accept only their kind; ANY passes through. Fails `ConstraintViolation`.
-    pub fn coerceStrict(typeName: []const u8, value: Value) !Value {
+    /// STRICT single-value check with affinity conversion first, mirroring
+    /// the reference `OP_TypeCheck`: each type applies its affinity, then
+    /// the converted storage class must match. INTEGER affinity converts
+    /// well-formed text numerals and lossless reals; REAL keeps small
+    /// integers as integers (`IntReal`) and widens the rest past 2**47;
+    /// TEXT renders numbers but never blobs; BLOB converts nothing. Blobs
+    /// (not strings) skip numeric affinity entirely. NULL passes through
+    /// (`NOT NULL` rejects separately).
+    pub fn coerceStrict(allocator: std.mem.Allocator, typeName: []const u8, value: Value) !Value {
         if (value == .null) return .null;
         if (std.ascii.eqlIgnoreCase(typeName, "INT") or std.ascii.eqlIgnoreCase(typeName, "INTEGER")) {
             return switch (value) {
                 .integer => value,
-                .real => |r| {
-                    if (!std.math.isNan(r) and !std.math.isInf(r) and @floor(r) == r) {
-                        return Value{ .integer = @intFromFloat(r) };
-                    }
-                    return error.ConstraintViolation;
+                .real => |r| if (coerce.realAffinityInt(r)) |i| .{ .integer = i } else error.ConstraintViolation,
+                .text => |t| switch (coerce.affinityNumeric(t) orelse return error.ConstraintViolation) {
+                    .int => |i| Value{ .integer = i },
+                    .real => |r| if (coerce.realAffinityInt(r)) |i| .{ .integer = i } else error.ConstraintViolation,
+                    .none => error.ConstraintViolation,
                 },
                 else => error.ConstraintViolation,
             };
         }
         if (std.ascii.eqlIgnoreCase(typeName, "REAL")) {
             return switch (value) {
-                .real => value,
-                .integer => |i| Value{ .real = @floatFromInt(i) },
+                .real => |r| if (coerce.realAffinityInt(r)) |i| .{ .integer = i } else value,
+                .integer => |i| if (i <= 140737488355327 and i >= -140737488355328) value else .{ .real = @floatFromInt(i) },
+                .text => |t| switch (coerce.affinityNumeric(t) orelse return error.ConstraintViolation) {
+                    .int => |i| if (i <= 140737488355327 and i >= -140737488355328) Value{ .integer = i } else .{ .real = @floatFromInt(i) },
+                    .real => |r| .{ .real = r },
+                    .none => error.ConstraintViolation,
+                },
                 else => error.ConstraintViolation,
             };
         }
         if (std.ascii.eqlIgnoreCase(typeName, "TEXT")) {
             return switch (value) {
                 .text => value,
+                .integer => |i| .{ .text = try std.fmt.allocPrint(allocator, "{d}", .{i}) },
+                .real => |r| .{ .text = try coerce.formatReal(allocator, r) },
                 else => error.ConstraintViolation,
             };
         }
@@ -1491,7 +1507,19 @@ pub const Schema = struct {
         }
         if (table.strict) {
             for (table.columns, 0..) |col, index| {
-                owned[index] = try coerceStrict(col.typeName, owned[index]);
+                const old = owned[index];
+                const coerced = try coerceStrict(self.allocator, col.typeName, old);
+                // Affinity rendering allocates a replacement (numbers to
+                // TEXT); release the staged payload it supersedes. Staged
+                // slots are always owned here, and pass-through keeps the
+                // same buffer (pointer check, never a double free).
+                const dropped = switch (old) {
+                    .text => |t| if (coerced == .text) coerced.text.ptr != t.ptr else true,
+                    .blob => |b| if (coerced == .blob) coerced.blob.ptr != b.ptr else true,
+                    else => false,
+                };
+                if (dropped) freeValue(self.allocator, old);
+                owned[index] = coerced;
             }
         }
         for (table.columns, 0..) |col, index| {
@@ -1509,7 +1537,7 @@ pub const Schema = struct {
         try assignRowidAlias(table, values);
         if (table.strict) {
             for (table.columns, 0..) |col, index| {
-                _ = try coerceStrict(col.typeName, values[index]);
+                _ = try coerceStrict(self.allocator, col.typeName, values[index]);
             }
         }
         for (table.columns, 0..) |col, index| {
@@ -1991,6 +2019,39 @@ test "schema enforces uniqueness strictness and renames" {
     try std.testing.expect(!valuesEqual(.null, .{ .integer = 1 }));
     try std.testing.expect(valuesEqual(.{ .real = 1.0 }, .{ .integer = 1 }));
     try std.testing.expect(!valuesEqual(.{ .text = "a" }, .{ .text = "b" }));
+}
+
+test "strict coercion applies affinity before the type check" {
+    const alloc = std.testing.allocator;
+    // Well-formed text numerals convert; junk stays TEXT and fails.
+    const fromText = try Schema.coerceStrict(alloc, "INT", .{ .text = "123" });
+    try std.testing.expectEqual(@as(i64, 123), fromText.integer);
+    try std.testing.expectError(error.ConstraintViolation, Schema.coerceStrict(alloc, "INT", .{ .text = "12x" }));
+    try std.testing.expectError(error.ConstraintViolation, Schema.coerceStrict(alloc, "INT", .{ .text = "1.5" }));
+    const floatText = try Schema.coerceStrict(alloc, "INT", .{ .text = "48.00" });
+    try std.testing.expectEqual(@as(i64, 48), floatText.integer);
+    const toReal = try Schema.coerceStrict(alloc, "REAL", .{ .text = "2.5" });
+    try std.testing.expectEqual(@as(f64, 2.5), toReal.real);
+    // Small integers stay integers in REAL columns (IntReal); large ones widen.
+    const intReal = try Schema.coerceStrict(alloc, "REAL", .{ .integer = 42 });
+    try std.testing.expectEqual(@as(i64, 42), intReal.integer);
+    const wide = try Schema.coerceStrict(alloc, "REAL", .{ .integer = std.math.maxInt(i64) });
+    try std.testing.expect(wide == .real);
+    // Lossless reals become integers; the rest (and huge magnitudes) fail
+    // for INT without trapping.
+    const lossless = try Schema.coerceStrict(alloc, "INT", .{ .real = 50.0 });
+    try std.testing.expectEqual(@as(i64, 50), lossless.integer);
+    try std.testing.expectError(error.ConstraintViolation, Schema.coerceStrict(alloc, "INT", .{ .real = 1e30 }));
+    try std.testing.expectError(error.ConstraintViolation, Schema.coerceStrict(alloc, "INT", .{ .real = 1.5 }));
+    // Numbers render to TEXT; blobs never convert.
+    const rendered = try Schema.coerceStrict(alloc, "TEXT", .{ .integer = 999 });
+    defer alloc.free(rendered.text);
+    try std.testing.expectEqualStrings("999", rendered.text);
+    try std.testing.expectError(error.ConstraintViolation, Schema.coerceStrict(alloc, "TEXT", .{ .blob = "x" }));
+    try std.testing.expectError(error.ConstraintViolation, Schema.coerceStrict(alloc, "BLOB", .{ .integer = 1 }));
+    try std.testing.expectError(error.ConstraintViolation, Schema.coerceStrict(alloc, "BLOB", .{ .text = "x" }));
+    const anyBlob = try Schema.coerceStrict(alloc, "ANY", .{ .blob = "x" });
+    try std.testing.expect(anyBlob == .blob);
 }
 
 test "addColumn stages fully before committing" {

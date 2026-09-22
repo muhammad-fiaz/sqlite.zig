@@ -32,20 +32,28 @@ pub fn main() !void {
         owned.deinit();
         return error.VerificationFailed;
     } else |_| {}
-    if (t_db_strict_widgets.insert(.{ .id = 4, .label = 999, .score = 1.0 })) |r| {
+    // Affinity renders numbers to TEXT (like the reference), so 999 would
+    // land as '999'; genuinely wrong types still fail in every interface.
+    var coerced = try t_db_strict_widgets.insert(.{ .id = 4, .label = 999, .score = 1.0 });
+    coerced.deinit();
+    var rendered = try db.exec("SELECT label FROM strict_widgets WHERE id = 4;");
+    defer rendered.deinit();
+    if (rendered.count() != 1) return error.VerificationFailed;
+    if (!std.mem.eql(u8, rendered.at(0)[0].text, "999")) return error.VerificationFailed;
+    if (t_db_strict_widgets.insert(.{ .id = "NaN", .label = "bad", .score = 1.0 })) |r| {
         var owned = r;
         owned.deinit();
         return error.VerificationFailed;
     } else |_| {}
     var intact = try db.exec("SELECT count(*) FROM strict_widgets;");
     defer intact.deinit();
-    if (intact.at(0)[0].integer != 3) return error.VerificationFailed;
+    if (intact.at(0)[0].integer != 4) return error.VerificationFailed;
     db.close();
     var reopened = try sqlite.open(std.heap.page_allocator, "example_66.db");
     defer reopened.close();
     try reopened.schema(Strict).validate();
     var persisted = try reopened.exec("SELECT count(*) FROM strict_widgets;");
     defer persisted.deinit();
-    if (persisted.at(0)[0].integer != 3) return error.VerificationFailed;
+    if (persisted.at(0)[0].integer != 4) return error.VerificationFailed;
     std.debug.print("66 strict tables: raw dynamic typed verified with persistence\n", .{});
 }

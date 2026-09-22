@@ -3533,6 +3533,21 @@ pub const Connection = struct {
         return if (expr == .collate) expr.collate.name else null;
     }
 
+    /// Frees a resolved temp superseded by STRICT coercion: only when the
+    /// temp was caller-owned (binary/unary/scalar-call per
+    /// `evalOwnsResult`) and the coercion dropped its payload (converted
+    /// to another type or replaced by a fresh rendering). Pass-through
+    /// and borrowed temps stay untouched.
+    fn freeSupersededStrictTemp(self: *Connection, expr: ast.Expr, old: Value, new: Value) void {
+        if (!evalOwnsResult(expr)) return;
+        const dropped = switch (old) {
+            .text => |t| if (new == .text) new.text.ptr != t.ptr else true,
+            .blob => |b| if (new == .blob) new.blob.ptr != b.ptr else true,
+            else => false,
+        };
+        if (dropped) self.freeConcatText(old);
+    }
+
     /// True when `evalContext` on `expr` always yields an owned text/blob
     /// the caller must release with `freeConcatText`. Binary/unary ops and
     /// scalar calls allocate (or return scalars, which free ignores);
@@ -4992,7 +5007,11 @@ pub const Connection = struct {
         for (columns, expressions) |name, expression| {
             const index = try columnIndex(tbl, name);
             var newValue = try self.evalContext(tbl, row.values, expression, parameters, &excludedOuter);
-            if (tbl.strict) newValue = try Schema.coerceStrict(tbl.columns[index].typeName, newValue);
+            if (tbl.strict) {
+                const oldTemp = newValue;
+                newValue = try Schema.coerceStrict(self.allocator, tbl.columns[index].typeName, newValue);
+                self.freeSupersededStrictTemp(expression, oldTemp, newValue);
+            }
             candidate[index] = newValue;
         }
         try self.recomputeGeneratedColumns(tbl, candidate, false);
@@ -5009,7 +5028,11 @@ pub const Connection = struct {
                 newValue = candidate[index];
                 ownedResult = false;
             }
-            if (tbl.strict) newValue = try Schema.coerceStrict(tbl.columns[index].typeName, newValue);
+            if (tbl.strict) {
+                const oldTemp = newValue;
+                newValue = try Schema.coerceStrict(self.allocator, tbl.columns[index].typeName, newValue);
+                self.freeSupersededStrictTemp(expression, oldTemp, newValue);
+            }
             // Duplicate before freeing: newValue may borrow the storage being
             // replaced (e.g. DO UPDATE SET label = label).
             const ownedCopy: Value = switch (newValue) {
@@ -6555,7 +6578,11 @@ pub const Connection = struct {
                         if (std.ascii.eqlIgnoreCase(qualifier, source.name)) break :blk sourceRow.values[try columnIndex(source, columnName)];
                         break :blk try self.resolve(expression, parameters);
                     } else try self.resolve(expression, parameters);
-                    if (tbl.strict) newValue = try Schema.coerceStrict(tbl.columns[index].typeName, newValue);
+                    if (tbl.strict) {
+                        const oldTemp = newValue;
+                        newValue = try Schema.coerceStrict(self.allocator, tbl.columns[index].typeName, newValue);
+                        self.freeSupersededStrictTemp(expression, oldTemp, newValue);
+                    }
                     candidate[index] = newValue;
                 }
                 try self.recomputeGeneratedColumns(tbl, candidate, false);
@@ -6650,10 +6677,15 @@ pub const Connection = struct {
                     if (value.conflict == .ignore) continue :outer;
                     return error.ConstraintViolation;
                 }
-                if (tbl.strict) newValue = Schema.coerceStrict(tbl.columns[index].typeName, newValue) catch |err| {
-                    if (err == error.ConstraintViolation and value.conflict == .ignore) continue :outer;
-                    return err;
-                };
+                if (tbl.strict) {
+                    const oldTemp = newValue;
+                    newValue = Schema.coerceStrict(self.allocator, tbl.columns[index].typeName, newValue) catch |err| {
+                        if (evalOwnsResult(expr)) self.freeConcatText(oldTemp);
+                        if (err == error.ConstraintViolation and value.conflict == .ignore) continue :outer;
+                        return err;
+                    };
+                    self.freeSupersededStrictTemp(expr, oldTemp, newValue);
+                }
                 candidate[index] = newValue;
             }
             try self.recomputeGeneratedColumns(tbl, candidate, false);
@@ -6698,7 +6730,19 @@ pub const Connection = struct {
                     newValue = candidate[index];
                     ownedResult = false;
                 }
-                if (tbl.strict) newValue = try Schema.coerceStrict(tbl.columns[index].typeName, newValue);
+                if (tbl.strict) {
+                    const oldTemp = newValue;
+                    newValue = try Schema.coerceStrict(self.allocator, tbl.columns[index].typeName, newValue);
+                    self.freeSupersededStrictTemp(expr, oldTemp, newValue);
+                    // A fresh rendering is owned even when the temp was
+                    // borrowed, so the duplicate-then-free below releases it.
+                    const fresh = switch (newValue) {
+                        .text => |t| oldTemp != .text or oldTemp.text.ptr != t.ptr,
+                        .blob => |b| oldTemp != .blob or oldTemp.blob.ptr != b.ptr,
+                        else => false,
+                    };
+                    ownedResult = ownedResult or fresh;
+                }
                 // Duplicate before freeing: newValue may borrow the storage
                 // being replaced (e.g. SET label = label).
                 const ownedCopy: Value = switch (newValue) {
@@ -9679,10 +9723,21 @@ test "STRICT tables enforce SQLite strict type affinity and coercion" {
     var insCoerceInt = try db.exec("INSERT INTO strict_ok VALUES (50.0, 1.0, 'int_from_float', X'00', NULL);");
     insCoerceInt.deinit();
 
-    var sel = try db.exec("SELECT i, r, a FROM strict_ok WHERE i = 30;");
+    // Affinity converts before the type check (reference OP_TypeCheck):
+    // well-formed text numerals land in INT/REAL, numbers render to TEXT,
+    // and small integers stay integers in REAL columns (IntReal).
+    var aff = try db.exec("INSERT INTO strict_ok VALUES ('123', '2.5', 999, X'00', 1);");
+    aff.deinit();
+    var sel = try db.exec("SELECT i, r, t FROM strict_ok WHERE i = 30;");
     defer sel.deinit();
     try std.testing.expectEqual(@as(usize, 1), sel.count());
-    try std.testing.expectEqual(@as(f64, 42.0), sel.rows[0][1].real);
+    try std.testing.expectEqual(@as(i64, 42), sel.rows[0][1].integer);
+    var selAff = try db.exec("SELECT i, r, t FROM strict_ok WHERE i = 123;");
+    defer selAff.deinit();
+    try std.testing.expectEqual(@as(usize, 1), selAff.count());
+    try std.testing.expectEqual(@as(i64, 123), selAff.rows[0][0].integer);
+    try std.testing.expectEqual(@as(f64, 2.5), selAff.rows[0][1].real);
+    try std.testing.expectEqualStrings("999", selAff.rows[0][2].text);
 
     var sel2 = try db.exec("SELECT i, r FROM strict_ok WHERE i = 50;");
     defer sel2.deinit();
@@ -9691,7 +9746,10 @@ test "STRICT tables enforce SQLite strict type affinity and coercion" {
 
     try std.testing.expectError(error.ConstraintViolation, db.exec("INSERT INTO strict_ok (i, r, t, b, a) VALUES ('not_an_int', 1.0, 'x', X'00', 1);"));
     try std.testing.expectError(error.ConstraintViolation, db.exec("INSERT INTO strict_ok (i, r, t, b, a) VALUES (1, 'not_a_real', 'x', X'00', 1);"));
-    try std.testing.expectError(error.ConstraintViolation, db.exec("INSERT INTO strict_ok (i, r, t, b, a) VALUES (1, 1.0, 999, X'00', 1);"));
+    try std.testing.expectError(error.ConstraintViolation, db.exec("INSERT INTO strict_ok (i, r, t, b, a) VALUES (1, 1.0, X'00', X'00', 1);"));
+    try std.testing.expectError(error.ConstraintViolation, db.exec("INSERT INTO strict_ok (i, r, t, b, a) VALUES (1, 1.0, 'x', 999, 1);"));
+    try std.testing.expectError(error.ConstraintViolation, db.exec("INSERT INTO strict_ok (i, r, t, b, a) VALUES (1e30, 1.0, 'x', X'00', 1);"));
+    try std.testing.expectError(error.ConstraintViolation, db.exec("INSERT INTO strict_ok (i, r, t, b, a) VALUES ('12x', 1.0, 'x', X'00', 1);"));
 
     try std.testing.expectError(error.ConstraintViolation, db.exec("ALTER TABLE strict_ok ADD COLUMN bad_col VARCHAR;"));
     var addOk = try db.exec("ALTER TABLE strict_ok ADD COLUMN good_col TEXT;");
