@@ -43,6 +43,10 @@ pub const QueryPlan = struct {
     needsTempSort: bool = false,
     joinPlan: ?*QueryPlan = null,
     allocator: std.mem.Allocator,
+    /// Borrowed schema column name for a WITHOUT ROWID primary-key lookup
+    /// (which has no rowid to name); `explain` renders it as
+    /// `USING PRIMARY KEY (col=?)` like the reference.
+    pkLookupColumn: ?[]const u8 = null,
 
     pub fn deinit(self: *QueryPlan) void {
         if (self.indexMatch) |im| {
@@ -68,7 +72,11 @@ pub const QueryPlan = struct {
                 }
             },
             .rowidLookup => {
-                baseText = try std.fmt.allocPrint(allocator, "SEARCH {s} USING INTEGER PRIMARY KEY (rowid=?)", .{self.tableName});
+                if (self.pkLookupColumn) |pkCol| {
+                    baseText = try std.fmt.allocPrint(allocator, "SEARCH {s} USING PRIMARY KEY ({s}=?)", .{ self.tableName, pkCol });
+                } else {
+                    baseText = try std.fmt.allocPrint(allocator, "SEARCH {s} USING INTEGER PRIMARY KEY (rowid=?)", .{self.tableName});
+                }
             },
             .indexScan => {
                 if (self.indexMatch) |im| {
@@ -316,9 +324,11 @@ pub fn planSelect(allocator: std.mem.Allocator, schema: *const Schema, selectStm
         for (conds) |cond| {
             const isRowid = std.ascii.eqlIgnoreCase(cond.column, "rowid") or std.ascii.eqlIgnoreCase(cond.column, "_rowid_") or std.ascii.eqlIgnoreCase(cond.column, "oid");
             var isPkInt = false;
+            var pkCol: ?[]const u8 = null;
             for (table.columns) |col| {
                 if (col.primaryKey and std.ascii.eqlIgnoreCase(col.name, cond.column) and std.ascii.eqlIgnoreCase(col.typeName, "INTEGER")) {
                     isPkInt = true;
+                    pkCol = col.name;
                     break;
                 }
             }
@@ -342,6 +352,9 @@ pub fn planSelect(allocator: std.mem.Allocator, schema: *const Schema, selectStm
                         .cost = rowidCost,
                         .needsTempSort = rowidNeedsSort,
                         .allocator = allocator,
+                        // WITHOUT ROWID tables have no rowid: name the PK
+                        // column like the reference does.
+                        .pkLookupColumn = if (table.withoutRowid) pkCol else null,
                     };
                 }
             }
@@ -736,6 +749,33 @@ test "planner plans integer primary key rowid search" {
     const explained = try plan.explain(std.testing.allocator);
     defer std.testing.allocator.free(explained);
     try std.testing.expectEqualStrings("SEARCH users USING INTEGER PRIMARY KEY (rowid=?)", explained);
+}
+
+test "planner names the pk column for without rowid lookups" {
+    var schema = Schema.init(std.testing.allocator);
+    defer schema.deinit();
+
+    const cols = [_]ast.ColumnDef{
+        .{ .name = "id", .typeName = "INTEGER", .primaryKey = true },
+        .{ .name = "val", .typeName = "TEXT" },
+    };
+    try schema.createTableWithOptions("widgets", &cols, &.{}, .{ .withoutRowid = true });
+
+    const conds = [_]ast.Condition{
+        .{ .column = "id", .op = .equal, .value = .{ .literal = .{ .integer = 7 } } },
+    };
+    var plan = try planSelect(std.testing.allocator, &schema, .{
+        .table = @as(?[]const u8, "widgets"),
+        .condition = @as(?ast.Conditions, &conds),
+        .orders = @as([]const ast.Order, &.{}),
+        .projections = @as([]const ast.Projection, &.{}),
+        .joins = @as([]const ast.Join, &.{}),
+    });
+    defer plan.deinit();
+
+    const explained = try plan.explain(std.testing.allocator);
+    defer std.testing.allocator.free(explained);
+    try std.testing.expectEqualStrings("SEARCH widgets USING PRIMARY KEY (id=?)", explained);
 }
 
 test "planner uses index for order by to elide temp sort" {

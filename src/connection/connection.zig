@@ -15279,6 +15279,24 @@ test "probe fromless order and operand collate corners" {
     try std.testing.expectEqual(@as(i64, 1), betweenPlain.rows[0][1].integer);
 }
 
+test "probe without rowid rowid alias behavior" {
+    var db = try freshDb("sqlite_zig_probe_worowid_test.db");
+    defer dropDb(db, "sqlite_zig_probe_worowid_test.db");
+    var setup = try db.exec("CREATE TABLE wr_t (id INTEGER PRIMARY KEY, v TEXT) WITHOUT ROWID; INSERT INTO wr_t VALUES (1, 'a');");
+    setup.deinit();
+    var ok = try db.exec("SELECT id, v FROM wr_t;");
+    defer ok.deinit();
+    try std.testing.expectEqual(@as(usize, 1), ok.count());
+    try std.testing.expectError(error.UnknownColumn, db.exec("SELECT rowid FROM wr_t;"));
+    try std.testing.expectError(error.UnknownColumn, db.exec("SELECT oid FROM wr_t;"));
+    try std.testing.expectError(error.UnknownColumn, db.exec("SELECT _rowid_ FROM wr_t;"));
+    try std.testing.expectError(error.ConstraintViolation, db.exec("INSERT INTO wr_t VALUES (NULL, 'b');"));
+    var plan = try db.exec("EXPLAIN QUERY PLAN SELECT * FROM wr_t WHERE id = 1;");
+    defer plan.deinit();
+    try std.testing.expectEqual(@as(usize, 1), plan.count());
+    try std.testing.expectEqualStrings("SEARCH wr_t USING PRIMARY KEY (id=?)", plan.rows[0][0].text);
+}
+
 test "case sensitive like pragma toggles operator and function forms" {
     var db = try freshDb("sqlite_zig_case_like_test.db");
     defer dropDb(db, "sqlite_zig_case_like_test.db");
