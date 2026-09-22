@@ -454,14 +454,18 @@ pub const Parser = struct {
         return self.advance().text;
     }
 
+    /// Aggregate/window names that may carry OVER or DISTINCT; delegates to
+    /// the single function registry so parser, evaluator, and DSL cannot drift.
     fn isAggregateName(name: []const u8) bool {
-        return std.ascii.eqlIgnoreCase(name, "count") or std.ascii.eqlIgnoreCase(name, "sum") or std.ascii.eqlIgnoreCase(name, "total") or std.ascii.eqlIgnoreCase(name, "avg") or std.ascii.eqlIgnoreCase(name, "average") or std.ascii.eqlIgnoreCase(name, "min") or std.ascii.eqlIgnoreCase(name, "max") or std.ascii.eqlIgnoreCase(name, "group_concat") or std.ascii.eqlIgnoreCase(name, "string_agg");
+        const functions = @import("functions.zig");
+        if (functions.aggregate.AggKind.fromName(name) != null) return true;
+        return std.ascii.eqlIgnoreCase(name, "min") or std.ascii.eqlIgnoreCase(name, "max");
     }
 
     /// Window-only function names (rank, lag, ...); with `isAggregateName`
     /// this covers every name that may carry OVER.
     fn isWindowOnlyName(name: []const u8) bool {
-        return std.ascii.eqlIgnoreCase(name, "row_number") or std.ascii.eqlIgnoreCase(name, "rank") or std.ascii.eqlIgnoreCase(name, "dense_rank") or std.ascii.eqlIgnoreCase(name, "percent_rank") or std.ascii.eqlIgnoreCase(name, "cume_dist") or std.ascii.eqlIgnoreCase(name, "ntile") or std.ascii.eqlIgnoreCase(name, "lag") or std.ascii.eqlIgnoreCase(name, "lead") or std.ascii.eqlIgnoreCase(name, "first_value") or std.ascii.eqlIgnoreCase(name, "last_value") or std.ascii.eqlIgnoreCase(name, "nth_value");
+        return @import("functions.zig").isWindowOnly(name);
     }
 
     /// Free one parsed window spec's node structure (strings stay arena-owned).
@@ -2975,6 +2979,45 @@ test "parser parses reindex with optional target" {
     var s4 = try p4.parse();
     defer ast.deinit(std.testing.allocator, &s4);
     try std.testing.expectEqualStrings("main.mytable", s4.reindex.target.?);
+}
+
+test "parser parses having and alter table statements" {
+    var p = try Parser.init(std.testing.allocator, "SELECT grp, count(*) FROM t GROUP BY grp HAVING count(*) > 1;");
+    defer p.deinit();
+    var s = try p.parse();
+    defer ast.deinit(std.testing.allocator, &s);
+    try std.testing.expect(s == .select);
+    try std.testing.expect(s.select.having != null);
+
+    var p2 = try Parser.init(std.testing.allocator, "ALTER TABLE t ADD COLUMN extra TEXT;");
+    defer p2.deinit();
+    var s2 = try p2.parse();
+    defer ast.deinit(std.testing.allocator, &s2);
+    try std.testing.expect(s2 == .alterTable);
+    try std.testing.expect(s2.alterTable == .addColumn);
+    try std.testing.expectEqualStrings("t", s2.alterTable.addColumn.table);
+
+    var p3 = try Parser.init(std.testing.allocator, "ALTER TABLE t RENAME COLUMN old TO new;");
+    defer p3.deinit();
+    var s3 = try p3.parse();
+    defer ast.deinit(std.testing.allocator, &s3);
+    try std.testing.expect(s3.alterTable == .renameColumn);
+    try std.testing.expectEqualStrings("old", s3.alterTable.renameColumn.oldName);
+    try std.testing.expectEqualStrings("new", s3.alterTable.renameColumn.newName);
+
+    var p4 = try Parser.init(std.testing.allocator, "ALTER TABLE t DROP COLUMN extra;");
+    defer p4.deinit();
+    var s4 = try p4.parse();
+    defer ast.deinit(std.testing.allocator, &s4);
+    try std.testing.expect(s4.alterTable == .dropColumn);
+    try std.testing.expectEqualStrings("extra", s4.alterTable.dropColumn.column);
+
+    var p5 = try Parser.init(std.testing.allocator, "ALTER TABLE t RENAME TO u;");
+    defer p5.deinit();
+    var s5 = try p5.parse();
+    defer ast.deinit(std.testing.allocator, &s5);
+    try std.testing.expect(s5.alterTable == .renameTable);
+    try std.testing.expectEqualStrings("u", s5.alterTable.renameTable.newName);
 }
 
 test "parser parses conflict policies on insert and update" {

@@ -5,7 +5,10 @@ description: "The hand-written SQL lexer, parser, and bytecode compiler supporti
 
 # SQL Engine
 
-`sqlite.zig` includes a hand-written SQL lexer, parser, and bytecode compiler that supports a substantial subset of SQLite's SQL dialect.
+`sqlite.zig` includes a hand-written SQL lexer, parser, and a bytecode
+compiler that lowers SELECT and bare expressions (other statements run
+through the connection interpreter) and supports a substantial subset
+of SQLite's SQL dialect.
 
 ## Supported Statements
 
@@ -161,8 +164,9 @@ Date/time (`date`, `time`, `datetime`, `julianday`, `unixepoch`,
 …), and window functions (`ROW_NUMBER`, `RANK`, `LAG`, `LEAD`, …) are
 supported in Raw SQL. The DSL provides column wrappers for scalar helpers
 (`abs`, `length`, `upper`, `lower`, `jsonExtract`, `jsonSet`), aggregates,
-and window functions; date/time and math functions have no DSL wrappers yet,
-so call them through Raw SQL.
+and window functions; date/time and math functions have no DSL wrappers yet
+so call them through Raw SQL, and named `WINDOW` clauses are also Raw SQL
+only (reuse a shared `WindowBuilder` in the DSL).
 
 ## Scalar Functions
 

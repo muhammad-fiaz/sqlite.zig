@@ -9,10 +9,14 @@ The bytecode virtual machine executes compiled SQL operations.
 
 ## Overview
 
-The VM takes bytecode programs produced by the compiler and executes them
-against the schema, producing query results. These modules are internal:
-client code reaches them through `Connection`, not by importing them
-directly.
+The VM executes compiler-produced programs against the schema and
+produces results. These modules are internal: client code reaches them
+through `Connection`, not by importing them directly.
+
+Today the compiler lowers SELECT and bare expressions only; other
+statement families run through the connection interpreter (`compile`
+returns `Unsupported` for them). Cursor/write/aggregate opcodes are
+implemented in the VM for the SELECT path and for future DML lowering.
 
 ## Components
 
@@ -27,6 +31,9 @@ directly.
 ```
 SQL String → Lexer → Parser → AST → Compiler → Program → VM → Results
 ```
+
+(Non-SELECT statements stop at the AST and run through the connection
+interpreter instead of the compiler.)
 
 ## Bytecode Opcodes
 
@@ -54,8 +61,9 @@ operand style of SQLite's own VDBE.
 
 ## Running the VM
 
-The connection compiles statements with
+The connection's test path builds programs with
 `Compiler.init(allocator, &store)` and runs them with
 `VirtualMachine.init(allocator, &store)` followed by
 `execute(&program, columnNames)`. Client code uses `db.exec` instead of
-driving these types directly.
+driving these types directly; production statements use the connection
+interpreter.

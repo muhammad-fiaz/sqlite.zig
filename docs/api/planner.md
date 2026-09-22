@@ -17,8 +17,8 @@ order, with cost estimates comparing candidate plans.
 
 | Module | Description |
 |--------|-------------|
-| `planner` | Main query planning logic |
-| `optimizer` | Plan optimization passes |
+| `planner` | Main query planning logic (access path, index seek, join order) |
+| `optimizer` | Constant folding and predicate pushdown checks (source-local tests; not yet wired into `planSelect`) |
 | `cost` | Cost estimation for plan comparison |
 
 ## Planning Process
@@ -26,8 +26,11 @@ order, with cost estimates comparing candidate plans.
 1. **Parse** — SQL is parsed into an AST
 2. **Analyze** — Schema is resolved, table/column references validated
 3. **Plan** — Execution plan is generated with candidate strategies
-4. **Optimize** — Cost-based optimization selects the best plan
-5. **Compile** — Plan is compiled into bytecode for the VM
+4. **Optimize** — Cost-based selection picks the best access path; the
+   optimizer module provides additional fold/pushdown helpers for future
+   integration
+5. **Compile** — A parallel bytecode path compiles SELECT programs for the VM;
+   the primary interpreter runs statements from the plan and AST
 
 ## Join Strategies
 

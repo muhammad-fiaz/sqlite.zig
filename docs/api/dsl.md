@@ -302,17 +302,20 @@ SQL keep using the SQL names directly.
 ## Public surface
 
 Clients use `sqlite.table`, `sqlite.tableWith`, `sqlite.column`,
-`db.from`, and `db.col`. There is no `sqlite.dsl` namespace and no public
-`DynamicColumn`, `DynamicQuery`, `Builder`, `Mutation`, `Expr`, or
-`Operator`: those are internal implementation types reached by inference.
+`sqlite.DynamicColumn`, `db.from`, and `db.col`. There is no
+`sqlite.dsl` namespace; `DynamicQuery`, `Builder`, `Mutation`, `Expr`,
+and `Operator` stay internal implementation types reached by
+inference.
 
 Foreign-key actions are the engine's own: `.restrict`, `.cascade`,
 `.setNull`, `.setDefault`, `.noAction`. Predicates include
 `like`/`glob`/`regexp`/`match`; window functions, compound selects, CTEs,
 derived tables, `RETURNING`, `insertSelect`, `updateFrom`, and partial /
 expression index creation (`createIndexWhere` / `createIndexExpr`) all have
-DSL builders. Features without a builder stay in Raw SQL: `VACUUM` is
-supported there, while `INSTEAD OF` triggers and `ATTACH`/`DETACH` are not
+DSL builders. Named `WINDOW` clauses are Raw SQL only — the DSL reuses a
+shared `WindowBuilder` value instead of a name. Features without a
+builder stay in Raw SQL: `VACUUM` and `ALTER TABLE` are supported
+there, while `INSTEAD OF` triggers and `ATTACH`/`DETACH` are not
 supported and fail with an explicit error.
 
 Builder limits (misuse panics instead of silently truncating): at most 32

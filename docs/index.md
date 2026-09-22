@@ -27,7 +27,7 @@ features:
     details: Full implementation of the SQLite .db/.sqlite file format including 100-byte header, B-tree pages, record encoding, varints, and freelist pages.
   - icon: "\U0001f4dd"
     title: SQL Parser & VM
-    details: Hand-written SQL lexer, parser, and bytecode compiler/VM modeled on SQLite's own architecture. Supports CREATE, INSERT, SELECT, UPDATE, DELETE, JOINs, and more.
+    details: Hand-written SQL lexer, parser, and a bytecode compiler/VM for SELECT and bare expressions; other statements run through the connection interpreter. Supports CREATE, INSERT, SELECT, UPDATE, DELETE, JOINs, and more.
   - icon: "\u26a1"
     title: Typed DSL Query Builder
     details: A comptime, type-safe Zig query builder that constructs the same internal query representation as Raw SQL directly, ensuring compile-time validation of table names, column names, and types.

@@ -512,16 +512,17 @@ fn caseToExpr(ctx: *Ctx, case: CaseBuilder, base: ?StripBase) !ast.Expr {
 }
 
 fn isWindowFunction(name: []const u8) bool {
-    const known = [_][]const u8{ "row_number", "rank", "dense_rank", "percent_rank", "cume_dist", "ntile", "lag", "lead", "first_value", "last_value", "nth_value", "count", "sum", "total", "avg", "average", "min", "max", "group_concat", "string_agg" };
-    for (known) |candidate| if (std.ascii.eqlIgnoreCase(candidate, name)) return true;
-    return false;
+    const functions = @import("../sql/functions.zig");
+    if (functions.isWindowOnly(name)) return true;
+    return functions.aggregate.AggKind.fromName(name) != null or
+        std.ascii.eqlIgnoreCase(name, "min") or std.ascii.eqlIgnoreCase(name, "max");
 }
 
 /// True for aggregate names (the only ones allowed to carry FILTER).
 fn isAggregateWindowFunction(name: []const u8) bool {
-    const known = [_][]const u8{ "count", "sum", "total", "avg", "average", "min", "max", "group_concat", "string_agg" };
-    for (known) |candidate| if (std.ascii.eqlIgnoreCase(candidate, name)) return true;
-    return false;
+    const functions = @import("../sql/functions.zig");
+    if (functions.aggregate.AggKind.fromName(name) != null) return true;
+    return std.ascii.eqlIgnoreCase(name, "min") or std.ascii.eqlIgnoreCase(name, "max");
 }
 
 fn mapWindowBound(ctx: *Ctx, bound: WindowBound) !struct { bound: ast.WindowFrameBound, offset: ?*const ast.Expr } {
