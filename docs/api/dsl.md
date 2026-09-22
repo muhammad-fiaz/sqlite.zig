@@ -187,6 +187,22 @@ to the declared Zig type, including range checks); column references,
 arithmetic, `excluded()` (upserts only), and explicit value/default
 markers pass through natively.
 
+Why is there no `User.name = "x"` spelling? Zig itself forbids it: struct
+field names must be identifiers, so `insert(.{ User.name = "x" })` fails
+in the parser with `expected ',' after initializer` before any library
+code runs. The `=` shape therefore lives in scoped position
+(`insert(.{ .name = "x" })`, which already works), while the explicit
+qualified shape is `User.name.set("x")`. Both converge on the same
+native assignment; an `Expr` predicate is never silently reinterpreted
+as an assignment (row values, column references, expressions, and
+assignments stay distinct types).
+
+The dynamic DSL mirrors this: `users.column("age").set(3)` builds an
+explicit dynamic assignment, accepted in the same tuples on dynamic and
+typed builders (typed targets validate the name and qualifier live).
+`insertFrom(Src, .{ .dst = .src })` resolves scoped values against the
+source table's own scope.
+
 Schema objects resolve the same way against the table being defined
 (`.primaryKey = .id`, `.unique = &.{.email}`, `.column = .thing_id`,
 `createIndex(User, "idx", .{.email}, ...)`, `addColumn(User, .nick, ...)`).

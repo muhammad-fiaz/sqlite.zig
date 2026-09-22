@@ -82,17 +82,50 @@ fn toOrder(item: anytype) Order {
     @compileError("orderBy() takes a column order such as col.asc()/col.desc(), a bare column, or a scoped field such as .name");
 }
 
-/// True when `assigns` is an explicit-assignment tuple: every element is a
-/// `Column.set(...)` assign carrying its own table identity (see
-/// `column.zig.Assign`). Empty tuples are rows, not assigns.
+/// True for one assign-tuple element: a typed `Column.set(...)` assign or
+/// a dynamic `column(...).set(...)` assign.
+fn isAssignItem(comptime T: type) bool {
+    return columnMod.isAssignValue(T) or columnMod.isDynAssignValue(T);
+}
+
+/// True when `assigns` is an explicit-assignment tuple: every element is an
+/// assign carrying its own table identity (see `column.zig.Assign` and
+/// `column.zig.DynAssign`). Empty tuples are rows, not assigns.
 fn isAssignList(comptime T: type) bool {
     const info = @typeInfo(T);
     if (info != .@"struct" or !info.@"struct".is_tuple) return false;
     if (info.@"struct".fields.len == 0) return false;
     inline for (info.@"struct".fields) |field| {
-        if (!columnMod.isAssignValue(field.type)) return false;
+        if (!isAssignItem(field.type)) return false;
     }
     return true;
+}
+
+/// Runtime duplicate-target guard shared by typed and dynamic assigns
+/// (covers mixed tuples, where comptime names are unavailable).
+fn checkDuplicateName(names: []const []const u8, dest: []const u8) !void {
+    for (names) |existing| if (std.mem.eql(u8, existing, dest)) return error.InvalidSql;
+}
+
+/// Runtime scope check for one dynamic assign: a set qualifier must be the
+/// statement's table (real name or alias); empty qualifiers bind to the
+/// target table by SQLite's own single-table rules.
+fn checkDynAssignScope(item: anytype, table: []const u8, tableAlias: ?[]const u8) !void {
+    if (item.table.len == 0) return;
+    if (std.mem.eql(u8, item.table, table)) return;
+    if (tableAlias) |alias| if (std.mem.eql(u8, item.table, alias)) return;
+    return error.UnknownColumn;
+}
+
+/// Runtime membership check for one dynamic assign on a typed target: the
+/// SQL name must be a column of the statement target. Dynamic targets
+/// (`Columns == void`) stay unchecked by design.
+fn checkDynAssignColumn(comptime Columns: type, name: []const u8) !void {
+    if (Columns == void) return;
+    inline for (@typeInfo(Columns).@"struct".fields) |field| {
+        if (std.mem.eql(u8, field.type.dslName, name)) return;
+    }
+    return error.UnknownColumn;
 }
 
 /// Comptime membership test for one explicit assignment: its SQL name must
@@ -109,12 +142,19 @@ fn hasAssignColumn(comptime Col: type, comptime Columns: type) bool {
 }
 
 /// Comptime duplicate test for assign tuple element `index`: true when an
-/// earlier element targets the same SQL column. Callers gate explicitly.
+/// earlier *typed* element targets the same SQL column. Dynamic elements
+/// carry runtime names, so they (and mixed pairs) are covered by the
+/// runtime `checkDuplicateName`/inline sweeps at each use site instead.
+/// Callers gate explicitly.
 fn hasDuplicateAssign(comptime Tuple: type, comptime index: usize) bool {
-    const needle = @typeInfo(Tuple).@"struct".fields[index].type.assignColumn.dslName;
+    const fields = @typeInfo(Tuple).@"struct".fields;
+    const needleT = fields[index].type;
+    if (comptime !columnMod.isAssignValue(needleT)) return false;
+    const needle = needleT.assignColumn.dslName;
     inline for (0..index) |prev| {
-        const cand = @typeInfo(Tuple).@"struct".fields[prev].type.assignColumn.dslName;
-        if (std.mem.eql(u8, cand, needle)) return true;
+        const candT = fields[prev].type;
+        if (comptime !columnMod.isAssignValue(candT)) continue;
+        if (std.mem.eql(u8, candT.assignColumn.dslName, needle)) return true;
     }
     return false;
 }
@@ -998,12 +1038,26 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
             if (comptime !isDynamicSource and !@import("table.zig").isTableValue(SourceT)) @compileError("insertFrom source must be a typed table value or a DynamicTable");
             var projs: [mapFields.len]Projection = undefined;
             var count: usize = 0;
+            // Scoped mapping values (`insertFrom(Src, .{ .dst = .src })`)
+            // resolve against the source table's own scope when typed.
             inline for (mapFields) |mapField| {
                 const destSql: []const u8 = if (Columns == void)
                     mapField.name
                 else
                     destSqlFor(Columns, mapField.name) orelse return error.InvalidSql;
-                var proj = toProjection(@field(mapping, mapField.name));
+                const mapValue = @field(mapping, mapField.name);
+                var proj: Projection = if (comptime !isDynamicSource and @import("table.zig").isTableValue(SourceT) and scopeMod.isScopedItem(@TypeOf(mapValue), @import("table.zig").rowTypeOfValue(SourceT)))
+                    .{
+                        .kind = .column,
+                        .column = scopeMod.resolveRef(
+                            @import("table.zig").rowTypeOfValue(SourceT),
+                            @import("table.zig").columnsTypeOfValue(SourceT),
+                            scopeMod.builderScope(source.tableName, if (source.tableAlias.len != 0) source.tableAlias else null),
+                            mapValue,
+                        ),
+                    }
+                else
+                    toProjection(mapValue);
                 proj.alias = destSql;
                 projs[count] = proj;
                 count += 1;
@@ -1172,6 +1226,20 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
             var count: usize = 0;
             const AssignsType = @TypeOf(assigns);
             inline for (assigns, 0..) |item, index| {
+                // Dynamic assigns resolve at setup time against the same
+                // target contract; typed assigns resolve at compile time.
+                if (comptime columnMod.isDynAssignValue(@TypeOf(item))) {
+                    try checkDynAssignScope(item, self.table, self.tableAlias);
+                    try checkDynAssignColumn(Columns, item.name);
+                    if (comptime isExplicitDefault(@TypeOf(item.value))) continue;
+                    if (@TypeOf(item.value) == columnMod.ExcludedColumn) @compileError("excluded() is only valid in UPSERT assignments");
+                    if (count >= names.len) return error.InvalidSql;
+                    try checkDuplicateName(names[0..count], item.name);
+                    names[count] = item.name;
+                    vals[count] = .{ .literal = insertFieldOf(item.value) };
+                    count += 1;
+                    continue;
+                }
                 const Col = @TypeOf(item).assignColumn;
                 if (comptime !hasAssignColumn(Col, Columns)) @compileError("assignment column is not a column of the statement target table");
                 // Same column twice is most likely a copy/paste slip; SQL
@@ -1181,6 +1249,7 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
                 if (comptime isExplicitDefault(@TypeOf(item.value))) continue;
                 if (@TypeOf(item.value) == columnMod.ExcludedColumn) @compileError("excluded() is only valid in UPSERT assignments");
                 if (count >= names.len) return error.InvalidSql;
+                try checkDuplicateName(names[0..count], Col.dslName);
                 names[count] = Col.dslName;
                 vals[count] = .{ .literal = insertFieldOf(item.value) };
                 count += 1;
@@ -1254,6 +1323,18 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
             // identity; expressions distinguish target from value natively.
             if (comptime isAssignList(RowType)) {
                 inline for (assignments, 0..) |item, index| {
+                    if (comptime columnMod.isDynAssignValue(@TypeOf(item))) {
+                        try checkDynAssignScope(item, self.table, self.tableAlias);
+                        try checkDynAssignColumn(Columns, item.name);
+                        if (comptime isExplicitDefault(@TypeOf(item.value))) continue;
+                        if (@TypeOf(item.value) == columnMod.ExcludedColumn) @compileError("excluded() is only valid in UPSERT assignments");
+                        if (mutation.setCount >= mutation.setNames.len) return error.InvalidSql;
+                        try checkDuplicateName(mutation.setNames[0..mutation.setCount], item.name);
+                        mutation.setNames[mutation.setCount] = item.name;
+                        mutation.setValues[mutation.setCount] = setValueOf(item.value);
+                        mutation.setCount += 1;
+                        continue;
+                    }
                     const Col = @TypeOf(item).assignColumn;
                     if (comptime !hasAssignColumn(Col, Columns)) @compileError("assignment column is not a column of the statement target table");
                     if (comptime hasDuplicateAssign(RowType, index)) @compileError("duplicate assignment to one column in an explicit assign list");
@@ -1261,6 +1342,7 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
                     if (comptime isExplicitDefault(@TypeOf(item.value))) continue;
                     if (@TypeOf(item.value) == columnMod.ExcludedColumn) @compileError("excluded() is only valid in UPSERT assignments");
                     if (mutation.setCount >= mutation.setNames.len) return error.InvalidSql;
+                    try checkDuplicateName(mutation.setNames[0..mutation.setCount], Col.dslName);
                     mutation.setNames[mutation.setCount] = Col.dslName;
                     mutation.setValues[mutation.setCount] = setValueOf(item.value);
                     mutation.setCount += 1;
@@ -2164,12 +2246,23 @@ pub fn UpsertBuilder(comptime Row: type, comptime Columns: type) type {
             if (comptime isAssignList(RowType)) {
                 self.setCount = 0;
                 inline for (assignments, 0..) |item, index| {
+                    if (comptime columnMod.isDynAssignValue(@TypeOf(item))) {
+                        try checkDynAssignScope(item, self.table, self.tableAlias);
+                        try checkDynAssignColumn(Columns, item.name);
+                        if (comptime isExplicitDefault(@TypeOf(item.value))) continue;
+                        if (self.setCount >= self.sets.len) return error.InvalidSql;
+                        for (self.sets[0..self.setCount]) |existing| if (std.mem.eql(u8, existing.name, item.name)) return error.InvalidSql;
+                        self.sets[self.setCount] = .{ .name = item.name, .value = upsertValueOf(item.value) };
+                        self.setCount += 1;
+                        continue;
+                    }
                     const Col = @TypeOf(item).assignColumn;
                     if (comptime !hasAssignColumn(Col, Columns)) @compileError("assignment column is not a column of the statement target table");
                     if (comptime hasDuplicateAssign(RowType, index)) @compileError("duplicate assignment to one column in an explicit assign list");
                     try checkAssignScope(Col, self.table, self.tableAlias);
                     if (comptime isExplicitDefault(@TypeOf(item.value))) continue;
                     if (self.setCount >= self.sets.len) return error.InvalidSql;
+                    for (self.sets[0..self.setCount]) |existing| if (std.mem.eql(u8, existing.name, Col.dslName)) return error.InvalidSql;
                     self.sets[self.setCount] = .{ .name = Col.dslName, .value = upsertValueOf(item.value) };
                     self.setCount += 1;
                 }

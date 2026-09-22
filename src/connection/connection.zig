@@ -9115,6 +9115,101 @@ test "predicates staged before update delete and upsert carry over" {
     try std.testing.expectEqualStrings("b2", after.name);
 }
 
+test "dynamic assigns write through the same native paths" {
+    const tableMod = @import("../dsl/table.zig");
+    const W = tableMod.table("dyn_assign_w", struct { id: i64, name: []const u8 });
+    const path = "sqlite_zig_dyn_assign_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    try db.createTable(W, .{ .overWrite = true, .primaryKey = W.id });
+    const w = db.table("dyn_assign_w");
+    // Dynamic assigns on a dynamic builder, incl. an expression payload.
+    var i = try db.table("dyn_assign_w").insert(.{
+        w.column("id").set(1),
+        w.column("name").set("a"),
+    });
+    i.deinit();
+    var u = try (try w.update(.{w.column("name").set("b")})).where(w.column("id").eq(1)).execute();
+    u.deinit();
+    // Mixed typed + dynamic assigns on a typed builder converge.
+    var m = try db.from(W).insert(.{
+        W.id.set(2),
+        w.column("name").set("c"),
+    });
+    m.deinit();
+    var got = try db.from(W).select(W.all()).orderBy(W.id.asc()).fetch();
+    defer got.deinit();
+    try std.testing.expectEqual(@as(usize, 2), got.count());
+    try std.testing.expectEqualStrings("b", got.at(0).name);
+    try std.testing.expectEqualStrings("c", got.at(1).name);
+    // Wrong-table qualifier never binds silently.
+    const other = db.table("dyn_assign_other");
+    try std.testing.expectError(error.UnknownColumn, db.from(W).insert(.{other.column("id").set(9)}));
+    // Unknown names are rejected on typed targets (dynamic stays open).
+    try std.testing.expectError(error.UnknownColumn, db.from(W).insert(.{w.column("nope").set(1)}));
+    // Duplicates across the mixed tuple are rejected like typed pairs.
+    try std.testing.expectError(error.InvalidSql, db.from(W).insert(.{ W.id.set(3), w.column("id").set(3), w.column("name").set("d") }));
+    // Cross-table typed assigns are rejected too (same-named id elsewhere).
+    const W2 = tableMod.table("dyn_assign_w2", struct { id: i64 });
+    try db.createTable(W2, .{ .overWrite = true, .primaryKey = W2.id });
+    try std.testing.expectError(error.UnknownColumn, db.from(W).insert(.{ W2.id.set(9), W.name.set("x") }));
+}
+
+test "createTable accepts every scoped explicit key combination" {
+    const tableMod = @import("../dsl/table.zig");
+    const P = tableMod.table("combo_parents", struct { id: i64 });
+    // Explicit PK + explicit FK column (the example-28 shape).
+    const C1 = tableMod.table("combo_c1", struct { id: i64, parent_id: i64 });
+    // Scoped PK + scoped FK column.
+    const C2 = tableMod.table("combo_c2", struct { id: i64, parent_id: i64 });
+    // Explicit PK + scoped FK column.
+    const C3 = tableMod.table("combo_c3", struct { id: i64, parent_id: i64 });
+    // Scoped PK + explicit FK column.
+    const C4 = tableMod.table("combo_c4", struct { id: i64, parent_id: i64 });
+    const path = "sqlite_zig_combo_keys_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    try db.createTable(P, .{ .overWrite = true, .primaryKey = P.id });
+    try db.createTable(C1, .{ .overWrite = true, .primaryKey = C1.id, .foreignKeys = &.{.{ .column = C1.parent_id, .references = P.id }} });
+    try db.createTable(C2, .{ .overWrite = true, .primaryKey = .id, .foreignKeys = &.{.{ .column = .parent_id, .references = P.id }} });
+    try db.createTable(C3, .{ .overWrite = true, .primaryKey = C3.id, .foreignKeys = &.{.{ .column = .parent_id, .references = P.id }} });
+    try db.createTable(C4, .{ .overWrite = true, .primaryKey = .id, .foreignKeys = &.{.{ .column = C4.parent_id, .references = P.id }} });
+    try db.schema(C1).validate();
+    try db.schema(C2).validate();
+    try db.schema(C3).validate();
+    try db.schema(C4).validate();
+}
+
+test "insertFrom accepts scoped source fields" {
+    const tableMod = @import("../dsl/table.zig");
+    const Src = tableMod.table("map_scope_src", struct { id: i64, label: []const u8 });
+    const Dst = tableMod.table("map_scope_dst", struct { id: i64, parent_id: i64, name: []const u8 });
+    const path = "sqlite_zig_insert_from_scoped_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    try db.createTable(Src, .{ .overWrite = true, .primaryKey = Src.id });
+    try db.createTable(Dst, .{ .overWrite = true, .primaryKey = Dst.id });
+    var seed = try db.from(Src).insert(.{ .id = 10, .label = "root" });
+    seed.deinit();
+    // Scoped values resolve against the source table's own scope...
+    var copied = try db.from(Dst).insertFrom(Src, .{ .id = .id, .parent_id = .id, .name = .label });
+    copied.deinit();
+    // ...exactly like explicit source columns (second source row).
+    var seed2 = try db.from(Src).insert(.{ .id = 11, .label = "leaf" });
+    seed2.deinit();
+    var wipe = try db.exec("DELETE FROM map_scope_src WHERE id = 10;");
+    wipe.deinit();
+    var copiedExplicit = try db.from(Dst).insertFrom(Src, .{ .id = Src.id, .parent_id = Src.id, .name = Src.label });
+    copiedExplicit.deinit();
+    var rows = try db.from(Dst).select(Dst.all()).orderBy(Dst.id.asc()).fetch();
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(usize, 2), rows.count());
+    try std.testing.expectEqual(@as(i64, 10), rows.at(0).parent_id);
+    try std.testing.expectEqualStrings("root", rows.at(0).name);
+    try std.testing.expectEqual(@as(i64, 11), rows.at(1).parent_id);
+    try std.testing.expectEqualStrings("leaf", rows.at(1).name);
+}
+
 test "scoped upsert returning and delete share one model" {
     const tableMod = @import("../dsl/table.zig");
     const Stock = tableMod.table("dual_stock", struct { id: i64, qty: i64 });

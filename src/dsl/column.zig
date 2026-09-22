@@ -892,6 +892,48 @@ pub fn Column(comptime tableName: []const u8, comptime columnName: []const u8, c
     };
 }
 
+/// Explicit dynamic assignment (`users.column("age").set(3)`), the runtime
+/// counterpart of typed `Column.set`. Carries borrowed table/name identity
+/// plus payload; accepted in assign tuples alongside typed assigns, on both
+/// dynamic and typed builders (typed targets validate the name live).
+pub fn DynAssign(comptime V: type) type {
+    return struct {
+        pub const isDynAssign = true;
+        table: []const u8,
+        name: []const u8,
+        value: V,
+    };
+}
+
+/// True when `T` is a `DynAssign(V)` explicit dynamic assignment.
+pub fn isDynAssignValue(comptime T: type) bool {
+    if (@typeInfo(T) != .@"struct") return false;
+    return @hasDecl(T, "isDynAssign") and T.isDynAssign;
+}
+
+/// Stored payload type for `DynamicColumn.set`: comptime literals widen to
+/// runtime scalars (`comptime_int` to `i64`, `comptime_float` to `f64`,
+/// `null` to `Value`), so assigns stay runtime values; everything else is
+/// stored verbatim for the per-path converters.
+fn DynStoredPayload(comptime V: type) type {
+    return switch (@typeInfo(V)) {
+        .comptime_int => i64,
+        .comptime_float => f64,
+        .null => Value,
+        else => V,
+    };
+}
+
+fn dynStored(payload: anytype) DynStoredPayload(@TypeOf(payload)) {
+    const V = @TypeOf(payload);
+    switch (@typeInfo(V)) {
+        .comptime_int => return @as(i64, @intCast(payload)),
+        .comptime_float => return @as(f64, @floatCast(payload)),
+        .null => return .null,
+        else => return payload,
+    }
+}
+
 /// Runtime column descriptor. Typeless; `name` may be dotted.
 /// All slices borrowed from the caller/table handle.
 pub const DynamicColumn = struct {
@@ -899,6 +941,14 @@ pub const DynamicColumn = struct {
     schema: []const u8 = "",
     table: []const u8 = "",
     func: ?FuncCall = null,
+
+    /// Explicit dynamic assignment of this column
+    /// (`update(.{ users.column("age").set(3) })`). The qualifier travels
+    /// with the assign and is checked against the statement target at
+    /// execution-setup time; empty qualifiers bind to the target table.
+    pub fn set(self: @This(), payload: anytype) DynAssign(DynStoredPayload(@TypeOf(payload))) {
+        return .{ .table = self.table, .name = self.name, .value = dynStored(payload) };
+    }
 
     fn ref(self: @This()) ColumnRef {
         return dynRef(self);
@@ -1305,6 +1355,23 @@ test "set stores typed payloads with row struct coercion" {
     try std.testing.expectEqualStrings("name", exc.value.name);
     const def = (Name{}).set((Name{}).defaultValue());
     try std.testing.expect(@TypeOf(def.value) == ExplicitDefault);
+}
+
+test "dynamic set builds table qualified assignments" {
+    const DynTable = @import("dynamic.zig").DynamicTable;
+    var t = DynTable.init(std.testing.allocator, undefined, undefined, undefined, undefined, "", "dyn_t");
+    const a = t.column("id").set(1);
+    try std.testing.expect(isDynAssignValue(@TypeOf(a)));
+    try std.testing.expectEqualStrings("dyn_t", a.table);
+    try std.testing.expectEqualStrings("id", a.name);
+    try std.testing.expect(a.value == 1);
+    const b = t.column("name").set("x");
+    try std.testing.expectEqualStrings("x", b.value);
+    try std.testing.expect(!isDynAssignValue(@TypeOf(1)));
+    try std.testing.expect(!isAssignValue(@TypeOf(a)));
+    // Aliased handles qualify assigns with the alias, like columns.
+    const u = t.as("u");
+    try std.testing.expectEqualStrings("u", u.column("id").set(2).table);
 }
 
 test "qualifier overrides follow scoped values through expressions" {
