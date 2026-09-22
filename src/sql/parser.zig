@@ -2606,7 +2606,15 @@ pub const Parser = struct {
                 const orderCollate: ?[]const u8 = if (self.acceptWord("collate")) try self.word() else null;
                 if (!descending) descending = self.acceptWord("desc");
                 if (!descending) _ = self.acceptWord("asc");
-                try orders.append(self.allocator, .{ .column = orderColumn, .descending = descending, .collate = orderCollate });
+                var orderNullsFirst: ?bool = null;
+                if (self.acceptWord("nulls")) {
+                    if (self.acceptWord("first")) {
+                        orderNullsFirst = true;
+                    } else if (self.acceptWord("last")) {
+                        orderNullsFirst = false;
+                    } else return Error.UnexpectedToken;
+                }
+                try orders.append(self.allocator, .{ .column = orderColumn, .descending = descending, .collate = orderCollate, .nullsFirst = orderNullsFirst });
                 if (!self.acceptTag(.comma)) break;
             }
         }

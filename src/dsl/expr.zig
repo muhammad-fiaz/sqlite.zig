@@ -114,13 +114,58 @@ pub const Expr = struct {
         copy.negated = !copy.negated;
         return copy;
     }
+
+    /// Combine two predicates with AND (`User.id.eq(1).@"and"(User.name.eq("ann"))`).
+    /// `and`/`or` are reserved words in Zig, so the escaped-identifier
+    /// spelling is the canonical API. Builders flatten the pair into the
+    /// condition list; see `ExprPair`.
+    pub fn @"and"(self: Expr, other: Expr) ExprPair {
+        return .{ .first = self, .second = other, .joinOr = false };
+    }
+
+    /// Combine two predicates with OR. Builders flatten the pair; an OR-pair
+    /// nested under an AND-context distributes (`x AND (a OR b)` becomes
+    /// `(x AND a) OR (x AND b)`) so SQL AND-binds-tighter precedence cannot
+    /// misfire. Pure predicates only — DSL predicates have no side effects.
+    pub fn @"or"(self: Expr, other: Expr) ExprPair {
+        return .{ .first = self, .second = other, .joinOr = true };
+    }
 };
 
-/// Sort key: borrowed column plus direction and optional scalar wrapper.
+/// Two predicates joined by AND (`joinOr == false`) or OR (`joinOr == true`),
+/// built by `Expr.and`/`Expr.or`. Plain borrowed copies; `where()` accepts a
+/// pair by flattening, `andWhere()` distributes OR-pairs over existing
+/// AND-groups, and `orWhere()` appends (AND-pairs stay grouped by SQL
+/// precedence). Pairs do not nest; chain further predicates with the
+/// builder's `andWhere`/`orWhere`.
+pub const ExprPair = struct {
+    first: Expr,
+    second: Expr,
+    joinOr: bool = false,
+};
+
+/// Sort key: borrowed column plus direction, NULL placement, and optional
+/// scalar wrapper. `nullsFirst == null` selects SQLite's default (NULL
+/// smallest: first on ASC, last on DESC).
 pub const Order = struct {
     column: ColumnRef,
     descending: bool = false,
+    nullsFirst: ?bool = null,
     function: ?FuncCall = null,
+
+    /// NULLS FIRST override; the original is unchanged.
+    pub fn withNullsFirst(self: Order) Order {
+        var copy = self;
+        copy.nullsFirst = true;
+        return copy;
+    }
+
+    /// NULLS LAST override; the original is unchanged.
+    pub fn withNullsLast(self: Order) Order {
+        var copy = self;
+        copy.nullsFirst = false;
+        return copy;
+    }
 };
 
 /// SELECT/RETURNING projection. `.star` is native `*`, `.countStar` is native

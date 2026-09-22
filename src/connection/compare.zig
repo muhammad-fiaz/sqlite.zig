@@ -176,24 +176,42 @@ pub fn rowsEqual(left: []const Value, right: []const Value) bool {
 }
 
 /// One resolved sort key: which output column to compare, its direction,
-/// and its collation (null selects binary, like the reference default).
+/// its collation (null selects binary, like the reference default), and an
+/// optional NULL-placement override (null selects SQLite's default: NULL
+/// smallest, first on ASC and last on DESC).
 pub const SortKey = struct {
     colIdx: usize,
     descending: bool = false,
     collate: ?[]const u8 = null,
+    nullsFirst: ?bool = null,
 };
+
+/// Null-aware comparison of one sort key. An explicit `nullsFirst` places
+/// NULLs absolutely (first or last regardless of direction); otherwise
+/// SQLite's default applies (NULL smallest: first on ASC, last on DESC).
+/// Non-null values compare under `collation`, inverted when `descending`.
+pub fn compareKey(a: Value, b: Value, descending: bool, nullsFirst: ?bool, collation: Collation) std.math.Order {
+    const aNull = a == .null;
+    const bNull = b == .null;
+    if (aNull or bNull) {
+        if (aNull and bNull) return .eq;
+        const first = nullsFirst orelse !descending;
+        return if (aNull == first) .lt else .gt;
+    }
+    const ord = a.order(b, collation);
+    return if (descending) ord.invert() else ord;
+}
 
 /// Multi-key row ordering over already-materialized rows.
 ///
-/// Compares `a`/`b` key by key with `Value.order` under each key's
-/// collation; the first non-equal key decides (inverted when
-/// `descending`). Returns `.eq` when all keys tie. Callers must guarantee
-/// every `colIdx` is in bounds.
+/// Compares `a`/`b` key by key with `compareKey`; the first non-equal key
+/// decides. Returns `.eq` when all keys tie. Callers must guarantee every
+/// `colIdx` is in bounds.
 pub fn compareRowsByKeys(a: []const Value, b: []const Value, sortKeys: []const SortKey) std.math.Order {
     for (sortKeys) |key| {
-        const ord = a[key.colIdx].order(b[key.colIdx], Collation.fromName(key.collate));
+        const ord = compareKey(a[key.colIdx], b[key.colIdx], key.descending, key.nullsFirst, Collation.fromName(key.collate));
         if (ord == .eq) continue;
-        return if (key.descending) ord.invert() else ord;
+        return ord;
     }
     return .eq;
 }

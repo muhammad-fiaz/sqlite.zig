@@ -8,6 +8,7 @@
 const std = @import("std");
 const ast = @import("../sql/ast.zig");
 const dslExpr = @import("expr.zig");
+const scopeMod = @import("scope.zig");
 const CaseBuilder = @import("column.zig").CaseBuilder;
 const WindowBuilder = @import("column.zig").WindowBuilder;
 const WindowBound = @import("column.zig").WindowBound;
@@ -38,8 +39,9 @@ pub const DerivedExecFn = *const fn (*anyopaque, sub: CompoundArm, outer: Compou
 pub const JoinKind = enum { inner, left, right, full, cross };
 
 /// Base-table identity used to strip redundant single-table qualifiers.
+/// Alias of `scope.Scope`: one shared scope representation, no duplicate.
 /// All slices borrowed; `alias` (when set) replaces `table` for stripping.
-pub const StripBase = struct { table: []const u8, schema: []const u8 = "", alias: ?[]const u8 = null };
+pub const StripBase = scopeMod.Scope;
 
 /// Borrowed predicate plus its AND/OR join flag into the condition list.
 pub const CondEntry = struct { expr: dslExpr.Expr, joinOr: bool = false };
@@ -289,6 +291,14 @@ fn projectionToAst(ctx: *Ctx, proj: dslExpr.Projection, base: ?StripBase, cases:
     switch (proj.kind) {
         .star => {
             if (proj.filterExpr != null) return error.InvalidSql;
+            // TODO(qualified-star): render QualifiedAllColumns (`u.*`) in
+            // multi-table projections. `u.all()` currently lowers to the
+            // bare wildcard, which is identical for single-table queries
+            // but cannot project one side of a join. Needs a qualified
+            // wildcard AST node plus qualifier-aware expansion at every
+            // `.wildcard` site in connection.zig, the raw parser, and
+            // EXPLAIN output. Workaround: project the side's columns
+            // explicitly (`select(.{ u.id, u.name })`).
             return .{ .expr = .wildcard, .alias = proj.alias };
         },
         .countStar => {
@@ -586,7 +596,7 @@ fn windowToExpr(ctx: *Ctx, window: WindowBuilder, base: ?StripBase) !ast.Expr {
         errdefer ctx.alloc.free(owned);
         for (window.orders[0..window.orderCount], 0..) |ord, index| {
             if (ord.function != null) return error.InvalidSql;
-            owned[index] = .{ .expr = .{ .identifier = try ctx.refName(ord.column, base) }, .descending = ord.descending };
+            owned[index] = .{ .expr = .{ .identifier = try ctx.refName(ord.column, base) }, .descending = ord.descending, .nullsFirst = ord.nullsFirst orelse false };
         }
         orderBy = owned;
     }
@@ -645,6 +655,20 @@ fn mapHavingOp(operator: []const u8) !ast.CompareOp {
 /// Borrowed SELECT assembly inputs. String/column slices are borrowed from
 /// the builder snapshot; `buildSelect` duplicates whatever the AST retains.
 /// `havingValid == false` forces `error.InvalidSql` (unsupported HAVING shape).
+/// One lowered join leg: borrowed table identity plus the join condition in
+/// exactly one form (`on` predicate, `usingCols`, `natural`, or cross).
+/// Mirrors `query_builder.JoinSpec`; `buildSelect` lowers each leg to an
+/// `ast.Join` in order, so chained `.join()` calls execute left to right.
+pub const JoinArgs = struct {
+    table: []const u8,
+    schema: []const u8 = "",
+    alias: ?[]const u8 = null,
+    kind: JoinKind = .inner,
+    on: ?dslExpr.Expr = null,
+    usingCols: []const []const u8 = &.{},
+    natural: bool = false,
+};
+
 pub const SelectArgs = struct {
     table: []const u8,
     schema: []const u8 = "",
@@ -662,13 +686,7 @@ pub const SelectArgs = struct {
     groupBy: ?dslExpr.ColumnRef,
     having: []const HavingEntry = &.{},
     havingValid: bool = true,
-    joinTable: ?[]const u8,
-    joinSchema: []const u8 = "",
-    joinAlias: ?[]const u8 = null,
-    joinKind: JoinKind,
-    joinOn: ?dslExpr.Expr,
-    joinUsingCols: []const []const u8 = &.{},
-    joinNatural: bool = false,
+    joins: []const JoinArgs = &.{},
     inQuery: ?InQueryArgs,
     existsQuery: ?ExistsQueryArgs,
     literalIn: ?LiteralInArgs,
@@ -687,7 +705,7 @@ fn qualifiedRef(ctx: *Ctx, ref: dslExpr.ColumnRef) ![]const u8 {
 }
 
 fn stripBase(table: []const u8, schema: []const u8, alias: ?[]const u8) StripBase {
-    return .{ .table = table, .schema = schema, .alias = alias };
+    return scopeMod.tableScope(table, schema, alias);
 }
 
 /// Lower borrowed SELECT inputs into an owned `BuiltStatement`.
@@ -701,7 +719,7 @@ pub fn buildSelect(allocator: std.mem.Allocator, args: SelectArgs) !BuiltStateme
     errdefer ctx.fail();
     // In joins, qualifiers are load-bearing (ambiguity + scope), so nothing
     // strips. Single-table queries keep the historical bare rendering.
-    const base: ?StripBase = if (args.joinTable != null) null else stripBase(args.table, args.schema, args.tableAlias);
+    const base: ?StripBase = if (args.joins.len != 0) null else stripBase(args.table, args.schema, args.tableAlias);
     const fromTable = try qualifiedTable(&ctx, args.schema, args.table);
     if (args.allColumns) {
         try projections.append(allocator, .{ .expr = .wildcard });
@@ -749,39 +767,44 @@ pub fn buildSelect(allocator: std.mem.Allocator, args: SelectArgs) !BuiltStateme
             .joinOr = conditions.items.len != 0,
         });
     }
-    var join: ?ast.Join = null;
-    var ownedUsing: []const []const u8 = &.{};
-    errdefer if (ownedUsing.len != 0) allocator.free(ownedUsing);
-    if (args.joinTable) |joined| {
-        const joinedFull = try qualifiedTable(&ctx, args.joinSchema, joined);
-        if (args.joinNatural) {
-            join = .{ .kind = mapJoinKind(args.joinKind), .table = joinedFull, .tableAlias = args.joinAlias, .leftTable = "", .leftColumn = "", .rightTable = "", .rightColumn = "", .mergeOutput = true };
-        } else if (args.joinUsingCols.len == 1) {
-            const usingCol = args.joinUsingCols[0];
+    var joinList = std.ArrayList(ast.Join).empty;
+    defer joinList.deinit(allocator);
+    // Borrowed container only: the slices themselves move into the
+    // statement on success (freed by `BuiltStatement.deinit`).
+    var ownedUsings = std.ArrayList([]const []const u8).empty;
+    defer ownedUsings.deinit(allocator);
+    errdefer for (ownedUsings.items) |slice| allocator.free(slice);
+    for (args.joins) |leg| {
+        const joinedFull = try qualifiedTable(&ctx, leg.schema, leg.table);
+        if (leg.natural) {
+            try joinList.append(allocator, .{ .kind = mapJoinKind(leg.kind), .table = joinedFull, .tableAlias = leg.alias, .leftTable = "", .leftColumn = "", .rightTable = "", .rightColumn = "", .mergeOutput = true });
+        } else if (leg.usingCols.len == 1) {
+            const usingCol = leg.usingCols[0];
             if (usingCol.len == 0) return error.InvalidSql;
-            join = .{ .kind = mapJoinKind(args.joinKind), .table = joinedFull, .tableAlias = args.joinAlias, .leftTable = fromTable, .leftColumn = usingCol, .rightTable = joinedFull, .rightColumn = usingCol, .mergeOutput = true };
-        } else if (args.joinUsingCols.len > 1) {
-            for (args.joinUsingCols) |usingCol| if (usingCol.len == 0) return error.InvalidSql;
-            ownedUsing = try allocator.dupe([]const u8, args.joinUsingCols);
-            join = .{ .kind = mapJoinKind(args.joinKind), .table = joinedFull, .tableAlias = args.joinAlias, .leftTable = fromTable, .leftColumn = "", .rightTable = joinedFull, .rightColumn = "", .mergeOutput = true, .usingColumns = ownedUsing };
-        } else if (args.joinKind == .cross) {
-            join = .{ .kind = .cross, .table = joinedFull, .tableAlias = args.joinAlias, .leftTable = "", .leftColumn = "", .rightTable = "", .rightColumn = "" };
+            try joinList.append(allocator, .{ .kind = mapJoinKind(leg.kind), .table = joinedFull, .tableAlias = leg.alias, .leftTable = fromTable, .leftColumn = usingCol, .rightTable = joinedFull, .rightColumn = usingCol, .mergeOutput = true });
+        } else if (leg.usingCols.len > 1) {
+            for (leg.usingCols) |usingCol| if (usingCol.len == 0) return error.InvalidSql;
+            const owned = try allocator.dupe([]const u8, leg.usingCols);
+            try ownedUsings.append(allocator, owned);
+            try joinList.append(allocator, .{ .kind = mapJoinKind(leg.kind), .table = joinedFull, .tableAlias = leg.alias, .leftTable = fromTable, .leftColumn = "", .rightTable = joinedFull, .rightColumn = "", .mergeOutput = true, .usingColumns = owned });
+        } else if (leg.kind == .cross) {
+            try joinList.append(allocator, .{ .kind = .cross, .table = joinedFull, .tableAlias = leg.alias, .leftTable = "", .leftColumn = "", .rightTable = "", .rightColumn = "" });
         } else {
-            const on = args.joinOn orelse return error.InvalidSql;
+            const on = leg.on orelse return error.InvalidSql;
             if (on.operator != .equal) return error.InvalidSql;
             const rightRef = switch (on.rhs) {
                 .column => |ref| ref,
                 .value => return error.InvalidSql,
             };
-            join = .{
-                .kind = mapJoinKind(args.joinKind),
+            try joinList.append(allocator, .{
+                .kind = mapJoinKind(leg.kind),
                 .table = joinedFull,
-                .tableAlias = args.joinAlias,
+                .tableAlias = leg.alias,
                 .leftTable = try qualifiedRef(&ctx, on.column),
                 .leftColumn = on.column.name,
                 .rightTable = try qualifiedRef(&ctx, rightRef),
                 .rightColumn = rightRef.name,
-            };
+            });
         }
     }
     var groupBy: ?[]const u8 = null;
@@ -823,12 +846,11 @@ pub fn buildSelect(allocator: std.mem.Allocator, args: SelectArgs) !BuiltStateme
         ownedOrders = owned;
         for (args.orders, 0..) |ord, index| {
             if (ord.function != null) return error.InvalidSql;
-            owned[index] = .{ .column = try ctx.refName(ord.column, null), .descending = ord.descending };
+            owned[index] = .{ .column = try ctx.refName(ord.column, null), .descending = ord.descending, .nullsFirst = ord.nullsFirst };
         }
     }
-    var ownedJoins: []const ast.Join = &.{};
-    errdefer if (ownedJoins.len != 0) allocator.free(ownedJoins);
-    if (join) |single| ownedJoins = try allocator.dupe(ast.Join, &[_]ast.Join{single});
+    const ownedJoins = try joinList.toOwnedSlice(allocator);
+    errdefer allocator.free(ownedJoins);
     const stmt = ast.Statement{ .select = .{
         .projections = try projections.toOwnedSlice(allocator),
         .table = fromTable,
@@ -1033,9 +1055,6 @@ test "buildSelect preserves projection order and star/countStar shapes" {
         .offset = null,
         .groupBy = null,
         .having = &.{},
-        .joinTable = null,
-        .joinKind = .inner,
-        .joinOn = null,
         .inQuery = null,
         .existsQuery = null,
         .literalIn = null,
@@ -1055,9 +1074,6 @@ test "buildSelect preserves projection order and star/countStar shapes" {
         .offset = null,
         .groupBy = null,
         .having = &.{},
-        .joinTable = null,
-        .joinKind = .inner,
-        .joinOn = null,
         .inQuery = null,
         .existsQuery = null,
         .literalIn = null,
@@ -1074,9 +1090,6 @@ test "buildSelect preserves projection order and star/countStar shapes" {
         .offset = null,
         .groupBy = null,
         .having = &.{},
-        .joinTable = null,
-        .joinKind = .inner,
-        .joinOn = null,
         .inQuery = null,
         .existsQuery = null,
         .literalIn = null,

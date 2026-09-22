@@ -3311,7 +3311,7 @@ pub const Connection = struct {
                         }
                     }
                 }
-                sortKeys[keyIndex] = .{ .colIdx = sortIdx orelse return error.UnknownColumn, .descending = ord.descending, .collate = ord.collate };
+                sortKeys[keyIndex] = .{ .colIdx = sortIdx orelse return error.UnknownColumn, .descending = ord.descending, .collate = ord.collate, .nullsFirst = ord.nullsFirst };
             }
             const SortCtx = struct {
                 keys: []const ResolvedSortKey,
@@ -4760,8 +4760,8 @@ pub const Connection = struct {
                 while (gi < groups.items.len) : (gi += 1) {
                     var gj = gi + 1;
                     while (gj < groups.items.len) : (gj += 1) {
-                        const placed = groups.items[gi].key.order(groups.items[gj].key, .binary);
-                        if ((if (ord.descending) placed.invert() else placed) == .gt)
+                        const placed = compareBridge.compareKey(groups.items[gi].key, groups.items[gj].key, ord.descending, ord.nullsFirst, .binary);
+                        if (placed == .gt)
                             std.mem.swap(Group, &groups.items[gi], &groups.items[gj]);
                     }
                 }
@@ -5929,7 +5929,7 @@ pub const Connection = struct {
         const sortKeys = try self.allocator.alloc(ResolvedSortKey, value.orders.len);
         defer self.allocator.free(sortKeys);
         for (value.orders, 0..) |keyOrder, keyIndex| {
-            sortKeys[keyIndex] = .{ .colIdx = resolveOrderColumnIndex(tbl, value.projections, keyOrder.column) orelse try columnIndex(tbl, keyOrder.column), .descending = keyOrder.descending, .collate = keyOrder.collate };
+            sortKeys[keyIndex] = .{ .colIdx = resolveOrderColumnIndex(tbl, value.projections, keyOrder.column) orelse try columnIndex(tbl, keyOrder.column), .descending = keyOrder.descending, .collate = keyOrder.collate, .nullsFirst = keyOrder.nullsFirst };
         }
         var i: usize = 0;
         while (i < orderedIndices.len) : (i += 1) {
@@ -5946,7 +5946,7 @@ pub const Connection = struct {
         const sortKeys = try self.allocator.alloc(ResolvedSortKey, orders.len);
         defer self.allocator.free(sortKeys);
         for (orders, 0..) |ord, keyIndex| {
-            sortKeys[keyIndex] = .{ .colIdx = resolveSortOutputIndex(columns, projections, ord.column) orelse return error.Unsupported, .descending = ord.descending, .collate = ord.collate };
+            sortKeys[keyIndex] = .{ .colIdx = resolveSortOutputIndex(columns, projections, ord.column) orelse return error.Unsupported, .descending = ord.descending, .collate = ord.collate, .nullsFirst = ord.nullsFirst };
         }
         var i: usize = 0;
         while (i < rows.items.len) : (i += 1) {
@@ -6313,8 +6313,7 @@ pub const Connection = struct {
                             const orderParts = splitQualifier(ord.column);
                             const first = try joinRowField(pairs.items[indices[i]], mergedGroups.items, orderParts.qualifier, orderParts.column);
                             const second = try joinRowField(pairs.items[indices[j]], mergedGroups.items, orderParts.qualifier, orderParts.column);
-                            const placed = first.order(second, .binary);
-                            const resolved = if (ord.descending) placed.invert() else placed;
+                            const resolved = compareBridge.compareKey(first, second, ord.descending, ord.nullsFirst, .binary);
                             if (resolved == .eq) continue;
                             swap = resolved == .gt;
                             break;
@@ -6518,8 +6517,8 @@ pub const Connection = struct {
                 while (gi < grouped.items.len) : (gi += 1) {
                     var gj = gi + 1;
                     while (gj < grouped.items.len) : (gj += 1) {
-                        const placed = grouped.items[gi].key.order(grouped.items[gj].key, .binary);
-                        if ((if (ord.descending) placed.invert() else placed) == .gt)
+                        const placed = compareBridge.compareKey(grouped.items[gi].key, grouped.items[gj].key, ord.descending, ord.nullsFirst, .binary);
+                        if (placed == .gt)
                             std.mem.swap(Group, &grouped.items[gi], &grouped.items[gj]);
                     }
                 }
@@ -9238,6 +9237,266 @@ test "autoincrement accepts scoped and explicit keys" {
     defer rb.deinit();
     try std.testing.expectEqual(@as(i64, 1), rb.at(0).id);
     try std.testing.expectEqual(@as(i64, 2), rb.at(1).id);
+}
+
+test "and or pairs flatten with correct precedence" {
+    const tableMod = @import("../dsl/table.zig");
+    const T = tableMod.table("pair_users", struct { id: i64, name: []const u8 });
+    const path = "sqlite_zig_pair_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    try db.createTable(T, .{ .overWrite = true, .primaryKey = T.id });
+    for ([_]struct { id: i64, name: []const u8 }{ .{ .id = 1, .name = "a" }, .{ .id = 2, .name = "b" }, .{ .id = 3, .name = "c" } }) |row| {
+        var ins = try db.from(T).insert(.{ .id = row.id, .name = row.name });
+        ins.deinit();
+    }
+    // Top-level AND pair.
+    var ab = try db.from(T).where(T.id.eq(1).@"and"(T.name.eq("a"))).select(.{.id}).fetch();
+    defer ab.deinit();
+    try std.testing.expectEqual(@as(usize, 1), ab.count());
+    // Top-level OR pair.
+    var ob = try db.from(T).where(T.id.eq(1).@"or"(T.id.eq(3))).select(.{.id}).fetch();
+    defer ob.deinit();
+    try std.testing.expectEqual(@as(usize, 2), ob.count());
+    // OR-pair under AND distributes: id != 2 AND (id == 1 OR id == 2) = {1}.
+    // Naive flattening would give ((id != 2 AND id == 1) OR id == 2) = {1, 2}.
+    var dist = try db.from(T).where(T.id.ne(2)).andWhere(T.id.eq(1).@"or"(T.id.eq(2))).select(.{.id}).fetch();
+    defer dist.deinit();
+    try std.testing.expectEqual(@as(usize, 1), dist.count());
+    try std.testing.expectEqual(@as(i64, 1), dist.rows[0][0].integer);
+    // AND-pair under OR stays grouped: id == 9 OR (id == 1 AND name == "a").
+    var og = try db.from(T).where(T.id.eq(9)).orWhere(T.id.eq(1).@"and"(T.name.eq("a"))).select(.{.id}).fetch();
+    defer og.deinit();
+    try std.testing.expectEqual(@as(usize, 1), og.count());
+    // Pairs work on mutations too.
+    var mu = try (try db.from(T).update(.{ .name = "z" })).where(T.id.eq(2).@"and"(T.name.eq("b"))).execute();
+    mu.deinit();
+    var got = try db.from(T).select(T.all()).where(T.id.eq(2)).fetchOne();
+    defer db.from(T).freeRow(&got);
+    try std.testing.expectEqualStrings("z", got.name);
+}
+
+test "chained multi-join resolves three tables in order" {
+    const tableMod = @import("../dsl/table.zig");
+    const U = tableMod.table("chain_users", struct { id: i64, name: []const u8 });
+    const M = tableMod.table("chain_memberships", struct { user_id: i64, group_id: i64 });
+    const G = tableMod.table("chain_groups", struct { id: i64, title: []const u8 });
+    const path = "sqlite_zig_chain_join_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    try db.createTable(U, .{ .overWrite = true, .primaryKey = U.id });
+    try db.createTable(G, .{ .overWrite = true, .primaryKey = G.id });
+    try db.createTable(M, .{
+        .overWrite = true,
+        .primaryKey = &.{ M.user_id, M.group_id },
+        .foreignKeys = &.{
+            .{ .column = M.user_id, .references = U.id },
+            .{ .column = M.group_id, .references = G.id },
+        },
+    });
+    var iu = try db.from(U).insert(.{ .id = 1, .name = "ann" });
+    iu.deinit();
+    var ig = try db.from(G).insert(.{ .id = 7, .title = "ops" });
+    ig.deinit();
+    var im = try db.from(M).insert(.{ .user_id = 1, .group_id = 7 });
+    im.deinit();
+    // Explicit three-leg chain: users -> memberships -> groups.
+    var rows = try db.from(U).join(M, .inner, U.id.eq(M.user_id)).join(G, .inner, M.group_id.eq(G.id)).select(.{ U.name, G.title }).fetch();
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(usize, 1), rows.count());
+    try std.testing.expectEqualStrings("ann", rows.rows[0][0].text);
+    try std.testing.expectEqualStrings("ops", rows.rows[0][1].text);
+    // Aliased chain keeps alias identity on every leg.
+    const u = tableMod.aliased(U, "u");
+    const m = tableMod.aliased(M, "m");
+    const g = tableMod.aliased(G, "g");
+    var arows = try db.from(u).join(m, .inner, u.id.eq(m.user_id)).join(g, .inner, m.group_id.eq(g.id)).select(.{ u.name, g.title }).fetch();
+    defer arows.deinit();
+    try std.testing.expectEqual(@as(usize, 1), arows.count());
+    try std.testing.expectEqualStrings("ann", arows.rows[0][0].text);
+    // Scoped predicate on the chained root still binds the root table.
+    const q = db.from(U);
+    var srows = try q.where(q.c().id.eq(1)).join(M, .inner, U.id.eq(M.user_id)).join(G, .inner, M.group_id.eq(G.id)).select(.{.id}).fetch();
+    defer srows.deinit();
+    try std.testing.expectEqual(@as(usize, 1), srows.count());
+}
+
+test "scoped star and bare all markers project every column" {
+    const tableMod = @import("../dsl/table.zig");
+    const T = tableMod.table("star_users", struct { id: i64, name: []const u8 });
+    const path = "sqlite_zig_star_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    try db.createTable(T, .{ .overWrite = true, .primaryKey = T.id });
+    var ins = try db.from(T).insert(.{ .id = 1, .name = "ann" });
+    ins.deinit();
+    // Bare explicit marker routes to the mapped star.
+    var mapped = try db.from(T).select(T.all()).fetch();
+    defer mapped.deinit();
+    try std.testing.expectEqual(@as(usize, 1), mapped.count());
+    try std.testing.expectEqualStrings("ann", mapped.at(0).name);
+    // Scoped single and tuple stars project raw rows with every column.
+    var s1 = try db.from(T).select(.all).fetch();
+    defer s1.deinit();
+    try std.testing.expectEqual(@as(usize, 1), s1.count());
+    try std.testing.expectEqual(@as(usize, 2), s1.rows[0].len);
+    var s2 = try db.from(T).select(.{.all}).fetch();
+    defer s2.deinit();
+    try std.testing.expectEqual(@as(usize, 1), s2.count());
+    try std.testing.expectEqualStrings("ann", s2.rows[0][1].text);
+    // Scoped star in RETURNING also renders the native wildcard.
+    var r = try (try db.from(T).returning(.all).update(.{ .name = "ann2" })).where(T.id.eq(1)).execute();
+    defer r.deinit();
+    try std.testing.expectEqual(@as(usize, 1), r.count());
+    // Bare single explicit column in RETURNING (previously a compile error).
+    var r2 = try (try db.from(T).returning(T.name).update(.{ .name = "ann3" })).where(T.id.eq(1)).execute();
+    defer r2.deinit();
+    try std.testing.expectEqual(@as(usize, 1), r2.count());
+}
+
+test "scoped assigns and aliases flow through writes" {
+    const tableMod = @import("../dsl/table.zig");
+    const T = tableMod.table("cass_users", struct { id: i64, name: []const u8 });
+    const path = "sqlite_zig_cassign_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    try db.createTable(T, .{ .overWrite = true, .primaryKey = T.id });
+    var ins = try db.from(T).insert(.{ .id = 1, .name = "a" });
+    ins.deinit();
+    // Scoped assign through the columns value, incl. arithmetic on itself.
+    const q = db.from(T);
+    var uw = try (try q.update(.{q.c().name.set("b")})).where(q.c().id.eq(1)).execute();
+    uw.deinit();
+    var ux = try (try db.from(T).update(.{q.c().id.set(q.c().id.add(10))})).where(T.name.eq("b")).execute();
+    ux.deinit();
+    var got = try db.from(T).select(T.all()).fetchOne();
+    defer db.from(T).freeRow(&got);
+    try std.testing.expectEqual(@as(i64, 11), got.id);
+    try std.testing.expectEqualStrings("b", got.name);
+    // Expression alias on an aliased column.
+    const u = tableMod.aliased(T, "u");
+    var ar = try db.from(u).select(.{u.name.as("displayName")}).fetch();
+    defer ar.deinit();
+    try std.testing.expectEqual(@as(usize, 1), ar.count());
+    try std.testing.expectEqualStrings("b", ar.rows[0][0].text);
+}
+
+test "dynamic columns interoperate with typed builders" {
+    const tableMod = @import("../dsl/table.zig");
+    const T = tableMod.table("interop_users", struct { id: i64, name: []const u8 });
+    const path = "sqlite_zig_interop_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    try db.createTable(T, .{ .overWrite = true, .primaryKey = T.id });
+    var ins = try db.from(T).insert(.{ .id = 1, .name = "ann" });
+    ins.deinit();
+    const dyn = db.table("interop_users");
+    // Dynamic predicate inside a typed query over the same table.
+    var rows = try db.from(T).where(dyn.column("id").eq(1)).select(.{.name}).fetch();
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(usize, 1), rows.count());
+    // Dynamic table joins a typed table; schema relationship is explicit.
+    var jrows = try db.from(T).innerJoin(dyn, dyn.column("id").eq(T.id)).select(.{T.name}).fetch();
+    defer jrows.deinit();
+    try std.testing.expectEqual(@as(usize, 1), jrows.count());
+}
+
+test "composite scoped conflict targets resolve" {
+    const tableMod = @import("../dsl/table.zig");
+    const T = tableMod.table("cconf", struct { country: []const u8, email: []const u8, n: i64 });
+    const path = "sqlite_zig_cconf_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    try db.createTable(T, .{
+        .overWrite = true,
+        .unique = &.{&.{ T.country, T.email }},
+    });
+    var s = try db.from(T).insert(.{ .country = "us", .email = "a@x.y", .n = 1 });
+    s.deinit();
+    var up = try (try db.from(T).onConflict(.{ .country, .email }).doUpdate(.{ .n = 2 })).insert(.{ .country = "us", .email = "a@x.y", .n = 9 });
+    up.deinit();
+    var got = try db.from(T).select(T.all()).fetchOne();
+    defer db.from(T).freeRow(&got);
+    try std.testing.expectEqual(@as(i64, 2), got.n);
+    var up2 = try (try db.from(T).onConflict(.{ T.country, T.email }).doUpdate(.{T.n.set(3)})).insert(.{ .country = "us", .email = "a@x.y", .n = 9 });
+    up2.deinit();
+    var got2 = try db.from(T).select(T.all()).fetchOne();
+    defer db.from(T).freeRow(&got2);
+    try std.testing.expectEqual(@as(i64, 3), got2.n);
+}
+
+test "unique and index keys accept scoped pointer forms" {
+    const tableMod = @import("../dsl/table.zig");
+    const T = tableMod.table("ptr_keys", struct { id: i64, email: []const u8 });
+    const path = "sqlite_zig_ptr_keys_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    try db.createTable(T, .{ .overWrite = true, .primaryKey = .id, .unique = &.{.email} });
+    try db.schema(T).validate();
+    try db.createIndex(T, "ptr_keys_email", .{.email}, false);
+    try db.createIndex(T, "ptr_keys_id_email", .{ T.id, T.email }, false);
+    var ok = try db.from(T).insert(.{ .id = 1, .email = "a@x.y" });
+    ok.deinit();
+    const dup = db.from(T).insert(.{ .id = 2, .email = "a@x.y" });
+    try std.testing.expectError(error.ConstraintViolation, dup);
+}
+
+test "nulls ordering follows explicit overrides and sqlite defaults" {
+    const tableMod = @import("../dsl/table.zig");
+    const T = tableMod.table("nullord", struct { id: i64, v: ?i64 });
+    const path = "sqlite_zig_nullord_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    try db.createTable(T, .{ .overWrite = true, .primaryKey = T.id });
+    const seedVals = [_]?i64{ 2, null, 1 };
+    for (seedVals, 0..) |val, i| {
+        var ins = try db.from(T).insert(.{ .id = @as(i64, @intCast(i + 1)), .v = val });
+        ins.deinit();
+    }
+    // Raw SQL: defaults (NULL smallest) plus all four explicit combos.
+    const cases = [_]struct { sql: []const u8, first: ?i64, last: ?i64 }{
+        .{ .sql = "SELECT v FROM nullord ORDER BY v;", .first = null, .last = 2 },
+        .{ .sql = "SELECT v FROM nullord ORDER BY v DESC;", .first = 2, .last = null },
+        .{ .sql = "SELECT v FROM nullord ORDER BY v ASC NULLS LAST;", .first = 1, .last = null },
+        .{ .sql = "SELECT v FROM nullord ORDER BY v DESC NULLS FIRST;", .first = null, .last = 1 },
+        .{ .sql = "SELECT v FROM nullord ORDER BY v ASC NULLS FIRST;", .first = null, .last = 2 },
+        .{ .sql = "SELECT v FROM nullord ORDER BY v DESC NULLS LAST;", .first = 2, .last = null },
+    };
+    inline for (cases) |c| {
+        var r = try db.exec(c.sql);
+        defer r.deinit();
+        try std.testing.expectEqual(@as(usize, 3), r.count());
+        if (c.first) |fv| {
+            try std.testing.expectEqual(fv, r.rows[0][0].integer);
+        } else {
+            try std.testing.expect(r.rows[0][0] == .null);
+        }
+        if (c.last) |lv| {
+            try std.testing.expectEqual(lv, r.rows[2][0].integer);
+        } else {
+            try std.testing.expect(r.rows[2][0] == .null);
+        }
+    }
+    // Typed DSL: same orderings through native sort keys.
+    var d1 = try db.from(T).orderBy(T.v.asc()).select(.{.v}).fetch();
+    defer d1.deinit();
+    try std.testing.expect(d1.rows[0][0] == .null);
+    var d2 = try db.from(T).orderBy(T.v.desc()).select(.{.v}).fetch();
+    defer d2.deinit();
+    try std.testing.expect(d2.rows[2][0] == .null);
+    var d3 = try db.from(T).orderBy(T.v.asc().withNullsLast()).select(.{.v}).fetch();
+    defer d3.deinit();
+    try std.testing.expect(d3.rows[2][0] == .null);
+    try std.testing.expectEqual(@as(i64, 1), d3.rows[0][0].integer);
+    var d4 = try db.from(T).orderBy(T.v.desc().withNullsFirst()).select(.{.v}).fetch();
+    defer d4.deinit();
+    try std.testing.expect(d4.rows[0][0] == .null);
+    try std.testing.expectEqual(@as(i64, 1), d4.rows[2][0].integer);
+    // Dynamic builder honors the same overrides.
+    const dyn = db.table("nullord");
+    var d5 = try dyn.select(dyn.column("v")).orderBy(dyn.column("v").asc().withNullsLast()).fetch();
+    defer d5.deinit();
+    try std.testing.expect(d5.rows[2][0] == .null);
 }
 
 test "scoped upsert returning and delete share one model" {

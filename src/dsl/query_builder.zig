@@ -168,6 +168,97 @@ fn checkAssignScope(comptime Col: type, table: []const u8, tableAlias: ?[]const 
     return error.UnknownColumn;
 }
 
+/// Append one predicate to a condition slice with the given OR-join flag.
+/// The first element's flag is engine-ignored; callers keep the historical
+/// shape (false) so existing single-predicate behavior is untouched.
+fn appendCond(conds: []ConditionEntry, count: *usize, expr: Expr, joinOr: bool) void {
+    if (count.* >= conds.len) @panic("too many DSL predicates");
+    conds[count.*] = .{ .expr = expr, .joinOr = if (count.* == 0) false else joinOr };
+    count.* += 1;
+}
+
+/// Distribute `L AND (a OR b)` over the existing AND-groups of a condition
+/// slice as `(L1 AND a) OR (L1 AND b) OR ...`, valid in Kleene three-valued
+/// logic, so SQL AND-binds-tighter precedence evaluates the intended
+/// grouping. DSL predicates are pure, so duplicating them is side-effect
+/// free. Panics on overflow like every other condition-limit path.
+fn distributeOr(conds: []ConditionEntry, count: *usize, pair: dslExpr.ExprPair) void {
+    var starts: [17]usize = undefined;
+    var ngroups: usize = 1;
+    starts[0] = 0;
+    var i: usize = 1;
+    while (i < count.*) : (i += 1) {
+        if (conds[i].joinOr) {
+            if (ngroups >= starts.len - 1) @panic("too many DSL predicates");
+            starts[ngroups] = i;
+            ngroups += 1;
+        }
+    }
+    var tmp: [16]ConditionEntry = undefined;
+    var n: usize = 0;
+    const members = [_]Expr{ pair.first, pair.second };
+    var gi: usize = 0;
+    while (gi < ngroups) : (gi += 1) {
+        const gend = if (gi + 1 < ngroups) starts[gi + 1] else count.*;
+        for (members) |pm| {
+            const boundary = n != 0;
+            var k: usize = starts[gi];
+            while (k < gend) : (k += 1) {
+                if (n >= conds.len) @panic("too many DSL predicates");
+                tmp[n] = .{ .expr = conds[k].expr, .joinOr = boundary and k == starts[gi] };
+                n += 1;
+            }
+            if (n >= conds.len) @panic("too many DSL predicates");
+            tmp[n] = .{ .expr = pm, .joinOr = boundary and gend == starts[gi] };
+            n += 1;
+        }
+    }
+    std.mem.copyForwards(ConditionEntry, conds[0..n], tmp[0..n]);
+    count.* = n;
+}
+
+/// Append one predicate-or-pair in an AND-context (`andWhere`): AND-pairs
+/// append directly (associative, always sound); OR-pairs distribute.
+fn appendAnd(conds: []ConditionEntry, count: *usize, cond: anytype) void {
+    const T = @TypeOf(cond);
+    if (T == dslExpr.ExprPair) {
+        if (!cond.joinOr) {
+            appendCond(conds, count, cond.first, false);
+            appendCond(conds, count, cond.second, false);
+        } else {
+            distributeOr(conds, count, cond);
+        }
+        return;
+    }
+    if (T == Expr) {
+        appendCond(conds, count, cond, false);
+        return;
+    }
+    @compileError("where() takes a predicate such as User.id.eq(1) or an and/or pair");
+}
+
+/// Append one predicate-or-pair in an OR-context (`orWhere`): SQL
+/// precedence keeps AND-pairs grouped, so straight appends are sound.
+fn appendOr(conds: []ConditionEntry, count: *usize, cond: anytype) void {
+    const T = @TypeOf(cond);
+    if (T == dslExpr.ExprPair) {
+        appendCond(conds, count, cond.first, true);
+        appendCond(conds, count, cond.second, cond.joinOr);
+        return;
+    }
+    if (T == Expr) {
+        appendCond(conds, count, cond, true);
+        return;
+    }
+    @compileError("where() takes a predicate such as User.id.eq(1) or an and/or pair");
+}
+
+/// Reset a condition slice to one predicate-or-pair (`where` semantics).
+fn storeWhere(conds: []ConditionEntry, count: *usize, cond: anytype) void {
+    count.* = 0;
+    appendAnd(conds, count, cond);
+}
+
 fn destSqlFor(comptime Columns: type, want: []const u8) ?[]const u8 {
     inline for (@typeInfo(Columns).@"struct".fields) |colField| {
         if (std.mem.eql(u8, colField.name, want)) return colField.type.dslName;
@@ -214,6 +305,25 @@ pub fn tableNameOf(other: anytype) []const u8 {
 /// Borrowed join target identity: name plus optional schema/alias.
 pub const JoinTarget = struct { name: []const u8, schema: []const u8 = "", alias: ?[]const u8 = null };
 
+/// One chained join leg on a `Builder`: borrowed table identity plus the
+/// join condition in exactly one form (`on` predicate, `usingCols`,
+/// `natural`, or cross). Legs append in call order and lower left to right,
+/// so `db.from(u).join(m, ...).join(g, ...)` chains `users → m → g`.
+/// All slices borrowed from the caller/targets.
+pub const JoinSpec = struct {
+    table: []const u8,
+    schema: []const u8 = "",
+    alias: ?[]const u8 = null,
+    kind: JoinKind = .inner,
+    on: ?Expr = null,
+    usingCols: [8][]const u8 = undefined,
+    usingCount: usize = 0,
+    natural: bool = false,
+};
+
+/// Maximum chained joins per query builder (matches snapshot capacity).
+pub const maxJoins = 4;
+
 /// Resolve a join target value into a borrowed `JoinTarget`. Accepts typed
 /// table values, `DynamicTable`s, table types, and plain name strings.
 pub fn joinTargetOf(other: anytype) JoinTarget {
@@ -243,7 +353,7 @@ fn containsAllMarker(comptime T: type) bool {
 /// Builder type returned by `select(cols)`: mapped (`selectAll`/star present)
 /// when `T` contains an `AllProjection` marker, unmapped otherwise.
 pub fn SelectOut(comptime Row: type, comptime Columns: type, comptime T: type) type {
-    if (containsAllMarker(T)) return Builder(Row, Columns, true);
+    if (T == tableMod.AllProjection or containsAllMarker(T)) return Builder(Row, Columns, true);
     return Builder(Row, Columns, false);
 }
 
@@ -347,14 +457,8 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
         havingCount: usize = 0,
         havingValid: bool = true,
 
-        joinTable: ?[]const u8 = null,
-        joinSchema: []const u8 = "",
-        joinAlias: ?[]const u8 = null,
-        joinKind: JoinKind = .inner,
-        joinOn: ?Expr = null,
-        joinUsingCols: [8][]const u8 = undefined,
-        joinUsingCount: usize = 0,
-        joinNatural: bool = false,
+        joins: [maxJoins]JoinSpec = undefined,
+        joinCount: usize = 0,
 
         inQuery: ?InQuery = null,
         existsQuery: ?ExistsQuery = null,
@@ -475,14 +579,8 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
                 .havingEntries = self.havingEntries,
                 .havingCount = self.havingCount,
                 .havingValid = self.havingValid,
-                .joinTable = self.joinTable,
-                .joinSchema = self.joinSchema,
-                .joinAlias = self.joinAlias,
-                .joinKind = self.joinKind,
-                .joinOn = self.joinOn,
-                .joinUsingCols = self.joinUsingCols,
-                .joinUsingCount = self.joinUsingCount,
-                .joinNatural = self.joinNatural,
+                .joins = self.joins,
+                .joinCount = self.joinCount,
                 .inQuery = self.inQuery,
                 .existsQuery = self.existsQuery,
                 .literalIn = self.literalIn,
@@ -501,12 +599,26 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
             if (comptime containsAllMarker(@TypeOf(cols))) {
                 return self.selectAll();
             }
+            // Bare `select(User.all())`: the AllProjection value routes to
+            // the native star like its tuple form does.
+            if (comptime @TypeOf(cols) == tableMod.AllProjection) {
+                return self.selectAll();
+            }
             var copy = self.retype(false);
             copy.allColumns = false;
             copy.projectionCount = 0;
             copy.caseCount = 0;
             copy.windowCount = 0;
             const T = @TypeOf(cols);
+            // Scoped star (`select(.all)`): the root table's native
+            // all-columns node in place (raw rows, like every other
+            // single-scoped select), unless the row declares a real `all`
+            // column (which wins as an ordinary scoped field per the
+            // collision rule). `selectAll()`/`User.all()` stay the mapped
+            // spellings.
+            if (T == scopeMod.EnumLiteral and comptime scopeMod.isScopedAll(T, Row, cols)) {
+                return copy.selectOneStar();
+            }
             if (T == Projection or T == columnMod.DynamicColumn or comptime isTypedColumnInstance(T) or T == CaseBuilder or T == WindowBuilder) {
                 return copy.selectOne(cols);
             }
@@ -526,6 +638,13 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
                     continue;
                 }
                 if (copy.projectionCount >= copy.projections.len) @panic("too many DSL projections");
+                // A scoped `.all` anywhere in the list appends the native
+                // star node (never silently dropped, never a string).
+                if (@TypeOf(item) == scopeMod.EnumLiteral and comptime scopeMod.isScopedAll(@TypeOf(item), Row, item)) {
+                    copy.projections[copy.projectionCount] = .{ .kind = .star };
+                    copy.projectionCount += 1;
+                    continue;
+                }
                 // Scoped (`.id`) and explicit (`Table.id`) items mix freely;
                 // both converge on the same native projection.
                 if (Row != void and comptime scopeMod.isScopedItem(@TypeOf(item), Row)) {
@@ -536,6 +655,14 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
                 copy.projectionCount += 1;
             }
             if (copy.projectionCount == 0) @panic("select() requires at least one column");
+            return copy;
+        }
+
+        /// Single native star projection (`select(.all)`).
+        fn selectOneStar(self: Builder(Row, Columns, false)) Builder(Row, Columns, false) {
+            var copy = self;
+            copy.projections[copy.projectionCount] = .{ .kind = .star };
+            copy.projectionCount += 1;
             return copy;
         }
 
@@ -573,13 +700,29 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
             if (comptime @TypeOf(cols) == tableMod.AllOpFn) @compileError("use User.all() (call it) for RETURNING all columns");
             var copy = self;
             copy.returningCount = 0;
+            const T = @TypeOf(cols);
+            // Single items (a bare column, star marker, or scoped field)
+            // project exactly one RETURNING expression.
+            if (T == Projection or T == columnMod.DynamicColumn or T == tableMod.AllProjection or comptime isTypedColumnInstance(T)) {
+                copy.returningCols[0] = toProjection(cols);
+                copy.returningCount = 1;
+                return copy;
+            }
+            // Scoped star (`returning(.all)` → native star node) wins over
+            // plain scoped fields, since `.all` would otherwise resolve as
+            // a (nonexistent) column.
+            if (T == scopeMod.EnumLiteral and comptime scopeMod.isScopedAll(T, Row, cols)) {
+                copy.returningCols[0] = .{ .kind = .star };
+                copy.returningCount = 1;
+                return copy;
+            }
             // Scoped single field (`returning(.id)`).
-            if (Row != void and comptime scopeMod.isScopedItem(@TypeOf(cols), Row)) {
+            if (Row != void and comptime scopeMod.isScopedItem(T, Row)) {
                 copy.returningCols[0] = copy.scopedProjection(cols);
                 copy.returningCount = 1;
                 return copy;
             }
-            const items = if (@typeInfo(@TypeOf(cols)) == .pointer) cols.* else cols;
+            const items = if (@typeInfo(T) == .pointer) cols.* else cols;
             inline for (items) |item| {
                 if (@TypeOf(item) == CaseBuilder) {
                     storeCaseProjection(&copy.cases, &copy.caseCount, copy.returningCols[0..], &copy.returningCount, item);
@@ -587,7 +730,9 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
                 }
                 if (@TypeOf(item) == WindowBuilder) @panic("window functions are not supported in RETURNING");
                 if (copy.returningCount >= copy.returningCols.len) @panic("too many DSL returning columns");
-                if (Row != void and comptime scopeMod.isScopedItem(@TypeOf(item), Row)) {
+                if (@TypeOf(item) == scopeMod.EnumLiteral and comptime scopeMod.isScopedAll(@TypeOf(item), Row, item)) {
+                    copy.returningCols[copy.returningCount] = .{ .kind = .star };
+                } else if (Row != void and comptime scopeMod.isScopedItem(@TypeOf(item), Row)) {
                     copy.returningCols[copy.returningCount] = copy.scopedProjection(item);
                 } else {
                     copy.returningCols[copy.returningCount] = toProjection(item);
@@ -606,36 +751,29 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
             return copy;
         }
 
-        pub fn where(self: Self, condition: Expr) Self {
+        /// Set the WHERE predicate, replacing any staged conditions. Accepts
+        /// one predicate (`User.id.eq(1)`) or an and/or pair, which flattens
+        /// (`a.and(b)` → `a AND b`; `a.or(b)` → `a OR b`).
+        pub fn where(self: Self, condition: anytype) Self {
             var copy = self;
-            copy.conditions[0] = .{ .expr = condition };
-            copy.conditionCount = 1;
+            storeWhere(copy.conditions[0..], &copy.conditionCount, condition);
             return copy;
         }
 
-        pub fn andWhere(self: Self, condition: Expr) Self {
+        /// Add an AND-context predicate or pair. OR-pairs distribute over
+        /// the staged AND-groups, so `where(x).andWhere(a.or(b))` means
+        /// `x AND (a OR b)` under SQL precedence.
+        pub fn andWhere(self: Self, condition: anytype) Self {
             var copy = self;
-            if (copy.conditionCount >= copy.conditions.len) @panic("too many DSL predicates");
-            if (copy.conditionCount == 0) {
-                copy.conditions[0] = .{ .expr = condition };
-                copy.conditionCount = 1;
-                return copy;
-            }
-            copy.conditions[copy.conditionCount] = .{ .expr = condition, .joinOr = false };
-            copy.conditionCount += 1;
+            appendAnd(copy.conditions[0..], &copy.conditionCount, condition);
             return copy;
         }
 
-        pub fn orWhere(self: Self, condition: Expr) Self {
+        /// Add an OR-context predicate or pair. AND-pairs stay grouped by
+        /// SQL precedence (`x OR (a AND b)`), so straight appends are sound.
+        pub fn orWhere(self: Self, condition: anytype) Self {
             var copy = self;
-            if (copy.conditionCount >= copy.conditions.len) @panic("too many DSL predicates");
-            if (copy.conditionCount == 0) {
-                copy.conditions[0] = .{ .expr = condition };
-                copy.conditionCount = 1;
-                return copy;
-            }
-            copy.conditions[copy.conditionCount] = .{ .expr = condition, .joinOr = true };
-            copy.conditionCount += 1;
+            appendOr(copy.conditions[0..], &copy.conditionCount, condition);
             return copy;
         }
 
@@ -841,29 +979,35 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
         pub fn fullJoin(self: Self, other: anytype, on: Expr) Self {
             return self.joinAs(other, on, .full);
         }
+        fn appendJoin(self: *Self, spec: JoinSpec) *JoinSpec {
+            if (self.joinCount >= self.joins.len) @panic("too many chained joins");
+            self.joins[self.joinCount] = spec;
+            self.joinCount += 1;
+            return &self.joins[self.joinCount - 1];
+        }
+
         pub fn crossJoin(self: Self, other: anytype) Self {
             var copy = self;
             const target = joinTargetOf(other);
-            copy.joinTable = target.name;
-            copy.joinSchema = target.schema;
-            copy.joinAlias = target.alias;
-            copy.joinKind = .cross;
-            copy.joinOn = null;
-            copy.joinUsingCount = 0;
-            copy.joinNatural = false;
+            _ = copy.appendJoin(.{
+                .table = target.name,
+                .schema = target.schema,
+                .alias = target.alias,
+                .kind = .cross,
+            });
             return copy;
         }
 
         fn joinAs(self: Self, other: anytype, on: Expr, kind: JoinKind) Self {
             var copy = self;
             const target = joinTargetOf(other);
-            copy.joinTable = target.name;
-            copy.joinSchema = target.schema;
-            copy.joinAlias = target.alias;
-            copy.joinKind = kind;
-            copy.joinOn = on;
-            copy.joinUsingCount = 0;
-            copy.joinNatural = false;
+            _ = copy.appendJoin(.{
+                .table = target.name,
+                .schema = target.schema,
+                .alias = target.alias,
+                .kind = kind,
+                .on = on,
+            });
             return copy;
         }
 
@@ -883,41 +1027,40 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
         fn joinUsingAs(self: Self, other: anytype, col: anytype, kind: JoinKind) Self {
             var copy = self;
             const target = joinTargetOf(other);
-            copy.joinTable = target.name;
-            copy.joinSchema = target.schema;
-            copy.joinAlias = target.alias;
-            copy.joinKind = kind;
-            copy.joinOn = null;
-            copy.joinNatural = false;
-            copy.joinUsingCount = 0;
+            const leg = copy.appendJoin(.{
+                .table = target.name,
+                .schema = target.schema,
+                .alias = target.alias,
+                .kind = kind,
+            });
             const T = @TypeOf(col);
             if (T == columnMod.DynamicColumn) {
-                copy.joinUsingCols[0] = columnMod.dynRef(col).name;
-                copy.joinUsingCount = 1;
+                leg.usingCols[0] = columnMod.dynRef(col).name;
+                leg.usingCount = 1;
             } else if (comptime isTypedColumnInstance(T)) {
-                copy.joinUsingCols[0] = T.dslName;
-                copy.joinUsingCount = 1;
+                leg.usingCols[0] = T.dslName;
+                leg.usingCount = 1;
             } else if (Row != void and comptime scopeMod.isScopedItem(T, Row)) {
                 // Scoped single (`joinUsing(Member, .user_id)`): USING names
                 // are bare by SQL rules; scope only maps zig to sql names.
-                copy.joinUsingCols[0] = copy.scopedRef(col).name;
-                copy.joinUsingCount = 1;
+                leg.usingCols[0] = copy.scopedRef(col).name;
+                leg.usingCount = 1;
             } else if (comptime @typeInfo(T) == .@"struct" and @typeInfo(T).@"struct".is_tuple) {
                 inline for (col) |item| {
-                    if (copy.joinUsingCount >= copy.joinUsingCols.len) @panic("too many USING columns");
+                    if (leg.usingCount >= leg.usingCols.len) @panic("too many USING columns");
                     const IT = @TypeOf(item);
                     if (IT == columnMod.DynamicColumn) {
-                        copy.joinUsingCols[copy.joinUsingCount] = columnMod.dynRef(item).name;
+                        leg.usingCols[leg.usingCount] = columnMod.dynRef(item).name;
                     } else if (comptime isTypedColumnInstance(IT)) {
-                        copy.joinUsingCols[copy.joinUsingCount] = IT.dslName;
+                        leg.usingCols[leg.usingCount] = IT.dslName;
                     } else if (Row != void and comptime scopeMod.isScopedItem(IT, Row)) {
-                        copy.joinUsingCols[copy.joinUsingCount] = copy.scopedRef(item).name;
+                        leg.usingCols[leg.usingCount] = copy.scopedRef(item).name;
                     } else {
                         @compileError("joinUsing columns must be column descriptors or scoped fields such as .user_id");
                     }
-                    copy.joinUsingCount += 1;
+                    leg.usingCount += 1;
                 }
-                if (copy.joinUsingCount == 0) @panic("joinUsing requires at least one column");
+                if (leg.usingCount == 0) @panic("joinUsing requires at least one column");
             } else {
                 @compileError("joinUsing column must be a column descriptor, a scoped field, or a tuple of those");
             }
@@ -940,13 +1083,13 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
         fn naturalAs(self: Self, other: anytype, kind: JoinKind) Self {
             var copy = self;
             const target = joinTargetOf(other);
-            copy.joinTable = target.name;
-            copy.joinSchema = target.schema;
-            copy.joinAlias = target.alias;
-            copy.joinKind = kind;
-            copy.joinOn = null;
-            copy.joinUsingCount = 0;
-            copy.joinNatural = true;
+            _ = copy.appendJoin(.{
+                .table = target.name,
+                .schema = target.schema,
+                .alias = target.alias,
+                .kind = kind,
+                .natural = true,
+            });
             return copy;
         }
 
@@ -1858,14 +2001,8 @@ const SelectSnapshot = struct {
     havingEntries: [8]astBuilder.HavingEntry = undefined,
     havingCount: usize = 0,
     havingValid: bool = true,
-    joinTable: ?[]const u8 = null,
-    joinSchema: []const u8 = "",
-    joinAlias: ?[]const u8 = null,
-    joinKind: JoinKind = .inner,
-    joinOn: ?Expr = null,
-    joinUsingCols: [8][]const u8 = undefined,
-    joinUsingCount: usize = 0,
-    joinNatural: bool = false,
+    joins: [maxJoins]JoinSpec = undefined,
+    joinCount: usize = 0,
     inQuery: ?InQuery = null,
     existsQuery: ?ExistsQuery = null,
     literalIn: ?LiteralIn = null,
@@ -1898,14 +2035,8 @@ const SubSnapshot = struct {
     havingEntries: [8]astBuilder.HavingEntry = undefined,
     havingCount: usize = 0,
     havingValid: bool = true,
-    joinTable: ?[]const u8 = null,
-    joinSchema: []const u8 = "",
-    joinAlias: ?[]const u8 = null,
-    joinKind: JoinKind = .inner,
-    joinOn: ?Expr = null,
-    joinUsingCols: [8][]const u8 = undefined,
-    joinUsingCount: usize = 0,
-    joinNatural: bool = false,
+    joins: [maxJoins]JoinSpec = undefined,
+    joinCount: usize = 0,
     inQuery: ?InQuery = null,
     existsQuery: ?ExistsQuery = null,
     literalIn: ?LiteralIn = null,
@@ -1940,14 +2071,8 @@ fn snapshotSelect(source: anytype, comptime allowSubquery: bool) SelectSnapshot 
         .havingEntries = source.havingEntries,
         .havingCount = source.havingCount,
         .havingValid = source.havingValid,
-        .joinTable = source.joinTable,
-        .joinSchema = source.joinSchema,
-        .joinAlias = source.joinAlias,
-        .joinKind = source.joinKind,
-        .joinOn = source.joinOn,
-        .joinUsingCols = source.joinUsingCols,
-        .joinUsingCount = source.joinUsingCount,
-        .joinNatural = source.joinNatural,
+        .joins = source.joins,
+        .joinCount = source.joinCount,
         .inQuery = source.inQuery,
         .existsQuery = source.existsQuery,
         .literalIn = source.literalIn,
@@ -1982,14 +2107,8 @@ fn snapshotSub(source: anytype) SubSnapshot {
         .havingEntries = source.havingEntries,
         .havingCount = source.havingCount,
         .havingValid = source.havingValid,
-        .joinTable = source.joinTable,
-        .joinSchema = source.joinSchema,
-        .joinAlias = source.joinAlias,
-        .joinKind = source.joinKind,
-        .joinOn = source.joinOn,
-        .joinUsingCols = source.joinUsingCols,
-        .joinUsingCount = source.joinUsingCount,
-        .joinNatural = source.joinNatural,
+        .joins = source.joins,
+        .joinCount = source.joinCount,
         .inQuery = source.inQuery,
         .existsQuery = source.existsQuery,
         .literalIn = source.literalIn,
@@ -2024,14 +2143,8 @@ fn selectFromSub(sub: *const SubSnapshot) SelectSnapshot {
         .havingEntries = sub.havingEntries,
         .havingCount = sub.havingCount,
         .havingValid = sub.havingValid,
-        .joinTable = sub.joinTable,
-        .joinSchema = sub.joinSchema,
-        .joinAlias = sub.joinAlias,
-        .joinKind = sub.joinKind,
-        .joinOn = sub.joinOn,
-        .joinUsingCols = sub.joinUsingCols,
-        .joinUsingCount = sub.joinUsingCount,
-        .joinNatural = sub.joinNatural,
+        .joins = sub.joins,
+        .joinCount = sub.joinCount,
         .inQuery = sub.inQuery,
         .existsQuery = sub.existsQuery,
         .literalIn = sub.literalIn,
@@ -2044,6 +2157,18 @@ fn selectFromSub(sub: *const SubSnapshot) SelectSnapshot {
 fn buildSnapshotSelect(allocator: std.mem.Allocator, snapshot: *const SelectSnapshot) !astBuilder.BuiltStatement {
     var literalIn: ?astBuilder.LiteralInArgs = null;
     if (snapshot.literalIn) |entry| literalIn = .{ .column = entry.column, .values = entry.values[0..entry.count], .negated = entry.negated };
+    var joinArgs: [maxJoins]astBuilder.JoinArgs = undefined;
+    for (snapshot.joins[0..snapshot.joinCount], 0..) |leg, i| {
+        joinArgs[i] = .{
+            .table = leg.table,
+            .schema = leg.schema,
+            .alias = leg.alias,
+            .kind = leg.kind,
+            .on = leg.on,
+            .usingCols = leg.usingCols[0..leg.usingCount],
+            .natural = leg.natural,
+        };
+    }
     return astBuilder.buildSelect(allocator, .{
         .table = snapshot.table,
         .schema = snapshot.schema,
@@ -2061,13 +2186,7 @@ fn buildSnapshotSelect(allocator: std.mem.Allocator, snapshot: *const SelectSnap
         .groupBy = snapshot.groupByColumn,
         .having = snapshot.havingEntries[0..snapshot.havingCount],
         .havingValid = snapshot.havingValid,
-        .joinTable = snapshot.joinTable,
-        .joinSchema = snapshot.joinSchema,
-        .joinAlias = snapshot.joinAlias,
-        .joinKind = snapshot.joinKind,
-        .joinOn = snapshot.joinOn,
-        .joinUsingCols = snapshot.joinUsingCols[0..snapshot.joinUsingCount],
-        .joinNatural = snapshot.joinNatural,
+        .joins = joinArgs[0..snapshot.joinCount],
         .inQuery = snapshot.inQuery,
         .existsQuery = snapshot.existsQuery,
         .literalIn = literalIn,
@@ -2164,28 +2283,21 @@ pub fn UpsertBuilder(comptime Row: type, comptime Columns: type) type {
             return copy;
         }
 
-        pub fn where(self: Self, condition: Expr) Self {
+        pub fn where(self: Self, condition: anytype) Self {
             var copy = self;
-            copy.upsertConds[0] = .{ .expr = condition };
-            copy.upsertCondCount = 1;
+            storeWhere(copy.upsertConds[0..], &copy.upsertCondCount, condition);
             return copy;
         }
 
-        pub fn andWhere(self: Self, condition: Expr) Self {
+        pub fn andWhere(self: Self, condition: anytype) Self {
             var copy = self;
-            if (copy.upsertCondCount >= copy.upsertConds.len) @panic("too many upsert predicates");
-            if (copy.upsertCondCount == 0) return copy.where(condition);
-            copy.upsertConds[copy.upsertCondCount] = .{ .expr = condition, .joinOr = false };
-            copy.upsertCondCount += 1;
+            appendAnd(copy.upsertConds[0..], &copy.upsertCondCount, condition);
             return copy;
         }
 
-        pub fn orWhere(self: Self, condition: Expr) Self {
+        pub fn orWhere(self: Self, condition: anytype) Self {
             var copy = self;
-            if (copy.upsertCondCount >= copy.upsertConds.len) @panic("too many upsert predicates");
-            if (copy.upsertCondCount == 0) return copy.where(condition);
-            copy.upsertConds[copy.upsertCondCount] = .{ .expr = condition, .joinOr = true };
-            copy.upsertCondCount += 1;
+            appendOr(copy.upsertConds[0..], &copy.upsertCondCount, condition);
             return copy;
         }
 
@@ -2216,14 +2328,27 @@ pub fn UpsertBuilder(comptime Row: type, comptime Columns: type) type {
             if (comptime @TypeOf(cols) == tableMod.AllOpFn) @compileError("use User.all() (call it) for RETURNING all columns");
             var copy = self;
             copy.returningCount = 0;
+            const T = @TypeOf(cols);
+            // Single items project exactly one RETURNING expression.
+            if (T == Projection or T == columnMod.DynamicColumn or T == tableMod.AllProjection or comptime isTypedColumnInstance(T)) {
+                copy.returningCols[0] = toProjection(cols);
+                copy.returningCount = 1;
+                return copy;
+            }
+            // Scoped star (`returning(.all)`) wins over plain scoped fields.
+            if (T == scopeMod.EnumLiteral and comptime scopeMod.isScopedAll(T, Row, cols)) {
+                copy.returningCols[0] = .{ .kind = .star };
+                copy.returningCount = 1;
+                return copy;
+            }
             // Scoped single field (`returning(.id)`): resolves against the
             // upsert's target table.
-            if (Row != void and comptime scopeMod.isScopedItem(@TypeOf(cols), Row)) {
+            if (Row != void and comptime scopeMod.isScopedItem(T, Row)) {
                 copy.returningCols[0] = .{ .kind = .column, .column = scopeMod.resolveRef(Row, Columns, scopeMod.builderScope(self.table, self.tableAlias), cols) };
                 copy.returningCount = 1;
                 return copy;
             }
-            const items = if (@typeInfo(@TypeOf(cols)) == .pointer) cols.* else cols;
+            const items = if (@typeInfo(T) == .pointer) cols.* else cols;
             inline for (items) |item| {
                 if (@TypeOf(item) == CaseBuilder) {
                     storeCaseProjection(&copy.cases, &copy.caseCount, copy.returningCols[0..], &copy.returningCount, item);
@@ -2231,7 +2356,9 @@ pub fn UpsertBuilder(comptime Row: type, comptime Columns: type) type {
                 }
                 if (@TypeOf(item) == WindowBuilder) @panic("window functions are not supported in RETURNING");
                 if (copy.returningCount >= copy.returningCols.len) @panic("too many DSL returning columns");
-                if (Row != void and comptime scopeMod.isScopedItem(@TypeOf(item), Row)) {
+                if (@TypeOf(item) == scopeMod.EnumLiteral and comptime scopeMod.isScopedAll(@TypeOf(item), Row, item)) {
+                    copy.returningCols[copy.returningCount] = .{ .kind = .star };
+                } else if (Row != void and comptime scopeMod.isScopedItem(@TypeOf(item), Row)) {
                     copy.returningCols[copy.returningCount] = .{ .kind = .column, .column = scopeMod.resolveRef(Row, Columns, scopeMod.builderScope(self.table, self.tableAlias), item) };
                 } else {
                     copy.returningCols[copy.returningCount] = toProjection(item);
@@ -2422,28 +2549,21 @@ pub const Mutation = struct {
         return copy;
     }
 
-    pub fn where(self: Mutation, condition: Expr) Mutation {
+    pub fn where(self: Mutation, condition: anytype) Mutation {
         var copy = self;
-        copy.conditions[0] = .{ .expr = condition };
-        copy.conditionCount = 1;
+        storeWhere(copy.conditions[0..], &copy.conditionCount, condition);
         return copy;
     }
 
-    pub fn andWhere(self: Mutation, condition: Expr) Mutation {
+    pub fn andWhere(self: Mutation, condition: anytype) Mutation {
         var copy = self;
-        if (copy.conditionCount >= copy.conditions.len) @panic("too many DSL predicates");
-        if (copy.conditionCount == 0) return copy.where(condition);
-        copy.conditions[copy.conditionCount] = .{ .expr = condition, .joinOr = false };
-        copy.conditionCount += 1;
+        appendAnd(copy.conditions[0..], &copy.conditionCount, condition);
         return copy;
     }
 
-    pub fn orWhere(self: Mutation, condition: Expr) Mutation {
+    pub fn orWhere(self: Mutation, condition: anytype) Mutation {
         var copy = self;
-        if (copy.conditionCount >= copy.conditions.len) @panic("too many DSL predicates");
-        if (copy.conditionCount == 0) return copy.where(condition);
-        copy.conditions[copy.conditionCount] = .{ .expr = condition, .joinOr = true };
-        copy.conditionCount += 1;
+        appendOr(copy.conditions[0..], &copy.conditionCount, condition);
         return copy;
     }
 
@@ -2621,8 +2741,14 @@ test "scoped order group returning and join keys resolve" {
     try std.testing.expectEqualStrings("id", ret.returningCols[0].column.name);
     const Other = @import("table.zig").table("scope_groups", struct { id: i64 });
     const joined = base.joinUsing(Other, .id);
-    try std.testing.expectEqual(@as(usize, 1), joined.joinUsingCount);
-    try std.testing.expectEqualStrings("id", joined.joinUsingCols[0]);
+    try std.testing.expectEqual(@as(usize, 1), joined.joinCount);
+    try std.testing.expectEqual(@as(usize, 1), joined.joins[0].usingCount);
+    try std.testing.expectEqualStrings("id", joined.joins[0].usingCols[0]);
+    // Chained joins append legs in call order (ON stays a single equality;
+    // wider conjunctions belong in WHERE, where AND binds correctly).
+    const chained = base.joinUsing(Other, .id).innerJoin(Other, Other.id.eq(base.c().id));
+    try std.testing.expectEqual(@as(usize, 2), chained.joinCount);
+    try std.testing.expect(chained.joins[1].on != null);
     const conflicted = base.onConflict(.id);
     try std.testing.expectEqual(@as(usize, 1), conflicted.targetCount);
     try std.testing.expectEqualStrings("id", conflicted.targetCols[0]);

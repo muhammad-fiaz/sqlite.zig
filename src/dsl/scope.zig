@@ -40,11 +40,14 @@ const ColumnRef = dslExpr.ColumnRef;
 pub const EnumLiteral = @TypeOf(.id);
 
 /// Native query-scope identity: which table unqualified typed fields belong
-/// to, plus the alias that replaces the table name when one is set (mirrors
-/// `StripBase` in `ast_builder`, which strips qualifiers matching the
-/// alias first, then the table name).
+/// to, plus the schema and alias that qualify references. The alias
+/// replaces the table name when set (`ast_builder` strips qualifiers
+/// matching the alias first, then the table name). This is the single
+/// scope representation shared by the DSL builders and the AST lowering
+/// (`StripBase` is an alias of this struct).
 pub const Scope = struct {
     table: []const u8,
+    schema: []const u8 = "",
     alias: ?[]const u8 = null,
 
     /// Effective qualifier for scoped references: the alias when set,
@@ -89,28 +92,6 @@ pub fn isScopedList(comptime T: type, comptime Row: type) bool {
     return false;
 }
 
-/// True when `T` mixes explicit column descriptors and scoped fields in one
-/// tuple (e.g. `.{ .id, Membership.group_id }`). Element-wise dispatch in
-/// the builder handles each form; this only detects the shape.
-pub fn isMixedList(comptime T: type, comptime Row: type) bool {
-    if (Row == void) return false;
-    const info = @typeInfo(T);
-    if (info == .pointer and info.pointer.size == .one) return isMixedList(info.pointer.child, Row);
-    if (info != .@"struct" or !info.@"struct".is_tuple) return false;
-    const fields = info.@"struct".fields;
-    if (fields.len == 0) return false;
-    var sawScoped = false;
-    var sawOther = false;
-    inline for (fields) |field| {
-        if (isScopedItem(field.type, Row)) {
-            sawScoped = true;
-        } else {
-            sawOther = true;
-        }
-    }
-    return sawScoped and sawOther;
-}
-
 /// Borrowed SQL name for a zig field name under `Columns` (the table's
 /// columns descriptor struct). Usable at runtime for slice inputs; returns
 /// null when the field is unknown.
@@ -123,29 +104,37 @@ pub fn sqlNameOf(comptime Columns: type, zigName: []const u8) ?[]const u8 {
 
 /// Resolve one scoped field to a native `ColumnRef` against `Columns` and
 /// `scope`. The item may be a bare enum literal (`.id`) or a field-enum
-/// value, comptime or runtime. Unknown fields panic naming the field and
-/// table (a compile error for comptime inputs): with no valid root scope
-/// to bind them, guessing would be silent magic. The panic (rather than
-/// `@compileError`) keeps valid runtime field-enum values working, since an
+/// value, comptime or runtime (`@tagName` reads both, so no enum coercion
+/// can fail). Unknown fields panic naming the field and table (a compile
+/// error for comptime inputs): with no valid root scope to bind them,
+/// guessing would be silent magic. The panic (rather than `@compileError`)
+/// keeps valid runtime field-enum values working, since an
 /// `orelse @compileError` would fire even for those.
 pub fn resolveRef(comptime Row: type, comptime Columns: type, scope: Scope, item: anytype) ColumnRef {
-    const E = std.meta.FieldEnum(Row);
-    const coerced: E = item;
-    const zigName = @tagName(coerced);
+    _ = Row;
+    const zigName = @tagName(item);
     const sqlName = sqlNameOf(Columns, zigName) orelse std.debug.panic("scoped field '{s}' is not a column of table '{s}'", .{ zigName, scope.table });
-    return .{ .table = scope.qualifier(), .name = sqlName };
-}
-
-/// Resolve one scoped field where the zig field name is already known
-/// (runtime slice path). Returns null for unknown fields.
-pub fn resolveName(comptime Columns: type, scope: Scope, zigName: []const u8) ?ColumnRef {
-    const sqlName = sqlNameOf(Columns, zigName) orelse return null;
     return .{ .table = scope.qualifier(), .name = sqlName };
 }
 
 /// Scope of a query builder: its alias when set, else its table name.
 pub fn builderScope(table: []const u8, tableAlias: ?[]const u8) Scope {
     return .{ .table = table, .alias = tableAlias };
+}
+
+/// Scope of a catalog operation over one table in a schema.
+pub fn tableScope(table: []const u8, schema: []const u8, tableAlias: ?[]const u8) Scope {
+    return .{ .table = table, .schema = schema, .alias = tableAlias };
+}
+
+/// True when `item` is the scoped all-columns marker: the bare `.all`
+/// literal on a row type with no `all` column. A real `all` column always
+/// wins (collision rule), resolving as an ordinary scoped field instead.
+/// `@tagName` reads bare literals directly, so no enum coercion can fail.
+pub fn isScopedAll(comptime T: type, comptime Row: type, item: anytype) bool {
+    if (T != EnumLiteral or Row == void) return false;
+    if (@hasField(Row, "all")) return false;
+    return std.mem.eql(u8, @tagName(item), "all");
 }
 
 /// Comptime scope bundle for key/DDL resolution: the row struct (for the
@@ -175,11 +164,11 @@ pub fn resolveSqlName(comptime S: type, scopeTable: []const u8, zigName: []const
     std.debug.panic("unqualified field '{s}' needs a typed table scope", .{zigName});
 }
 
-/// Coerce a scoped item (bare enum literal or field-enum value) to its zig
-/// field name. Callers must have established `isScopedItem` first.
+/// Read a scoped item's zig field name. Callers must have established
+/// `isScopedItem` first (`@tagName` reads literals and enum values alike).
 pub fn fieldNameOf(comptime S: type, item: anytype) []const u8 {
-    const coerced: std.meta.FieldEnum(S.Row) = item;
-    return @tagName(coerced);
+    _ = S;
+    return @tagName(item);
 }
 
 test "scopes qualify with alias first" {
@@ -225,5 +214,4 @@ test "resolveRef maps zig fields onto sql names under scope" {
     try std.testing.expectEqualStrings("id", aliased.name);
     try std.testing.expectEqualStrings("user_name", sqlNameOf(Columns, "userName").?);
     try std.testing.expect(sqlNameOf(Columns, "nope") == null);
-    try std.testing.expect(resolveName(Columns, .{ .table = "users" }, "id").?.name.len == 2);
 }
