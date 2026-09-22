@@ -8,6 +8,7 @@ const ast = @import("../sql/ast.zig");
 const Value = @import("../vm/value.zig").Value;
 const schemaMod = @import("../catalog/schema.zig");
 const dslColumn = @import("column.zig");
+const scopeMod = @import("scope.zig");
 const DynamicColumn = dslColumn.DynamicColumn;
 
 /// Re-exported referential action so table definitions need only import keys.
@@ -91,16 +92,42 @@ fn checkKeyTable(c: anytype, expectedTable: []const u8) !void {
     if (t.len != 0 and !std.ascii.eqlIgnoreCase(t, expectedTable)) return error.UnknownColumn;
 }
 
+/// Scoped field check: unqualified fields (`.id`) are bound by the target
+/// being defined, so they always pass the table guard; anything else uses
+/// the explicit table identity. `S` is a `scope.TypeScope` bundle.
+fn checkKeyTableScoped(comptime S: type, c: anytype, expectedTable: []const u8) !void {
+    if (comptime scopeMod.isScopedItem(@TypeOf(c), S.Row)) return;
+    try checkKeyTable(c, expectedTable);
+}
+
+/// Borrowed SQL column name of a key item: scoped fields resolve through
+/// the target's column mapping, everything else uses `colNameOf`.
+fn colNameOfScoped(comptime S: type, expectedTable: []const u8, c: anytype) []const u8 {
+    if (comptime scopeMod.isScopedItem(@TypeOf(c), S.Row)) {
+        return scopeMod.resolveSqlName(S, expectedTable, scopeMod.fieldNameOf(S, c));
+    }
+    return colNameOf(c);
+}
+
 /// Normalize one key (single or composite) into borrowed names in `out`.
 /// Returns the count written (max 16). `expectedTable` guards cross-table
 /// mixing; bare strings skip the check. Errors: `UnknownColumn` on table
 /// mismatch, `InvalidSql` on empty/oversized lists.
 pub fn normalizeKey(key: anytype, expectedTable: []const u8, out: *[16][]const u8) !usize {
+    return normalizeKeyScoped(key, expectedTable, scopeMod.Unscoped, out);
+}
+
+/// `normalizeKey` plus scoped-field support: unqualified fields (`.id`,
+/// `.{ .a, .b }` mixed with explicit columns) resolve against the target
+/// table described by `S` (a `scope.TypeScope` bundle). Unscoped targets
+/// reject bare fields with a compile error instead of guessing.
+pub fn normalizeKeyScoped(key: anytype, expectedTable: []const u8, comptime S: type, out: *[16][]const u8) !usize {
     const T = @TypeOf(key);
-    const isSingle = comptime (T == DynamicColumn or isDslColumn(T) or isStringLike(T));
+    const isSingle = comptime (T == DynamicColumn or isDslColumn(T) or isStringLike(T) or scopeMod.isScopedItem(T, S.Row));
     if (isSingle) {
-        try checkKeyTable(key, expectedTable);
-        out[0] = colNameOf(key);
+        if (comptime scopeMod.isScopedItem(T, S.Row) and !S.isScoped) @compileError("unqualified field needs a typed table scope (define keys on a sqlite.table(...) value)");
+        try checkKeyTableScoped(S, key, expectedTable);
+        out[0] = colNameOfScoped(S, expectedTable, key);
         return 1;
     }
     const items = derefItems(key);
@@ -109,8 +136,9 @@ pub fn normalizeKey(key: anytype, expectedTable: []const u8, out: *[16][]const u
     if ((info == .@"struct" and info.@"struct".is_tuple) or info == .array) {
         inline for (items) |item| {
             if (count >= out.len) return error.InvalidSql;
-            try checkKeyTable(item, expectedTable);
-            out[count] = colNameOf(item);
+            if (comptime scopeMod.isScopedItem(@TypeOf(item), S.Row) and !S.isScoped) @compileError("unqualified field needs a typed table scope (define keys on a sqlite.table(...) value)");
+            try checkKeyTableScoped(S, item, expectedTable);
+            out[count] = colNameOfScoped(S, expectedTable, item);
             count += 1;
         }
     } else {
@@ -141,8 +169,12 @@ pub const ForeignKeySpec = struct {
 
 /// Normalize `.{ .table, .column/.columns }`-style reference inputs plus
 /// tuple/array/slice reference lists into `(table, cols)`. Borrowed.
+/// Foreign-key `references` must stay explicit: the parent scope is unknown,
+/// so a bare field there is a compile error, never a guess.
 fn normalizeRefList(ref: anytype, outTable: *[]const u8, outCols: *[16][]const u8) !usize {
     const R = @TypeOf(ref);
+    // No scope exists on the parent side: a bare field cannot resolve.
+    if (R == scopeMod.EnumLiteral or @typeInfo(R) == .@"enum") @compileError("foreign-key references must be explicit table-qualified columns (Parent.id), not bare fields");
     if (R == DynamicColumn) {
         const split = dslColumn.dynRef(ref);
         if (split.table.len == 0) return error.InvalidSql;
@@ -202,14 +234,21 @@ fn normalizeRefList(ref: anytype, outTable: *[]const u8, outCols: *[16][]const u
 /// columns. Borrowed; fails `InvalidSql` on count mismatch.
 /// `initiallyDeferred` without `deferrable` is a compile error.
 pub fn parseFkSpec(fk: anytype, expectedTable: []const u8) !ForeignKeySpec {
+    return parseFkSpecScoped(fk, expectedTable, scopeMod.Unscoped);
+}
+
+/// `parseFkSpec` plus scoped-field support on the local side (`.column` /
+/// `.columns` accept `.parent_id` against the child table in `S`); the
+/// `references` side always stays explicit.
+pub fn parseFkSpecScoped(fk: anytype, expectedTable: []const u8, comptime S: type) !ForeignKeySpec {
     const F = @TypeOf(fk);
     const info = @typeInfo(F);
     if (info != .@"struct" or info.@"struct".is_tuple) @compileError("foreign key must be a struct with .column/.columns and .references");
     var spec = ForeignKeySpec{};
     if (@hasField(F, "columns")) {
-        spec.localCount = try normalizeKey(fk.columns, expectedTable, &spec.local);
+        spec.localCount = try normalizeKeyScoped(fk.columns, expectedTable, S, &spec.local);
     } else if (@hasField(F, "column")) {
-        spec.localCount = try normalizeKey(fk.column, expectedTable, &spec.local);
+        spec.localCount = try normalizeKeyScoped(fk.column, expectedTable, S, &spec.local);
     } else @compileError("foreign key needs .column or .columns");
     if (!@hasField(F, "references")) @compileError("foreign key needs .references");
     spec.refCount = try normalizeRefList(fk.references, &spec.refTable, &spec.refCols);
@@ -342,31 +381,47 @@ pub const ExpectedKeys = struct {
 };
 
 /// Record the expected primary key. Overwrites any previous expectation.
+/// The scoped form takes an explicit `scope.TypeScope` bundle so
+/// unqualified fields (`.id`) resolve against the table being defined.
 pub fn parsePkInto(src: anytype, tableName: []const u8, expected: *ExpectedKeys) !void {
+    return parsePkIntoScoped(src, tableName, scopeMod.Unscoped, expected);
+}
+
+/// `parsePkInto` with scoped-field support via `S`.
+pub fn parsePkIntoScoped(src: anytype, tableName: []const u8, comptime S: type, expected: *ExpectedKeys) !void {
     expected.hasPk = true;
-    expected.pkCount = try normalizeKey(src, tableName, &expected.pk);
+    expected.pkCount = try normalizeKeyScoped(src, tableName, S, &expected.pk);
 }
 
 /// Record expected UNIQUEs: singles go to `uniqueSingles`, composites to
 /// `uniqueGroups`. Accumulates across calls; sets `hasUnique`.
 pub fn parseUniqueInto(src: anytype, tableName: []const u8, expected: *ExpectedKeys) !void {
+    return parseUniqueIntoScoped(src, tableName, scopeMod.Unscoped, expected);
+}
+
+/// `parseUniqueInto` with scoped-field support via `S`.
+pub fn parseUniqueIntoScoped(src: anytype, tableName: []const u8, comptime S: type, expected: *ExpectedKeys) !void {
     const items = derefItems(src);
     const info = @typeInfo(@TypeOf(items));
     expected.hasUnique = true;
     if ((info == .@"struct" and info.@"struct".is_tuple) or info == .array) {
-        inline for (items) |item| try addUniqueItem(item, tableName, expected);
+        inline for (items) |item| try addUniqueItemScoped(item, tableName, S, expected);
     } else {
         for (items) |item| try addUniqueItem(item, tableName, expected);
     }
 }
 
 fn addUniqueItem(item: anytype, tableName: []const u8, expected: *ExpectedKeys) !void {
+    return addUniqueItemScoped(item, tableName, scopeMod.Unscoped, expected);
+}
+
+fn addUniqueItemScoped(item: anytype, tableName: []const u8, comptime S: type, expected: *ExpectedKeys) !void {
     const T = @TypeOf(item);
-    const isSingle = comptime (T == DynamicColumn or isDslColumn(T) or isStringLike(T));
+    const isSingle = comptime (T == DynamicColumn or isDslColumn(T) or isStringLike(T) or scopeMod.isScopedItem(T, S.Row));
     if (isSingle) {
         if (expected.uniqueSingleCount >= expected.uniqueSingles.len) return error.InvalidSql;
         var buf: [16][]const u8 = undefined;
-        const count = try normalizeKey(item, tableName, &buf);
+        const count = try normalizeKeyScoped(item, tableName, S, &buf);
         std.debug.assert(count == 1);
         expected.uniqueSingles[expected.uniqueSingleCount] = buf[0];
         expected.uniqueSingleCount += 1;
@@ -374,7 +429,7 @@ fn addUniqueItem(item: anytype, tableName: []const u8, expected: *ExpectedKeys) 
     }
     if (expected.uniqueGroupCount >= expected.uniqueGroups.len) return error.InvalidSql;
     var group = UniqueGroup{};
-    group.count = try normalizeKey(item, tableName, &group.names);
+    group.count = try normalizeKeyScoped(item, tableName, S, &group.names);
     expected.uniqueGroups[expected.uniqueGroupCount] = group;
     expected.uniqueGroupCount += 1;
 }
@@ -382,13 +437,18 @@ fn addUniqueItem(item: anytype, tableName: []const u8, expected: *ExpectedKeys) 
 /// Record expected foreign keys (tuple/slice/array of FK structs).
 /// Accumulates into `fks`; sets `hasFks`.
 pub fn parseFksInto(src: anytype, tableName: []const u8, expected: *ExpectedKeys) !void {
+    return parseFksIntoScoped(src, tableName, scopeMod.Unscoped, expected);
+}
+
+/// `parseFksInto` with scoped-field support on local sides via `S`.
+pub fn parseFksIntoScoped(src: anytype, tableName: []const u8, comptime S: type, expected: *ExpectedKeys) !void {
     const items = derefItems(src);
     const info = @typeInfo(@TypeOf(items));
     expected.hasFks = true;
     if ((info == .@"struct" and info.@"struct".is_tuple) or info == .array) {
         inline for (items) |item| {
             if (expected.fkCount >= expected.fks.len) return error.InvalidSql;
-            expected.fks[expected.fkCount] = try parseFkSpec(item, tableName);
+            expected.fks[expected.fkCount] = try parseFkSpecScoped(item, tableName, S);
             expected.fkCount += 1;
         }
     } else {

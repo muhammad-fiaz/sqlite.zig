@@ -16,6 +16,7 @@ const CaseBuilder = columnMod.CaseBuilder;
 const WindowBuilder = columnMod.WindowBuilder;
 const astBuilder = @import("ast_builder.zig");
 const ast = @import("../sql/ast.zig");
+const scopeMod = @import("scope.zig");
 const Result = @import("../connection/result.zig").Result;
 
 const tableMod = @import("table.zig");
@@ -78,7 +79,40 @@ fn toOrder(item: anytype) Order {
     if (T == Order) return item;
     if (T == columnMod.DynamicColumn) return .{ .column = columnMod.dynRef(item) };
     if (comptime isTypedColumnInstance(T)) return .{ .column = .{ .table = T.dslTable, .name = T.dslName } };
-    @compileError("orderBy() takes a column order such as col.asc()/col.desc() or a bare column for ascending order");
+    @compileError("orderBy() takes a column order such as col.asc()/col.desc(), a bare column, or a scoped field such as .name");
+}
+
+/// True when `assigns` is an explicit-assignment tuple: every element is a
+/// `Column.set(...)` assign carrying its own table identity (see
+/// `column.zig.Assign`). Empty tuples are rows, not assigns.
+fn isAssignList(comptime T: type) bool {
+    const info = @typeInfo(T);
+    if (info != .@"struct" or !info.@"struct".is_tuple) return false;
+    if (info.@"struct".fields.len == 0) return false;
+    inline for (info.@"struct".fields) |field| {
+        if (!columnMod.isAssignValue(field.type)) return false;
+    }
+    return true;
+}
+
+/// Comptime membership check for one explicit assignment: its SQL name must
+/// be a column of the statement target. Cross-table assigns with disjoint
+/// names fail here at compile time.
+fn checkAssignColumn(comptime Col: type, comptime Columns: type) void {
+    if (Columns == void) return;
+    inline for (@typeInfo(Columns).@"struct".fields) |field| {
+        if (std.mem.eql(u8, field.type.dslName, Col.dslName)) return;
+    }
+    @compileError("assignment column is not a column of the statement target table");
+}
+
+/// Runtime scope check for one explicit assignment: its table identity must
+/// be the statement's table (by real name or by the builder's alias).
+/// Same-named columns of other tables fail here, never binding silently.
+fn checkAssignScope(comptime Col: type, table: []const u8, tableAlias: ?[]const u8) !void {
+    if (std.mem.eql(u8, Col.dslTable, table)) return;
+    if (tableAlias) |alias| if (std.mem.eql(u8, Col.dslTable, alias)) return;
+    return error.UnknownColumn;
 }
 
 fn destSqlFor(comptime Columns: type, want: []const u8) ?[]const u8 {
@@ -305,6 +339,54 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
             return .{ .name = name };
         }
 
+        /// Scoped columns value for this query's root table
+        /// (`q.c().id.eq(1)`, `q.c().name`). Each field is the table's
+        /// typed column bound to the current scope: the builder's alias when
+        /// set, else its table name. The valid-Zig form of scoped `.id`
+        /// references for predicate positions (`where`, `having`, `join`
+        /// conditions), where a bare `.id` cannot carry an operator. Only
+        /// available on typed builders; dynamic queries use `column(name)`.
+        pub fn c(self: Self) Columns {
+            _ = self;
+            if (Columns == void) return {};
+            var scoped: Columns = undefined;
+            inline for (@typeInfo(Columns).@"struct".fields) |field| {
+                @field(scoped, field.name) = .{};
+            }
+            return scoped;
+        }
+
+        /// Rebind this query to `alias` (borrowed slice must outlive use),
+        /// the builder-level form of `sqlite.aliased(Table, "alias")`.
+        /// Scoped references (`col()`, `.{ .id }` lists) qualify with the
+        /// alias from here on; explicit `Table.col` references keep the real
+        /// table name, which stays valid SQL against `FROM table alias`.
+        pub fn as(self: Self, alias: []const u8) Self {
+            var copy = self;
+            copy.tableAlias = alias;
+            return copy;
+        }
+
+        /// This builder's resolver scope: alias when set, else table name.
+        fn scope(self: *const Self) scopeMod.Scope {
+            return scopeMod.builderScope(self.table, self.tableAlias);
+        }
+
+        /// Resolve one scoped field (`.id`) to a native `ColumnRef`.
+        fn scopedRef(self: *const Self, item: anytype) ColumnRef {
+            return scopeMod.resolveRef(Row, Columns, self.scope(), item);
+        }
+
+        /// Resolve one scoped field to a SELECT/RETURNING projection.
+        fn scopedProjection(self: *const Self, item: anytype) Projection {
+            return .{ .kind = .column, .column = self.scopedRef(item) };
+        }
+
+        /// Resolve one scoped field to an ascending ORDER BY key.
+        fn scopedOrder(self: *const Self, item: anytype) Order {
+            return .{ .column = self.scopedRef(item) };
+        }
+
         fn retype(self: Self, comptime nextMapped: bool) Builder(Row, Columns, nextMapped) {
             return .{
                 .allocator = self.allocator,
@@ -372,6 +454,11 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
             if (T == Projection or T == columnMod.DynamicColumn or comptime isTypedColumnInstance(T) or T == CaseBuilder or T == WindowBuilder) {
                 return copy.selectOne(cols);
             }
+            // Scoped single field (`select(.id)`): resolves against the
+            // root table, equivalent to `select(.{ Table.id })`.
+            if (Row != void and comptime scopeMod.isScopedItem(T, Row)) {
+                return copy.selectOne(copy.scopedProjection(cols));
+            }
             const items = if (@typeInfo(T) == .pointer) cols.* else cols;
             inline for (items) |item| {
                 if (@TypeOf(item) == CaseBuilder) {
@@ -383,7 +470,13 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
                     continue;
                 }
                 if (copy.projectionCount >= copy.projections.len) @panic("too many DSL projections");
-                copy.projections[copy.projectionCount] = toProjection(item);
+                // Scoped (`.id`) and explicit (`Table.id`) items mix freely;
+                // both converge on the same native projection.
+                if (Row != void and comptime scopeMod.isScopedItem(@TypeOf(item), Row)) {
+                    copy.projections[copy.projectionCount] = copy.scopedProjection(item);
+                } else {
+                    copy.projections[copy.projectionCount] = toProjection(item);
+                }
                 copy.projectionCount += 1;
             }
             if (copy.projectionCount == 0) @panic("select() requires at least one column");
@@ -424,6 +517,12 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
             if (comptime @TypeOf(cols) == tableMod.AllOpFn) @compileError("use User.all() (call it) for RETURNING all columns");
             var copy = self;
             copy.returningCount = 0;
+            // Scoped single field (`returning(.id)`).
+            if (Row != void and comptime scopeMod.isScopedItem(@TypeOf(cols), Row)) {
+                copy.returningCols[0] = copy.scopedProjection(cols);
+                copy.returningCount = 1;
+                return copy;
+            }
             const items = if (@typeInfo(@TypeOf(cols)) == .pointer) cols.* else cols;
             inline for (items) |item| {
                 if (@TypeOf(item) == CaseBuilder) {
@@ -432,7 +531,11 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
                 }
                 if (@TypeOf(item) == WindowBuilder) @panic("window functions are not supported in RETURNING");
                 if (copy.returningCount >= copy.returningCols.len) @panic("too many DSL returning columns");
-                copy.returningCols[copy.returningCount] = toProjection(item);
+                if (Row != void and comptime scopeMod.isScopedItem(@TypeOf(item), Row)) {
+                    copy.returningCols[copy.returningCount] = copy.scopedProjection(item);
+                } else {
+                    copy.returningCols[copy.returningCount] = toProjection(item);
+                }
                 copy.returningCount += 1;
             }
             if (copy.returningCount == 0) @panic("returning() requires at least one column");
@@ -514,7 +617,10 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
         fn inValues(self: Self, col: anytype, values: anytype, negated: bool) Self {
             var copy = self;
             const items = if (@typeInfo(@TypeOf(values)) == .pointer) values.* else values;
-            var entry = LiteralIn{ .column = toRef(col), .negated = negated };
+            // Scoped target (`whereInValues(.id, &.{ 1, 2 })`) resolves
+            // against the root table like every other scoped field.
+            const target: ColumnRef = if (Row != void and comptime scopeMod.isScopedItem(@TypeOf(col), Row)) copy.scopedRef(col) else toRef(col);
+            var entry = LiteralIn{ .column = target, .negated = negated };
             inline for (items) |item| {
                 if (entry.count >= entry.values.len) @panic("DSL IN supports at most 32 literal values");
                 entry.values[entry.count] = columnMod.toValue(item);
@@ -525,17 +631,22 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
             return copy;
         }
 
+        /// Outer column may be scoped (`.id` binds to this query's root
+        /// table); the subquery column stays explicit since the inner scope
+        /// belongs to `other`.
         pub fn whereInQuery(self: Self, col: anytype, other: anytype, otherCol: anytype) Self {
             var copy = self;
             const target = joinTargetOf(other);
-            copy.inQuery = .{ .column = toRef(col), .table = target.name, .schema = target.schema, .subcolumn = toRef(otherCol) };
+            const outer: ColumnRef = if (Row != void and comptime scopeMod.isScopedItem(@TypeOf(col), Row)) copy.scopedRef(col) else toRef(col);
+            copy.inQuery = .{ .column = outer, .table = target.name, .schema = target.schema, .subcolumn = toRef(otherCol) };
             return copy;
         }
 
         pub fn whereNotInQuery(self: Self, col: anytype, other: anytype, otherCol: anytype) Self {
             var copy = self;
             const target = joinTargetOf(other);
-            copy.inQuery = .{ .column = toRef(col), .table = target.name, .schema = target.schema, .subcolumn = toRef(otherCol), .negated = true };
+            const outer: ColumnRef = if (Row != void and comptime scopeMod.isScopedItem(@TypeOf(col), Row)) copy.scopedRef(col) else toRef(col);
+            copy.inQuery = .{ .column = outer, .table = target.name, .schema = target.schema, .subcolumn = toRef(otherCol), .negated = true };
             return copy;
         }
 
@@ -553,13 +664,26 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
             return copy;
         }
 
+        /// Order by explicit orders/descriptors (`User.id.desc()`), ascending
+        /// scoped fields (`orderBy(.name)`, `orderBy(.{ .name })`), or a
+        /// tuple mixing both. Scoped fields resolve against the root table.
         pub fn orderBy(self: Self, order: anytype) Self {
             var copy = self;
             const T = @TypeOf(order);
+            if (Row != void and comptime scopeMod.isScopedItem(T, Row)) {
+                if (copy.orderCount >= copy.orders.len) @panic("too many order columns");
+                copy.orders[copy.orderCount] = copy.scopedOrder(order);
+                copy.orderCount += 1;
+                return copy;
+            }
             if (comptime @typeInfo(T) == .@"struct" and @typeInfo(T).@"struct".is_tuple) {
                 inline for (order) |item| {
                     if (copy.orderCount >= copy.orders.len) @panic("too many order columns");
-                    copy.orders[copy.orderCount] = toOrder(item);
+                    if (Row != void and comptime scopeMod.isScopedItem(@TypeOf(item), Row)) {
+                        copy.orders[copy.orderCount] = copy.scopedOrder(item);
+                    } else {
+                        copy.orders[copy.orderCount] = toOrder(item);
+                    }
                     copy.orderCount += 1;
                 }
                 if (copy.orderCount == 0) @panic("orderBy() requires at least one order");
@@ -583,8 +707,23 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
             return copy;
         }
 
+        /// Group by an explicit descriptor (`User.id`), a dynamic column, or
+        /// a scoped field (`groupBy(.id)`, `groupBy(.{ .id })`) resolved
+        /// against the root table. The engine groups by one column; longer
+        /// scoped lists are compile errors.
         pub fn groupBy(self: Self, col: anytype) Self {
             var copy = self;
+            const T = @TypeOf(col);
+            if (Row != void and comptime scopeMod.isScopedItem(T, Row)) {
+                copy.groupByColumn = copy.scopedRef(col);
+                return copy;
+            }
+            if (Row != void and comptime scopeMod.isScopedList(T, Row)) {
+                const items = if (@typeInfo(T) == .pointer) col.* else col;
+                if (items.len != 1) @panic("groupBy() takes one column; pass a single descriptor or one scoped field");
+                copy.groupByColumn = copy.scopedRef(items[0]);
+                return copy;
+            }
             copy.groupByColumn = toRef(col);
             return copy;
         }
@@ -697,6 +836,11 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
             } else if (comptime isTypedColumnInstance(T)) {
                 copy.joinUsingCols[0] = T.dslName;
                 copy.joinUsingCount = 1;
+            } else if (Row != void and comptime scopeMod.isScopedItem(T, Row)) {
+                // Scoped single (`joinUsing(Member, .user_id)`): USING names
+                // are bare by SQL rules; scope only maps zig to sql names.
+                copy.joinUsingCols[0] = copy.scopedRef(col).name;
+                copy.joinUsingCount = 1;
             } else if (comptime @typeInfo(T) == .@"struct" and @typeInfo(T).@"struct".is_tuple) {
                 inline for (col) |item| {
                     if (copy.joinUsingCount >= copy.joinUsingCols.len) @panic("too many USING columns");
@@ -705,14 +849,16 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
                         copy.joinUsingCols[copy.joinUsingCount] = columnMod.dynRef(item).name;
                     } else if (comptime isTypedColumnInstance(IT)) {
                         copy.joinUsingCols[copy.joinUsingCount] = IT.dslName;
+                    } else if (Row != void and comptime scopeMod.isScopedItem(IT, Row)) {
+                        copy.joinUsingCols[copy.joinUsingCount] = copy.scopedRef(item).name;
                     } else {
-                        @compileError("joinUsing columns must be column descriptors");
+                        @compileError("joinUsing columns must be column descriptors or scoped fields such as .user_id");
                     }
                     copy.joinUsingCount += 1;
                 }
                 if (copy.joinUsingCount == 0) @panic("joinUsing requires at least one column");
             } else {
-                @compileError("joinUsing column must be a column descriptor or a tuple of column descriptors");
+                @compileError("joinUsing column must be a column descriptor, a scoped field, or a tuple of those");
             }
             return copy;
         }
@@ -930,6 +1076,7 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
                 .executeFn = self.executeFn,
                 .table = self.table,
                 .schema = self.schema,
+                .tableAlias = self.tableAlias,
                 .cases = self.cases,
                 .caseCount = self.caseCount,
                 .caseWhens = self.caseWhens,
@@ -948,6 +1095,11 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
             } else if (comptime isTypedColumnInstance(T)) {
                 up.targetCols[0] = T.dslName;
                 up.targetCount = 1;
+            } else if (Row != void and comptime scopeMod.isScopedItem(T, Row)) {
+                // Scoped single target (`onConflict(.id)`): resolves against
+                // the upsert's target table.
+                up.targetCols[0] = scopeMod.resolveRef(Row, Columns, self.scope(), target).name;
+                up.targetCount = 1;
             } else if (comptime @typeInfo(T) == .@"struct" and @typeInfo(T).@"struct".is_tuple) {
                 inline for (target) |item| {
                     if (up.targetCount >= up.targetCols.len) @panic("too many upsert target columns");
@@ -956,14 +1108,16 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
                         up.targetCols[up.targetCount] = columnMod.dynRef(item).name;
                     } else if (comptime isTypedColumnInstance(IT)) {
                         up.targetCols[up.targetCount] = IT.dslName;
+                    } else if (Row != void and comptime scopeMod.isScopedItem(IT, Row)) {
+                        up.targetCols[up.targetCount] = scopeMod.resolveRef(Row, Columns, self.scope(), item).name;
                     } else {
-                        @compileError("onConflict target must be column descriptors");
+                        @compileError("onConflict target must be column descriptors or scoped fields such as .id");
                     }
                     up.targetCount += 1;
                 }
                 if (up.targetCount == 0) @panic("onConflict requires at least one target column");
             } else {
-                @compileError("onConflict target must be a column descriptor or a tuple of column descriptors");
+                @compileError("onConflict target must be a column descriptor, a scoped field, or a tuple of those");
             }
             return up;
         }
@@ -981,9 +1135,40 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
             return up;
         }
 
+        /// Explicit-assignment INSERT (`insert(.{ User.id.set(1), ... })`).
+        /// Each assign carries its own table identity, checked against this
+        /// statement's table (real name or alias); omitted columns follow
+        /// normal default semantics, exactly like partial row structs.
+        fn insertAssigns(self: Self, assigns: anytype, conflict: ast.ConflictPolicy) !Result {
+            var names: [16][]const u8 = undefined;
+            var vals: [16]dslExpr.SetValue = undefined;
+            var count: usize = 0;
+            inline for (assigns, 0..) |item, index| {
+                const Col = @TypeOf(item).assignColumn;
+                checkAssignColumn(Col, Columns);
+                // Same column twice is most likely a copy/paste slip; SQL
+                // rejects duplicate targets, so fail loudly here too.
+                inline for (0..index) |prev| {
+                    if (std.mem.eql(u8, @TypeOf(assigns[prev]).assignColumn.dslName, Col.dslName)) @compileError("duplicate assignment to one column in an explicit assign list");
+                }
+                try checkAssignScope(Col, self.table, self.tableAlias);
+                if (comptime isExplicitDefault(@TypeOf(item.value))) continue;
+                if (@TypeOf(item.value) == columnMod.ExcludedColumn) @compileError("excluded() is only valid in UPSERT assignments");
+                if (count >= names.len) return error.InvalidSql;
+                names[count] = Col.dslName;
+                vals[count] = .{ .literal = insertFieldOf(item.value) };
+                count += 1;
+            }
+            if (count == 0) return error.InvalidSql;
+            var built = try astBuilder.buildInsert(self.allocator, self.table, self.schema, names[0..count], vals[0..count], conflict, self.returningCols[0..self.returningCount], self.cases[0..self.caseCount], .{});
+            defer built.deinit();
+            return self.executeFn(self.connection, &built.stmt, &.{}, false);
+        }
+
         fn insertWithMode(self: Self, row: anytype, comptime mode: []const u8) !Result {
             const conflict: ast.ConflictPolicy = if (comptime std.mem.eql(u8, mode, "")) .none else if (comptime std.mem.eql(u8, mode, "OR IGNORE")) .ignore else if (comptime std.mem.eql(u8, mode, "OR REPLACE")) .replace else if (comptime std.mem.eql(u8, mode, "OR ABORT")) .abort else if (comptime std.mem.eql(u8, mode, "OR FAIL")) .fail else if (comptime std.mem.eql(u8, mode, "OR ROLLBACK")) .rollback else @compileError("unknown insert mode");
             const RowType = @TypeOf(row);
+            if (comptime isAssignList(RowType)) return self.insertAssigns(row, conflict);
             validateRow(RowType);
             if (Columns == void) {
                 const fields = @typeInfo(RowType).@"struct".fields;
@@ -1022,7 +1207,6 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
 
         pub fn update(self: Self, assignments: anytype) !Mutation {
             const RowType = @TypeOf(assignments);
-            validateRow(RowType);
             var mutation = Mutation{
                 .allocator = self.allocator,
                 .connection = self.connection,
@@ -1037,6 +1221,28 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
                 .returningCols = self.returningCols,
                 .returningCount = self.returningCount,
             };
+            // Explicit assignments (`update(.{ User.name.set("x"),
+            // User.age.set(User.age.add(1)) })`): targets carry table
+            // identity; expressions distinguish target from value natively.
+            if (comptime isAssignList(RowType)) {
+                inline for (assignments, 0..) |item, index| {
+                    const Col = @TypeOf(item).assignColumn;
+                    checkAssignColumn(Col, Columns);
+                    inline for (0..index) |prev| {
+                        if (std.mem.eql(u8, @TypeOf(assignments[prev]).assignColumn.dslName, Col.dslName)) @compileError("duplicate assignment to one column in an explicit assign list");
+                    }
+                    try checkAssignScope(Col, self.table, self.tableAlias);
+                    if (comptime isExplicitDefault(@TypeOf(item.value))) continue;
+                    if (@TypeOf(item.value) == columnMod.ExcludedColumn) @compileError("excluded() is only valid in UPSERT assignments");
+                    if (mutation.setCount >= mutation.setNames.len) return error.InvalidSql;
+                    mutation.setNames[mutation.setCount] = Col.dslName;
+                    mutation.setValues[mutation.setCount] = setValueOf(item.value);
+                    mutation.setCount += 1;
+                }
+                if (mutation.setCount == 0) return error.InvalidSql;
+                return mutation;
+            }
+            validateRow(RowType);
             if (Columns == void) {
                 inline for (@typeInfo(RowType).@"struct".fields) |field| {
                     if (comptime isExplicitDefault(@TypeOf(@field(assignments, field.name)))) continue;
@@ -1791,6 +1997,7 @@ pub fn UpsertBuilder(comptime Row: type, comptime Columns: type) type {
         executeFn: astBuilder.ExecFn,
         table: []const u8,
         schema: []const u8 = "",
+        tableAlias: ?[]const u8 = null,
         targetCols: [8][]const u8 = undefined,
         targetCount: usize = 0,
         targetWhere: ?Expr = null,
@@ -1805,6 +2012,18 @@ pub fn UpsertBuilder(comptime Row: type, comptime Columns: type) type {
         caseCount: usize = 0,
         returningCols: [16]Projection = undefined,
         returningCount: usize = 0,
+
+        /// Scoped columns value for the upsert target table (`up.c().id`).
+        /// See `Builder.c` for the scoping contract.
+        pub fn c(self: Self) Columns {
+            _ = self;
+            if (Columns == void) return {};
+            var scoped: Columns = undefined;
+            inline for (@typeInfo(Columns).@"struct".fields) |field| {
+                @field(scoped, field.name) = .{};
+            }
+            return scoped;
+        }
 
         pub fn onConflictWhere(self: Self, condition: Expr) Self {
             var copy = self;
@@ -1877,6 +2096,13 @@ pub fn UpsertBuilder(comptime Row: type, comptime Columns: type) type {
             if (comptime @TypeOf(cols) == tableMod.AllOpFn) @compileError("use User.all() (call it) for RETURNING all columns");
             var copy = self;
             copy.returningCount = 0;
+            // Scoped single field (`returning(.id)`): resolves against the
+            // upsert's target table.
+            if (Row != void and comptime scopeMod.isScopedItem(@TypeOf(cols), Row)) {
+                copy.returningCols[0] = .{ .kind = .column, .column = scopeMod.resolveRef(Row, Columns, scopeMod.builderScope(self.table, self.tableAlias), cols) };
+                copy.returningCount = 1;
+                return copy;
+            }
             const items = if (@typeInfo(@TypeOf(cols)) == .pointer) cols.* else cols;
             inline for (items) |item| {
                 if (@TypeOf(item) == CaseBuilder) {
@@ -1885,7 +2111,11 @@ pub fn UpsertBuilder(comptime Row: type, comptime Columns: type) type {
                 }
                 if (@TypeOf(item) == WindowBuilder) @panic("window functions are not supported in RETURNING");
                 if (copy.returningCount >= copy.returningCols.len) @panic("too many DSL returning columns");
-                copy.returningCols[copy.returningCount] = toProjection(item);
+                if (Row != void and comptime scopeMod.isScopedItem(@TypeOf(item), Row)) {
+                    copy.returningCols[copy.returningCount] = .{ .kind = .column, .column = scopeMod.resolveRef(Row, Columns, scopeMod.builderScope(self.table, self.tableAlias), item) };
+                } else {
+                    copy.returningCols[copy.returningCount] = toProjection(item);
+                }
                 copy.returningCount += 1;
             }
             if (copy.returningCount == 0) @panic("returning() requires at least one column");
@@ -1895,6 +2125,26 @@ pub fn UpsertBuilder(comptime Row: type, comptime Columns: type) type {
         fn extractSets(self: *Self, assignments: anytype) !void {
             const RowType = @TypeOf(assignments);
             if (@typeInfo(RowType) != .@"struct") @compileError("DSL row must be a struct");
+            // Explicit UPSERT assignments (`doUpdate(.{ User.name.set("x"),
+            // User.age.set(db.excluded("age")) })`): `excluded()` markers,
+            // arithmetic, and column references all pass through natively.
+            if (comptime isAssignList(RowType)) {
+                self.setCount = 0;
+                inline for (assignments, 0..) |item, index| {
+                    const Col = @TypeOf(item).assignColumn;
+                    checkAssignColumn(Col, Columns);
+                    inline for (0..index) |prev| {
+                        if (std.mem.eql(u8, @TypeOf(assignments[prev]).assignColumn.dslName, Col.dslName)) @compileError("duplicate assignment to one column in an explicit assign list");
+                    }
+                    try checkAssignScope(Col, self.table, self.tableAlias);
+                    if (comptime isExplicitDefault(@TypeOf(item.value))) continue;
+                    if (self.setCount >= self.sets.len) return error.InvalidSql;
+                    self.sets[self.setCount] = .{ .name = Col.dslName, .value = upsertValueOf(item.value) };
+                    self.setCount += 1;
+                }
+                if (self.setCount == 0) return error.InvalidSql;
+                return;
+            }
             if (isTyped) {
                 inline for (@typeInfo(RowType).@"struct".fields) |field| {
                     if (!@hasField(Row, field.name)) @compileError("DSL row contains an unknown table column");

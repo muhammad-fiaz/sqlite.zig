@@ -28,6 +28,7 @@ const DynamicQuery = @import("../dsl/query_builder.zig").DynamicQuery;
 const DynamicTable = @import("../dsl/dynamic.zig").DynamicTable;
 const SchemaHandle = @import("../dsl/dynamic.zig").SchemaHandle;
 const keys = @import("../dsl/keys.zig");
+const scopeMod = @import("../dsl/scope.zig");
 const planner = @import("../plan/planner.zig");
 const exprEvaluator = @import("../sql/expr.zig");
 const functions = @import("../sql/functions.zig");
@@ -684,30 +685,33 @@ pub const Connection = struct {
             };
         }
         var expected = keys.ExpectedKeys{};
+        // Scoped key fields (`.id`) resolve against the table being defined;
+        // explicit columns keep their own table identity (checked inside).
+        const S = scopeMod.TypeScope(Row, Cols);
         const TO = @TypeOf(tableOpts);
         if (@hasField(@TypeOf(options), "primaryKey")) {
-            try keys.parsePkInto(options.primaryKey, tname, &expected);
+            try keys.parsePkIntoScoped(options.primaryKey, tname, S, &expected);
         } else if (@hasField(TO, "primaryKey")) {
-            try keys.parsePkInto(tableOpts.primaryKey, tname, &expected);
+            try keys.parsePkIntoScoped(tableOpts.primaryKey, tname, S, &expected);
         }
         if (@hasField(@TypeOf(options), "unique")) {
-            try keys.parseUniqueInto(options.unique, tname, &expected);
+            try keys.parseUniqueIntoScoped(options.unique, tname, S, &expected);
         } else if (@hasField(TO, "unique")) {
-            try keys.parseUniqueInto(tableOpts.unique, tname, &expected);
+            try keys.parseUniqueIntoScoped(tableOpts.unique, tname, S, &expected);
         }
         if (@hasField(@TypeOf(options), "foreignKeys")) {
-            try keys.parseFksInto(options.foreignKeys, tname, &expected);
+            try keys.parseFksIntoScoped(options.foreignKeys, tname, S, &expected);
         } else if (@hasField(TO, "foreignKeys")) {
-            try keys.parseFksInto(tableOpts.foreignKeys, tname, &expected);
+            try keys.parseFksIntoScoped(tableOpts.foreignKeys, tname, S, &expected);
         }
         if (@hasField(@TypeOf(options), "autoincrement")) {
             var autoNames: [16][]const u8 = undefined;
-            const autoCount = try keys.normalizeKey(options.autoincrement, tname, &autoNames);
+            const autoCount = try keys.normalizeKeyScoped(options.autoincrement, tname, S, &autoNames);
             if (autoCount != 1) return error.InvalidSql;
             (findDefinition(definitions[0..], autoNames[0]) orelse return error.UnknownColumn).autoincrement = true;
         } else if (@hasField(TO, "autoincrement")) {
             var autoNames: [16][]const u8 = undefined;
-            const autoCount = try keys.normalizeKey(tableOpts.autoincrement, tname, &autoNames);
+            const autoCount = try keys.normalizeKeyScoped(tableOpts.autoincrement, tname, S, &autoNames);
             if (autoCount != 1) return error.InvalidSql;
             (findDefinition(definitions[0..], autoNames[0]) orelse return error.UnknownColumn).autoincrement = true;
         }
@@ -847,10 +851,20 @@ pub const Connection = struct {
     }
 
     /// Creates a (unique) index over listed columns; planned by `plan/planner`.
+    /// Index over explicit columns (`User.email`) or scoped fields
+    /// (`createIndex(User, "idx", .{.email}, ...)`), resolved against the
+    /// target table when it is a `sqlite.table(...)` value.
     pub fn createIndex(self: *Connection, target: anytype, name: []const u8, cols: anytype, unique: bool) !void {
         const tableName: []const u8 = targetTableName(target);
+        const T = @TypeOf(target);
         var names: [16][]const u8 = undefined;
-        const count = try keys.normalizeKey(cols, tableName, &names);
+        var count: usize = 0;
+        if (comptime @import("../dsl/table.zig").isTableValue(T)) {
+            const S = scopeMod.TypeScope(@import("../dsl/table.zig").rowTypeOfValue(T), @import("../dsl/table.zig").columnsTypeOfValue(T));
+            count = try keys.normalizeKeyScoped(cols, tableName, S, &names);
+        } else {
+            count = try keys.normalizeKey(cols, tableName, &names);
+        }
         try self.store.createIndex(.{ .name = name, .table = tableName, .columns = names[0..count], .unique = unique });
         self.bumpSchemaVersion();
         if (!self.transactionActive) try self.persist();
@@ -867,8 +881,15 @@ pub const Connection = struct {
     pub fn createIndexWhere(self: *Connection, target: anytype, name: []const u8, cols: anytype, unique: bool, whereSql: []const u8) !void {
         if (whereSql.len == 0) return error.InvalidSql;
         const tableName: []const u8 = targetTableName(target);
+        const T = @TypeOf(target);
         var names: [16][]const u8 = undefined;
-        const count = try keys.normalizeKey(cols, tableName, &names);
+        var count: usize = 0;
+        if (comptime @import("../dsl/table.zig").isTableValue(T)) {
+            const S = scopeMod.TypeScope(@import("../dsl/table.zig").rowTypeOfValue(T), @import("../dsl/table.zig").columnsTypeOfValue(T));
+            count = try keys.normalizeKeyScoped(cols, tableName, S, &names);
+        } else {
+            count = try keys.normalizeKey(cols, tableName, &names);
+        }
         var ddl = std.ArrayList(u8).empty;
         defer ddl.deinit(self.allocator);
         try ddl.appendSlice(self.allocator, "CREATE ");
@@ -954,10 +975,22 @@ pub const Connection = struct {
     }
 
     /// ALTER TABLE ADD COLUMN with backfill of defaults/NULLs; STRICT and
-    /// generated-column rules enforced.
-    pub fn addColumn(self: *Connection, target: anytype, field: []const u8, FieldType: type) !void {
+    /// generated-column rules enforced. `field` is a name string, or (on
+    /// typed tables) a scoped field (`.nickname`) resolved against the
+    /// target table.
+    pub fn addColumn(self: *Connection, target: anytype, field: anytype, FieldType: type) !void {
         const tableName: []const u8 = targetTableName(target);
-        try self.store.addColumn(tableName, .{ .name = field, .typeName = keys.dslTypeName(FieldType) });
+        const T = @TypeOf(target);
+        if (comptime @import("../dsl/table.zig").isTableValue(T)) {
+            const S = scopeMod.TypeScope(@import("../dsl/table.zig").rowTypeOfValue(T), @import("../dsl/table.zig").columnsTypeOfValue(T));
+            if (comptime scopeMod.isScopedItem(@TypeOf(field), S.Row)) {
+                try self.store.addColumn(tableName, .{ .name = scopeMod.resolveSqlName(S, tableName, scopeMod.fieldNameOf(S, field)), .typeName = keys.dslTypeName(FieldType) });
+                self.bumpSchemaVersion();
+                if (!self.transactionActive) try self.persist();
+                return;
+            }
+        }
+        try self.store.addColumn(tableName, .{ .name = keys.coerceName(field), .typeName = keys.dslTypeName(FieldType) });
         self.bumpSchemaVersion();
         if (!self.transactionActive) try self.persist();
     }

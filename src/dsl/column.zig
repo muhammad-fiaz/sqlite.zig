@@ -484,6 +484,28 @@ pub const ExplicitDefault = struct {
     pub const isExplicitDefault = true;
 };
 
+/// Explicit column assignment for INSERT/UPDATE/UPSERT rows
+/// (`User.name.set("Alice")`). This is the valid-Zig form of the explicit
+/// table-qualified write syntax: it carries the column's table identity
+/// (`assignColumn`) plus the payload, so scoped row structs
+/// (`insert(.{ .name = "Alice" })`) and explicit assigns converge on the
+/// same native statement. Literals are validated against the column's Zig
+/// field type; column references, arithmetic, `excluded()` markers, and
+/// explicit value/default markers pass through to the per-path converters.
+pub fn Assign(comptime Col: type, comptime V: type) type {
+    return struct {
+        pub const isAssign = true;
+        pub const assignColumn = Col;
+        value: V,
+    };
+}
+
+/// True when `T` is an `Assign(Col, V)` explicit assignment.
+pub fn isAssignValue(comptime T: type) bool {
+    if (@typeInfo(T) != .@"struct") return false;
+    return @hasDecl(T, "isAssign") and T.isAssign and @hasDecl(T, "assignColumn") and isTypedColumn(T.assignColumn);
+}
+
 fn checkExplicitValue(comptime FieldType: type, comptime V: type) void {
     if (V == Value) return;
     if (V == @TypeOf(null)) {
@@ -804,6 +826,20 @@ pub fn Column(comptime tableName: []const u8, comptime columnName: []const u8, c
 
         pub fn defaultValue(_: Self) ExplicitDefault {
             return .{};
+        }
+
+        /// Explicit table-qualified assignment of this column
+        /// (`User.name.set("Alice")`, `User.age.set(User.age.add(1))`).
+        /// Use inside assign tuples: `update(.{ User.name.set("Alice") })`.
+        /// Literals are checked against the column type; references,
+        /// arithmetic, `excluded()`, and explicit markers pass through.
+        pub fn set(_: Self, payload: anytype) Assign(Self, @TypeOf(payload)) {
+            const V = @TypeOf(payload);
+            if (V == DynamicColumn or comptime isTypedColumn(V)) return .{ .value = payload };
+            if (V == ExcludedColumn) return .{ .value = payload };
+            if (comptime @typeInfo(V) == .@"struct" and (@hasDecl(V, "isExplicitValue") or @hasDecl(V, "isExplicitDefault") or @hasDecl(V, "isArithExpr"))) return .{ .value = payload };
+            checkExplicitValue(FieldType, V);
+            return .{ .value = payload };
         }
 
         pub fn add(self: Self, other: anytype) dslExpr.ArithExpr {
