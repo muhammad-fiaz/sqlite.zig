@@ -1594,7 +1594,13 @@ pub const Schema = struct {
                     const foreignIndex = self.columnIndex(foreignTable, foreignColumnName) orelse return error.ConstraintViolation;
                     if (values[index] != .null) {
                         var found = false;
-                        for (foreignTable.rows.items) |foreignRow| if (valuesEqual(foreignRow.values[foreignIndex], values[index])) {
+                        // Self-reference: like the reference engine, the row
+                        // under validation can satisfy its own parent key
+                        // (immediate checks see the statement's own row).
+                        if (std.ascii.eqlIgnoreCase(foreignTable.name, table.name) and valuesEqual(values[foreignIndex], values[index])) {
+                            found = true;
+                        }
+                        if (!found) for (foreignTable.rows.items) |foreignRow| if (valuesEqual(foreignRow.values[foreignIndex], values[index])) {
                             found = true;
                             break;
                         };
@@ -1623,15 +1629,25 @@ pub const Schema = struct {
                 if (self.fkCheckDeferred(constraint.deferrable, constraint.initiallyDeferred)) continue;
                 if (hasNull) continue;
                 const foreignTable = self.findConst(constraint.foreignTable orelse return error.ConstraintViolation) orelse return error.ConstraintViolation;
-                for (foreignTable.rows.items) |foreignRow| {
-                    var matched = true;
-                    for (constraint.columns, constraint.referencedColumns) |childName, parentName| {
-                        const childIndex = self.columnIndex(table, childName) orelse return error.UnknownColumn;
-                        const parentIndex = self.columnIndex(foreignTable, parentName) orelse return error.UnknownColumn;
-                        if (!valuesEqual(values[childIndex], foreignRow.values[parentIndex])) matched = false;
-                    }
-                    if (matched) break;
-                } else return error.ConstraintViolation;
+                // Self-reference: the row under validation can satisfy its
+                // own parent key (immediate checks see the statement's row).
+                var selfMatched = std.ascii.eqlIgnoreCase(foreignTable.name, table.name);
+                if (selfMatched) for (constraint.columns, constraint.referencedColumns) |childName, parentName| {
+                    const childIndex = self.columnIndex(table, childName) orelse return error.UnknownColumn;
+                    const parentIndex = self.columnIndex(foreignTable, parentName) orelse return error.UnknownColumn;
+                    if (!valuesEqual(values[childIndex], values[parentIndex])) selfMatched = false;
+                };
+                if (!selfMatched) {
+                    for (foreignTable.rows.items) |foreignRow| {
+                        var matched = true;
+                        for (constraint.columns, constraint.referencedColumns) |childName, parentName| {
+                            const childIndex = self.columnIndex(table, childName) orelse return error.UnknownColumn;
+                            const parentIndex = self.columnIndex(foreignTable, parentName) orelse return error.UnknownColumn;
+                            if (!valuesEqual(values[childIndex], foreignRow.values[parentIndex])) matched = false;
+                        }
+                        if (matched) break;
+                    } else return error.ConstraintViolation;
+                }
                 continue;
             }
             for (table.rows.items, 0..) |existing, existingIndex| {

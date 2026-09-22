@@ -144,6 +144,20 @@ scope, unqualified typed fields resolve against the root table, while
 explicit table paths carry their own identity. Both forms converge on the
 same native column reference; neither generates SQL text.
 
+The canonical rule, everywhere a column reference is semantically legal:
+
+```text
+A bare column such as `.id` refers to the current/root table scope.
+Use `Table.id` or an alias such as `t.id` when referring to another
+table or when explicit qualification is required.
+```
+
+This holds for queries, joins, constraints, keys, foreign keys,
+relationships, updates, deletes, inserts, returning, indexes, subqueries,
+and CTEs: scoped by default, explicit when needed, deterministic when
+ambiguous (bare fields bind to exactly one scope and never search all
+tables), and identical across every DSL context.
+
 ```zig
 // Scoped: .id means User.id because User is the root table.
 db.from(User).select(.{ .id, .name });
@@ -162,14 +176,20 @@ db.from(User).join(Membership, .inner, User.id.eq(Membership.user_id))
     .select(.{ .id, Membership.group_id });
 ```
 
-Predicate positions (`where`, `having`, join conditions) cannot take a
-bare `.id` — Zig has no syntax for an operator on an unscoped literal —
-so the query exposes its scoped columns as a value:
+Predicate positions (`where`, `having`, join `ON`) cannot take a
+bare `.id` receiver — Zig itself rejects method calls on enum literals
+(`.id.eq(1)` fails with `no field or member function named 'eq' in
+'@EnumLiteral()'` before any library code runs) — so the query exposes
+its scoped columns as a value:
 
 ```zig
 const q = db.from(User);
 q.where(q.c().id.eq(1)).select(.{.name});
+q.join(Profile, .inner, q.c().id.eq(Profile.user_id));
 ```
+
+`q.c().id` is the scoped spelling of the root table's `id`; `User.id`
+is the explicit spelling. Both converge on the same native predicate.
 
 Writes accept scoped row structs and explicit qualified assignments:
 
@@ -206,10 +226,18 @@ source table's own scope.
 Schema objects resolve the same way against the table being defined
 (`.primaryKey = .id`, `.unique = &.{.email}`, `.column = .thing_id`,
 `createIndex(User, "idx", .{.email}, ...)`, `addColumn(User, .nick, ...)`).
-Foreign-key `references` must stay explicit (`Parent.id`): the parent
-scope is unknown there, so a bare field would be a guess. Unknown scoped
-fields and cross-table assigns fail loudly (compile error or
-`UnknownColumn`), never by silent picking.
+Foreign-key `references` follows the same rule: a bare field resolves
+against the table being defined — the reference target for
+self-references (`.references = .id` on `Employee` means `Employee.id`) —
+while cross-table parents stay explicit (`Parent.id`), because only the
+explicit form identifies the other table. Both forms converge on one
+native `ForeignKeySpec` (child table, child columns, parent table, parent
+columns, actions, deferrability); nothing is ever inferred from column
+names (`parent_id` alone creates no relationship), and relationships stay
+explicit FK metadata. Bare and explicit spellings of the same reference
+normalize identically. Unknown scoped fields, cross-table assigns, and
+mixed-scope composites fail loudly (compile error, `UnknownColumn`, or
+`InvalidSql`), never by silent picking.
 
 Aliases never mutate the schema. `sqlite.aliased(User, "u")` rebinds the
 table value's columns to the alias; `db.from(User).as("u")` rebinds a
@@ -226,6 +254,58 @@ values over the CTE name (`sqlite.table("lite", LiteRow)`), so they
 scope like any table; CTE bodies themselves and migration version
 scripts stay SQL text by design (frozen, stable over time). See
 `examples/72_scoped_and_explicit_typed.zig`.
+
+Joins chain: every `.join()`/`.joinUsing()`/cross/natural call appends
+one leg (up to four), lowered left to right into native join nodes:
+
+```zig
+db.from(u).join(m, .inner, u.id.eq(m.user_id)).join(g, .inner, m.group_id.eq(g.id));
+```
+
+Predicates compose with `@"and"`/`@"or"` (`and`/`or` are reserved words
+in Zig, so the escaped-identifier spelling is canonical):
+
+```zig
+db.from(User).where(User.id.eq(1).@"and"(User.name.eq("ann")));
+```
+
+Pairs flatten into the condition list. An OR-pair under an AND-context
+distributes (`x AND (a OR b)` becomes `(x AND a) OR (x AND b)`, valid in
+three-valued logic), so SQL AND-binds-tighter precedence cannot misfire.
+Join `ON` stays a single equality (what the AST join node represents);
+wider conjunctions belong in `WHERE`.
+
+Equality is `.eq()`; `.is()` is SQL `IS` (null-safe, not an equality
+shorthand). Ordering supports explicit NULL placement, defaulting to
+SQLite semantics (NULL smallest: first on ASC, last on DESC):
+
+```zig
+db.from(User).orderBy(User.name.asc().withNullsLast());
+db.from(User).orderBy(User.name.desc().withNullsFirst());
+```
+
+`select(.all)` and `returning(.all)` project the root table's native
+star node (raw rows; a real `all` column wins per the collision rule),
+while `select(User.all())` and `selectAll()` return mapped rows.
+All-columns markers carry their source scope: `User.all()` qualifies with
+the table name and `u.all()` with the alias. A marker naming the query's
+own scope keeps the mapped star; a marker naming another scope expands to
+that side's explicit qualified column references (native `ColumnRef`s in
+declaration order, never SQL text), so one side of a join projects exactly
+its own columns (`db.from(A).join(B, ...).select(B.all())`). Bare-star
+expansion keeps SQL `*` semantics everywhere else.
+
+Impossible syntax is never documented as supported: `.where(.id.eq(1))`,
+`.join(P, .inner, .id.eq(P.x))`, `.id.set(1)`, `.id.asc()`,
+`.having(.x.count().gt(1))`, `User.as("u")`, `select(.all())`, and
+`User.id = 1` cannot compile in Zig (method calls on enum literals,
+methods on comptime structs, and assignment through struct literals are
+all rejected by the language). The canonical forms are
+`q.c().id.eq(1)`, `q.c().id.eq(P.x)`, `q.c().id.set(1)`,
+`User.id.asc()`, `q.c().x.count().gt(1)`,
+`sqlite.aliased(User, "u")`, `select(.all)`, and
+`User.id.set(1)`/`User.id.eq(1)`. See
+`examples/73_dual_form_matrix.zig` and `examples/74_relationships.zig`.
 
 ## Queries
 

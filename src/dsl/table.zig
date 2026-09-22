@@ -6,17 +6,55 @@
 const std = @import("std");
 const Column = @import("column.zig").Column;
 
-/// Native all-columns marker. Only produced by the synthesized `all()` call;
-/// a schema field named `all` is a `Column`, never this struct.
-pub const AllProjection = struct {};
-
-/// Build the marker value. Call it (`User.all()`) — passing `User.all`
-/// without calling is a comptime error downstream in `query_builder.select`.
-pub fn allColumnsOp() AllProjection {
-    return .{};
+/// Native all-columns marker, parameterized by source scope: the table name
+/// (or alias) qualifier plus the source columns descriptor. `User.all()`
+/// carries `"users"`; `u.all()` on an aliased table carries the alias.
+/// Query builders expand a foreign scope's marker into that side's explicit
+/// qualified column references (native `ColumnRef`s, never SQL text), while
+/// a marker naming the builder's own scope keeps the mapped star. Bare
+/// `.all` in scoped lists stays the root star (see `query_builder`).
+/// Only produced by the synthesized `all()` call; a schema field named
+/// `all` is a `Column`, never this struct.
+pub fn AllProjection(comptime qualifier: []const u8, comptime Cols: type) type {
+    return struct {
+        /// Table name (or alias) this marker projects.
+        pub const qualifierName = qualifier;
+        /// Source columns descriptor, for scope-aware expansion.
+        pub const Columns = Cols;
+        pub const isAllProjection = true;
+    };
 }
-/// Function-pointer type of the synthesized `all` operation field.
-pub const AllOpFn = *const fn () AllProjection;
+
+/// True for any `AllProjection(qualifier, Columns)` marker instantiation.
+pub fn isAllProjectionType(comptime T: type) bool {
+    if (@typeInfo(T) != .@"struct") return false;
+    return @hasDecl(T, "isAllProjection") and T.isAllProjection;
+}
+
+/// True for a synthesized `all` operation function pointer: `*const fn ()`
+/// returning an `AllProjection` marker. Each table (or alias) value carries
+/// its own instantiation, so the marker always knows its source scope.
+pub fn isAllOpFn(comptime T: type) bool {
+    const info = @typeInfo(T);
+    if (info != .pointer or info.pointer.size != .one) return false;
+    const fnInfo = @typeInfo(info.pointer.child);
+    if (fnInfo != .@"fn") return false;
+    if (fnInfo.@"fn".params.len != 0) return false;
+    const Ret = fnInfo.@"fn".return_type orelse return false;
+    return isAllProjectionType(Ret);
+}
+
+/// Build the per-value `all` operation returning a scope-carrying marker.
+/// `qualifier` is the table name (or alias); `Cols` is that value's columns
+/// descriptor type. The marker value itself is empty — all identity lives
+/// in its type, so `query_builder` can expand it at comptime.
+fn allOpFor(comptime qualifier: []const u8, comptime Cols: type) *const fn () AllProjection(qualifier, Cols) {
+    return &struct {
+        fn f() AllProjection(qualifier, Cols) {
+            return .{};
+        }
+    }.f;
+}
 
 /// Number of synthesized metadata fields prepended to every table struct.
 pub const metaCount = 5;
@@ -46,7 +84,8 @@ pub fn table(comptime name: []const u8, comptime spec: anytype) TablePublic(name
 }
 
 /// Table type for `table()`/`tableWith()`: metadata fields plus one `Column`
-/// per schema field, plus a synthesized `all: AllOpFn` unless the schema
+/// per schema field, plus a synthesized `all` operation (returning a
+/// scope-carrying `AllProjection` marker) unless the schema
 /// declares its own `all` column (collision rule).
 pub fn TablePublic(comptime name: []const u8, comptime spec: anytype, comptime opts: anytype) type {
     if (@TypeOf(spec) == type) {
@@ -110,14 +149,19 @@ fn TableTypeFor(
     types[2] = RowHolder(Row);
     types[3] = OptHolder(opts);
     types[4] = []const u8;
+    comptime var colNames: [N][:0]const u8 = undefined;
+    comptime var colTypes: [N]type = undefined;
     inline for (rowFields, 0..) |field, i| {
         const buf = field.name ++ [_]u8{0};
         names[metaCount + i] = buf[0..field.name.len :0];
         types[metaCount + i] = Column(name, sqlNameFor(field.name, mappings), field.type);
+        colNames[i] = names[metaCount + i];
+        colTypes[i] = types[metaCount + i];
     }
     if (!hasUserAll) {
         names[metaCount + N] = "all";
-        types[metaCount + N] = AllOpFn;
+        const ColsOnly = @Struct(.auto, null, &colNames, &colTypes, makeAttrs(N));
+        types[metaCount + N] = *const fn () AllProjection(name, ColsOnly);
     }
     return @Struct(.auto, null, &names, &types, makeAttrs(Total));
 }
@@ -139,16 +183,21 @@ fn DescribedTypeFor(comptime tname: []const u8, comptime spec: anytype, comptime
     types[1] = [N][]const u8;
     types[3] = OptHolder(opts);
     types[4] = []const u8;
+    comptime var colNames: [N][:0]const u8 = undefined;
+    comptime var colTypes: [N]type = undefined;
     inline for (fields, 0..) |field, i| {
         const VT = @TypeOf(@field(spec, field.name));
         const zbuf = field.name ++ [_]u8{0};
         names[metaCount + i] = zbuf[0..field.name.len :0];
         types[metaCount + i] = Column(tname, VT.dslName, VT.fieldType);
         ftypes[i] = VT.fieldType;
+        colNames[i] = names[metaCount + i];
+        colTypes[i] = types[metaCount + i];
     }
     if (!hasUserAll) {
         names[metaCount + N] = "all";
-        types[metaCount + N] = AllOpFn;
+        const ColsOnly = @Struct(.auto, null, &colNames, &colTypes, makeAttrs(N));
+        types[metaCount + N] = *const fn () AllProjection(tname, ColsOnly);
     }
     comptime var fnames: [N][:0]const u8 = undefined;
     inline for (0..N) |i| {
@@ -181,8 +230,8 @@ fn buildTable(
     inline for (@typeInfo(T).@"struct".fields) |field| {
         if (comptime isColumnField(field.type)) {
             @field(v, field.name) = .{};
-        } else if (comptime field.type == AllOpFn) {
-            @field(v, field.name) = &allColumnsOp;
+        } else if (comptime isAllOpFn(field.type)) {
+            @field(v, field.name) = allOpForType(field.type);
         }
     }
     return v;
@@ -205,8 +254,8 @@ fn buildDescribed(comptime tname: []const u8, comptime spec: anytype, comptime o
     inline for (@typeInfo(T).@"struct".fields) |field| {
         if (comptime isColumnField(field.type)) {
             @field(v, field.name) = .{};
-        } else if (comptime field.type == AllOpFn) {
-            @field(v, field.name) = &allColumnsOp;
+        } else if (comptime isAllOpFn(field.type)) {
+            @field(v, field.name) = allOpForType(field.type);
         }
     }
     return v;
@@ -240,16 +289,50 @@ pub fn AliasedType(comptime T: type, comptime aliasName: []const u8) type {
     const fields = @typeInfo(T).@"struct".fields;
     comptime var names: [fields.len][:0]const u8 = undefined;
     comptime var types: [fields.len]type = undefined;
+    comptime var allIndex: ?usize = null;
     inline for (fields, 0..) |field, i| {
         const buf = field.name ++ [_]u8{0};
         names[i] = buf[0..field.name.len :0];
-        if (isMetaFieldName(field.name) or field.type == AllOpFn) {
+        if (isMetaFieldName(field.name)) {
             types[i] = field.type;
+        } else if (comptime isAllOpFn(field.type)) {
+            allIndex = i;
         } else {
             types[i] = Column(aliasName, field.type.dslName, field.type.fieldType);
         }
     }
+    if (allIndex) |ai| {
+        // The alias carries its own all-columns operation. Column fields
+        // sit between the metadata prefix and the trailing `all` operation
+        // (the same layout `columnsTypeOfValue` assumes); bundle the
+        // rebound columns so `u.all()` expands to the alias's references.
+        const first = metaCount;
+        const n = if (ai > first) ai - first else 0;
+        comptime var colNames: [n][:0]const u8 = undefined;
+        comptime var colTypes: [n]type = undefined;
+        inline for (0..n) |k| {
+            colNames[k] = names[first + k];
+            colTypes[k] = types[first + k];
+        }
+        const ColsOnly = @Struct(.auto, null, &colNames, &colTypes, makeAttrs(n));
+        types[ai] = *const fn () AllProjection(aliasName, ColsOnly);
+    }
     return @Struct(.auto, null, &names, &types, makeAttrs(fields.len));
+}
+
+/// Build the `all` operation value matching a specialized `all` field type
+/// exactly. The marker value is empty; all identity lives in its type, so
+/// `query_builder` can expand it into that scope's qualified references.
+fn allOpForType(comptime Fn: type) Fn {
+    const Child = @typeInfo(Fn).pointer.child;
+    const fnInfo = @typeInfo(Child);
+    if (fnInfo != .@"fn") @compileError("all operation field must be a function pointer");
+    const Ret = fnInfo.@"fn".return_type orelse @compileError("all operation must return an AllProjection marker");
+    return &struct {
+        fn f() Ret {
+            return .{};
+        }
+    }.f;
 }
 
 /// Build the aliased table value described by `AliasedType`.
@@ -266,8 +349,8 @@ pub fn aliased(tbl: anytype, comptime aliasName: []const u8) AliasedType(@TypeOf
             } else {
                 @field(v, afield.name) = @field(tbl, TF[i].name);
             }
-        } else if (comptime afield.type == AllOpFn) {
-            @field(v, afield.name) = @field(tbl, TF[i].name);
+        } else if (comptime isAllOpFn(afield.type)) {
+            @field(v, afield.name) = allOpForType(afield.type);
         } else {
             // Column fields rebound to the alias; default-constructed values.
             @field(v, afield.name) = .{};
@@ -295,7 +378,7 @@ fn hasTrailingAllOp(comptime T: type) bool {
     const f = @typeInfo(T).@"struct".fields;
     if (f.len <= metaCount) return false;
     const last = f[f.len - 1];
-    return comptimeStringEq(last.name, "all") and last.type == AllOpFn;
+    return comptimeStringEq(last.name, "all") and isAllOpFn(last.type);
 }
 
 /// Columns-only struct type of a table value (metadata + trailing `all` op
@@ -365,12 +448,21 @@ test "aliased tables rebind columns without losing types" {
 test "all() builds the all-columns operation on collision-free tables" {
     const User = table("users", struct { id: i64, name: []const u8 });
     const proj = User.all();
-    try std.testing.expect(@TypeOf(proj) == AllProjection);
+    try std.testing.expect(isAllProjectionType(@TypeOf(proj)));
+    try std.testing.expectEqualStrings("users", @TypeOf(proj).qualifierName);
     try std.testing.expect(isTableValue(@TypeOf(User)));
     try std.testing.expectEqual(@as(usize, 2), columnCount(@TypeOf(User)));
-    // The alias keeps a working all-columns operation.
+    // The alias keeps a working all-columns operation bound to the alias.
     const u = aliased(User, "u");
-    try std.testing.expect(@TypeOf(u.all()) == AllProjection);
+    try std.testing.expect(isAllProjectionType(@TypeOf(u.all())));
+    try std.testing.expectEqualStrings("u", @TypeOf(u.all()).qualifierName);
+    // The marker's columns describe the source scope for expansion.
+    inline for (@typeInfo(@TypeOf(u.all()).Columns).@"struct".fields) |f| {
+        try std.testing.expectEqualStrings("u", f.type.table);
+    }
+    inline for (@typeInfo(@TypeOf(proj).Columns).@"struct".fields) |f| {
+        try std.testing.expectEqualStrings("users", f.type.table);
+    }
 }
 
 test "columns named like dsl operations stay plain fields" {
@@ -443,7 +535,7 @@ test "column order is declaration order and all() stays last" {
     try std.testing.expectEqual(@as(usize, 3), columnCount(@TypeOf(User)));
     // AllColumns marker is distinct from any column value, including a column
     // literally named `all` on another table.
-    try std.testing.expect(@TypeOf(User.all()) == AllProjection);
+    try std.testing.expect(isAllProjectionType(@TypeOf(User.all())));
     const Weird = table("weird", struct { all: []const u8, id: i64 });
     try std.testing.expect(@TypeOf(Weird.all).fieldType == []const u8);
     try std.testing.expectEqualStrings("all", Weird.columnNames[0]);

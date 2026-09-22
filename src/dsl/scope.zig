@@ -10,7 +10,10 @@
 //!
 //! ```text
 //! Unqualified typed field (.id):
-//!     resolves against the current/root query table (or its alias).
+//!     resolves against the current/root table scope (or its alias).
+//!     A bare column such as `.id` refers to the current/root table scope.
+//!     Use `Table.id` or an alias such as `t.id` when referring to another
+//!     table or when explicit qualification is required.
 //!
 //! Qualified typed column (User.id / u.id):
 //!     explicitly identifies a table or alias; scope never overrides it.
@@ -22,14 +25,29 @@
 //!     may explicitly reference an outer scope by table/alias identity.
 //!
 //! Schema definition (createTable / keys / indexes):
-//!     unqualified fields resolve against the target table being defined;
-//!     foreign-key `references` must stay explicit (the parent scope is
-//!     unknown there, so guessing would be silent magic).
+//!     unqualified fields resolve against the target table being defined.
+//!     Foreign-key `references` follows the same rule: a bare field means
+//!     the table being defined (the reference target for self-references),
+//!     while cross-table parents stay explicit (`Parent.id`) — never a
+//!     name-inferred guess, and relationships stay explicit FK metadata.
+//!
+//! All-columns markers (User.all() / u.all()):
+//!     carry their source scope (table name or alias); a foreign scope
+//!     expands to that side's qualified references, the root scope keeps
+//!     the mapped star, and bare `.all` is the root star.
 //! ```
 //!
 //! Resolution is comptime over borrowed names; nothing allocates and no SQL
 //! text is ever produced or reparsed. Unknown fields are compile errors
-//! naming the problem, never silent guesses.
+//! naming the problem, never silent guesses. Bare fields never search all
+//! tables: with no deterministic scope they fail loudly instead.
+//!
+//! One Zig-expressible boundary: operators and method calls cannot hang off
+//! a bare literal (`.id.eq(1)` is rejected by the Zig compiler itself, with
+//! `no field or member function named 'eq' in '@EnumLiteral()'`), so scoped
+//! predicates spell through the builder's scoped columns (`q.c().id.eq(1)`)
+//! or explicit paths (`User.id.eq(1)`). The scope rule itself is unchanged:
+//! `q.c().id` still means the current/root table's `id`.
 
 const std = @import("std");
 const dslExpr = @import("expr.zig");

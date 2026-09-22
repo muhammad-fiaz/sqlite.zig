@@ -1055,9 +1055,12 @@ pub const Connection = struct {
                 }
                 var expected = keys.ExpectedKeys{};
                 const TO = @TypeOf(TableOpts);
-                if (@hasField(TO, "primaryKey")) try keys.parsePkInto(TableOpts.primaryKey, self.tableName, &expected);
-                if (@hasField(TO, "unique")) try keys.parseUniqueInto(TableOpts.unique, self.tableName, &expected);
-                if (@hasField(TO, "foreignKeys")) try keys.parseFksInto(TableOpts.foreignKeys, self.tableName, &expected);
+                // Validate with the same scope the table was defined with, so
+                // scoped tableOptions keys resolve identically to creation.
+                const VS = scopeMod.TypeScope(Row, Cols);
+                if (@hasField(TO, "primaryKey")) try keys.parsePkIntoScoped(TableOpts.primaryKey, self.tableName, VS, &expected);
+                if (@hasField(TO, "unique")) try keys.parseUniqueIntoScoped(TableOpts.unique, self.tableName, VS, &expected);
+                if (@hasField(TO, "foreignKeys")) try keys.parseFksIntoScoped(TableOpts.foreignKeys, self.tableName, VS, &expected);
                 try keys.validateKeys(t, &expected);
             }
         };
@@ -9519,6 +9522,105 @@ test "self referencing and multi target foreign keys stay independent" {
     try std.testing.expectEqual(@as(usize, 0), gone2.count());
 }
 
+test "bare scoped foreign-key references resolve to the defining table" {
+    const tableMod = @import("../dsl/table.zig");
+    const Emp = tableMod.table("rel_bare_emp", struct { id: i64, manager_id: ?i64 });
+    const path = "sqlite_zig_bare_fk_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    // Bare .references = .id means the table being defined: a self-reference
+    // with identical runtime behavior to the explicit Employee.id form.
+    try db.createTable(Emp, .{
+        .overWrite = true,
+        .primaryKey = .id,
+        .foreignKeys = &.{.{ .column = .manager_id, .references = .id, .onDelete = .setNull }},
+    });
+    try db.schema(Emp).validate();
+    var ceo = try db.from(Emp).insert(.{ .id = 1, .manager_id = null });
+    ceo.deinit();
+    var dev = try db.from(Emp).insert(.{ .id = 2, .manager_id = 1 });
+    dev.deinit();
+    // A row may reference itself in a single insert (immediate checks see
+    // the statement's own row); remove it again to keep the counts below.
+    var selfRef = try db.from(Emp).insert(.{ .id = 3, .manager_id = 3 });
+    selfRef.deinit();
+    var delSelf = try db.from(Emp).where(Emp.id.eq(3)).delete().execute();
+    delSelf.deinit();
+    // Scoped predicate via the builder's scoped columns: same scope, no guessing.
+    const emp = db.from(Emp);
+    var delMgr = try emp.where(emp.c().id.eq(1)).delete().execute();
+    delMgr.deinit();
+    var orphan = try db.from(Emp).select(Emp.all()).fetchOne();
+    defer db.from(Emp).freeRow(&orphan);
+    try std.testing.expect(orphan.manager_id == null);
+    // A child pointing at a missing parent still violates the constraint.
+    const bad = db.from(Emp).insert(.{ .id = 9, .manager_id = 42 });
+    try std.testing.expectError(error.ConstraintViolation, bad);
+}
+
+test "composite scoped references resolve against the defining table" {
+    const tableMod = @import("../dsl/table.zig");
+    const Duo = tableMod.table("rel_duo", struct { a: i64, region: []const u8, pa: i64, pr: []const u8 });
+    const path = "sqlite_zig_duo_fk_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    try db.createTable(Duo, .{
+        .overWrite = true,
+        .primaryKey = &.{ Duo.a, Duo.region },
+        .foreignKeys = &.{.{ .columns = &.{ .pa, .pr }, .references = &.{ .a, .region }, .onUpdate = .cascade }},
+    });
+    try db.schema(Duo).validate();
+    var r1 = try db.from(Duo).insert(.{ .a = 1, .region = "w", .pa = 1, .pr = "w" });
+    r1.deinit();
+    var r2 = try db.from(Duo).insert(.{ .a = 2, .region = "e", .pa = 1, .pr = "w" });
+    r2.deinit();
+    var rows = try db.from(Duo).selectAll().fetch();
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(usize, 2), rows.count());
+    const bad = db.from(Duo).insert(.{ .a = 3, .region = "n", .pa = 9, .pr = "z" });
+    try std.testing.expectError(error.ConstraintViolation, bad);
+}
+
+test "qualified all() projects exactly one join side" {
+    const tableMod = @import("../dsl/table.zig");
+    const A = tableMod.table("qa_left", struct { id: i64, name: []const u8 });
+    const B = tableMod.table("qa_right", struct { id: i64, tag: []const u8 });
+    const path = "sqlite_zig_qualified_all_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    try db.createTable(A, .{ .overWrite = true, .primaryKey = A.id });
+    try db.createTable(B, .{ .overWrite = true, .primaryKey = B.id });
+    var a1 = try db.from(A).insert(.{ .id = 1, .name = "ann" });
+    a1.deinit();
+    var b1 = try db.from(B).insert(.{ .id = 1, .tag = "x" });
+    b1.deinit();
+    // The joined side's marker projects only that side's columns (raw).
+    var rightOnly = try db.from(A).join(B, .inner, A.id.eq(B.id)).select(B.all()).fetch();
+    defer rightOnly.deinit();
+    try std.testing.expectEqual(@as(usize, 1), rightOnly.count());
+    try std.testing.expectEqual(@as(usize, 2), rightOnly.rows[0].len);
+    try std.testing.expectEqual(@as(i64, 1), rightOnly.rows[0][0].integer);
+    try std.testing.expectEqualStrings("x", rightOnly.rows[0][1].text);
+    // Root-side marker keeps the mapped star.
+    var leftMapped = try db.from(A).join(B, .inner, A.id.eq(B.id)).select(A.all()).fetch();
+    defer leftMapped.deinit();
+    try std.testing.expectEqual(@as(usize, 1), leftMapped.count());
+    try std.testing.expectEqual(@as(i64, 1), leftMapped.at(0).id);
+    // Builder-scoped join predicate resolves against the root scope.
+    const aq = db.from(A);
+    var scopedJoin = try aq.join(B, .inner, aq.c().id.eq(B.id)).select(B.all()).fetch();
+    defer scopedJoin.deinit();
+    try std.testing.expectEqual(@as(usize, 1), scopedJoin.count());
+    try std.testing.expectEqualStrings("x", scopedJoin.rows[0][1].text);
+    // An aliased marker carries the alias qualifier.
+    const bu = tableMod.aliased(B, "bu");
+    var aliasedRight = try db.from(A).join(bu, .inner, A.id.eq(bu.id)).select(bu.all()).fetch();
+    defer aliasedRight.deinit();
+    try std.testing.expectEqual(@as(usize, 1), aliasedRight.count());
+    try std.testing.expectEqual(@as(usize, 2), aliasedRight.rows[0].len);
+    try std.testing.expectEqualStrings("x", aliasedRight.rows[0][1].text);
+}
+
 test "one to one unique foreign keys reject duplicates" {
     const tableMod = @import("../dsl/table.zig");
     const U = tableMod.table("o2o_users", struct { id: i64 });
@@ -9533,7 +9635,7 @@ test "one to one unique foreign keys reject duplicates" {
         .unique = &.{P.user_id},
         .foreignKeys = &.{.{ .column = P.user_id, .references = U.id, .onDelete = .cascade }},
     });
-    var u = try db.from(U).insert(.{.id = 1});
+    var u = try db.from(U).insert(.{ .id = 1 });
     u.deinit();
     var p = try db.from(P).insert(.{ .id = 1, .user_id = 1 });
     p.deinit();
@@ -9571,7 +9673,7 @@ test "set default no action and composite actions execute" {
         .primaryKey = N.id,
         .foreignKeys = &.{.{ .column = N.parent_id, .references = P.id, .onDelete = .noAction }},
     });
-    var p = try db.from(P).insert(.{.id = 1});
+    var p = try db.from(P).insert(.{ .id = 1 });
     p.deinit();
     var d = try db.from(D).insert(.{ .id = 1, .parent_id = 1 });
     d.deinit();
@@ -9588,15 +9690,15 @@ test "set default no action and composite actions execute" {
     var dp = try db.from(P).where(P.id.eq(1)).delete().execute();
     dp.deinit();
     // ...and SET DEFAULT fires on delete when the child survives via default.
-    var p2 = try db.from(P).insert(.{.id = 2});
+    var p2 = try db.from(P).insert(.{ .id = 2 });
     p2.deinit();
     var d2 = try db.from(D).insert(.{ .id = 2, .parent_id = 2 });
     d2.deinit();
     // Point the child at the default row, then delete a *different* parent:
     // use update to prove SET DEFAULT lands on the declared default.
-    var p3 = try db.from(P).insert(.{.id = 3});
+    var p3 = try db.from(P).insert(.{ .id = 3 });
     p3.deinit();
-    var mv = try (try db.from(D).update(.{.parent_id = 3})).where(D.id.eq(2)).execute();
+    var mv = try (try db.from(D).update(.{ .parent_id = 3 })).where(D.id.eq(2)).execute();
     mv.deinit();
     var dp3 = try db.from(P).where(P.id.eq(3)).delete().execute();
     dp3.deinit();
@@ -9652,7 +9754,7 @@ test "foreign keys work on without rowid tables" {
         .primaryKey = C.id,
         .foreignKeys = &.{.{ .column = C.parent_id, .references = P.id, .onDelete = .cascade }},
     });
-    var p = try db.from(P).insert(.{.id = 1});
+    var p = try db.from(P).insert(.{ .id = 1 });
     p.deinit();
     var c = try db.from(C).insert(.{ .id = 1, .parent_id = 1 });
     c.deinit();
@@ -10050,6 +10152,25 @@ test "schema validation accepts a matching typed table" {
     try db.createTable(Order, .{});
     try db.schema(User).validate();
     try db.schema(Order).validate();
+}
+
+test "schema validation accepts scoped tableOptions keys" {
+    const path = "sqlite_zig_scoped_opts_validate_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    const Emp = @import("../dsl/table.zig").tableWith("sov_emp", struct { id: i64, manager_id: ?i64, email: []const u8 }, .{
+        .primaryKey = .id,
+        .unique = &.{.email},
+        .foreignKeys = &.{.{ .column = .manager_id, .references = .id, .onDelete = .setNull }},
+    });
+    try db.createTable(Emp, .{ .overWrite = true });
+    try db.schema(Emp).validate();
+    var ceo = try db.from(Emp).insert(.{ .id = 1, .manager_id = null, .email = "ceo@x.y" });
+    ceo.deinit();
+    var dev = try db.from(Emp).insert(.{ .id = 2, .manager_id = 1, .email = "dev@x.y" });
+    dev.deinit();
+    const dup = db.from(Emp).insert(.{ .id = 3, .manager_id = null, .email = "ceo@x.y" });
+    try std.testing.expectError(error.ConstraintViolation, dup);
 }
 
 test "schema validation rejects mismatched tables" {
@@ -16544,11 +16665,11 @@ test "savepoints roll back to the marked statement only" {
     defer dropDb(db, path);
     try db.createTable(T, .{ .overWrite = true, .primaryKey = T.id });
     try db.begin();
-    var a = try db.from(T).insert(.{.id = 1});
+    var a = try db.from(T).insert(.{ .id = 1 });
     a.deinit();
     try db.savepoint("sp1");
     // A second insert, then rolled back via savepoint.
-    var b2 = try db.from(T).insert(.{.id = 2});
+    var b2 = try db.from(T).insert(.{ .id = 2 });
     b2.deinit();
     try db.rollbackToSavepoint("sp1");
     try db.commit();
@@ -16612,7 +16733,7 @@ test "triggers and views compose with dual form reads" {
     defer ve.deinit();
     try std.testing.expectEqual(@as(i64, 10), ve.rows[0][0].integer);
     // A typed update is visible through the view under both spellings.
-    var up = try (try db.from(T).update(.{.n = 20})).where(T.id.eq(1)).execute();
+    var up = try (try db.from(T).update(.{ .n = 20 })).where(T.id.eq(1)).execute();
     up.deinit();
     var after = try db.from(V).select(.{.n}).fetch();
     defer after.deinit();
@@ -16641,7 +16762,7 @@ test "limit offset and transactions behave in every form" {
     try std.testing.expectEqual(@as(i64, 2), scoped.rows[0][0].integer);
     // Rollback removes uncommitted rows.
     try db.begin();
-    var tmp = try db.from(T).insert(.{.id = 9});
+    var tmp = try db.from(T).insert(.{ .id = 9 });
     tmp.deinit();
     try db.rollback();
     var cnt = try db.exec("SELECT count(*) FROM lim_t;");

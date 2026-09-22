@@ -291,14 +291,11 @@ fn projectionToAst(ctx: *Ctx, proj: dslExpr.Projection, base: ?StripBase, cases:
     switch (proj.kind) {
         .star => {
             if (proj.filterExpr != null) return error.InvalidSql;
-            // TODO(qualified-star): render QualifiedAllColumns (`u.*`) in
-            // multi-table projections. `u.all()` currently lowers to the
-            // bare wildcard, which is identical for single-table queries
-            // but cannot project one side of a join. Needs a qualified
-            // wildcard AST node plus qualifier-aware expansion at every
-            // `.wildcard` site in connection.zig, the raw parser, and
-            // EXPLAIN output. Workaround: project the side's columns
-            // explicitly (`select(.{ u.id, u.name })`).
+            // The bare wildcard is the root scope's all-columns node only.
+            // Qualified sides (`u.all()`) never reach this arm: the query
+            // builder expands them into that side's explicit qualified
+            // column references first (native `ColumnRef`s, never SQL text),
+            // so one side of a join projects exactly its own columns.
             return .{ .expr = .wildcard, .alias = proj.alias };
         },
         .countStar => {

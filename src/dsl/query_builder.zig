@@ -61,10 +61,56 @@ fn toProjection(item: anytype) Projection {
     const T = @TypeOf(item);
     if (T == Projection) return item;
     if (T == columnMod.DynamicColumn) return item.projection();
-    if (T == tableMod.AllProjection) return .{ .kind = .star };
+    if (comptime tableMod.isAllProjectionType(T)) return .{ .kind = .star };
     if (T == dslExpr.Order) @compileError("select() takes columns, not orders; pass col.asc()/col.desc() to orderBy()");
     if (comptime isTypedColumnInstance(T)) return item.projection();
     @compileError("select() takes column descriptors (User.id / table.column(\"x\")) or their aggregates");
+}
+
+/// Root-scope qualifier for column resolution: the table name (or alias)
+/// carried by the columns descriptor. Empty for untyped builders.
+fn rootScopeName(comptime Columns: type) []const u8 {
+    if (Columns == void) return "";
+    const info = @typeInfo(Columns);
+    if (info != .@"struct") return "";
+    for (info.@"struct".fields) |field| {
+        if (@hasDecl(field.type, "dslTable")) return field.type.dslTable;
+    }
+    return "";
+}
+
+/// True when an all-columns marker names the builder's own scope: the
+/// mapped star path stays. Anything else expands to that side's explicit
+/// qualified columns (see `appendMarkerColumns`).
+fn allMatchesRoot(comptime Columns: type, comptime Marker: type) bool {
+    return std.ascii.eqlIgnoreCase(rootScopeName(Columns), Marker.qualifierName);
+}
+
+/// True when `T` is (or contains, for tuples/arrays/pointers) an
+/// all-columns marker naming a scope other than the builder's own.
+fn tupleHasForeignAll(comptime Columns: type, comptime T: type) bool {
+    const info = @typeInfo(T);
+    if (info == .pointer) return tupleHasForeignAll(Columns, info.pointer.child);
+    if (info == .array) return tupleHasForeignAll(Columns, info.array.child);
+    if (comptime tableMod.isAllProjectionType(T)) return !allMatchesRoot(Columns, T);
+    if (info == .@"struct" and info.@"struct".is_tuple) {
+        inline for (info.@"struct".fields) |field| {
+            if (comptime tupleHasForeignAll(Columns, field.type)) return true;
+        }
+    }
+    return false;
+}
+
+/// Append one all-columns marker's side as explicit qualified column
+/// references (native `ColumnRef`s in declaration order, never SQL text).
+/// The marker carries its own columns descriptor, so the qualifier is
+/// always the side the marker was built from (table name or alias).
+fn appendMarkerColumns(projections: []Projection, count: *usize, comptime Marker: type) void {
+    inline for (@typeInfo(Marker.Columns).@"struct".fields) |field| {
+        if (count.* >= projections.len) @panic("too many DSL projections");
+        projections[count.*] = toProjection(field.type{});
+        count.* += 1;
+    }
 }
 
 fn toRef(item: anytype) ColumnRef {
@@ -338,7 +384,7 @@ pub fn joinTargetOf(other: anytype) JoinTarget {
 }
 
 fn containsAllMarker(comptime T: type) bool {
-    if (T == tableMod.AllProjection) return true;
+    if (comptime tableMod.isAllProjectionType(T)) return true;
     const info = @typeInfo(T);
     if (info == .pointer) return containsAllMarker(info.pointer.child);
     if (info == .array) return containsAllMarker(info.array.child);
@@ -350,10 +396,16 @@ fn containsAllMarker(comptime T: type) bool {
     return false;
 }
 
-/// Builder type returned by `select(cols)`: mapped (`selectAll`/star present)
-/// when `T` contains an `AllProjection` marker, unmapped otherwise.
+/// Builder type returned by `select(cols)`: mapped when `T` is a root-scope
+/// all-columns marker (or a list of only root-scope markers), unmapped
+/// when a marker names a foreign scope (those expand to explicit columns),
+/// unmapped otherwise.
 pub fn SelectOut(comptime Row: type, comptime Columns: type, comptime T: type) type {
-    if (T == tableMod.AllProjection or containsAllMarker(T)) return Builder(Row, Columns, true);
+    if (comptime tableMod.isAllProjectionType(T)) return Builder(Row, Columns, allMatchesRoot(Columns, T));
+    if (comptime containsAllMarker(T)) {
+        if (comptime tupleHasForeignAll(Columns, T)) return Builder(Row, Columns, false);
+        return Builder(Row, Columns, true);
+    }
     return Builder(Row, Columns, false);
 }
 
@@ -592,16 +644,20 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
         }
 
         /// Project explicit columns/projections in order (order preserved into
-        /// the native AST). `AllProjection` items route to `selectAll()`.
-        /// Passing the `all` operation without calling is a comptime error.
+        /// the native AST). Root-scope `AllProjection` items route to
+        /// `selectAll()`; a marker naming another scope expands to that
+        /// side's explicit qualified columns (unmapped). Passing the `all`
+        /// operation without calling is a comptime error.
         pub fn select(self: Self, cols: anytype) SelectOut(Row, Columns, @TypeOf(cols)) {
-            if (comptime @TypeOf(cols) == tableMod.AllOpFn) @compileError("use User.all() (call it) for the all-columns projection, or db.from(User).selectAll()");
-            if (comptime containsAllMarker(@TypeOf(cols))) {
-                return self.selectAll();
+            if (comptime tableMod.isAllOpFn(@TypeOf(cols))) @compileError("use User.all() (call it) for the all-columns projection, or db.from(User).selectAll()");
+            const T = @TypeOf(cols);
+            // Single qualified marker: this scope keeps the mapped star,
+            // a foreign scope expands (recurse as an explicit list).
+            if (comptime tableMod.isAllProjectionType(T)) {
+                if (comptime allMatchesRoot(Columns, T)) return self.selectAll();
+                return self.select(.{cols});
             }
-            // Bare `select(User.all())`: the AllProjection value routes to
-            // the native star like its tuple form does.
-            if (comptime @TypeOf(cols) == tableMod.AllProjection) {
+            if (comptime containsAllMarker(T) and !tupleHasForeignAll(Columns, T)) {
                 return self.selectAll();
             }
             var copy = self.retype(false);
@@ -609,13 +665,12 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
             copy.projectionCount = 0;
             copy.caseCount = 0;
             copy.windowCount = 0;
-            const T = @TypeOf(cols);
             // Scoped star (`select(.all)`): the root table's native
             // all-columns node in place (raw rows, like every other
             // single-scoped select), unless the row declares a real `all`
             // column (which wins as an ordinary scoped field per the
-            // collision rule). `selectAll()`/`User.all()` stay the mapped
-            // spellings.
+            // collision rule). `selectAll()`/root `User.all()` stay the
+            // mapped spellings.
             if (T == scopeMod.EnumLiteral and comptime scopeMod.isScopedAll(T, Row, cols)) {
                 return copy.selectOneStar();
             }
@@ -638,6 +693,13 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
                     continue;
                 }
                 if (copy.projectionCount >= copy.projections.len) @panic("too many DSL projections");
+                // A qualified all-columns marker expands to its own side's
+                // explicit qualified references (exact one-side projection,
+                // never star bleed into other join sides).
+                if (comptime tableMod.isAllProjectionType(@TypeOf(item))) {
+                    appendMarkerColumns(copy.projections[0..], &copy.projectionCount, @TypeOf(item));
+                    continue;
+                }
                 // A scoped `.all` anywhere in the list appends the native
                 // star node (never silently dropped, never a string).
                 if (@TypeOf(item) == scopeMod.EnumLiteral and comptime scopeMod.isScopedAll(@TypeOf(item), Row, item)) {
@@ -697,13 +759,18 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
         }
 
         pub fn returning(self: Self, cols: anytype) Self {
-            if (comptime @TypeOf(cols) == tableMod.AllOpFn) @compileError("use User.all() (call it) for RETURNING all columns");
+            if (comptime tableMod.isAllOpFn(@TypeOf(cols))) @compileError("use User.all() (call it) for RETURNING all columns");
             var copy = self;
             copy.returningCount = 0;
             const T = @TypeOf(cols);
+            // A foreign-scope marker expands as an explicit list; a
+            // root-scope marker keeps the native star below.
+            if (comptime tableMod.isAllProjectionType(T) and !allMatchesRoot(Columns, T)) {
+                return self.returning(.{cols});
+            }
             // Single items (a bare column, star marker, or scoped field)
             // project exactly one RETURNING expression.
-            if (T == Projection or T == columnMod.DynamicColumn or T == tableMod.AllProjection or comptime isTypedColumnInstance(T)) {
+            if (T == Projection or T == columnMod.DynamicColumn or comptime tableMod.isAllProjectionType(T) or isTypedColumnInstance(T)) {
                 copy.returningCols[0] = toProjection(cols);
                 copy.returningCount = 1;
                 return copy;
@@ -730,6 +797,12 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
                 }
                 if (@TypeOf(item) == WindowBuilder) @panic("window functions are not supported in RETURNING");
                 if (copy.returningCount >= copy.returningCols.len) @panic("too many DSL returning columns");
+                // A qualified marker expands to its own side's explicit
+                // qualified references (exact one-side projection).
+                if (comptime tableMod.isAllProjectionType(@TypeOf(item))) {
+                    appendMarkerColumns(copy.returningCols[0..], &copy.returningCount, @TypeOf(item));
+                    continue;
+                }
                 if (@TypeOf(item) == scopeMod.EnumLiteral and comptime scopeMod.isScopedAll(@TypeOf(item), Row, item)) {
                     copy.returningCols[copy.returningCount] = .{ .kind = .star };
                 } else if (Row != void and comptime scopeMod.isScopedItem(@TypeOf(item), Row)) {
@@ -2325,12 +2398,17 @@ pub fn UpsertBuilder(comptime Row: type, comptime Columns: type) type {
         }
 
         pub fn returning(self: Self, cols: anytype) Self {
-            if (comptime @TypeOf(cols) == tableMod.AllOpFn) @compileError("use User.all() (call it) for RETURNING all columns");
+            if (comptime tableMod.isAllOpFn(@TypeOf(cols))) @compileError("use User.all() (call it) for RETURNING all columns");
             var copy = self;
             copy.returningCount = 0;
             const T = @TypeOf(cols);
+            // A foreign-scope marker expands as an explicit list; a
+            // root-scope marker keeps the native star below.
+            if (comptime tableMod.isAllProjectionType(T) and !allMatchesRoot(Columns, T)) {
+                return self.returning(.{cols});
+            }
             // Single items project exactly one RETURNING expression.
-            if (T == Projection or T == columnMod.DynamicColumn or T == tableMod.AllProjection or comptime isTypedColumnInstance(T)) {
+            if (T == Projection or T == columnMod.DynamicColumn or comptime tableMod.isAllProjectionType(T) or isTypedColumnInstance(T)) {
                 copy.returningCols[0] = toProjection(cols);
                 copy.returningCount = 1;
                 return copy;
@@ -2356,6 +2434,12 @@ pub fn UpsertBuilder(comptime Row: type, comptime Columns: type) type {
                 }
                 if (@TypeOf(item) == WindowBuilder) @panic("window functions are not supported in RETURNING");
                 if (copy.returningCount >= copy.returningCols.len) @panic("too many DSL returning columns");
+                // A qualified marker expands to its own side's explicit
+                // qualified references (exact one-side projection).
+                if (comptime tableMod.isAllProjectionType(@TypeOf(item))) {
+                    appendMarkerColumns(copy.returningCols[0..], &copy.returningCount, @TypeOf(item));
+                    continue;
+                }
                 if (@TypeOf(item) == scopeMod.EnumLiteral and comptime scopeMod.isScopedAll(@TypeOf(item), Row, item)) {
                     copy.returningCols[copy.returningCount] = .{ .kind = .star };
                 } else if (Row != void and comptime scopeMod.isScopedItem(@TypeOf(item), Row)) {
@@ -2591,10 +2675,24 @@ pub const Mutation = struct {
     }
 
     pub fn returning(self: Mutation, cols: anytype) Mutation {
-        if (comptime @TypeOf(cols) == tableMod.AllOpFn) @compileError("use User.all() (call it) for RETURNING all columns");
+        if (comptime tableMod.isAllOpFn(@TypeOf(cols))) @compileError("use User.all() (call it) for RETURNING all columns");
         var copy = self;
         copy.returningCount = 0;
-        const items = if (@typeInfo(@TypeOf(cols)) == .pointer) cols.* else cols;
+        const T = @TypeOf(cols);
+        // Mutations are untyped: the root scope is the runtime target
+        // table. A marker naming it keeps the native star; anything else
+        // expands to that side's explicit qualified references.
+        if (comptime tableMod.isAllProjectionType(T)) {
+            if (std.ascii.eqlIgnoreCase(copy.table, T.qualifierName)) {
+                copy.returningCols[0] = .{ .kind = .star };
+                copy.returningCount = 1;
+            } else {
+                appendMarkerColumns(copy.returningCols[0..], &copy.returningCount, T);
+            }
+            if (copy.returningCount == 0) @panic("returning() requires at least one column");
+            return copy;
+        }
+        const items = if (@typeInfo(T) == .pointer) cols.* else cols;
         inline for (items) |item| {
             if (@TypeOf(item) == CaseBuilder) {
                 storeCaseProjection(&copy.cases, &copy.caseCount, copy.returningCols[0..], &copy.returningCount, item);
@@ -2602,6 +2700,15 @@ pub const Mutation = struct {
             }
             if (@TypeOf(item) == WindowBuilder) @panic("window functions are not supported in RETURNING");
             if (copy.returningCount >= copy.returningCols.len) @panic("too many DSL returning columns");
+            if (comptime tableMod.isAllProjectionType(@TypeOf(item))) {
+                if (std.ascii.eqlIgnoreCase(copy.table, @TypeOf(item).qualifierName)) {
+                    copy.returningCols[copy.returningCount] = .{ .kind = .star };
+                    copy.returningCount += 1;
+                } else {
+                    appendMarkerColumns(copy.returningCols[0..], &copy.returningCount, @TypeOf(item));
+                }
+                continue;
+            }
             copy.returningCols[copy.returningCount] = toProjection(item);
             copy.returningCount += 1;
         }
@@ -2667,13 +2774,14 @@ test "select preserves projection order and AllColumns routing" {
     try std.testing.expectEqualStrings("where", weird.projections[0].column.name);
     // AllColumns marker routes to the mapped star builder (native wildcard).
     const T = @import("table.zig").table("t", struct { id: i64, name: []const u8 });
-    const Star = @import("table.zig").AllProjection;
-    try std.testing.expect(@TypeOf(Star{}) == Star);
+    const Star = @import("table.zig").AllProjection("t", @import("table.zig").columnsTypeOfValue(@TypeOf(T)));
+    try std.testing.expect(@import("table.zig").isAllProjectionType(Star));
+    try std.testing.expectEqualStrings("t", Star.qualifierName);
     const starBase = DynamicQuery.initRaw(std.testing.allocator, conn, "t", undefined, undefined, undefined);
     const all = starBase.selectAll();
     try std.testing.expect(all.allColumns);
     try std.testing.expectEqual(@as(usize, 0), all.projectionCount);
-    _ = T;
+    try std.testing.expectEqual(@as(usize, 2), @typeInfo(@TypeOf(T.all()).Columns).@"struct".fields.len);
 }
 
 test "scoped and explicit selects converge on one projection" {
@@ -2772,4 +2880,54 @@ test "explicit assigns carry table identity for writes" {
     // Plain values are not assigns; row structs stay the scoped write form.
     try std.testing.expect(!columnMod.isAssignValue(@TypeOf(1)));
     try std.testing.expect(!columnMod.isAssignValue(@TypeOf(.{ .id = 1 })));
+}
+
+test "qualified all() markers expand to their own side" {
+    const conn = @as(*anyopaque, @ptrFromInt(0x1000));
+    const A = tableMod.table("qa_a", struct { id: i64, name: []const u8 });
+    const B = tableMod.table("qa_b", struct { id: i64, tag: []const u8, extra: i64 });
+    const base = Query(@TypeOf(A)).initRaw(std.testing.allocator, conn, "qa_a", undefined, undefined, undefined);
+    // A marker naming the builder's own scope keeps the mapped star.
+    const rooted = base.select(A.all());
+    try std.testing.expect(@TypeOf(rooted).isMapped);
+    // A marker naming another scope expands to that side's explicit
+    // qualified references (native ColumnRefs, never SQL text), unmapped.
+    const expanded = base.select(B.all());
+    try std.testing.expect(!@TypeOf(expanded).isMapped);
+    try std.testing.expectEqual(@as(usize, 3), expanded.projectionCount);
+    for (expanded.projections[0..expanded.projectionCount]) |proj| {
+        try std.testing.expect(proj.kind == .column);
+        try std.testing.expectEqualStrings("qa_b", proj.column.table);
+    }
+    try std.testing.expectEqualStrings("id", expanded.projections[0].column.name);
+    try std.testing.expectEqualStrings("tag", expanded.projections[1].column.name);
+    try std.testing.expectEqualStrings("extra", expanded.projections[2].column.name);
+    // Mixed lists expand foreign markers in place, preserving order.
+    const mixed = base.select(.{ A.id, B.all() });
+    try std.testing.expect(!@TypeOf(mixed).isMapped);
+    try std.testing.expectEqual(@as(usize, 4), mixed.projectionCount);
+    try std.testing.expectEqualStrings("id", mixed.projections[0].column.name);
+    try std.testing.expectEqualStrings("qa_a", mixed.projections[0].column.table);
+    try std.testing.expectEqualStrings("qa_b", mixed.projections[1].column.table);
+    try std.testing.expectEqualStrings("extra", mixed.projections[3].column.name);
+    // Aliased markers carry the alias qualifier through expansion.
+    const buAlias = tableMod.aliased(B, "bu");
+    const aliasedSel = base.select(buAlias.all());
+    try std.testing.expect(!@TypeOf(aliasedSel).isMapped);
+    try std.testing.expectEqual(@as(usize, 3), aliasedSel.projectionCount);
+    for (aliasedSel.projections[0..aliasedSel.projectionCount]) |proj| {
+        try std.testing.expect(proj.kind == .column);
+        try std.testing.expectEqualStrings("bu", proj.column.table);
+    }
+    // Root-scope returning keeps the single native star.
+    const retRoot = base.returning(A.all());
+    try std.testing.expectEqual(@as(usize, 1), retRoot.returningCount);
+    try std.testing.expect(retRoot.returningCols[0].kind == .star);
+    // Foreign-scope returning expands to that side's columns.
+    const retForeign = base.returning(B.all());
+    try std.testing.expectEqual(@as(usize, 3), retForeign.returningCount);
+    for (retForeign.returningCols[0..retForeign.returningCount]) |proj| {
+        try std.testing.expect(proj.kind == .column);
+        try std.testing.expectEqualStrings("qa_b", proj.column.table);
+    }
 }

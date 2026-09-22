@@ -137,6 +137,7 @@ pub fn build(b: *std.Build) void {
         "71_instead_of_triggers",
         "72_scoped_and_explicit_typed",
         "73_dual_form_matrix",
+        "74_relationships",
     };
 
     inline for (examples) |name| {

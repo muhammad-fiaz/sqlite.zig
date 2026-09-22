@@ -167,14 +167,40 @@ pub const ForeignKeySpec = struct {
     initiallyDeferred: bool = false,
 };
 
+/// True when a `references` value must resolve through the table scope: a
+/// bare scoped field (`.id`), a scoped list, or a tuple holding at least
+/// one scoped field. Explicit-only values (typed columns, dynamic columns,
+/// `.{ .table, .column }` structs, homogeneous typed tuples) keep the
+/// explicit `normalizeRefList` path, and unscoped targets (dynamic tables,
+/// `Row == void`) never want scope: there is no table to resolve against.
+fn referencesWantScope(comptime S: type, comptime T: type) bool {
+    if (comptime !S.isScoped) return false;
+    if (comptime scopeMod.isScopedItem(T, S.Row)) return true;
+    if (comptime scopeMod.isScopedList(T, S.Row)) return true;
+    const info = @typeInfo(T);
+    if (info == .pointer and info.pointer.size == .one) return referencesWantScope(S, info.pointer.child);
+    if (info == .@"struct" and info.@"struct".is_tuple) {
+        inline for (info.@"struct".fields) |field| {
+            if (comptime scopeMod.isScopedItem(field.type, S.Row)) return true;
+        }
+    }
+    return false;
+}
+
 /// Normalize `.{ .table, .column/.columns }`-style reference inputs plus
 /// tuple/array/slice reference lists into `(table, cols)`. Borrowed.
-/// Foreign-key `references` must stay explicit: the parent scope is unknown,
-/// so a bare field there is a compile error, never a guess.
+/// This is the explicit-only normalizer: typed columns, dynamic columns,
+/// and dynamic `.{ .table, ... }` structs carry their own table identity.
+/// Bare scoped fields never reach here on scoped targets — `parseFkSpecScoped`
+/// routes them through `normalizeKeyScoped` against the table being defined
+/// (self-reference) first. They reach here only for unscoped targets, where
+/// the compile error below names the missing scope instead of guessing.
 fn normalizeRefList(ref: anytype, outTable: *[]const u8, outCols: *[16][]const u8) !usize {
     const R = @TypeOf(ref);
-    // No scope exists on the parent side: a bare field cannot resolve.
-    if (R == scopeMod.EnumLiteral or @typeInfo(R) == .@"enum") @compileError("foreign-key references must be explicit table-qualified columns (Parent.id), not bare fields");
+    // No scope exists on this path: a bare field cannot resolve. Scoped
+    // targets bypass this normalizer entirely (see `parseFkSpecScoped`).
+    if (R == scopeMod.EnumLiteral) @compileError("unqualified foreign-key reference needs a typed table scope (define keys on a sqlite.table(...) value); use Parent.id to reference another table");
+    if (@typeInfo(R) == .@"enum") @compileError("foreign-key reference must be a typed column, a scoped field on a typed table, or .{ .table, .column }");
     if (R == DynamicColumn) {
         const split = dslColumn.dynRef(ref);
         if (split.table.len == 0) return error.InvalidSql;
@@ -204,7 +230,7 @@ fn normalizeRefList(ref: anytype, outTable: *[]const u8, outCols: *[16][]const u
     if ((info == .@"struct" and info.@"struct".is_tuple) or info == .array) {
         inline for (items) |item| {
             const IT = @TypeOf(item);
-            if (comptime (IT != DynamicColumn and !isDslColumn(IT))) @compileError("composite foreign-key references must be typed columns");
+            if (comptime (IT != DynamicColumn and !isDslColumn(IT))) @compileError("composite foreign-key references must be typed columns (or scoped fields on a typed table)");
             const t = colTableOf(item);
             if (t.len == 0) return error.InvalidSql;
             if (count == 0) table = t else if (!std.ascii.eqlIgnoreCase(table, t)) return error.InvalidSql;
@@ -231,15 +257,21 @@ fn normalizeRefList(ref: anytype, outTable: *[]const u8, outCols: *[16][]const u
 /// .deferrable?, .initiallyDeferred? }` into a `ForeignKeySpec`.
 /// `references` may be a typed column, a `DynamicColumn` with `table` set, a
 /// `.{ .table, .column/.columns }` struct, or a tuple of same-table typed
-/// columns. Borrowed; fails `InvalidSql` on count mismatch.
-/// `initiallyDeferred` without `deferrable` is a compile error.
+/// columns. On scoped targets (see `parseFkSpecScoped`) bare fields resolve
+/// against the table being defined. Borrowed; fails `InvalidSql` on count
+/// mismatch. `initiallyDeferred` without `deferrable` is a compile error.
 pub fn parseFkSpec(fk: anytype, expectedTable: []const u8) !ForeignKeySpec {
     return parseFkSpecScoped(fk, expectedTable, scopeMod.Unscoped);
 }
 
-/// `parseFkSpec` plus scoped-field support on the local side (`.column` /
-/// `.columns` accept `.parent_id` against the child table in `S`); the
-/// `references` side always stays explicit.
+/// `parseFkSpec` plus scoped-field support on both sides. The local side
+/// (`.column` / `.columns`) resolves `.parent_id` against the child table in
+/// `S`; the `references` side follows the same rule: bare scoped fields
+/// (`.id`, `&.{ .id, .region }`) resolve against the table being defined —
+/// the reference target for self-references — while explicit columns
+/// (`Parent.id`) keep their own table identity for cross-table parents. Both
+/// forms converge on one `ForeignKeySpec`; no table is ever guessed (a bare
+/// field always means the current scope, never a name-inferred parent).
 pub fn parseFkSpecScoped(fk: anytype, expectedTable: []const u8, comptime S: type) !ForeignKeySpec {
     const F = @TypeOf(fk);
     const info = @typeInfo(F);
@@ -251,7 +283,12 @@ pub fn parseFkSpecScoped(fk: anytype, expectedTable: []const u8, comptime S: typ
         spec.localCount = try normalizeKeyScoped(fk.column, expectedTable, S, &spec.local);
     } else @compileError("foreign key needs .column or .columns");
     if (!@hasField(F, "references")) @compileError("foreign key needs .references");
-    spec.refCount = try normalizeRefList(fk.references, &spec.refTable, &spec.refCols);
+    if (comptime referencesWantScope(S, @TypeOf(fk.references))) {
+        spec.refTable = expectedTable;
+        spec.refCount = try normalizeKeyScoped(fk.references, expectedTable, S, &spec.refCols);
+    } else {
+        spec.refCount = try normalizeRefList(fk.references, &spec.refTable, &spec.refCols);
+    }
     if (@hasField(F, "onDelete")) spec.onDelete = fk.onDelete;
     if (@hasField(F, "onUpdate")) spec.onUpdate = fk.onUpdate;
     if (@hasField(F, "deferrable")) spec.deferrable = fk.deferrable;
@@ -407,7 +444,7 @@ pub fn parseUniqueIntoScoped(src: anytype, tableName: []const u8, comptime S: ty
     if ((info == .@"struct" and info.@"struct".is_tuple) or info == .array) {
         inline for (items) |item| try addUniqueItemScoped(item, tableName, S, expected);
     } else {
-        for (items) |item| try addUniqueItem(item, tableName, expected);
+        for (items) |item| try addUniqueItemScoped(item, tableName, S, expected);
     }
 }
 
@@ -454,7 +491,7 @@ pub fn parseFksIntoScoped(src: anytype, tableName: []const u8, comptime S: type,
     } else {
         for (items) |item| {
             if (expected.fkCount >= expected.fks.len) return error.InvalidSql;
-            expected.fks[expected.fkCount] = try parseFkSpec(item, tableName);
+            expected.fks[expected.fkCount] = try parseFkSpecScoped(item, tableName, S);
             expected.fkCount += 1;
         }
     }
@@ -605,6 +642,82 @@ test "parseFkSpec funnels every key shape into one spec" {
     try std.testing.expect(composite.refCount == 2);
     try std.testing.expectEqualStrings("p", composite.refTable);
     try std.testing.expectError(error.InvalidSql, parseFkSpec(.{ .column = Oid{}, .references = &.{ P{}, Q{} } }, "orders"));
+}
+
+test "scoped and explicit foreign-key references normalize identically" {
+    const Row = struct { id: i64, manager_id: ?i64 };
+    const Cols = struct {
+        id: dslColumn.Column("rel_employees", "id", i64),
+        manager_id: dslColumn.Column("rel_employees", "manager_id", ?i64),
+    };
+    const S = scopeMod.TypeScope(Row, Cols);
+    const Eid = dslColumn.Column("rel_employees", "id", i64);
+    const Emid = dslColumn.Column("rel_employees", "manager_id", ?i64);
+    // Bare self-reference: .references = .id means the current table's id.
+    const scoped = try parseFkSpecScoped(.{ .column = .manager_id, .references = .id, .onDelete = .setNull }, "rel_employees", S);
+    try std.testing.expectEqualStrings("manager_id", scoped.local[0]);
+    try std.testing.expectEqualStrings("rel_employees", scoped.refTable);
+    try std.testing.expectEqualStrings("id", scoped.refCols[0]);
+    try std.testing.expect(scoped.localCount == 1 and scoped.refCount == 1);
+    try std.testing.expect(scoped.onDelete == .setNull);
+    try std.testing.expect(scoped.onUpdate == .noAction);
+    // Explicit self-reference resolves to byte-identical native metadata.
+    const explicit = try parseFkSpecScoped(.{ .column = Emid{}, .references = Eid{}, .onDelete = .setNull }, "rel_employees", S);
+    try std.testing.expectEqualStrings(scoped.local[0], explicit.local[0]);
+    try std.testing.expectEqualStrings(scoped.refTable, explicit.refTable);
+    try std.testing.expectEqualStrings(scoped.refCols[0], explicit.refCols[0]);
+    try std.testing.expect(explicit.localCount == scoped.localCount);
+    try std.testing.expect(explicit.refCount == scoped.refCount);
+    try std.testing.expect(explicit.onDelete == scoped.onDelete);
+    try std.testing.expect(explicit.onUpdate == scoped.onUpdate);
+}
+
+test "scoped child with explicit parent resolves cross-table" {
+    const Row = struct { id: i64, parent_id: i64 };
+    const Cols = struct {
+        id: dslColumn.Column("children", "id", i64),
+        parent_id: dslColumn.Column("children", "parent_id", i64),
+    };
+    const S = scopeMod.TypeScope(Row, Cols);
+    const Pid = dslColumn.Column("parents", "id", i64);
+    const cross = try parseFkSpecScoped(.{ .column = .parent_id, .references = Pid{}, .onDelete = .cascade }, "children", S);
+    try std.testing.expectEqualStrings("parent_id", cross.local[0]);
+    try std.testing.expectEqualStrings("parents", cross.refTable);
+    try std.testing.expectEqualStrings("id", cross.refCols[0]);
+    try std.testing.expect(cross.onDelete == .cascade);
+    // Explicit child side is the same native spec.
+    const Cid = dslColumn.Column("children", "parent_id", i64);
+    const explicit = try parseFkSpecScoped(.{ .column = Cid{}, .references = Pid{}, .onDelete = .cascade }, "children", S);
+    try std.testing.expectEqualStrings(cross.local[0], explicit.local[0]);
+    try std.testing.expectEqualStrings(cross.refTable, explicit.refTable);
+    try std.testing.expectEqualStrings(cross.refCols[0], explicit.refCols[0]);
+}
+
+test "composite scoped references resolve against the current scope" {
+    const Row = struct { a: i64, region: []const u8, pa: i64, pr: []const u8 };
+    const Cols = struct {
+        a: dslColumn.Column("duo", "a", i64),
+        region: dslColumn.Column("duo", "region", []const u8),
+        pa: dslColumn.Column("duo", "pa", i64),
+        pr: dslColumn.Column("duo", "pr", []const u8),
+    };
+    const S = scopeMod.TypeScope(Row, Cols);
+    const scoped = try parseFkSpecScoped(.{ .columns = &.{ .pa, .pr }, .references = &.{ .a, .region }, .onUpdate = .cascade }, "duo", S);
+    try std.testing.expect(scoped.localCount == 2 and scoped.refCount == 2);
+    try std.testing.expectEqualStrings("duo", scoped.refTable);
+    try std.testing.expectEqualStrings("a", scoped.refCols[0]);
+    try std.testing.expectEqualStrings("region", scoped.refCols[1]);
+    try std.testing.expect(scoped.onUpdate == .cascade);
+    // Mixed scoped local with explicit self columns stays in the same scope.
+    const Da = dslColumn.Column("duo", "a", i64);
+    const Dr = dslColumn.Column("duo", "region", []const u8);
+    const mixed = try parseFkSpecScoped(.{ .columns = &.{ .pa, .pr }, .references = &.{ Da{}, Dr{} } }, "duo", S);
+    try std.testing.expectEqualStrings(scoped.refTable, mixed.refTable);
+    try std.testing.expectEqualStrings(scoped.refCols[0], mixed.refCols[0]);
+    try std.testing.expectEqualStrings(scoped.refCols[1], mixed.refCols[1]);
+    // A scoped field paired with another table's column is incoherent.
+    const Other = dslColumn.Column("other", "x", i64);
+    try std.testing.expectError(error.UnknownColumn, parseFkSpecScoped(.{ .columns = &.{ .pa, .pr }, .references = &.{ .a, Other{} } }, "duo", S));
 }
 
 test "affinities map declared types to storage classes" {

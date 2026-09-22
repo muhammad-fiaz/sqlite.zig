@@ -1,4 +1,7 @@
 //! Compound SELECT (UNION/UNION ALL) through the DSL.
+//!
+//! Sections run as small functions so no single frame grows large
+//! (one giant main frame overflows the stack in Debug).
 const std = @import("std");
 const sqlite = @import("sqlite");
 
@@ -7,13 +10,28 @@ const Right = sqlite.table("cp_right", struct { id: ?i64, label: ?[]const u8 });
 
 pub fn main() !void {
     var db = try sqlite.open(std.heap.page_allocator, "example_61.db");
-    const t_db_cp_left = db.table("cp_left");
-    const t_db_cp_right = db.table("cp_right");
-    errdefer db.close();
+    var dbClosed = false;
+    errdefer if (!dbClosed) db.close();
+    try setupPart(db);
+    try setOpsPart(db);
+    try pagingPart(db);
+    try typedPart(db);
+    db.close();
+    dbClosed = true;
+    try reopenPart();
+    std.debug.print("61 compound dsl: raw dynamic typed verified with persistence\n", .{});
+}
+
+fn setupPart(db: *sqlite.Connection) !void {
     var setup = try db.exec("DROP TABLE IF EXISTS cp_left; DROP TABLE IF EXISTS cp_right; CREATE TABLE cp_left (id INTEGER, label TEXT); CREATE TABLE cp_right (id INTEGER, label TEXT); INSERT INTO cp_left VALUES (1, 'alpha'), (2, 'beta'), (2, 'beta'), (NULL, 'null'), (4, 'delta'); INSERT INTO cp_right VALUES (2, 'beta'), (3, 'gamma'), (NULL, 'null'), (5, 'eps');");
     setup.deinit();
     try db.schema(Left).validate();
     try db.schema(Right).validate();
+}
+
+fn setOpsPart(db: *sqlite.Connection) !void {
+    const t_db_cp_left = db.table("cp_left");
+    const t_db_cp_right = db.table("cp_right");
     var rawUnion = try db.exec("SELECT id FROM cp_left UNION SELECT id FROM cp_right ORDER BY id;");
     defer rawUnion.deinit();
     if (rawUnion.count() != 6) return error.VerificationFailed;
@@ -49,6 +67,11 @@ pub fn main() !void {
     if (dynExcept.count() != 2) return error.VerificationFailed;
     if (dynExcept.at(0)[0].integer != 1) return error.VerificationFailed;
     if (dynExcept.at(1)[0].integer != 4) return error.VerificationFailed;
+}
+
+fn pagingPart(db: *sqlite.Connection) !void {
+    const t_db_cp_left = db.table("cp_left");
+    const t_db_cp_right = db.table("cp_right");
     var crossType = try db.exec("SELECT 1 UNION SELECT 1.0;");
     defer crossType.deinit();
     if (crossType.count() != 1) return error.VerificationFailed;
@@ -66,6 +89,11 @@ pub fn main() !void {
     var dynChain = try t_db_cp_left.select(.{t_db_cp_left.column("id")}).except(t_db_cp_right.select(.{t_db_cp_right.column("id")})).unionDistinct(t_db_cp_right.select(.{t_db_cp_right.column("id")})).orderBy(t_db_cp_left.column("id").asc()).fetch();
     defer dynChain.deinit();
     if (dynChain.count() != 6) return error.VerificationFailed;
+}
+
+fn typedPart(db: *sqlite.Connection) !void {
+    const t_db_cp_left = db.table("cp_left");
+    const t_db_cp_right = db.table("cp_right");
     var typedUnion = try db.from(Left).unionDistinct(db.from(Right)).fetch();
     defer typedUnion.deinit();
     if (typedUnion.count() != 6) return error.VerificationFailed;
@@ -96,16 +124,17 @@ pub fn main() !void {
     var intactRight = try db.exec("SELECT count(*) FROM cp_right;");
     defer intactRight.deinit();
     if (intactRight.at(0)[0].integer != 4) return error.VerificationFailed;
-    db.close();
+}
+
+fn reopenPart() !void {
     var reopened = try sqlite.open(std.heap.page_allocator, "example_61.db");
+    defer reopened.close();
     const t_reopened_cp_left = reopened.table("cp_left");
     const t_reopened_cp_right = reopened.table("cp_right");
-    defer reopened.close();
     var persisted = try reopened.exec("SELECT id FROM cp_left UNION SELECT id FROM cp_right ORDER BY id;");
     defer persisted.deinit();
     if (persisted.count() != 7) return error.VerificationFailed;
     var persistedDyn = try t_reopened_cp_left.select(.{t_reopened_cp_left.column("id")}).unionDistinct(t_reopened_cp_right.select(.{t_reopened_cp_right.column("id")})).orderBy(t_reopened_cp_left.column("id").asc()).fetch();
     defer persistedDyn.deinit();
     if (persistedDyn.count() != 7) return error.VerificationFailed;
-    std.debug.print("61 compound dsl: raw dynamic typed verified with persistence\n", .{});
 }
