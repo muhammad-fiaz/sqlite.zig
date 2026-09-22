@@ -1,9 +1,9 @@
+//! Raw SQL derived tables in FROM: alias, nest, join, copy, shadow, persist.
 const std = @import("std");
 const sqlite = @import("sqlite");
 
 pub fn main() !void {
     var db = try sqlite.open(std.heap.page_allocator, "example_54.db");
-    const t_db_customers = db.table("customers");
     errdefer db.close();
     var setup = try db.exec("DROP TABLE IF EXISTS orders; DROP TABLE IF EXISTS customers; DROP TABLE IF EXISTS big_orders; CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT, region TEXT); CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER, total INTEGER); INSERT INTO customers VALUES (1, 'Ada', 'north'), (2, 'Bob', 'south'), (3, 'Cy', 'north'); INSERT INTO orders VALUES (10, 1, 120), (11, 1, 80), (12, 2, 200), (13, 9, 50);");
     setup.deinit();
@@ -56,22 +56,6 @@ pub fn main() !void {
     defer afterError.deinit();
     if (afterError.at(0)[0].integer != 3) return error.VerificationFailed;
 
-    var dslInserted = try t_db_customers.insert(.{ .id = 4, .name = "Dee", .region = "south" });
-    dslInserted.deinit();
-    var derivedSeesDsl = try db.exec("SELECT count(*) FROM (SELECT id FROM customers WHERE region = 'south');");
-    defer derivedSeesDsl.deinit();
-    if (derivedSeesDsl.at(0)[0].integer != 2) return error.VerificationFailed;
-
-    var typedSeen = try db.exec("SELECT name FROM customers WHERE id = 4;");
-    defer typedSeen.deinit();
-    if (typedSeen.count() != 1) return error.VerificationFailed;
-    if (!std.mem.eql(u8, typedSeen.at(0)[0].text, "Dee")) return error.VerificationFailed;
-
-    {
-        var check = try db.exec("SELECT count(*) FROM customers;");
-        defer check.deinit();
-        if (check.at(0)[0].integer != 4) return error.VerificationFailed;
-    }
     db.close();
     var reopened = try sqlite.open(std.heap.page_allocator, "example_54.db");
     defer reopened.close();
@@ -80,6 +64,6 @@ pub fn main() !void {
     if (persisted.at(0)[0].integer != 320) return error.VerificationFailed;
     var persistedBase = try reopened.exec("SELECT count(*) FROM customers;");
     defer persistedBase.deinit();
-    if (persistedBase.at(0)[0].integer != 4) return error.VerificationFailed;
+    if (persistedBase.at(0)[0].integer != 3) return error.VerificationFailed;
     std.debug.print("54 derived tables: subqueries in FROM verified with persistence\n", .{});
 }

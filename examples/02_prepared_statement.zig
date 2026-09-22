@@ -1,3 +1,4 @@
+//! Prepared statement with a bound parameter insert.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

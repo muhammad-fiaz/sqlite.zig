@@ -1,3 +1,4 @@
+//! Dynamic DSL: runtime table and column handles with select and where.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

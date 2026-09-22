@@ -1,3 +1,4 @@
+//! On-disk page format verified with close and reopen.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

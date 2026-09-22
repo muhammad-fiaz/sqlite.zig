@@ -1,3 +1,4 @@
+//! UPSERT DO UPDATE replaces conflicting row values.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

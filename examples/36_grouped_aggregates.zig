@@ -1,3 +1,4 @@
+//! COUNT, SUM, AVG, MIN, and MAX over grouped rows.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

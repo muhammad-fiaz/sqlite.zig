@@ -1,3 +1,4 @@
+//! Layered coverage: raw SQL, dynamic DSL, and typed DSL.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

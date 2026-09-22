@@ -1,3 +1,4 @@
+//! STRICT table typing across raw, dynamic, and typed layers.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

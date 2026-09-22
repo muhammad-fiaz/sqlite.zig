@@ -1,3 +1,4 @@
+//! Multiple dependent non-recursive CTEs in one query.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

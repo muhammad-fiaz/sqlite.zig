@@ -1,3 +1,4 @@
+//! BEFORE triggers: timing, WHEN filters, and persistence.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

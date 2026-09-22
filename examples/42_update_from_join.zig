@@ -1,3 +1,4 @@
+//! UPDATE FROM assigns values from a join source.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

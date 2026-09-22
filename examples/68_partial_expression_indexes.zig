@@ -1,3 +1,4 @@
+//! Partial and expression indexes across all frontends.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

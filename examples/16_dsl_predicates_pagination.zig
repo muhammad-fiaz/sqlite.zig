@@ -1,3 +1,4 @@
+//! Typed DSL predicate builders with offset and limit pagination.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

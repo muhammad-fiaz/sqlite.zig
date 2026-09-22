@@ -1,3 +1,4 @@
+//! DEFAULT values and DEFAULT VALUES insertion behavior.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

@@ -1,3 +1,4 @@
+//! Rows survive close and reopen of the database file.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

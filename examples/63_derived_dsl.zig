@@ -1,3 +1,4 @@
+//! DSL derived tables: asSubquery dynamic and typed paths with persistence.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

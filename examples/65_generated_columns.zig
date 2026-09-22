@@ -1,3 +1,4 @@
+//! Generated columns: raw, dynamic, and typed with persistence.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

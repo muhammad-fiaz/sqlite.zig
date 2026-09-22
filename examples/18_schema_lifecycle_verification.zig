@@ -1,3 +1,4 @@
+//! Schema lifecycle: create, alter, rename, truncate, and drop.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

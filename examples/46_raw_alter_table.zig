@@ -1,3 +1,4 @@
+//! ALTER TABLE add, rename, and drop column operations.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

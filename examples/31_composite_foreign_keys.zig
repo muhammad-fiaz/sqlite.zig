@@ -1,3 +1,4 @@
+//! Multi-column foreign keys with cascade relationships.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

@@ -1,3 +1,4 @@
+//! Recursive CTE with UNION ALL fixpoint iteration.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

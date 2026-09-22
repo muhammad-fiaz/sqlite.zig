@@ -1,3 +1,4 @@
+//! Raw WITH materialization plus a typed table read over the same CTE shape.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

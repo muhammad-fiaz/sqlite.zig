@@ -1,3 +1,4 @@
+//! INSERT INTO ... SELECT copies filtered rows.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

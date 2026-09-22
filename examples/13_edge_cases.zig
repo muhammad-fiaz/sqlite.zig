@@ -1,3 +1,4 @@
+//! Edge cases: null handling, savepoints, and error paths.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

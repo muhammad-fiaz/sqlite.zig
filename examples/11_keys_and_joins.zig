@@ -1,3 +1,4 @@
+//! Primary keys, foreign keys, and join queries together.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

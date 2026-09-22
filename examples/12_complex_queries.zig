@@ -1,3 +1,4 @@
+//! Complex SELECT: distinct, joins, and grouped aggregates.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

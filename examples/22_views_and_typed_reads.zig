@@ -1,3 +1,4 @@
+//! Create views and read them through the typed DSL.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

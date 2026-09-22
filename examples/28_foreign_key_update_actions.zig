@@ -1,3 +1,4 @@
+//! ON UPDATE CASCADE, SET NULL, and RESTRICT actions.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

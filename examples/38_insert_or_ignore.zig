@@ -1,3 +1,4 @@
+//! INSERT OR IGNORE skips conflicting rows only.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

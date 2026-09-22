@@ -1,3 +1,4 @@
+//! Transactions: commit applies and rollback discards changes.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

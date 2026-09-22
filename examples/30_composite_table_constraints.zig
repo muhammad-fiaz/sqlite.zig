@@ -1,3 +1,4 @@
+//! Composite PRIMARY KEY and UNIQUE table constraints.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

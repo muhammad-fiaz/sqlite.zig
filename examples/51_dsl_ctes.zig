@@ -1,3 +1,4 @@
+//! DSL with() and withRecursive(): dynamic, typed, chained, and recursive CTEs.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

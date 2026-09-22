@@ -1,3 +1,4 @@
+//! Prepared parameters bind, execute, and read back correctly.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

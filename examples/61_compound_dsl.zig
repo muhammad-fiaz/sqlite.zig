@@ -1,3 +1,4 @@
+//! Compound SELECT (UNION/UNION ALL) through the DSL.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

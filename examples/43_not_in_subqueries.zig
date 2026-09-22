@@ -1,3 +1,4 @@
+//! NOT IN anti-subquery filtering in raw and typed form.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

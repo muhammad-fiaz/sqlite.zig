@@ -1,3 +1,4 @@
+//! Collision-free DSL column naming against SQL keywords.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

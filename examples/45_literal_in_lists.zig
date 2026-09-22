@@ -1,3 +1,4 @@
+//! Literal IN lists for membership checks in raw and typed SQL.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

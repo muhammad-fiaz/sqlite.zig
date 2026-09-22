@@ -1,3 +1,4 @@
+//! Multi-key ORDER BY verified across all frontends.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

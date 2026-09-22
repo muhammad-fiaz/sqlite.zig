@@ -1,3 +1,4 @@
+//! Advanced typed DSL: transactions, savepoints, and aggregates.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

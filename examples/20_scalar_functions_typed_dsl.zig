@@ -1,3 +1,4 @@
+//! Scalar SQL functions through raw SQL and typed DSL.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

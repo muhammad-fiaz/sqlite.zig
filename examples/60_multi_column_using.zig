@@ -1,3 +1,4 @@
+//! Multi-column USING joins across all three frontends.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

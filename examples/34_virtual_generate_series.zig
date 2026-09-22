@@ -1,3 +1,4 @@
+//! Virtual generate_series table read natively and via DSL.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

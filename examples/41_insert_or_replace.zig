@@ -1,3 +1,4 @@
+//! INSERT OR REPLACE overwrites the conflicting row.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

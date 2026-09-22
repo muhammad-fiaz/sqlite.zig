@@ -1,3 +1,4 @@
+//! Subqueries: raw IN SELECT and typed whereInQuery.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

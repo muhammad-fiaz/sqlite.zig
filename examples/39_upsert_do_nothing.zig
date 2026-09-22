@@ -1,3 +1,4 @@
+//! UPSERT DO NOTHING keeps existing rows on conflict.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

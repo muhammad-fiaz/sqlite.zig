@@ -1,3 +1,4 @@
+//! Searched and simple CASE expressions in the DSL.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

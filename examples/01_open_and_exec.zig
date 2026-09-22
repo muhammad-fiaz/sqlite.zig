@@ -1,3 +1,4 @@
+//! Open a database file, create a table, and insert a row.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

@@ -1,3 +1,4 @@
+//! Typed DSL projections and distinct result sets.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

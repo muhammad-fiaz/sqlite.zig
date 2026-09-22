@@ -1,3 +1,4 @@
+//! ON DELETE CASCADE verified through typed DSL reads.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

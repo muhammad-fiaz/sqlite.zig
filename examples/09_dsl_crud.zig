@@ -1,3 +1,4 @@
+//! Typed DSL CRUD: insert, update, select, and delete.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

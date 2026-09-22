@@ -1,3 +1,4 @@
+//! Raw SQL and typed DSL produce identical results.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

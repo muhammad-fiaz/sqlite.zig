@@ -1,3 +1,4 @@
+//! Create indexes and verify indexed query results.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

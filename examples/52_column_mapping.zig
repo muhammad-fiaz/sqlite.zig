@@ -1,3 +1,4 @@
+//! Zig snake_case fields map onto SQL column names.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

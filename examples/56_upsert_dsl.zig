@@ -1,3 +1,4 @@
+//! Typed DSL upsert with conflict targets and excluded values.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

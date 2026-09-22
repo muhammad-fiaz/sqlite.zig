@@ -1,3 +1,4 @@
+//! Apply ordered schema migrations to a fresh database.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

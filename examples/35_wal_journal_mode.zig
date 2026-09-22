@@ -1,3 +1,4 @@
+//! WAL mode write, reopen, readback, and checkpoint.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

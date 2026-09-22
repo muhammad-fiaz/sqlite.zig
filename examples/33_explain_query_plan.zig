@@ -1,3 +1,4 @@
+//! EXPLAIN QUERY PLAN reports indexed equality access.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

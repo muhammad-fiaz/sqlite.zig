@@ -1,3 +1,4 @@
+//! RETURNING clauses on insert, update, and delete.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

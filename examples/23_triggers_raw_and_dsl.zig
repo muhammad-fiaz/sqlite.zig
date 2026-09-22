@@ -1,3 +1,4 @@
+//! Triggers via raw DDL with NEW references and typed mutation.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

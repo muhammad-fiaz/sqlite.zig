@@ -1,3 +1,4 @@
+//! PRAGMA integrity_check, foreign_key_check, and settings.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

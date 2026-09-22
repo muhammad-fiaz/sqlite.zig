@@ -1,3 +1,4 @@
+//! Invalid SQL and failed operations surface typed errors.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

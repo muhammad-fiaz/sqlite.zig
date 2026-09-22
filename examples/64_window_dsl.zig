@@ -1,3 +1,4 @@
+//! Window functions verified raw, dynamic, and typed.
 const std = @import("std");
 const sqlite = @import("sqlite");
 

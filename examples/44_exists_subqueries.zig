@@ -1,3 +1,4 @@
+//! EXISTS and NOT EXISTS subquery predicates.
 const std = @import("std");
 const sqlite = @import("sqlite");
 
