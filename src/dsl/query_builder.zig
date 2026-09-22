@@ -182,6 +182,13 @@ fn havingCondFromExpr(pred: dslExpr.Expr) ?dslExpr.HavingCond {
     return .{ .proj = proj, .op = pred.operator.sql(), .rhs = rhs };
 }
 
+fn tryHavingCond(cond: anytype) ?dslExpr.HavingCond {
+    const T = @TypeOf(cond);
+    if (T == dslExpr.HavingCond) return cond;
+    if (T == dslExpr.Expr) return havingCondFromExpr(cond);
+    @compileError("having() takes an aggregate/scalar comparison such as col.count().gt(1) or a column predicate");
+}
+
 fn storeCaseProjection(cases: *[2]CaseBuilder, caseCount: *usize, out: []Projection, outCount: *usize, item: CaseBuilder) void {
     if (caseCount.* >= cases.len) @panic("too many DSL case expressions");
     if (outCount.* >= out.len) @panic("too many DSL projections");
@@ -249,7 +256,8 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
         limitValue: ?usize = null,
         offsetValue: ?usize = null,
         groupByColumn: ?ColumnRef = null,
-        havingCond: ?dslExpr.HavingCond = null,
+        havingEntries: [8]astBuilder.HavingEntry = undefined,
+        havingCount: usize = 0,
         havingValid: bool = true,
 
         joinTable: ?[]const u8 = null,
@@ -326,7 +334,8 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
                 .limitValue = self.limitValue,
                 .offsetValue = self.offsetValue,
                 .groupByColumn = self.groupByColumn,
-                .havingCond = self.havingCond,
+                .havingEntries = self.havingEntries,
+                .havingCount = self.havingCount,
                 .havingValid = self.havingValid,
                 .joinTable = self.joinTable,
                 .joinSchema = self.joinSchema,
@@ -582,16 +591,41 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
 
         pub fn having(self: Self, cond: anytype) Self {
             var copy = self;
-            const T = @TypeOf(cond);
-            if (T == dslExpr.HavingCond) {
-                copy.havingCond = cond;
-                copy.havingValid = true;
-            } else if (T == dslExpr.Expr) {
-                copy.havingCond = havingCondFromExpr(cond);
-                copy.havingValid = copy.havingCond != null;
-            } else {
-                @compileError("having() takes an aggregate/scalar comparison such as col.count().gt(1) or a column predicate");
+            copy.havingCount = 0;
+            const parsed = tryHavingCond(cond) orelse {
+                copy.havingValid = false;
+                return copy;
+            };
+            copy.havingEntries[0] = .{ .cond = parsed };
+            copy.havingCount = 1;
+            copy.havingValid = true;
+            return copy;
+        }
+
+        pub fn andHaving(self: Self, cond: anytype) Self {
+            return self.appendHaving(cond, false);
+        }
+
+        pub fn orHaving(self: Self, cond: anytype) Self {
+            return self.appendHaving(cond, true);
+        }
+
+        fn appendHaving(self: Self, cond: anytype, joinOr: bool) Self {
+            var copy = self;
+            const parsed = tryHavingCond(cond) orelse {
+                copy.havingValid = false;
+                copy.havingCount = 0;
+                return copy;
+            };
+            if (!copy.havingValid) return copy;
+            if (copy.havingCount == 0) {
+                copy.havingEntries[0] = .{ .cond = parsed };
+                copy.havingCount = 1;
+                return copy;
             }
+            if (copy.havingCount >= copy.havingEntries.len) @panic("too many DSL having predicates");
+            copy.havingEntries[copy.havingCount] = .{ .cond = parsed, .joinOr = joinOr };
+            copy.havingCount += 1;
             return copy;
         }
 
@@ -1496,7 +1530,8 @@ const SelectSnapshot = struct {
     limitValue: ?usize = null,
     offsetValue: ?usize = null,
     groupByColumn: ?ColumnRef = null,
-    havingCond: ?dslExpr.HavingCond = null,
+    havingEntries: [8]astBuilder.HavingEntry = undefined,
+    havingCount: usize = 0,
     havingValid: bool = true,
     joinTable: ?[]const u8 = null,
     joinSchema: []const u8 = "",
@@ -1535,7 +1570,8 @@ const SubSnapshot = struct {
     limitValue: ?usize = null,
     offsetValue: ?usize = null,
     groupByColumn: ?ColumnRef = null,
-    havingCond: ?dslExpr.HavingCond = null,
+    havingEntries: [8]astBuilder.HavingEntry = undefined,
+    havingCount: usize = 0,
     havingValid: bool = true,
     joinTable: ?[]const u8 = null,
     joinSchema: []const u8 = "",
@@ -1576,7 +1612,8 @@ fn snapshotSelect(source: anytype, comptime allowSubquery: bool) SelectSnapshot 
         .limitValue = source.limitValue,
         .offsetValue = source.offsetValue,
         .groupByColumn = source.groupByColumn,
-        .havingCond = source.havingCond,
+        .havingEntries = source.havingEntries,
+        .havingCount = source.havingCount,
         .havingValid = source.havingValid,
         .joinTable = source.joinTable,
         .joinSchema = source.joinSchema,
@@ -1617,7 +1654,8 @@ fn snapshotSub(source: anytype) SubSnapshot {
         .limitValue = source.limitValue,
         .offsetValue = source.offsetValue,
         .groupByColumn = source.groupByColumn,
-        .havingCond = source.havingCond,
+        .havingEntries = source.havingEntries,
+        .havingCount = source.havingCount,
         .havingValid = source.havingValid,
         .joinTable = source.joinTable,
         .joinSchema = source.joinSchema,
@@ -1658,7 +1696,8 @@ fn selectFromSub(sub: *const SubSnapshot) SelectSnapshot {
         .limitValue = sub.limitValue,
         .offsetValue = sub.offsetValue,
         .groupByColumn = sub.groupByColumn,
-        .havingCond = sub.havingCond,
+        .havingEntries = sub.havingEntries,
+        .havingCount = sub.havingCount,
         .havingValid = sub.havingValid,
         .joinTable = sub.joinTable,
         .joinSchema = sub.joinSchema,
@@ -1695,7 +1734,7 @@ fn buildSnapshotSelect(allocator: std.mem.Allocator, snapshot: *const SelectSnap
         .limit = snapshot.limitValue,
         .offset = snapshot.offsetValue,
         .groupBy = snapshot.groupByColumn,
-        .having = snapshot.havingCond,
+        .having = snapshot.havingEntries[0..snapshot.havingCount],
         .havingValid = snapshot.havingValid,
         .joinTable = snapshot.joinTable,
         .joinSchema = snapshot.joinSchema,

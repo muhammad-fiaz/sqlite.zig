@@ -163,8 +163,10 @@ One builder, one method chain:
 .orderBy(User.name.asc())
 .orderBy(.{ User.name.asc(), User.age.desc() }) // multi-key ORDER BY
 .limit(10).offset(20)
-.groupBy(User.age).having(User.id.count().gt(1))
-.countStar() // COUNT(*)
+    .groupBy(User.age).having(User.id.count().gt(1))
+    .andHaving(User.age.avg().lt(40)) // compound HAVING AND
+    .orHaving(User.id.count().gt(10)) // compound HAVING OR
+    .countStar() // COUNT(*)
 .with("live", "SELECT ...") // CTE with a raw SQL body
 .withRecursive("nums", "SELECT 1 AS n", "SELECT n + 1 AS n FROM nums WHERE n < 5")
 .fetch()     // one canonical fetch; see below

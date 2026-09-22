@@ -73,8 +73,10 @@ pub const CaseWhen = struct { condition: Expr, result: Expr };
 pub const Condition = struct { column: []const u8, op: CompareOp, value: Expr, value2: ?Expr = null, subquery: ?[]const u8 = null, tableScan: ?TableScan = null, listValues: []const Expr = &.{}, joinOr: bool = false, leftExpr: ?Expr = null, escape: ?Expr = null, negated: bool = false, collate: ?[]const u8 = null };
 /// Correlated table-scan predicate (EXISTS-style delegation to storage).
 pub const TableScan = struct { table: []const u8, column: []const u8 = "", conditions: ?Conditions = null };
-/// HAVING clause as a single comparison until full expression HAVING lands.
-pub const Having = struct { left: Expr, op: CompareOp, right: Expr };
+/// One HAVING comparison arm; `joinOr` on element i joins i to i+1 with OR.
+pub const HavingItem = struct { left: Expr, op: CompareOp, right: Expr, joinOr: bool = false };
+/// HAVING clause arms; same AND/OR join semantics as `Conditions`.
+pub const Having = []const HavingItem;
 /// WHERE condition list; `joinOr == true` on element i joins i to i+1 with OR.
 pub const Conditions = []const Condition;
 /// Legacy ORDER BY entry (column-name form; `OrderItem` is the expression form).
@@ -816,9 +818,12 @@ pub fn deinit(allocator: anytype, statement: *Statement) void {
                 }
                 allocator.free(conditions);
             }
-            if (value.having) |having| {
-                freeExpr(allocator, having.left);
-                freeExpr(allocator, having.right);
+            if (value.having) |items| {
+                for (items) |item| {
+                    freeExpr(allocator, item.left);
+                    freeExpr(allocator, item.right);
+                }
+                allocator.free(items);
             }
             if (value.orders.len != 0) allocator.free(value.orders);
             for (value.joins) |join| if (join.usingColumns.len != 0) allocator.free(join.usingColumns);

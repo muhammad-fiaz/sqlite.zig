@@ -4199,45 +4199,64 @@ pub const Connection = struct {
             }
         }
         for (groups.items) |group| {
-            if (value.having) |having| {
-                const leftValue: Value = switch (having.left) {
-                    .identifier => |name| blk: {
-                        const parts = splitQualifier(name);
-                        if (!std.ascii.eqlIgnoreCase(parts.column, groupParts.column) or !groupQualifierMatches(parts.qualifier, tbl, value.tableAlias)) return error.Unsupported;
-                        break :blk try self.copyValue(group.key);
-                    },
-                    .function => |function| blk: {
-                        if (functions.classify(function.name, functions.argCount(function)) == .aggregate) {
-                            const kind = functions.aggregate.AggKind.fromName(function.name).?;
-                            var sep: ?[]const u8 = null;
-                            if (function.argument2) |a2| {
-                                const sVal = try self.resolve(a2.*, parameters);
-                                if (sVal == .text) sep = sVal.text;
-                            }
-                            var agg = functions.aggregate.AggState.init(self.allocator, kind, sep);
-                            defer agg.deinit();
-                            for (group.rows.items) |rowIndex| {
-                                const rowValues = tbl.rows.items[rowIndex].values;
-                                if (!try self.filterKeepsRow(tbl, rowValues, function.filter, parameters, null)) continue;
-                                if (function.argument.* == .wildcard) {
-                                    agg.stepWildcard();
-                                } else {
-                                    const item = try self.eval(tbl, rowValues, function.argument.*, parameters);
-                                    try agg.step(item, function.distinct);
+            if (value.having) |arms| {
+                var total = false;
+                var groupOk = true;
+                var started = false;
+                for (arms) |having| {
+                    const leftValue: Value = switch (having.left) {
+                        .identifier => |name| blk: {
+                            const parts = splitQualifier(name);
+                            if (!std.ascii.eqlIgnoreCase(parts.column, groupParts.column) or !groupQualifierMatches(parts.qualifier, tbl, value.tableAlias)) return error.Unsupported;
+                            break :blk try self.copyValue(group.key);
+                        },
+                        .function => |function| blk: {
+                            if (functions.classify(function.name, functions.argCount(function)) == .aggregate) {
+                                const kind = functions.aggregate.AggKind.fromName(function.name).?;
+                                var sep: ?[]const u8 = null;
+                                if (function.argument2) |a2| {
+                                    const sVal = try self.resolve(a2.*, parameters);
+                                    if (sVal == .text) sep = sVal.text;
                                 }
+                                var agg = functions.aggregate.AggState.init(self.allocator, kind, sep);
+                                defer agg.deinit();
+                                for (group.rows.items) |rowIndex| {
+                                    const rowValues = tbl.rows.items[rowIndex].values;
+                                    if (!try self.filterKeepsRow(tbl, rowValues, function.filter, parameters, null)) continue;
+                                    if (function.argument.* == .wildcard) {
+                                        agg.stepWildcard();
+                                    } else {
+                                        const item = try self.eval(tbl, rowValues, function.argument.*, parameters);
+                                        try agg.step(item, function.distinct);
+                                    }
+                                }
+                                break :blk try agg.result();
                             }
-                            break :blk try agg.result();
-                        }
-                        return error.Unsupported;
-                    },
-                    else => return error.Unsupported,
-                };
-                defer if (leftValue == .text) self.allocator.free(leftValue.text) else if (leftValue == .blob) self.allocator.free(leftValue.blob);
-                if (having.op == .isTrue and !functions.scalar.isTruthyValue(leftValue)) continue;
-                const rightValue = try self.resolve(having.right, parameters);
-                const rightOwned = having.right == .binary or having.right == .unary;
-                defer if (rightOwned) self.freeConcatText(rightValue);
-                if (having.op != .isTrue and !compare(leftValue, having.op, rightValue)) continue;
+                            return error.Unsupported;
+                        },
+                        else => return error.Unsupported,
+                    };
+                    defer if (leftValue == .text) self.allocator.free(leftValue.text) else if (leftValue == .blob) self.allocator.free(leftValue.blob);
+                    var itemResult: bool = undefined;
+                    if (having.op == .isTrue) {
+                        itemResult = functions.scalar.isTruthyValue(leftValue);
+                    } else {
+                        const rightValue = try self.resolve(having.right, parameters);
+                        const rightOwned = having.right == .binary or having.right == .unary;
+                        defer if (rightOwned) self.freeConcatText(rightValue);
+                        itemResult = compare(leftValue, having.op, rightValue);
+                    }
+                    if (!started) {
+                        groupOk = itemResult;
+                        started = true;
+                    } else if (having.joinOr) {
+                        total = total or groupOk;
+                        groupOk = itemResult;
+                    } else {
+                        groupOk = groupOk and itemResult;
+                    }
+                }
+                if (!(total or groupOk)) continue;
             }
             const output = try self.allocator.alloc(Value, value.projections.len);
             errdefer self.allocator.free(output);
@@ -4670,43 +4689,60 @@ pub const Connection = struct {
                         }
                     }
                 }
-                if (value.having) |having| {
-                    const leftValue: Value = switch (having.left) {
-                        .function => |function| blk: {
-                            if (functions.classify(function.name, functions.argCount(function)) == .aggregate) {
-                                const kind = functions.aggregate.AggKind.fromName(function.name).?;
-                                var sep: ?[]const u8 = null;
-                                if (function.argument2) |a2| {
-                                    const sVal = try self.resolve(a2.*, parameters);
-                                    if (sVal == .text) sep = sVal.text;
-                                }
-                                var havingAgg = functions.aggregate.AggState.init(self.allocator, kind, sep);
-                                defer havingAgg.deinit();
-                                for (tbl.rows.items) |row| {
-                                    const rowOuter = OuterRow{ .table = tbl, .alias = value.tableAlias, .values = row.values, .prev = outer };
-                                    if (!try self.matchesContext(tbl, row.values, value.condition, parameters, &rowOuter)) continue;
-                                    if (!try self.filterKeepsRow(tbl, row.values, function.filter, parameters, &rowOuter)) continue;
-                                    if (function.argument.* == .wildcard) {
-                                        havingAgg.stepWildcard();
-                                    } else {
-                                        const item = try self.evalContext(tbl, row.values, function.argument.*, parameters, &rowOuter);
-                                        try havingAgg.step(item, function.distinct);
+                if (value.having) |arms| {
+                    var total = false;
+                    var groupOk = true;
+                    var started = false;
+                    for (arms) |having| {
+                        const leftValue: Value = switch (having.left) {
+                            .function => |function| blk: {
+                                if (functions.classify(function.name, functions.argCount(function)) == .aggregate) {
+                                    const kind = functions.aggregate.AggKind.fromName(function.name).?;
+                                    var sep: ?[]const u8 = null;
+                                    if (function.argument2) |a2| {
+                                        const sVal = try self.resolve(a2.*, parameters);
+                                        if (sVal == .text) sep = sVal.text;
                                     }
+                                    var havingAgg = functions.aggregate.AggState.init(self.allocator, kind, sep);
+                                    defer havingAgg.deinit();
+                                    for (tbl.rows.items) |row| {
+                                        const rowOuter = OuterRow{ .table = tbl, .alias = value.tableAlias, .values = row.values, .prev = outer };
+                                        if (!try self.matchesContext(tbl, row.values, value.condition, parameters, &rowOuter)) continue;
+                                        if (!try self.filterKeepsRow(tbl, row.values, function.filter, parameters, &rowOuter)) continue;
+                                        if (function.argument.* == .wildcard) {
+                                            havingAgg.stepWildcard();
+                                        } else {
+                                            const item = try self.evalContext(tbl, row.values, function.argument.*, parameters, &rowOuter);
+                                            try havingAgg.step(item, function.distinct);
+                                        }
+                                    }
+                                    break :blk try havingAgg.result();
                                 }
-                                break :blk try havingAgg.result();
-                            }
-                            return error.Unsupported;
-                        },
-                        else => if (firstRow) |frow| try self.materializeContext(tbl, frow, having.left, parameters, null) else .null,
-                    };
-                    defer if (leftValue == .text) self.allocator.free(leftValue.text) else if (leftValue == .blob) self.allocator.free(leftValue.blob);
-                    if (having.op == .isTrue and !functions.scalar.isTruthyValue(leftValue)) {
-                        return .{ .allocator = self.allocator, .columns = try self.ownedColumns(columns.items), .rows = try self.allocator.alloc([]Value, 0) };
+                                return error.Unsupported;
+                            },
+                            else => if (firstRow) |frow| try self.materializeContext(tbl, frow, having.left, parameters, null) else .null,
+                        };
+                        defer if (leftValue == .text) self.allocator.free(leftValue.text) else if (leftValue == .blob) self.allocator.free(leftValue.blob);
+                        var itemResult: bool = undefined;
+                        if (having.op == .isTrue) {
+                            itemResult = functions.scalar.isTruthyValue(leftValue);
+                        } else {
+                            const rightValue = try self.resolve(having.right, parameters);
+                            const rightOwned = having.right == .binary or having.right == .unary;
+                            defer if (rightOwned) self.freeConcatText(rightValue);
+                            itemResult = compare(leftValue, having.op, rightValue);
+                        }
+                        if (!started) {
+                            groupOk = itemResult;
+                            started = true;
+                        } else if (having.joinOr) {
+                            total = total or groupOk;
+                            groupOk = itemResult;
+                        } else {
+                            groupOk = groupOk and itemResult;
+                        }
                     }
-                    const rightValue = try self.resolve(having.right, parameters);
-                    const rightOwned = having.right == .binary or having.right == .unary;
-                    defer if (rightOwned) self.freeConcatText(rightValue);
-                    if (having.op != .isTrue and !compare(leftValue, having.op, rightValue)) {
+                    if (!(total or groupOk)) {
                         return .{ .allocator = self.allocator, .columns = try self.ownedColumns(columns.items), .rows = try self.allocator.alloc([]Value, 0) };
                     }
                 }
@@ -5390,9 +5426,11 @@ pub const Connection = struct {
                 if (cond.escape) |e| try self.collectJoinBareIdents(e, &bare);
             };
             for (value.projections) |projection| try self.collectJoinBareIdents(projection.expr, &bare);
-            if (value.having) |having| {
-                try self.collectJoinBareIdents(having.left, &bare);
-                try self.collectJoinBareIdents(having.right, &bare);
+            if (value.having) |arms| {
+                for (arms) |having| {
+                    try self.collectJoinBareIdents(having.left, &bare);
+                    try self.collectJoinBareIdents(having.right, &bare);
+                }
             }
             for (value.orders) |ord| {
                 const parts = splitQualifier(ord.column);
@@ -5756,44 +5794,63 @@ pub const Connection = struct {
             }
         }
         for (grouped.items) |group| {
-            if (value.having) |having| {
-                const leftValue: Value = switch (having.left) {
-                    .identifier => |name| blk: {
-                        if (!keyQualifierOk(splitQualifier(name), keyName, tables, aliases, loc, groups)) return error.Unsupported;
-                        break :blk try self.copyValue(group.key);
-                    },
-                    .function => |function| blk: {
-                        if (functions.classify(function.name, functions.argCount(function)) == .aggregate) {
-                            const kind = functions.aggregate.AggKind.fromName(function.name).?;
-                            var sep: ?[]const u8 = null;
-                            if (function.argument2) |a2| {
-                                const sVal = try self.resolve(a2.*, parameters);
-                                if (sVal == .text) sep = sVal.text;
-                            }
-                            var agg = functions.aggregate.AggState.init(self.allocator, kind, sep);
-                            defer agg.deinit();
-                            for (group.rows.items) |pairIndex| {
-                                const pair = pairs[pairIndex];
-                                if (!try self.filterKeepsJoinRow(pair, function.filter, parameters)) continue;
-                                if (function.argument.* == .wildcard) {
-                                    agg.stepWildcard();
-                                } else {
-                                    const item = try self.evalJoinRowExpr(pair, function.argument.*, parameters);
-                                    try agg.step(item, function.distinct);
+            if (value.having) |arms| {
+                var total = false;
+                var groupOk = true;
+                var started = false;
+                for (arms) |having| {
+                    const leftValue: Value = switch (having.left) {
+                        .identifier => |name| blk: {
+                            if (!keyQualifierOk(splitQualifier(name), keyName, tables, aliases, loc, groups)) return error.Unsupported;
+                            break :blk try self.copyValue(group.key);
+                        },
+                        .function => |function| blk: {
+                            if (functions.classify(function.name, functions.argCount(function)) == .aggregate) {
+                                const kind = functions.aggregate.AggKind.fromName(function.name).?;
+                                var sep: ?[]const u8 = null;
+                                if (function.argument2) |a2| {
+                                    const sVal = try self.resolve(a2.*, parameters);
+                                    if (sVal == .text) sep = sVal.text;
                                 }
+                                var agg = functions.aggregate.AggState.init(self.allocator, kind, sep);
+                                defer agg.deinit();
+                                for (group.rows.items) |pairIndex| {
+                                    const pair = pairs[pairIndex];
+                                    if (!try self.filterKeepsJoinRow(pair, function.filter, parameters)) continue;
+                                    if (function.argument.* == .wildcard) {
+                                        agg.stepWildcard();
+                                    } else {
+                                        const item = try self.evalJoinRowExpr(pair, function.argument.*, parameters);
+                                        try agg.step(item, function.distinct);
+                                    }
+                                }
+                                break :blk try agg.result();
                             }
-                            break :blk try agg.result();
-                        }
-                        return error.Unsupported;
-                    },
-                    else => return error.Unsupported,
-                };
-                defer self.freeConcatText(leftValue);
-                if (having.op == .isTrue and !functions.scalar.isTruthyValue(leftValue)) continue;
-                const rightValue = try self.resolve(having.right, parameters);
-                const rightOwned = having.right == .binary or having.right == .unary;
-                defer if (rightOwned) self.freeConcatText(rightValue);
-                if (having.op != .isTrue and !compare(leftValue, having.op, rightValue)) continue;
+                            return error.Unsupported;
+                        },
+                        else => return error.Unsupported,
+                    };
+                    defer self.freeConcatText(leftValue);
+                    var itemResult: bool = undefined;
+                    if (having.op == .isTrue) {
+                        itemResult = functions.scalar.isTruthyValue(leftValue);
+                    } else {
+                        const rightValue = try self.resolve(having.right, parameters);
+                        const rightOwned = having.right == .binary or having.right == .unary;
+                        defer if (rightOwned) self.freeConcatText(rightValue);
+                        itemResult = compare(leftValue, having.op, rightValue);
+                    }
+                    if (!started) {
+                        groupOk = itemResult;
+                        started = true;
+                    } else if (having.joinOr) {
+                        total = total or groupOk;
+                        groupOk = itemResult;
+                    } else {
+                        groupOk = groupOk and itemResult;
+                    }
+                }
+                if (!(total or groupOk)) continue;
             }
             const output = try self.allocator.alloc(Value, value.projections.len);
             var done: usize = 0;
@@ -7095,6 +7152,39 @@ test "grouped aggregates support HAVING predicates" {
     defer typed.deinit();
     try std.testing.expectEqual(@as(usize, 1), typed.count());
     try std.testing.expectEqual(@as(i64, 30), typed.at(0)[0].integer);
+
+    // Compound HAVING: AND keeps only groups meeting both arms; OR keeps either.
+    var andRows = try db.exec("SELECT category FROM having_sales GROUP BY category HAVING COUNT(*) > 1 AND SUM(amount) > 25;");
+    defer andRows.deinit();
+    try std.testing.expectEqual(@as(usize, 1), andRows.count());
+    try std.testing.expectEqualStrings("a", andRows.at(0)[0].text);
+    var orRows = try db.exec("SELECT category FROM having_sales GROUP BY category HAVING COUNT(*) > 1 OR SUM(amount) > 25;");
+    defer orRows.deinit();
+    try std.testing.expectEqual(@as(usize, 1), orRows.count());
+    try std.testing.expectEqualStrings("a", orRows.at(0)[0].text);
+    var mixed = try db.exec("SELECT category FROM having_sales GROUP BY category HAVING COUNT(*) > 1 OR SUM(amount) > 6 AND COUNT(*) = 1;");
+    defer mixed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), mixed.count());
+    var dslAnd = try db
+        .from(Sale)
+        .select(.{Sale.category})
+        .groupBy(Sale.category)
+        .having(@import("../dsl/expr.zig").countStar().gt(1))
+        .andHaving(Sale.amount.sum().gt(25))
+        .fetch();
+    defer dslAnd.deinit();
+    try std.testing.expectEqual(@as(usize, 1), dslAnd.count());
+    try std.testing.expectEqualStrings("a", dslAnd.at(0)[0].text);
+    var dslOr = try db
+        .from(Sale)
+        .select(.{Sale.category})
+        .groupBy(Sale.category)
+        .having(@import("../dsl/expr.zig").countStar().gt(1))
+        .orHaving(Sale.amount.sum().gt(25))
+        .fetch();
+    defer dslOr.deinit();
+    try std.testing.expectEqual(@as(usize, 1), dslOr.count());
+    try std.testing.expectEqualStrings("a", dslOr.at(0)[0].text);
 }
 
 test "insert select copies query results into a destination table" {
@@ -13615,6 +13705,23 @@ test "having filters groups through the common expression system" {
         .fetch();
     defer typedPlain.deinit();
     try std.testing.expectEqual(@as(usize, 1), typedPlain.count());
+
+    var compoundRaw = try db.exec("SELECT grp FROM hsales GROUP BY grp HAVING COUNT(*) > 1 OR SUM(amount) > 6;");
+    defer compoundRaw.deinit();
+    try std.testing.expectEqual(@as(usize, 2), compoundRaw.count());
+    var compoundAnd = try db.exec("SELECT grp FROM hsales GROUP BY grp HAVING COUNT(*) > 1 AND SUM(amount) > 25;");
+    defer compoundAnd.deinit();
+    try std.testing.expectEqual(@as(usize, 1), compoundAnd.count());
+    try std.testing.expectEqualStrings("a", compoundAnd.at(0)[0].text);
+    var compoundDsl = try sales
+        .select(.{sales.column("grp")})
+        .groupBy(sales.column("grp"))
+        .having(sales.column("amount").sum().gt(6))
+        .andHaving(sales.column("grp").eq("b"))
+        .fetch();
+    defer compoundDsl.deinit();
+    try std.testing.expectEqual(@as(usize, 1), compoundDsl.count());
+    try std.testing.expectEqualStrings("b", compoundDsl.at(0)[0].text);
 }
 
 test "scalar fetchOne and fetchOptional return single projection values" {

@@ -44,6 +44,9 @@ pub const StripBase = struct { table: []const u8, schema: []const u8 = "", alias
 /// Borrowed predicate plus its AND/OR join flag into the condition list.
 pub const CondEntry = struct { expr: dslExpr.Expr, joinOr: bool = false };
 
+/// Borrowed HAVING arm plus its AND/OR join flag into the HAVING list.
+pub const HavingEntry = struct { cond: dslExpr.HavingCond, joinOr: bool = false };
+
 /// Borrowed IN-subquery args: outer column, inner table/schema/column.
 pub const InQueryArgs = struct {
     column: dslExpr.ColumnRef,
@@ -657,7 +660,7 @@ pub const SelectArgs = struct {
     limit: ?usize,
     offset: ?usize,
     groupBy: ?dslExpr.ColumnRef,
-    having: ?dslExpr.HavingCond,
+    having: []const HavingEntry = &.{},
     havingValid: bool = true,
     joinTable: ?[]const u8,
     joinSchema: []const u8 = "",
@@ -784,13 +787,34 @@ pub fn buildSelect(allocator: std.mem.Allocator, args: SelectArgs) !BuiltStateme
     var groupBy: ?[]const u8 = null;
     if (args.groupBy) |group| groupBy = try ctx.refName(group, null);
     var having: ?ast.Having = null;
+    errdefer if (having) |items| {
+        for (items) |item| {
+            ast.freeExprRec(allocator, item.left);
+            ast.freeExprRec(allocator, item.right);
+        }
+        allocator.free(items);
+    };
     if (!args.havingValid) return error.InvalidSql;
-    if (args.having) |cond| {
-        having = .{
-            .left = (try projectionToAst(&ctx, cond.proj, base, args.cases, args.windows)).expr,
-            .op = try mapHavingOp(cond.op),
-            .right = .{ .literal = cond.rhs },
-        };
+    if (args.having.len != 0) {
+        const items = try allocator.alloc(ast.HavingItem, args.having.len);
+        var built: usize = 0;
+        errdefer {
+            for (items[0..built]) |item| {
+                ast.freeExprRec(allocator, item.left);
+                ast.freeExprRec(allocator, item.right);
+            }
+            allocator.free(items);
+        }
+        for (args.having, 0..) |entry, index| {
+            items[index] = .{
+                .left = (try projectionToAst(&ctx, entry.cond.proj, base, args.cases, args.windows)).expr,
+                .op = try mapHavingOp(entry.cond.op),
+                .right = .{ .literal = entry.cond.rhs },
+                .joinOr = entry.joinOr,
+            };
+            built = index + 1;
+        }
+        having = items;
     }
     var ownedOrders: []const ast.Order = &.{};
     errdefer if (ownedOrders.len != 0) allocator.free(ownedOrders);
@@ -1008,7 +1032,7 @@ test "buildSelect preserves projection order and star/countStar shapes" {
         .limit = null,
         .offset = null,
         .groupBy = null,
-        .having = null,
+        .having = &.{},
         .joinTable = null,
         .joinKind = .inner,
         .joinOn = null,
@@ -1030,7 +1054,7 @@ test "buildSelect preserves projection order and star/countStar shapes" {
         .limit = null,
         .offset = null,
         .groupBy = null,
-        .having = null,
+        .having = &.{},
         .joinTable = null,
         .joinKind = .inner,
         .joinOn = null,
@@ -1049,7 +1073,7 @@ test "buildSelect preserves projection order and star/countStar shapes" {
         .limit = null,
         .offset = null,
         .groupBy = null,
-        .having = null,
+        .having = &.{},
         .joinTable = null,
         .joinKind = .inner,
         .joinOn = null,

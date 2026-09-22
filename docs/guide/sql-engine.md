@@ -148,7 +148,10 @@ SQLite identity predicates are also supported: `IS`, `IS NOT`, `IS NULL`, and
 Standard comparison operators: `=`, `!=`, `<>`, `<`, `>`, `<=`, `>=`, `LIKE`, `NOT LIKE`, `IS NULL`, `IS NOT NULL`, `BETWEEN ... AND ...`, `IN (...)`, `NOT IN (...)`, `EXISTS (...)`. A bare column or expression
 (`WHERE active`, `WHERE NOT ready`) filters by numeric truthiness, so
 `'1'` and `'2x'` match while `'0'`, `'0.0'`, `''`, and `'abc'` do not; the
-same rule applies to bare `HAVING` expressions.
+same rule applies to bare `HAVING` expressions. `HAVING` accepts compound
+`AND`/`OR` arms (for example `HAVING COUNT(*) > 1 OR SUM(amount) > 25`)
+with the same precedence as `WHERE`; the DSL mirrors this with
+`.having(...).andHaving(...).orHaving(...)`.
 
 Connection write counters are readable with `LAST_INSERT_ROWID()`,
 `CHANGES()`, and `TOTAL_CHANGES()`.

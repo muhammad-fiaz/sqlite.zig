@@ -2430,32 +2430,56 @@ pub const Parser = struct {
                 }
             } else groupBy = groupQualifier;
         }
-        var having: ?ast.Having = null;
-        if (self.acceptWord("having")) {
-            const left = try self.parseBitOr();
-            var op: ast.CompareOp = .isTrue;
-            var right: ast.Expr = .{ .literal = .null };
-            if (self.acceptTag(.equal)) {
-                op = .equal;
-                right = try self.parseBitOr();
-            } else if (self.acceptTag(.notEqual)) {
-                op = .notEqual;
-                right = try self.parseBitOr();
-            } else if (self.acceptTag(.less)) {
-                op = .less;
-                right = try self.parseBitOr();
-            } else if (self.acceptTag(.lessEqual)) {
-                op = .lessEqual;
-                right = try self.parseBitOr();
-            } else if (self.acceptTag(.greater)) {
-                op = .greater;
-                right = try self.parseBitOr();
-            } else if (self.acceptTag(.greaterEqual)) {
-                op = .greaterEqual;
-                right = try self.parseBitOr();
+        var havingItems = std.ArrayList(ast.HavingItem).empty;
+        errdefer {
+            for (havingItems.items) |item| {
+                freeParserExpr(self.allocator, item.left);
+                freeParserExpr(self.allocator, item.right);
             }
-            having = .{ .left = left, .op = op, .right = right };
+            havingItems.deinit(self.allocator);
         }
+        if (self.acceptWord("having")) {
+            var joinOr = false;
+            while (true) {
+                const left = try self.parseBitOr();
+                var op: ast.CompareOp = .isTrue;
+                var right: ast.Expr = .{ .literal = .null };
+                if (self.acceptTag(.equal)) {
+                    op = .equal;
+                    right = try self.parseBitOr();
+                } else if (self.acceptTag(.notEqual)) {
+                    op = .notEqual;
+                    right = try self.parseBitOr();
+                } else if (self.acceptTag(.less)) {
+                    op = .less;
+                    right = try self.parseBitOr();
+                } else if (self.acceptTag(.lessEqual)) {
+                    op = .lessEqual;
+                    right = try self.parseBitOr();
+                } else if (self.acceptTag(.greater)) {
+                    op = .greater;
+                    right = try self.parseBitOr();
+                } else if (self.acceptTag(.greaterEqual)) {
+                    op = .greaterEqual;
+                    right = try self.parseBitOr();
+                }
+                try havingItems.append(self.allocator, .{ .left = left, .op = op, .right = right, .joinOr = joinOr });
+                if (self.acceptWord("or")) {
+                    joinOr = true;
+                } else if (self.acceptWord("and")) {
+                    joinOr = false;
+                } else break;
+            }
+        }
+        var having: ?ast.Having = null;
+        errdefer if (having) |items| {
+            for (items) |item| {
+                freeParserExpr(self.allocator, item.left);
+                freeParserExpr(self.allocator, item.right);
+            }
+            self.allocator.free(items);
+        };
+        if (havingItems.items.len != 0) having = try havingItems.toOwnedSlice(self.allocator);
         // WINDOW clause (after HAVING, before ORDER BY). Definitions resolve
         // left to right so later names may build on earlier ones; every
         // `OVER name` use in the projections/having/where is expanded into
@@ -2484,9 +2508,12 @@ pub const Parser = struct {
         for (projections.items) |*proj| {
             try self.resolveWindowRefs(&proj.expr, namedWindows.items);
         }
-        if (having) |*have| {
-            try self.resolveWindowRefs(&have.left, namedWindows.items);
-            try self.resolveWindowRefs(&have.right, namedWindows.items);
+        if (having) |arms| {
+            for (0..arms.len) |idx| {
+                const item: *ast.HavingItem = @constCast(&arms[idx]);
+                try self.resolveWindowRefs(&item.left, namedWindows.items);
+                try self.resolveWindowRefs(&item.right, namedWindows.items);
+            }
         }
         if (condition) |conds| try self.resolveWindowRefsInConditions(conds, namedWindows.items);
         var orders = std.ArrayList(ast.Order).empty;
@@ -2988,6 +3015,20 @@ test "parser parses having and alter table statements" {
     defer ast.deinit(std.testing.allocator, &s);
     try std.testing.expect(s == .select);
     try std.testing.expect(s.select.having != null);
+    try std.testing.expectEqual(@as(usize, 1), s.select.having.?.len);
+
+    var pc = try Parser.init(std.testing.allocator, "SELECT grp, count(*), sum(v) FROM t GROUP BY grp HAVING count(*) > 1 AND sum(v) < 100 OR grp = 'x';");
+    defer pc.deinit();
+    var sc = try pc.parse();
+    defer ast.deinit(std.testing.allocator, &sc);
+    try std.testing.expect(sc == .select);
+    try std.testing.expectEqual(@as(usize, 3), sc.select.having.?.len);
+    try std.testing.expect(!sc.select.having.?[0].joinOr);
+    try std.testing.expect(!sc.select.having.?[1].joinOr);
+    try std.testing.expect(sc.select.having.?[2].joinOr);
+    try std.testing.expectEqual(ast.CompareOp.greater, sc.select.having.?[0].op);
+    try std.testing.expectEqual(ast.CompareOp.less, sc.select.having.?[1].op);
+    try std.testing.expectEqual(ast.CompareOp.equal, sc.select.having.?[2].op);
 
     var p2 = try Parser.init(std.testing.allocator, "ALTER TABLE t ADD COLUMN extra TEXT;");
     defer p2.deinit();

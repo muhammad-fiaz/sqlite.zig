@@ -21,13 +21,15 @@ Aggregates work with and without `GROUP BY`: `COUNT` (including
 methods (`.sum()`, `.avg()`, `.min()`, `.max()`, `.count()`,
 `.countDistinct()`), plus grouped aggregate filters with
 `groupBy(...).having(...)` over the same expression system (for example
-`Sale.id.count().gt(1)`).
+`Sale.id.count().gt(1)`). Compound filters chain with `.andHaving(...)` and
+`.orHaving(...)`; raw SQL accepts the same `AND`/`OR` arms in `HAVING`.
 
 ```zig
 var rows = try db.from(Sale)
     .select(.{Sale.amount.sum()})
     .groupBy(Sale.category)
     .having(Sale.id.count().gt(1))
+    .andHaving(Sale.amount.sum().gte(100))
     .fetch();
 defer rows.deinit();
 ```
