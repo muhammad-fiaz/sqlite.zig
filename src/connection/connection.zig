@@ -16519,3 +16519,132 @@ test "soundex like glob and json_array_length run as raw sql" {
     try std.testing.expectEqual(@as(usize, 1), filtered.count());
     try std.testing.expectEqualStrings("Euler", filtered.rows[0][0].text);
 }
+
+test "recursive cte typed references scope independently" {
+    const tableMod = @import("../dsl/table.zig");
+    const N = tableMod.table("rnums", struct { n: i64 });
+    const path = "sqlite_zig_rcte_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    // Typed reference over a recursive CTE: inner scope is the CTE's own.
+    var rows = try db.from(N).withRecursive("rnums", "SELECT 1 AS n", "SELECT n + 1 AS n FROM rnums WHERE n < 4").select(.{.n}).fetch();
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(usize, 4), rows.count());
+    try std.testing.expectEqual(@as(i64, 4), rows.rows[3][0].integer);
+    var expl = try db.from(N).withRecursive("rnums", "SELECT 1 AS n", "SELECT n + 1 AS n FROM rnums WHERE n < 4").select(.{N.n}).fetch();
+    defer expl.deinit();
+    try std.testing.expectEqual(rows.count(), expl.count());
+}
+
+test "savepoints roll back to the marked statement only" {
+    const tableMod = @import("../dsl/table.zig");
+    const T = tableMod.table("sv_t", struct { id: i64 });
+    const path = "sqlite_zig_savepoint_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    try db.createTable(T, .{ .overWrite = true, .primaryKey = T.id });
+    try db.begin();
+    var a = try db.from(T).insert(.{.id = 1});
+    a.deinit();
+    try db.savepoint("sp1");
+    // A second insert, then rolled back via savepoint.
+    var b2 = try db.from(T).insert(.{.id = 2});
+    b2.deinit();
+    try db.rollbackToSavepoint("sp1");
+    try db.commit();
+    var left = try db.from(T).select(T.all()).fetch();
+    defer left.deinit();
+    try std.testing.expectEqual(@as(usize, 1), left.count());
+    try std.testing.expectEqual(@as(i64, 1), left.at(0).id);
+}
+
+test "strict and without rowid tables serve typed dual forms" {
+    const tableMod = @import("../dsl/table.zig");
+    const S = tableMod.table("mx_strict", struct { id: i64, v: []const u8 });
+    const W = tableMod.table("mx_worowid", struct { id: i64, v: []const u8 });
+    const path = "sqlite_zig_mx_modes_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    try db.createTable(S, .{ .overWrite = true, .primaryKey = S.id, .strict = true });
+    try db.createTable(W, .{ .overWrite = true, .primaryKey = W.id, .withoutRowid = true });
+    var s = try db.from(S).insert(.{ .id = 1, .v = "a" });
+    s.deinit();
+    var w = try db.from(W).insert(.{ W.id.set(1), W.v.set("b") });
+    w.deinit();
+    const q = db.from(S);
+    var rs = try q.where(q.c().id.eq(1)).select(.{.v}).fetch();
+    defer rs.deinit();
+    try std.testing.expectEqualStrings("a", rs.rows[0][0].text);
+    const qw = db.from(W);
+    var rw = try qw.where(qw.c().id.eq(1)).select(.{W.v}).fetch();
+    defer rw.deinit();
+    try std.testing.expectEqualStrings("b", rw.rows[0][0].text);
+    // Wrong-affinity writes still fail on STRICT tables.
+    const bad = db.exec("INSERT INTO mx_strict VALUES ('nope', 'x');");
+    try std.testing.expectError(error.ConstraintViolation, bad);
+}
+
+test "triggers and views compose with dual form reads" {
+    const tableMod = @import("../dsl/table.zig");
+    const T = tableMod.table("tv_t", struct { id: i64, n: i64 });
+    const V = tableMod.table("tv_v", struct { id: i64, n: i64 });
+    const L = tableMod.table("tv_log", struct { id: i64 });
+    const path = "sqlite_zig_tv_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    try db.createTable(T, .{ .overWrite = true, .primaryKey = T.id });
+    try db.createTable(L, .{ .overWrite = true, .primaryKey = L.id });
+    var setup = try db.exec("CREATE TRIGGER tv_audit AFTER INSERT ON tv_t BEGIN INSERT INTO tv_log VALUES (NEW.id); END;");
+    setup.deinit();
+    try db.createView("tv_v", "SELECT id, n FROM tv_t;");
+    var ins = try db.from(T).insert(.{ .id = 1, .n = 10 });
+    ins.deinit();
+    // The trigger fired on the typed insert; the log proves it.
+    var logged = try db.from(L).select(L.all()).fetch();
+    defer logged.deinit();
+    try std.testing.expectEqual(@as(usize, 1), logged.count());
+    try std.testing.expectEqual(@as(i64, 1), logged.at(0).id);
+    // Typed reads flow through the view with both spellings.
+    var vs = try db.from(V).select(.{.n}).fetch();
+    defer vs.deinit();
+    try std.testing.expectEqual(@as(i64, 10), vs.rows[0][0].integer);
+    var ve = try db.from(V).select(.{V.n}).fetch();
+    defer ve.deinit();
+    try std.testing.expectEqual(@as(i64, 10), ve.rows[0][0].integer);
+    // A typed update is visible through the view under both spellings.
+    var up = try (try db.from(T).update(.{.n = 20})).where(T.id.eq(1)).execute();
+    up.deinit();
+    var after = try db.from(V).select(.{.n}).fetch();
+    defer after.deinit();
+    try std.testing.expectEqual(@as(i64, 20), after.rows[0][0].integer);
+}
+
+test "limit offset and transactions behave in every form" {
+    const tableMod = @import("../dsl/table.zig");
+    const T = tableMod.table("lim_t", struct { id: i64 });
+    const path = "sqlite_zig_lim_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    try db.createTable(T, .{ .overWrite = true, .primaryKey = T.id });
+    try db.begin();
+    for (1..6) |i| {
+        var ins = try db.from(T).insert(.{ .id = @as(i64, @intCast(i)) });
+        ins.deinit();
+    }
+    try db.commit();
+    var scoped = try db.from(T).select(.{.id}).orderBy(.id).limit(2).offset(1).fetch();
+    defer scoped.deinit();
+    var explicit = try db.from(T).select(.{T.id}).orderBy(T.id.asc()).limit(2).offset(1).fetch();
+    defer explicit.deinit();
+    try std.testing.expectEqual(scoped.count(), explicit.count());
+    try std.testing.expectEqual(@as(usize, 2), scoped.count());
+    try std.testing.expectEqual(@as(i64, 2), scoped.rows[0][0].integer);
+    // Rollback removes uncommitted rows.
+    try db.begin();
+    var tmp = try db.from(T).insert(.{.id = 9});
+    tmp.deinit();
+    try db.rollback();
+    var cnt = try db.exec("SELECT count(*) FROM lim_t;");
+    defer cnt.deinit();
+    try std.testing.expectEqual(@as(i64, 5), cnt.rows[0][0].integer);
+}
