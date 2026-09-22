@@ -11,6 +11,7 @@ const image = @import("../storage/image.zig");
 const sqliteImage = @import("../storage/sqlite_image.zig");
 const Schema = @import("../catalog/schema.zig").Schema;
 const Table = @import("../catalog/schema.zig").Table;
+const Column = @import("../catalog/schema.zig").Column;
 const View = @import("../catalog/schema.zig").View;
 const Index = @import("../catalog/schema.zig").Index;
 const Trigger = @import("../catalog/schema.zig").Trigger;
@@ -2756,6 +2757,7 @@ pub const Connection = struct {
         return try emptyResult(self.allocator);
     }
     fn createTriggerCommand(self: *Connection, value: ast.TriggerDef) !Result {
+        if (value.timing == .insteadOf) return self.createViewTriggerCommand(value);
         const resolvedTable = self.resolveTableName(value.table) orelse return error.UnknownTable;
         const tableStore = self.storeFor(resolvedTable.ref);
         const nameParts = splitSchemaName(value.name);
@@ -2771,6 +2773,272 @@ pub const Connection = struct {
         scoped.table = resolvedTable.table.name;
         try tableStore.createTrigger(scoped);
         return try emptyResult(self.allocator);
+    }
+
+    /// `CREATE TRIGGER ... INSTEAD OF ... ON <view>`: the target must be a
+    /// view (a table target fails `InvalidSql`). `UPDATE OF` names validate
+    /// against the view's output columns.
+    fn createViewTriggerCommand(self: *Connection, value: ast.TriggerDef) !Result {
+        if (self.resolveTableName(value.table) != null) return error.InvalidSql;
+        const resolvedView = self.resolveViewName(value.table) orelse return error.UnknownTable;
+        const viewStore = self.storeFor(resolvedView.ref);
+        const nameParts = splitSchemaName(value.name);
+        if (nameParts.qualifier) |qualifier| {
+            const triggerRef = self.resolveSchema(qualifier) orelse return error.UnknownDatabase;
+            if (!std.meta.eql(triggerRef, resolvedView.ref)) return error.InvalidSql;
+        }
+        if (value.temporary and resolvedView.ref != .temp) return error.InvalidSql;
+        if (!value.temporary and resolvedView.ref == .temp) return error.InvalidSql;
+        if (viewStore.findTriggerConst(nameParts.object) != null and value.ifNotExists) return try emptyResult(self.allocator);
+        if (value.updateOf.len != 0) {
+            var shape = try self.viewShapeForDml(resolvedView.ref, resolvedView.view);
+            defer self.freeViewShape(&shape);
+            for (value.updateOf) |name| _ = columnIndex(&shape.table, name) catch return error.UnknownColumn;
+        }
+        var scoped = value;
+        scoped.name = nameParts.object;
+        scoped.table = resolvedView.view.name;
+        try viewStore.createTrigger(scoped);
+        return try emptyResult(self.allocator);
+    }
+
+    /// Fake row shape over a view's output columns so view DML reuses the
+    /// table matching/eval/render paths. `table.columns` owns name/type
+    /// dupes; release with `freeViewShape`. The table borrows the view name.
+    const ViewShape = struct { table: Table };
+
+    fn viewShapeForDml(self: *Connection, ref: SchemaRef, view: *const View) !ViewShape {
+        var probe = try self.executeViewRows(ref, view.name, true);
+        defer probe.deinit();
+        const columns = try self.allocator.alloc(Column, probe.columns.len);
+        errdefer self.allocator.free(columns);
+        var made: usize = 0;
+        errdefer {
+            for (columns[0..made]) |*column| {
+                self.allocator.free(column.name);
+                self.allocator.free(column.typeName);
+            }
+        }
+        for (probe.columns, 0..) |name, index| {
+            const ownedName = try self.allocator.dupe(u8, name);
+            errdefer self.allocator.free(ownedName);
+            const ownedType = try self.allocator.dupe(u8, "");
+            errdefer self.allocator.free(ownedType);
+            columns[index] = .{ .name = ownedName, .typeName = ownedType, .primaryKey = false, .notNull = false };
+            made += 1;
+        }
+        return .{ .table = .{ .name = view.name, .columns = columns, .constraints = &.{}, .rows = .empty } };
+    }
+
+    fn freeViewShape(self: *Connection, shape: *ViewShape) void {
+        for (shape.table.columns) |*column| {
+            self.allocator.free(column.name);
+            self.allocator.free(column.typeName);
+        }
+        self.allocator.free(shape.table.columns);
+    }
+
+    /// Reads a view's rows (`LIMIT 0` when only output names are needed),
+    /// qualifying temp/attached views so the probe hits the owning store.
+    fn executeViewRows(self: *Connection, ref: SchemaRef, viewName: []const u8, namesOnly: bool) !Result {
+        var quoted = std.ArrayList(u8).empty;
+        defer quoted.deinit(self.allocator);
+        const qualifier: ?[]const u8 = switch (ref) {
+            .main => null,
+            .temp => "temp",
+            .attached => |index| self.attached.items[index].name,
+        };
+        if (qualifier) |schemaName| {
+            try quoted.appendSlice(self.allocator, schemaName);
+            try quoted.append(self.allocator, '.');
+        }
+        try quoted.append(self.allocator, '"');
+        for (viewName) |byte| {
+            if (byte == '"') try quoted.append(self.allocator, '"');
+            try quoted.append(self.allocator, byte);
+        }
+        try quoted.append(self.allocator, '"');
+        const sql = if (namesOnly)
+            try std.fmt.allocPrint(self.allocator, "SELECT * FROM {s} LIMIT 0;", .{quoted.items})
+        else
+            try std.fmt.allocPrint(self.allocator, "SELECT * FROM {s};", .{quoted.items});
+        defer self.allocator.free(sql);
+        return self.execute(sql, &.{});
+    }
+
+    /// True when `store` holds an INSTEAD OF trigger for `event` on the view.
+    fn hasViewTrigger(store: *const Schema, viewName: []const u8, event: ast.TriggerEvent) bool {
+        for (store.triggers.items) |trigger| {
+            if (trigger.timing == .insteadOf and trigger.event == event and std.ascii.eqlIgnoreCase(trigger.table, viewName)) return true;
+        }
+        return false;
+    }
+
+    /// Fires every matching INSTEAD OF trigger for one view row: WHEN and
+    /// UPDATE OF filter, bodies render with NEW/OLD over the view shape and
+    /// run under the shared recursion guard. BEFORE/AFTER triggers never
+    /// fire on views.
+    fn fireViewTriggers(self: *Connection, store: *Schema, shape: *const Table, viewName: []const u8, event: ast.TriggerEvent, newRow: ?[]const Value, oldRow: ?[]const Value, updatedColumns: []const []const u8) !void {
+        const PendingBody = struct { name: []u8, sql: []u8 };
+        var pending = std.ArrayList(PendingBody).empty;
+        defer {
+            for (pending.items) |item| {
+                self.allocator.free(item.name);
+                self.allocator.free(item.sql);
+            }
+            pending.deinit(self.allocator);
+        }
+        for (store.triggers.items) |trigger| {
+            if (trigger.timing != .insteadOf) continue;
+            if (trigger.event == event and std.ascii.eqlIgnoreCase(trigger.table, viewName)) {
+                if (!trigger.firesOnUpdate(updatedColumns)) continue;
+                if (!try self.triggerWhenMatched(shape, trigger, event, newRow, oldRow)) continue;
+                const ownedName = try self.allocator.dupe(u8, trigger.name);
+                errdefer self.allocator.free(ownedName);
+                const sql = try self.renderTriggerBody(trigger.body, shape, event, newRow, oldRow);
+                errdefer self.allocator.free(sql);
+                try pending.append(self.allocator, .{ .name = ownedName, .sql = sql });
+            }
+        }
+        for (pending.items) |item| try self.runTriggerBody(item.name, item.sql);
+    }
+
+    /// Resolves a row-independent INSERT expression into an owned value:
+    /// complex results already own their payload, borrowed literals and
+    /// parameters are duped.
+    fn resolveViewValue(self: *Connection, expr: ast.Expr, parameters: []const Value) !Value {
+        const resolved = try self.resolve(expr, parameters);
+        return switch (expr) {
+            .binary, .unary, .function, .caseExpr => resolved,
+            else => try self.copyValue(resolved),
+        };
+    }
+
+    /// Resolves an UPDATE SET expression over a view row into an owned value.
+    fn evalViewValue(self: *Connection, shape: *const Table, row: []const Value, expr: ast.Expr, parameters: []const Value) !Value {
+        const resolved = try self.eval(shape, row, expr, parameters);
+        return switch (expr) {
+            .binary, .unary, .function, .caseExpr => resolved,
+            else => try self.copyValue(resolved),
+        };
+    }
+
+    /// `INSERT INTO <view>`: each row becomes a NEW view-shaped row routed
+    /// to the view's INSTEAD OF INSERT triggers. Views without one fail
+    /// `Unsupported`; conflict policies do not apply to view writes.
+    fn insertIntoView(self: *Connection, store: *Schema, ref: SchemaRef, view: *const View, value: anytype, parameters: []const Value) !Result {
+        var shape = try self.viewShapeForDml(ref, view);
+        defer self.freeViewShape(&shape);
+        try validateReturningColumns(&shape.table, value.returning);
+        if (!hasViewTrigger(store, view.name, .insert)) return error.Unsupported;
+        const width = shape.table.columns.len;
+        var newRows = std.ArrayList([]Value).empty;
+        defer {
+            for (newRows.items) |row| self.freeCompoundRow(row);
+            newRows.deinit(self.allocator);
+        }
+        if (value.selectSql) |selectSql| {
+            var source = try self.execute(selectSql, parameters);
+            defer source.deinit();
+            for (source.rows) |sourceRow| {
+                if (sourceRow.len != width) return error.ColumnCountMismatch;
+                const owned = try self.allocator.alloc(Value, width);
+                errdefer self.allocator.free(owned);
+                for (sourceRow, 0..) |item, index| owned[index] = try self.copyValue(item);
+                try newRows.append(self.allocator, owned);
+            }
+        } else for (value.rows) |rowExprs| {
+            const owned = try self.allocator.alloc(Value, width);
+            // Every slot starts NULL (frees as no-op); assigned slots own
+            // their payload, so the errdefer below frees exactly those.
+            for (owned) |*slot| slot.* = .null;
+            errdefer {
+                for (owned) |item| self.freeConcatText(item);
+                self.allocator.free(owned);
+            }
+            if (value.columns.len == 0) {
+                if (rowExprs.len != 0 and rowExprs.len != width) return error.ColumnCountMismatch;
+                for (rowExprs, 0..) |expr, index| owned[index] = try self.resolveViewValue(expr, parameters);
+            } else {
+                if (value.columns.len != rowExprs.len) return error.ColumnCountMismatch;
+                for (value.columns, rowExprs) |name, expr| {
+                    const index = try columnIndex(&shape.table, name);
+                    owned[index] = try self.resolveViewValue(expr, parameters);
+                }
+            }
+            try newRows.append(self.allocator, owned);
+        }
+        var affected = std.ArrayList([]const Value).empty;
+        defer affected.deinit(self.allocator);
+        for (newRows.items) |newRow| {
+            try self.fireViewTriggers(store, &shape.table, view.name, .insert, newRow, null, &.{});
+            try affected.append(self.allocator, newRow);
+        }
+        if (value.returning.len > 0) return self.evaluateReturning(&shape.table, value.returning, affected.items, parameters);
+        return .{ .allocator = self.allocator, .columns = try self.allocator.alloc([]const u8, 0), .rows = try self.allocator.alloc([]Value, 0), .changes = affected.items.len };
+    }
+
+    /// `UPDATE <view>`: matching view rows become OLD/NEW pairs routed to
+    /// the view's INSTEAD OF UPDATE triggers (`UPDATE OF`/`WHEN` filter).
+    /// `UPDATE..FROM` on views fails `Unsupported`.
+    fn updateView(self: *Connection, store: *Schema, ref: SchemaRef, view: *const View, value: anytype, parameters: []const Value) !Result {
+        if (value.from != null) return error.Unsupported;
+        var shape = try self.viewShapeForDml(ref, view);
+        defer self.freeViewShape(&shape);
+        try validateReturningColumns(&shape.table, value.returning);
+        if (!hasViewTrigger(store, view.name, .update)) return error.Unsupported;
+        var probe = try self.executeViewRows(ref, view.name, false);
+        defer probe.deinit();
+        var candidates = std.ArrayList([]Value).empty;
+        defer {
+            for (candidates.items) |row| self.freeCompoundRow(row);
+            candidates.deinit(self.allocator);
+        }
+        var affected = std.ArrayList([]const Value).empty;
+        defer affected.deinit(self.allocator);
+        for (probe.rows) |oldRow| {
+            if (!(try self.matches(&shape.table, oldRow, value.condition, parameters))) continue;
+            const candidate = try self.allocator.alloc(Value, oldRow.len);
+            var filled: usize = 0;
+            errdefer {
+                for (candidate[0..filled]) |item| self.freeConcatText(item);
+                self.allocator.free(candidate);
+            }
+            for (oldRow, 0..) |item, index| {
+                candidate[index] = try self.copyValue(item);
+                filled = index + 1;
+            }
+            for (value.columns, value.values) |name, expr| {
+                const index = try columnIndex(&shape.table, name);
+                self.freeConcatText(candidate[index]);
+                candidate[index] = try self.evalViewValue(&shape.table, oldRow, expr, parameters);
+            }
+            try self.fireViewTriggers(store, &shape.table, view.name, .update, candidate, oldRow, value.columns);
+            try candidates.append(self.allocator, candidate);
+            try affected.append(self.allocator, candidate);
+        }
+        if (value.returning.len > 0) return self.evaluateReturning(&shape.table, value.returning, affected.items, parameters);
+        return .{ .allocator = self.allocator, .columns = try self.allocator.alloc([]const u8, 0), .rows = try self.allocator.alloc([]Value, 0), .changes = affected.items.len };
+    }
+
+    /// `DELETE FROM <view>`: matching view rows route as OLD rows to the
+    /// view's INSTEAD OF DELETE triggers.
+    fn deleteView(self: *Connection, store: *Schema, ref: SchemaRef, view: *const View, value: anytype, parameters: []const Value) !Result {
+        var shape = try self.viewShapeForDml(ref, view);
+        defer self.freeViewShape(&shape);
+        try validateReturningColumns(&shape.table, value.returning);
+        if (!hasViewTrigger(store, view.name, .delete)) return error.Unsupported;
+        var probe = try self.executeViewRows(ref, view.name, false);
+        defer probe.deinit();
+        var affected = std.ArrayList([]const Value).empty;
+        defer affected.deinit(self.allocator);
+        for (probe.rows) |oldRow| {
+            if (!(try self.matches(&shape.table, oldRow, value.condition, parameters))) continue;
+            try self.fireViewTriggers(store, &shape.table, view.name, .delete, null, oldRow, &.{});
+            try affected.append(self.allocator, oldRow);
+        }
+        if (value.returning.len > 0) return self.evaluateReturning(&shape.table, value.returning, affected.items, parameters);
+        return .{ .allocator = self.allocator, .columns = try self.allocator.alloc([]const u8, 0), .rows = try self.allocator.alloc([]Value, 0), .changes = affected.items.len };
     }
     fn createVirtualTableCommand(self: *Connection, value: ast.VirtualTableDef) !Result {
         const target = try self.createTarget(value.name, false);
@@ -3143,24 +3411,30 @@ pub const Connection = struct {
                 try pending.append(self.allocator, .{ .name = ownedName, .sql = sql });
             }
         }
-        for (pending.items) |item| {
-            if (self.triggerOnStack(item.name)) {
-                if (!self.recursiveTriggers) continue;
-                if (self.triggerStack.items.len >= maxTriggerDepth) return error.TriggerDepthExceeded;
-            } else if (self.triggerStack.items.len >= maxTriggerDepth) {
-                return error.TriggerDepthExceeded;
-            }
-            const owned = try self.allocator.dupe(u8, item.name);
-            try self.triggerStack.append(self.allocator, owned);
-            var result = self.execute(item.sql, &.{}) catch |err| {
-                const dropped = self.triggerStack.pop() orelse unreachable;
-                self.allocator.free(dropped);
-                return err;
-            };
-            result.deinit();
+        for (pending.items) |item| try self.runTriggerBody(item.name, item.sql);
+    }
+
+    /// Runs one rendered trigger body under the recursion guard: re-entry
+    /// runs only with `recursiveTriggers`, past `maxTriggerDepth` fails.
+    /// Bodies run through `exec`, so multi-statement bodies work for table
+    /// and INSTEAD OF triggers alike. Shared by both trigger paths.
+    fn runTriggerBody(self: *Connection, name: []const u8, sql: []const u8) !void {
+        if (self.triggerOnStack(name)) {
+            if (!self.recursiveTriggers) return;
+            if (self.triggerStack.items.len >= maxTriggerDepth) return error.TriggerDepthExceeded;
+        } else if (self.triggerStack.items.len >= maxTriggerDepth) {
+            return error.TriggerDepthExceeded;
+        }
+        const owned = try self.allocator.dupe(u8, name);
+        try self.triggerStack.append(self.allocator, owned);
+        var result = self.exec(sql) catch |err| {
             const dropped = self.triggerStack.pop() orelse unreachable;
             self.allocator.free(dropped);
-        }
+            return err;
+        };
+        result.deinit();
+        const dropped = self.triggerStack.pop() orelse unreachable;
+        self.allocator.free(dropped);
     }
 
     fn triggerOnStack(self: *Connection, name: []const u8) bool {
@@ -4114,7 +4388,10 @@ pub const Connection = struct {
 
     fn insertInto(self: *Connection, value: anytype, parameters: []const Value) anyerror!Result {
         if (self.cteActive(value.table)) return error.InvalidSql;
-        const resolved = self.resolveTableName(value.table) orelse return error.UnknownTable;
+        const resolved = self.resolveTableName(value.table) orelse {
+            const resolvedView = self.resolveViewName(value.table) orelse return error.UnknownTable;
+            return self.insertIntoView(self.storeFor(resolvedView.ref), resolvedView.ref, resolvedView.view, value, parameters);
+        };
         const store = self.storeFor(resolved.ref);
         const tbl = resolved.table;
         try validateReturningColumns(tbl, value.returning);
@@ -6135,9 +6412,15 @@ pub const Connection = struct {
     }
 
     fn update(self: *Connection, value: anytype, parameters: []const Value) !Result {
-        if (value.from != null) return self.updateFrom(value, parameters);
+        if (value.from != null) {
+            if (self.resolveTableName(value.table) == null and self.resolveViewName(value.table) != null) return error.Unsupported;
+            return self.updateFrom(value, parameters);
+        }
         if (self.cteActive(value.table)) return error.InvalidSql;
-        const resolved = self.resolveTableName(value.table) orelse return error.UnknownTable;
+        const resolved = self.resolveTableName(value.table) orelse {
+            const resolvedView = self.resolveViewName(value.table) orelse return error.UnknownTable;
+            return self.updateView(self.storeFor(resolvedView.ref), resolvedView.ref, resolvedView.view, value, parameters);
+        };
         const store = self.storeFor(resolved.ref);
         const tbl = resolved.table;
         try validateReturningColumns(tbl, value.returning);
@@ -6490,7 +6773,10 @@ pub const Connection = struct {
 
     fn delete(self: *Connection, value: anytype, parameters: []const Value) !Result {
         if (self.cteActive(value.table)) return error.InvalidSql;
-        const resolved = self.resolveTableName(value.table) orelse return error.UnknownTable;
+        const resolved = self.resolveTableName(value.table) orelse {
+            const resolvedView = self.resolveViewName(value.table) orelse return error.UnknownTable;
+            return self.deleteView(self.storeFor(resolvedView.ref), resolvedView.ref, resolvedView.view, value, parameters);
+        };
         const store = self.storeFor(resolved.ref);
         const tbl = resolved.table;
         try validateReturningColumns(tbl, value.returning);
@@ -14558,4 +14844,90 @@ test "self referential deferrable insert commits in one statement" {
     var absent = try db.exec("SELECT count(*) FROM emp WHERE id = 3;");
     defer absent.deinit();
     try std.testing.expectEqual(@as(i64, 0), absent.rows[0][0].integer);
+}
+
+test "instead of insert routes view writes to base tables" {
+    var db = try freshDb("sqlite_zig_instead_of_insert_test.db");
+    defer dropDb(db, "sqlite_zig_instead_of_insert_test.db");
+    var setup = try db.exec("CREATE TABLE iv_users (id INTEGER PRIMARY KEY, name TEXT); CREATE TABLE iv_orders (id INTEGER PRIMARY KEY, user_id INTEGER, amount INTEGER); CREATE VIEW iv_customer_orders AS SELECT u.name AS name, o.amount AS amount FROM iv_users u JOIN iv_orders o ON o.user_id = u.id;");
+    setup.deinit();
+    // A view without an INSTEAD OF trigger is not writable.
+    try std.testing.expectError(error.Unsupported, db.exec("INSERT INTO iv_customer_orders VALUES ('Zed', 5);"));
+    var make = try db.exec("CREATE TRIGGER iv_customer_orders_ins INSTEAD OF INSERT ON iv_customer_orders BEGIN INSERT INTO iv_users (name) VALUES (NEW.name); INSERT INTO iv_orders (user_id, amount) VALUES (last_insert_rowid(), NEW.amount); END;");
+    make.deinit();
+    var inserted = try db.exec("INSERT INTO iv_customer_orders VALUES ('Ada', 120);");
+    defer inserted.deinit();
+    try std.testing.expectEqual(@as(usize, 1), inserted.changes);
+    var users = try db.exec("SELECT id, name FROM iv_users;");
+    defer users.deinit();
+    try std.testing.expectEqual(@as(usize, 1), users.count());
+    var orders = try db.exec("SELECT user_id, amount FROM iv_orders;");
+    defer orders.deinit();
+    try std.testing.expectEqual(@as(usize, 1), orders.count());
+    try std.testing.expectEqual(users.rows[0][0].integer, orders.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 120), orders.rows[0][1].integer);
+    // RETURNING sees the NEW view row.
+    var returning = try db.exec("INSERT INTO iv_customer_orders VALUES ('Bo', 30) RETURNING name, amount;");
+    defer returning.deinit();
+    try std.testing.expectEqualStrings("Bo", returning.rows[0][0].text);
+    try std.testing.expectEqual(@as(i64, 30), returning.rows[0][1].integer);
+}
+
+test "instead of update and delete honor when and update of" {
+    var db = try freshDb("sqlite_zig_instead_of_update_test.db");
+    defer dropDb(db, "sqlite_zig_instead_of_update_test.db");
+    var setup = try db.exec("CREATE TABLE uu_items (id INTEGER PRIMARY KEY, label TEXT, price INTEGER); CREATE VIEW uu_priced AS SELECT id, label, price FROM uu_items; INSERT INTO uu_items VALUES (1, 'a', 10), (2, 'b', 20);");
+    setup.deinit();
+    var makeUpdate = try db.exec("CREATE TRIGGER uu_priced_upd INSTEAD OF UPDATE OF price ON uu_priced WHEN NEW.price >= 0 BEGIN UPDATE uu_items SET price = NEW.price WHERE id = OLD.id; END;");
+    makeUpdate.deinit();
+    var makeDelete = try db.exec("CREATE TRIGGER uu_priced_del INSTEAD OF DELETE ON uu_priced BEGIN DELETE FROM uu_items WHERE id = OLD.id; END;");
+    makeDelete.deinit();
+    // UPDATE OF price fires; other columns do not match the trigger.
+    var updated = try db.exec("UPDATE uu_priced SET price = 15 WHERE id = 1;");
+    defer updated.deinit();
+    try std.testing.expectEqual(@as(usize, 1), updated.changes);
+    var negative = try db.exec("UPDATE uu_priced SET price = -5 WHERE id = 2;");
+    negative.deinit();
+    var prices = try db.exec("SELECT price FROM uu_items ORDER BY id;");
+    defer prices.deinit();
+    try std.testing.expectEqual(@as(i64, 15), prices.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 20), prices.rows[1][0].integer);
+    var renamed = try db.exec("UPDATE uu_priced SET label = 'z' WHERE id = 1;");
+    renamed.deinit();
+    var labels = try db.exec("SELECT label FROM uu_items WHERE id = 1;");
+    defer labels.deinit();
+    try std.testing.expectEqualStrings("a", labels.rows[0][0].text);
+    // DELETE routes through OLD rows with RETURNING support.
+    var deleted = try db.exec("DELETE FROM uu_priced WHERE id = 2 RETURNING id;");
+    defer deleted.deinit();
+    try std.testing.expectEqual(@as(i64, 2), deleted.rows[0][0].integer);
+    var remaining = try db.exec("SELECT count(*) FROM uu_items;");
+    defer remaining.deinit();
+    try std.testing.expectEqual(@as(i64, 1), remaining.rows[0][0].integer);
+}
+
+test "instead of triggers reject bad targets and columns" {
+    var db = try freshDb("sqlite_zig_instead_of_bad_test.db");
+    defer dropDb(db, "sqlite_zig_instead_of_bad_test.db");
+    var setup = try db.exec("CREATE TABLE ib_t (id INTEGER); CREATE VIEW ib_v AS SELECT id FROM ib_t;");
+    setup.deinit();
+    // INSTEAD OF on a table is invalid; BEFORE on a view has no table target.
+    try std.testing.expectError(error.InvalidSql, db.exec("CREATE TRIGGER bad_ins INSTEAD OF INSERT ON ib_t BEGIN SELECT 1; END;"));
+    try std.testing.expectError(error.UnknownTable, db.exec("CREATE TRIGGER bad_before BEFORE INSERT ON ib_v BEGIN SELECT 1; END;"));
+    // UPDATE OF names validate against the view's output columns.
+    try std.testing.expectError(error.UnknownColumn, db.exec("CREATE TRIGGER bad_of INSTEAD OF UPDATE OF nope ON ib_v BEGIN SELECT 1; END;"));
+    // UPDATE..FROM on a view is unsupported.
+    var make = try db.exec("CREATE TRIGGER ib_v_del INSTEAD OF DELETE ON ib_v BEGIN DELETE FROM ib_t WHERE id = OLD.id; END;");
+    make.deinit();
+    try std.testing.expectError(error.Unsupported, db.exec("UPDATE ib_v SET id = 1 FROM ib_t WHERE ib_t.id = ib_v.id;"));
+    // INSERT..SELECT into a view routes each source row through the trigger.
+    var makeIns = try db.exec("CREATE TRIGGER ib_v_ins INSTEAD OF INSERT ON ib_v BEGIN INSERT INTO ib_t VALUES (NEW.id); END;");
+    makeIns.deinit();
+    var seed = try db.exec("INSERT INTO ib_t VALUES (5);");
+    seed.deinit();
+    var copied = try db.exec("INSERT INTO ib_v SELECT id + 1 FROM ib_t;");
+    copied.deinit();
+    var check = try db.exec("SELECT count(*) FROM ib_t;");
+    defer check.deinit();
+    try std.testing.expectEqual(@as(i64, 2), check.rows[0][0].integer);
 }

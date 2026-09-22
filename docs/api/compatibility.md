@@ -56,7 +56,7 @@ differential harness against SQLite and no fault-injection runner;
 | 6 | Subqueries (scalar, IN, EXISTS, derived tables) | `connection/connection.zig` (`executeWithOuter`, `materializeDerivedTable`), `dsl/ast_builder.zig` | `connection.zig` subquery tests; `examples/25,43,44,45,54,63` | Covered | `TODO(subq)`: correlated-subquery performance, derived-table pushdown |
 | 7 | CTEs incl. recursive (`WITH`, `WITH RECURSIVE`, compound) | `connection/connection.zig` (`setupCtes`, `executeWith`, `executeCompound`), `sql/parser.zig` | `connection.zig` CTE tests; `examples/24,29,32,51,61` | Covered | `TODO(cte)`: recursion-depth and cycle diagnostics |
 | 8 | Window functions (ROW_NUMBER, RANK, LAG/LEAD, PARTITION BY) | `sql/functions/window.zig`, `sql/parser.zig`, `dsl/column.zig`, `dsl/ast_builder.zig` | `window.zig` unit tests; `parser.zig` named-window tests; `examples/64` | Covered | `TODO(window)`: `RANGE`/`GROUPS` frame edge parity; `EXCLUDE TIES` corner cases |
-| 9 | Triggers (BEFORE/AFTER INSERT/UPDATE/DELETE, WHEN, NEW/OLD) | `catalog/schema.zig` (`Trigger`), `connection/connection.zig` (`fireTriggers`, `renderTriggerBody`) | `connection.zig` trigger tests; `examples/23,57` | Partial | `TODO(trigger)`: `INSTEAD OF` missing (`ast.zig` notes it); recursion policy |
+| 9 | Triggers (BEFORE/AFTER/INSTEAD OF INSERT/UPDATE/DELETE, WHEN, NEW/OLD) | `catalog/schema.zig` (`Trigger`), `connection/connection.zig` (`fireTriggers`, `fireViewTriggers`, `renderTriggerBody`, `runTriggerBody`) | `connection.zig` trigger + instead-of tests; `examples/23,57` | Partial | `TODO(trigger)`: recursion policy; `UPDATE..FROM` on views unsupported |
 | 10 | Views (CREATE VIEW, read path, updatable subset) | `catalog/schema.zig` (`View`), `connection/connection.zig` (`createViewCommand`) | `connection.zig` view tests; `examples/22` | Partial | `TODO(view)`: writable views limited to `viewTargetsSingleTable`; `TEMP` scoping |
 | 11 | Indexes (UNIQUE, partial, expression, EXPLAIN QUERY PLAN) | `catalog/schema.zig` (`Index`), `storage/sqlite_image.zig` (index root pages), `plan/planner.zig`, `connection/connection.zig` (`plannedIndices`) | source-local `plan` tests; `examples/21,33,68` | Covered | `TODO(index)`: covering-index fast path, multi-index AND/OR planning |
 | 12 | Foreign keys (CASCADE/SET NULL/SET DEFAULT/RESTRICT, composite, DEFERRABLE) | `catalog/schema.zig` (FK constraints, `fkCheckDeferred`), `connection/connection.zig` (`apply*Actions`, `pragmaForeignKey*`, `enforceDeferredForeignKeys`) | `connection.zig` FK + deferrable tests; `examples/26,28,31,62` | Covered | none: immediate, `INITIALLY DEFERRED/IMMEDIATE`, and `defer_foreign_keys` verified |
@@ -101,8 +101,8 @@ conditions directly.
 `src/catalog/schema.zig` owns `Table`/`Index`/`View`/`Trigger` records plus
 `strict`, `withoutRowid`, and `generatedExpr` flags; `src/sql/parser.zig`
 owns DDL parsing (`CREATE`, `ALTER`, `ATTACH`, `VACUUM`, `ANALYZE`,
-`PRAGMA`). Documented gaps are load-bearing: no `INSTEAD OF` triggers
-(`src/sql/ast.zig`), writable views limited to
+`PRAGMA`). Documented gaps are load-bearing: views without `INSTEAD OF`
+triggers stay read-only, writable views limited to
 `viewTargetsSingleTable`, and `txn/locking.zig` as a stub. `UPSERT` and
 `RETURNING` are the most complete recent features
 (`examples/38–41,55,56`).

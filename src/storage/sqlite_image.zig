@@ -609,6 +609,7 @@ fn createTriggerSql(allocator: std.mem.Allocator, trigger: anytype) ![]u8 {
     try sql.appendSlice(allocator, switch (trigger.timing) {
         .before => " BEFORE ",
         .after => " AFTER ",
+        .insteadOf => " INSTEAD OF ",
     });
     try sql.appendSlice(allocator, switch (trigger.event) {
         .insert => "INSERT",

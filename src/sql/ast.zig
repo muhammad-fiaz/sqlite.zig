@@ -104,8 +104,8 @@ pub const TableConstraint = union(enum) { primaryKey: []const []const u8, unique
 pub const IndexDef = struct { name: []const u8, table: []const u8, columns: []const []const u8, keyExprs: []const ?Expr = &.{}, unique: bool = false, ifNotExists: bool = false, whereExpr: ?Expr = null, whereSql: ?[]const u8 = null };
 /// Trigger DML event.
 pub const TriggerEvent = enum { insert, update, delete };
-/// Trigger firing time (SQLite has no INSTEAD OF here yet).
-pub const TriggerTiming = enum { before, after };
+/// Trigger firing time; `insteadOf` fires on views in place of the write.
+pub const TriggerTiming = enum { before, after, insteadOf };
 /// CREATE TRIGGER payload; `body`/`whenSql` are retained source slices.
 pub const TriggerDef = struct { name: []const u8, table: []const u8, timing: TriggerTiming = .after, event: TriggerEvent, updateOf: []const []const u8 = &.{}, whenSql: ?[]const u8 = null, body: []const u8, ifNotExists: bool = false, temporary: bool = false };
 /// CREATE VIRTUAL TABLE payload; args are raw token texts.

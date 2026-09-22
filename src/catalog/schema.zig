@@ -212,9 +212,17 @@ pub const Schema = struct {
     /// `UnknownTable`, `UnknownColumn`, or `InvalidSql` (UPDATE OF on non-UPDATE).
     pub fn createTrigger(self: *Schema, definition: ast.TriggerDef) !void {
         if (self.findTrigger(definition.name) != null) return error.TriggerExists;
-        const table = self.find(definition.table) orelse return error.UnknownTable;
-        if (definition.event != .update and definition.updateOf.len != 0) return error.InvalidSql;
-        for (definition.updateOf) |name| if (self.columnIndex(table, name) == null) return error.UnknownColumn;
+        if (definition.timing == .insteadOf) {
+            // INSTEAD OF triggers live on views; the connection validates
+            // UPDATE OF names against the view's output columns first.
+            if (self.find(definition.table) != null) return error.InvalidSql;
+            if (self.findViewConst(definition.table) == null) return error.UnknownTable;
+            if (definition.event != .update and definition.updateOf.len != 0) return error.InvalidSql;
+        } else {
+            const table = self.find(definition.table) orelse return error.UnknownTable;
+            if (definition.event != .update and definition.updateOf.len != 0) return error.InvalidSql;
+            for (definition.updateOf) |name| if (self.columnIndex(table, name) == null) return error.UnknownColumn;
+        }
         const whenSql = if (definition.whenSql) |when| try self.allocator.dupe(u8, when) else null;
         errdefer if (whenSql) |when| self.allocator.free(when);
         const updateOf = try self.allocator.alloc([]u8, definition.updateOf.len);

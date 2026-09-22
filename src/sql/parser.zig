@@ -1204,7 +1204,10 @@ pub const Parser = struct {
             break :blk true;
         } else false;
         const name = try self.tableName();
-        const timing: ast.TriggerTiming = if (self.acceptWord("before")) .before else blk: {
+        const timing: ast.TriggerTiming = if (self.acceptWord("before")) .before else if (self.acceptWord("instead")) blk: {
+            try self.requireWord("of");
+            break :blk .insteadOf;
+        } else blk: {
             try self.requireWord("after");
             break :blk .after;
         };
@@ -3175,6 +3178,25 @@ test "parser parses deferrable foreign key clauses" {
     defer ast.deinit(std.testing.allocator, &s6);
     try std.testing.expect(s6.createTable.columns[0].foreignKey.?.onDelete == .cascade);
     try std.testing.expect(s6.createTable.columns[0].foreignKey.?.initiallyDeferred);
+}
+
+test "parser parses instead of triggers" {
+    var p1 = try Parser.init(std.testing.allocator, "CREATE TRIGGER v_ins INSTEAD OF INSERT ON v BEGIN INSERT INTO t VALUES (NEW.a); END;");
+    defer p1.deinit();
+    var s1 = try p1.parse();
+    defer ast.deinit(std.testing.allocator, &s1);
+    try std.testing.expect(s1 == .createTrigger);
+    try std.testing.expect(s1.createTrigger.timing == .insteadOf);
+    try std.testing.expect(s1.createTrigger.event == .insert);
+
+    var p2 = try Parser.init(std.testing.allocator, "CREATE TRIGGER v_upd INSTEAD OF UPDATE OF a, b ON v WHEN OLD.a != NEW.a BEGIN UPDATE t SET a = NEW.a; END;");
+    defer p2.deinit();
+    var s2 = try p2.parse();
+    defer ast.deinit(std.testing.allocator, &s2);
+    try std.testing.expect(s2.createTrigger.timing == .insteadOf);
+    try std.testing.expect(s2.createTrigger.event == .update);
+    try std.testing.expectEqual(@as(usize, 2), s2.createTrigger.updateOf.len);
+    try std.testing.expect(s2.createTrigger.whenSql != null);
 }
 
 test "parser parses attach, detach, and vacuum statements" {
