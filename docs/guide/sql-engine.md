@@ -38,7 +38,7 @@ of SQLite's SQL dialect.
 | **EXPLAIN QUERY PLAN** | `EXPLAIN QUERY PLAN SELECT ...` reports index use vs table scans |
 | **CREATE VIRTUAL TABLE** | `generate_series` module only; other modules return an explicit error |
 | **DROP** | `DROP TABLE/INDEX/VIEW/TRIGGER [IF EXISTS] name` |
-| **PRAGMA** | `foreign_keys`, `user_version`, `application_id`, `schema_version`, `journal_mode`, `wal_checkpoint`, `synchronous`, `cache_size`, `page_size`, `encoding`, `busy_timeout`, `locking_mode`, `auto_vacuum`, `recursive_triggers`, `integrity_check`, `foreign_key_check`, `table_info`, `table_xinfo`, `table_list`, `index_list`, `index_info`, `index_xinfo`, `foreign_key_list`, `database_list` |
+| **PRAGMA** | `foreign_keys`, `user_version`, `application_id`, `schema_version`, `journal_mode`, `wal_checkpoint`, `synchronous`, `cache_size`, `page_size`, `encoding`, `busy_timeout`, `locking_mode`, `auto_vacuum`, `recursive_triggers`, `integrity_check`, `foreign_key_check`, `table_info`, `table_xinfo`, `table_list`, `index_list`, `index_info`, `index_xinfo`, `foreign_key_list`, `database_list`, `case_sensitive_like`, `defer_foreign_keys` |
 
 ## Schemas: main, temp, and attached databases
 
@@ -80,7 +80,10 @@ match, following SQLite's three-valued predicate behavior. The typed DSL exposes
 these as `column.like(pattern)` and `column.notLike(pattern)`.
 
 `LIKE` folds ASCII letters by default, while `GLOB` remains case-sensitive, matching
-SQLite's standard distinction between the two operators.
+SQLite's standard distinction between the two operators. `PRAGMA
+case_sensitive_like=ON` makes `LIKE` byte-exact (operator and function
+forms); explicit `COLLATE` clauses do not affect `LIKE`, also matching the
+reference.
 
 NULL-safe comparisons are available with `IS DISTINCT FROM` and
 `IS NOT DISTINCT FROM`; the typed equivalents are `isDistinctFrom` and

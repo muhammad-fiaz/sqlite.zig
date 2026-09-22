@@ -81,6 +81,9 @@ pub const Connection = struct {
     /// Active CTE names (recursion guard); trigger recursion state follows.
     activeCtes: std.ArrayList([]const u8) = .empty,
     recursiveTriggers: bool = false,
+    /// `PRAGMA case_sensitive_like`: byte-exact LIKE matching (operator and
+    /// function forms); default folds ASCII case like the reference.
+    caseSensitiveLike: bool = false,
     triggerStack: std.ArrayList([]const u8) = .empty,
     /// True inside BEGIN..COMMIT; savepoints nest inside it.
     transactionActive: bool = false,
@@ -1645,6 +1648,22 @@ pub const Connection = struct {
             const rows = try self.allocator.alloc([]Value, 1);
             rows[0] = try self.allocator.alloc(Value, 1);
             rows[0][0] = .{ .integer = if (self.recursiveTriggers) 1 else 0 };
+            return .{ .allocator = self.allocator, .columns = columns, .rows = rows };
+        }
+        if (std.ascii.eqlIgnoreCase(value.name, "case_sensitive_like")) {
+            if (value.argument != null) return error.InvalidSql;
+            if (value.value) |text| {
+                if (std.ascii.eqlIgnoreCase(text, "on") or std.mem.eql(u8, text, "1")) {
+                    self.caseSensitiveLike = true;
+                } else if (std.ascii.eqlIgnoreCase(text, "off") or std.mem.eql(u8, text, "0")) {
+                    self.caseSensitiveLike = false;
+                } else return error.InvalidSql;
+            }
+            const names = [_][]const u8{"case_sensitive_like"};
+            const columns = try self.ownedColumns(&names);
+            const rows = try self.allocator.alloc([]Value, 1);
+            rows[0] = try self.allocator.alloc(Value, 1);
+            rows[0][0] = .{ .integer = if (self.caseSensitiveLike) 1 else 0 };
             return .{ .allocator = self.allocator, .columns = columns, .rows = rows };
         }
         if (std.ascii.eqlIgnoreCase(value.name, "wal_checkpoint")) {
@@ -3994,7 +4013,12 @@ pub const Connection = struct {
             self.freeConcatText(patternText);
             return null;
         }
-        const matched = if (glob) globMatch(currentText.text, patternText.text) else likeMatchEscape(currentText.text, patternText.text, escapeChar);
+        const matched = if (glob)
+            globMatch(currentText.text, patternText.text)
+        else if (self.caseSensitiveLike)
+            patternLib.likeCaseSensitiveWithEscape(currentText.text, patternText.text, escapeChar)
+        else
+            likeMatchEscape(currentText.text, patternText.text, escapeChar);
         self.freeConcatText(currentText);
         self.freeConcatText(patternText);
         return matched;
@@ -4256,6 +4280,13 @@ pub const Connection = struct {
                     const vea = try self.evalContext(tbl, row, ea, parameters, outer);
                     try argList.append(self.allocator, vea);
                     try ownedList.append(self.allocator, ea == .function or ea == .binary);
+                }
+                // The `like` function form follows `case_sensitive_like`
+                // like the operator does; every other scalar routes through
+                // the shared dispatcher (which stays case-insensitive).
+                if (self.caseSensitiveLike and std.ascii.eqlIgnoreCase(call.name, "like")) {
+                    if (argList.items.len != 2 and argList.items.len != 3) return error.InvalidArgumentCount;
+                    break :blk try functions.scalar.evalLike(self.allocator, argList.items[0], argList.items[1], if (argList.items.len == 3) argList.items[2] else null, true);
                 }
                 break :blk functions.evalScalar(self.allocator, call.name, argList.items) catch return error.Unsupported;
             },
@@ -15188,6 +15219,30 @@ test "probe fromless order and operand collate corners" {
     defer betweenPlain.deinit();
     try std.testing.expectEqual(@as(i64, 0), betweenPlain.rows[0][0].integer);
     try std.testing.expectEqual(@as(i64, 1), betweenPlain.rows[0][1].integer);
+}
+
+test "case sensitive like pragma toggles operator and function forms" {
+    var db = try freshDb("sqlite_zig_case_like_test.db");
+    defer dropDb(db, "sqlite_zig_case_like_test.db");
+    var def = try db.exec("SELECT 'abc' LIKE 'A%', like('A%', 'abc');");
+    defer def.deinit();
+    try std.testing.expectEqual(@as(i64, 1), def.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 1), def.rows[0][1].integer);
+    var pragma = try db.exec("PRAGMA case_sensitive_like = ON;");
+    defer pragma.deinit();
+    try std.testing.expectEqual(@as(i64, 1), pragma.rows[0][0].integer);
+    var sens = try db.exec("SELECT 'abc' LIKE 'A%', like('A%', 'abc'), 'abc' LIKE 'a%', like('a%', 'abc');");
+    defer sens.deinit();
+    try std.testing.expectEqual(@as(i64, 0), sens.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 0), sens.rows[0][1].integer);
+    try std.testing.expectEqual(@as(i64, 1), sens.rows[0][2].integer);
+    try std.testing.expectEqual(@as(i64, 1), sens.rows[0][3].integer);
+    var off = try db.exec("PRAGMA case_sensitive_like = OFF;");
+    off.deinit();
+    var back = try db.exec("SELECT 'abc' LIKE 'A%';");
+    defer back.deinit();
+    try std.testing.expectEqual(@as(i64, 1), back.rows[0][0].integer);
+    try std.testing.expectError(error.InvalidSql, db.exec("PRAGMA case_sensitive_like = MAYBE;"));
 }
 
 test "soundex like glob and json_array_length run as raw sql" {

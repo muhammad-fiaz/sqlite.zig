@@ -1,9 +1,11 @@
 //! Pure `LIKE`/`GLOB`/`REGEXP`/`MATCH` predicates over byte slices.
 //!
-//! `LIKE` folds ASCII case (`%` any run, `_` one byte, optional `ESCAPE`);
-//! `GLOB` is case-sensitive (`*`, `?`, `[...]` classes); `REGEXP` is a small
-//! built-in subset, not PCRE; `MATCH` is a case-insensitive substring test.
-//! Pure and infallible; NULL handling stays with the caller.
+//! `LIKE` folds ASCII case (`%` any run, `_` one byte, optional `ESCAPE`),
+//! or matches byte-exactly via `likeCaseSensitiveWithEscape` under
+//! `PRAGMA case_sensitive_like=ON`; `GLOB` is case-sensitive (`*`, `?`,
+//! `[...]` classes); `REGEXP` is a small built-in subset, not PCRE; `MATCH`
+//! is a case-insensitive substring test. Pure and infallible; NULL handling
+//! stays with the caller.
 
 const std = @import("std");
 
@@ -21,18 +23,33 @@ pub fn like(text: []const u8, pattern: []const u8) bool {
 /// next pattern byte matches literally (case-insensitively). A trailing lone
 /// escape byte matches nothing. A `null` escape behaves like `like`.
 pub fn likeWithEscape(text: []const u8, pattern: []const u8, escape: ?u8) bool {
+    return likeWithEscapeInner(text, pattern, escape, false);
+}
+
+/// Byte-exact `LIKE` for `PRAGMA case_sensitive_like=ON`: same wildcards
+/// and escape rules as `likeWithEscape` but no ASCII folding.
+pub fn likeCaseSensitiveWithEscape(text: []const u8, pattern: []const u8, escape: ?u8) bool {
+    return likeWithEscapeInner(text, pattern, escape, true);
+}
+
+fn likeWithEscapeInner(text: []const u8, pattern: []const u8, escape: ?u8, caseSensitive: bool) bool {
+    const eq = struct {
+        fn run(a: u8, b: u8, sensitive: bool) bool {
+            return if (sensitive) a == b else std.ascii.toLower(a) == std.ascii.toLower(b);
+        }
+    }.run;
     if (pattern.len == 0) return text.len == 0;
     if (escape) |esc| if (pattern[0] == esc) {
         if (pattern.len == 1) return false;
-        return text.len != 0 and std.ascii.toLower(pattern[1]) == std.ascii.toLower(text[0]) and likeWithEscape(text[1..], pattern[2..], escape);
+        return text.len != 0 and eq(pattern[1], text[0], caseSensitive) and likeWithEscapeInner(text[1..], pattern[2..], escape, caseSensitive);
     };
     if (pattern[0] == '%') {
         var index: usize = 0;
-        while (index <= text.len) : (index += 1) if (likeWithEscape(text[index..], pattern[1..], escape)) return true;
+        while (index <= text.len) : (index += 1) if (likeWithEscapeInner(text[index..], pattern[1..], escape, caseSensitive)) return true;
         return false;
     }
-    if (pattern[0] == '_') return text.len != 0 and likeWithEscape(text[1..], pattern[1..], escape);
-    return text.len != 0 and std.ascii.toLower(pattern[0]) == std.ascii.toLower(text[0]) and likeWithEscape(text[1..], pattern[1..], escape);
+    if (pattern[0] == '_') return text.len != 0 and likeWithEscapeInner(text[1..], pattern[1..], escape, caseSensitive);
+    return text.len != 0 and eq(pattern[0], text[0], caseSensitive) and likeWithEscapeInner(text[1..], pattern[1..], escape, caseSensitive);
 }
 
 /// Case-sensitive `GLOB` match.
@@ -245,6 +262,14 @@ test "like is ascii case-insensitive with percent and underscore" {
     try std.testing.expect(like("", ""));
     try std.testing.expect(!like("a", ""));
     try std.testing.expect(like("aaa", "%a%a%a%"));
+}
+
+test "like case-sensitive mode skips folding" {
+    try std.testing.expect(likeCaseSensitiveWithEscape("abc", "a_c", null));
+    try std.testing.expect(!likeCaseSensitiveWithEscape("abc", "A_C", null));
+    try std.testing.expect(likeCaseSensitiveWithEscape("a%b", "a\\%b", '\\'));
+    try std.testing.expect(!likeCaseSensitiveWithEscape("aXB", "a\\%b", '\\'));
+    try std.testing.expect(likeCaseSensitiveWithEscape("", "%", null));
 }
 
 test "like escape makes wildcards literal" {

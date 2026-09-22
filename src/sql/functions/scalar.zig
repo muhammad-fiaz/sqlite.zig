@@ -983,7 +983,8 @@ fn patternOperand(allocator: std.mem.Allocator, arg: Value) !Value {
 /// pattern-first order, mirroring `likeFunc` in the C reference). NULL
 /// in/out yields NULL; a missing or multi-character escape fails
 /// `InvalidSql` like the operator path; overlong patterns fail `SqlTooBig`.
-pub fn evalLike(allocator: std.mem.Allocator, pattern: Value, input: Value, escape: ?Value) !Value {
+/// `caseSensitive` selects the `PRAGMA case_sensitive_like=ON` semantics.
+pub fn evalLike(allocator: std.mem.Allocator, pattern: Value, input: Value, escape: ?Value, caseSensitive: bool) !Value {
     const ownedPattern = try patternOperand(allocator, pattern);
     defer if (ownedPattern != .null) allocator.free(ownedPattern.text);
     const ownedInput = try patternOperand(allocator, input);
@@ -997,7 +998,11 @@ pub fn evalLike(allocator: std.mem.Allocator, pattern: Value, input: Value, esca
         if (ownedEscape == .null or ownedEscape.text.len != 1) return error.InvalidSql;
         escapeChar = ownedEscape.text[0];
     }
-    return .{ .integer = if (patternLib.likeWithEscape(ownedInput.text, ownedPattern.text, escapeChar)) 1 else 0 };
+    const matched = if (caseSensitive)
+        patternLib.likeCaseSensitiveWithEscape(ownedInput.text, ownedPattern.text, escapeChar)
+    else
+        patternLib.likeWithEscape(ownedInput.text, ownedPattern.text, escapeChar);
+    return .{ .integer = if (matched) 1 else 0 };
 }
 
 /// `glob(pattern, X)`: function form of the operator (pattern first).
@@ -1122,10 +1127,10 @@ test "soundex like glob edges" {
     const padded = try evalSoundex(alloc, .{ .text = "123Euler" });
     defer padded.free(alloc);
     try std.testing.expectEqualStrings("E460", padded.text);
-    const like_num = try evalLike(alloc, .{ .text = "1%" }, .{ .integer = 123 }, null);
+    const like_num = try evalLike(alloc, .{ .text = "1%" }, .{ .integer = 123 }, null, false);
     defer like_num.free(alloc);
     try std.testing.expectEqual(@as(i64, 1), like_num.integer);
-    const like_null = try evalLike(alloc, .null, .{ .text = "x" }, null);
+    const like_null = try evalLike(alloc, .null, .{ .text = "x" }, null, false);
     defer like_null.free(alloc);
     try std.testing.expect(like_null == .null);
     const glob_q = try evalGlob(alloc, .{ .text = "a?c" }, .{ .text = "abc" });

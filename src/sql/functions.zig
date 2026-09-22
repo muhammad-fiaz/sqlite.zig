@@ -436,7 +436,7 @@ pub fn evalScalar(allocator: std.mem.Allocator, name: []const u8, args: []const 
     }
     if (std.ascii.eqlIgnoreCase(name, "like")) {
         if (args.len != 2 and args.len != 3) return error.InvalidArgumentCount;
-        return scalar.evalLike(allocator, args[0], args[1], if (args.len == 3) args[2] else null);
+        return scalar.evalLike(allocator, args[0], args[1], if (args.len == 3) args[2] else null, false);
     }
     if (std.ascii.eqlIgnoreCase(name, "glob")) {
         if (args.len != 2) return error.InvalidArgumentCount;
