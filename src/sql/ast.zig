@@ -313,7 +313,7 @@ fn freeOwnedExprChildren(allocator: std.mem.Allocator, expr: Expr, stack: *std.A
 /// caller-built trees fail closed with `error.TooDeep` instead of
 /// overflowing the call stack during the recursive descent. The cap is
 /// 400 because Debug Windows frames overflow the default stack near 412
-/// recursive `cloneOwnedExprDepth` calls; 400 keeps a margin above the
+/// recursive `cloneExprDepth` calls; 400 keeps a margin above the
 /// parser's 200 limit while still failing closed on hostile depth.
 pub const max_clone_depth: usize = 400;
 
@@ -321,68 +321,106 @@ pub const max_clone_depth: usize = 400;
 /// On error, partially built output is freed; the input is never consumed.
 /// Trees deeper than `max_clone_depth` fail with `error.TooDeep`.
 pub fn cloneOwnedExpr(allocator: std.mem.Allocator, expr: Expr) !Expr {
-    return cloneOwnedExprDepth(allocator, expr, 0);
+    return cloneExprDepth(true, allocator, expr, 0);
+}
+
+/// Deep-clone only an expression's node structure, sharing every string
+/// slice with the input. For embedding the copy in a borrowed (parser)
+/// tree freed by `freeExprRec`, which never frees strings. Same depth and
+/// error semantics as `cloneOwnedExpr`.
+pub fn cloneBorrowedExpr(allocator: std.mem.Allocator, expr: Expr) !Expr {
+    return cloneExprDepth(false, allocator, expr, 0);
+}
+
+/// Release a partial clone on error: owned clones free strings too,
+/// borrowed clones only drop node structure (strings stay with the input).
+fn freeClonePartial(comptime owned_strings: bool, allocator: std.mem.Allocator, expr: Expr) void {
+    if (owned_strings) {
+        freeOwnedExpr(allocator, expr);
+    } else {
+        freeExprRec(allocator, expr);
+    }
+}
+
+/// Duplicate a string slice for owned clones, share it for borrowed ones.
+/// The shared case const-casts because `Value` payloads are `[]u8`; expression
+/// strings are never mutated through the AST, so the alias is read-only.
+fn cloneString(comptime owned_strings: bool, allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    if (owned_strings) return try allocator.dupe(u8, text);
+    return @constCast(text);
 }
 
 /// Clone one optional heap expression node (`null` stays `null`).
-fn cloneOptionalNode(allocator: std.mem.Allocator, node: ?*const Expr, depth: usize) (std.mem.Allocator.Error || error{TooDeep})!?*const Expr {
+fn cloneOptionalNode(comptime owned_strings: bool, allocator: std.mem.Allocator, node: ?*const Expr, depth: usize) (std.mem.Allocator.Error || error{TooDeep})!?*const Expr {
     const src = node orelse return null;
     const owned = try allocator.create(Expr);
     errdefer allocator.destroy(owned);
-    owned.* = try cloneOwnedExprDepth(allocator, src.*, depth + 1);
+    owned.* = try cloneExprDepth(owned_strings, allocator, src.*, depth + 1);
     return owned;
 }
 
+test "cloner shares strings in borrowed mode" {
+    const t = try std.testing.allocator.dupe(u8, "abc");
+    defer std.testing.allocator.free(t);
+    const borrowed = try cloneBorrowedExpr(std.testing.allocator, .{ .literal = .{ .text = t } });
+    // Shares the input slice: no new allocation to free.
+    try std.testing.expect(borrowed.literal.text.ptr == t.ptr);
+    const owned = try cloneOwnedExpr(std.testing.allocator, .{ .literal = .{ .text = t } });
+    defer freeOwnedExpr(std.testing.allocator, owned);
+    try std.testing.expect(owned.literal.text.ptr != t.ptr);
+    try std.testing.expectEqualStrings("abc", owned.literal.text);
+}
+
 /// Deep-clone a window frame, duplicating any offset expressions.
-fn cloneFrame(allocator: std.mem.Allocator, frame: ?WindowFrame, depth: usize) (std.mem.Allocator.Error || error{TooDeep})!?WindowFrame {
+fn cloneFrame(comptime owned_strings: bool, allocator: std.mem.Allocator, frame: ?WindowFrame, depth: usize) (std.mem.Allocator.Error || error{TooDeep})!?WindowFrame {
     var fr = frame orelse return null;
-    fr.startOffset = try cloneOptionalNode(allocator, fr.startOffset, depth);
+    fr.startOffset = try cloneOptionalNode(owned_strings, allocator, fr.startOffset, depth);
     errdefer if (fr.startOffset) |n| {
-        freeOwnedExpr(allocator, @constCast(n).*);
+        freeClonePartial(owned_strings, allocator, @constCast(n).*);
         allocator.destroy(n);
     };
-    fr.endOffset = try cloneOptionalNode(allocator, fr.endOffset, depth);
+    fr.endOffset = try cloneOptionalNode(owned_strings, allocator, fr.endOffset, depth);
     return fr;
 }
 
-fn cloneOwnedExprDepth(allocator: std.mem.Allocator, expr: Expr, depth: usize) (std.mem.Allocator.Error || error{TooDeep})!Expr {
+fn cloneExprDepth(comptime owned_strings: bool, allocator: std.mem.Allocator, expr: Expr, depth: usize) (std.mem.Allocator.Error || error{TooDeep})!Expr {
     if (depth > max_clone_depth) return error.TooDeep;
     switch (expr) {
         .literal => |lit| return .{ .literal = switch (lit) {
-            .text => |t| .{ .text = try allocator.dupe(u8, t) },
-            .blob => |b| .{ .blob = try allocator.dupe(u8, b) },
+            .text => |t| .{ .text = try cloneString(owned_strings, allocator, t) },
+            .blob => |b| .{ .blob = try cloneString(owned_strings, allocator, b) },
             else => lit,
         } },
-        .identifier => |id| return .{ .identifier = try allocator.dupe(u8, id) },
+        .identifier => |id| return .{ .identifier = try cloneString(owned_strings, allocator, id) },
         .parameter => |p| return .{ .parameter = p },
         .wildcard => return .wildcard,
         .function => |call| {
-            const ownedName = try allocator.dupe(u8, call.name);
-            errdefer allocator.free(ownedName);
+            const ownedName = try cloneString(owned_strings, allocator, call.name);
+            errdefer if (owned_strings) allocator.free(ownedName);
             const arg1 = try allocator.create(Expr);
             errdefer allocator.destroy(arg1);
-            arg1.* = try cloneOwnedExprDepth(allocator, call.argument.*, depth + 1);
-            errdefer freeOwnedExpr(allocator, arg1.*);
+            arg1.* = try cloneExprDepth(owned_strings, allocator, call.argument.*, depth + 1);
+            errdefer freeClonePartial(owned_strings, allocator, arg1.*);
             var arg2: ?*const Expr = null;
             if (call.argument2) |a2| {
                 const node = try allocator.create(Expr);
                 errdefer allocator.destroy(node);
-                node.* = try cloneOwnedExprDepth(allocator, a2.*, depth + 1);
+                node.* = try cloneExprDepth(owned_strings, allocator, a2.*, depth + 1);
                 arg2 = node;
             }
             errdefer if (arg2) |n| {
-                freeOwnedExpr(allocator, @constCast(n).*);
+                freeClonePartial(owned_strings, allocator, @constCast(n).*);
                 allocator.destroy(n);
             };
             var arg3: ?*const Expr = null;
             if (call.argument3) |a3| {
                 const node = try allocator.create(Expr);
                 errdefer allocator.destroy(node);
-                node.* = try cloneOwnedExprDepth(allocator, a3.*, depth + 1);
+                node.* = try cloneExprDepth(owned_strings, allocator, a3.*, depth + 1);
                 arg3 = node;
             }
             errdefer if (arg3) |n| {
-                freeOwnedExpr(allocator, @constCast(n).*);
+                freeClonePartial(owned_strings, allocator, @constCast(n).*);
                 allocator.destroy(n);
             };
             var extraArgs: []Expr = &.{};
@@ -390,18 +428,18 @@ fn cloneOwnedExprDepth(allocator: std.mem.Allocator, expr: Expr, depth: usize) (
                 const list = try allocator.alloc(Expr, call.extraArgs.len);
                 var count: usize = 0;
                 errdefer {
-                    for (list[0..count]) |item| freeOwnedExpr(allocator, item);
+                    for (list[0..count]) |item| freeClonePartial(owned_strings, allocator, item);
                     allocator.free(list);
                 }
                 for (call.extraArgs, 0..) |item, idx| {
-                    list[idx] = try cloneOwnedExprDepth(allocator, item, depth + 1);
+                    list[idx] = try cloneExprDepth(owned_strings, allocator, item, depth + 1);
                     count += 1;
                 }
                 extraArgs = list;
             }
-            const filter = try cloneOptionalNode(allocator, call.filter, depth);
+            const filter = try cloneOptionalNode(owned_strings, allocator, call.filter, depth);
             errdefer if (filter) |n| {
-                freeOwnedExpr(allocator, @constCast(n).*);
+                freeClonePartial(owned_strings, allocator, @constCast(n).*);
                 allocator.destroy(n);
             };
             return .{ .function = .{ .name = ownedName, .argument = arg1, .argument2 = arg2, .argument3 = arg3, .extraArgs = extraArgs, .distinct = call.distinct, .filter = filter } };
@@ -409,25 +447,25 @@ fn cloneOwnedExprDepth(allocator: std.mem.Allocator, expr: Expr, depth: usize) (
         .binary => |bin| {
             const left = try allocator.create(Expr);
             errdefer allocator.destroy(left);
-            left.* = try cloneOwnedExprDepth(allocator, bin.left.*, depth + 1);
-            errdefer freeOwnedExpr(allocator, left.*);
+            left.* = try cloneExprDepth(owned_strings, allocator, bin.left.*, depth + 1);
+            errdefer freeClonePartial(owned_strings, allocator, left.*);
             const right = try allocator.create(Expr);
             errdefer allocator.destroy(right);
-            right.* = try cloneOwnedExprDepth(allocator, bin.right.*, depth + 1);
+            right.* = try cloneExprDepth(owned_strings, allocator, bin.right.*, depth + 1);
             return .{ .binary = .{ .op = bin.op, .left = left, .right = right } };
         },
         .unary => |un| {
             const inner = try allocator.create(Expr);
             errdefer allocator.destroy(inner);
-            inner.* = try cloneOwnedExprDepth(allocator, un.expr.*, depth + 1);
+            inner.* = try cloneExprDepth(owned_strings, allocator, un.expr.*, depth + 1);
             return .{ .unary = .{ .op = un.op, .expr = inner } };
         },
         .collate => |col| {
-            const ownedName = try allocator.dupe(u8, col.name);
-            errdefer allocator.free(ownedName);
+            const ownedName = try cloneString(owned_strings, allocator, col.name);
+            errdefer if (owned_strings) allocator.free(ownedName);
             const inner = try allocator.create(Expr);
             errdefer allocator.destroy(inner);
-            inner.* = try cloneOwnedExprDepth(allocator, col.expr.*, depth + 1);
+            inner.* = try cloneExprDepth(owned_strings, allocator, col.expr.*, depth + 1);
             return .{ .collate = .{ .name = ownedName, .expr = inner } };
         },
         .caseExpr => |cs| {
@@ -435,26 +473,26 @@ fn cloneOwnedExprDepth(allocator: std.mem.Allocator, expr: Expr, depth: usize) (
             if (cs.base) |b| {
                 const node = try allocator.create(Expr);
                 errdefer allocator.destroy(node);
-                node.* = try cloneOwnedExprDepth(allocator, b.*, depth + 1);
+                node.* = try cloneExprDepth(owned_strings, allocator, b.*, depth + 1);
                 baseNode = node;
             }
             errdefer if (baseNode) |n| {
-                freeOwnedExpr(allocator, @constCast(n).*);
+                freeClonePartial(owned_strings, allocator, @constCast(n).*);
                 allocator.destroy(n);
             };
             const whens = try allocator.alloc(CaseWhen, cs.whens.len);
             var whensCount: usize = 0;
             errdefer {
                 for (whens[0..whensCount]) |w| {
-                    freeOwnedExpr(allocator, w.condition);
-                    freeOwnedExpr(allocator, w.result);
+                    freeClonePartial(owned_strings, allocator, w.condition);
+                    freeClonePartial(owned_strings, allocator, w.result);
                 }
                 allocator.free(whens);
             }
             for (cs.whens, 0..) |w, idx| {
                 whens[idx] = .{
-                    .condition = try cloneOwnedExprDepth(allocator, w.condition, depth + 1),
-                    .result = try cloneOwnedExprDepth(allocator, w.result, depth + 1),
+                    .condition = try cloneExprDepth(owned_strings, allocator, w.condition, depth + 1),
+                    .result = try cloneExprDepth(owned_strings, allocator, w.result, depth + 1),
                 };
                 whensCount += 1;
             }
@@ -462,7 +500,7 @@ fn cloneOwnedExprDepth(allocator: std.mem.Allocator, expr: Expr, depth: usize) (
             if (cs.otherwise) |o| {
                 const node = try allocator.create(Expr);
                 errdefer allocator.destroy(node);
-                node.* = try cloneOwnedExprDepth(allocator, o.*, depth + 1);
+                node.* = try cloneExprDepth(owned_strings, allocator, o.*, depth + 1);
                 otherwiseNode = node;
             }
             return .{ .caseExpr = .{ .base = baseNode, .whens = whens, .otherwise = otherwiseNode } };
@@ -470,17 +508,17 @@ fn cloneOwnedExprDepth(allocator: std.mem.Allocator, expr: Expr, depth: usize) (
         .patternMatch => |pm| {
             const val = try allocator.create(Expr);
             errdefer allocator.destroy(val);
-            val.* = try cloneOwnedExprDepth(allocator, pm.value.*, depth + 1);
-            errdefer freeOwnedExpr(allocator, val.*);
+            val.* = try cloneExprDepth(owned_strings, allocator, pm.value.*, depth + 1);
+            errdefer freeClonePartial(owned_strings, allocator, val.*);
             const pat = try allocator.create(Expr);
             errdefer allocator.destroy(pat);
-            pat.* = try cloneOwnedExprDepth(allocator, pm.pattern.*, depth + 1);
-            errdefer freeOwnedExpr(allocator, pat.*);
+            pat.* = try cloneExprDepth(owned_strings, allocator, pm.pattern.*, depth + 1);
+            errdefer freeClonePartial(owned_strings, allocator, pat.*);
             var esc: ?*const Expr = null;
             if (pm.escape) |e| {
                 const node = try allocator.create(Expr);
                 errdefer allocator.destroy(node);
-                node.* = try cloneOwnedExprDepth(allocator, e.*, depth + 1);
+                node.* = try cloneExprDepth(owned_strings, allocator, e.*, depth + 1);
                 esc = node;
             }
             return .{ .patternMatch = .{ .value = val, .pattern = pat, .escape = esc, .negated = pm.negated, .glob = pm.glob, .isRegexp = pm.isRegexp, .isMatch = pm.isMatch } };
@@ -488,16 +526,16 @@ fn cloneOwnedExprDepth(allocator: std.mem.Allocator, expr: Expr, depth: usize) (
         .inList => |il| {
             const target = try allocator.create(Expr);
             errdefer allocator.destroy(target);
-            target.* = try cloneOwnedExprDepth(allocator, il.expr.*, depth + 1);
-            errdefer freeOwnedExpr(allocator, target.*);
+            target.* = try cloneExprDepth(owned_strings, allocator, il.expr.*, depth + 1);
+            errdefer freeClonePartial(owned_strings, allocator, target.*);
             const list = try allocator.alloc(Expr, il.list.len);
             var listCount: usize = 0;
             errdefer {
-                for (list[0..listCount]) |item| freeOwnedExpr(allocator, item);
+                for (list[0..listCount]) |item| freeClonePartial(owned_strings, allocator, item);
                 allocator.free(list);
             }
             for (il.list, 0..) |item, idx| {
-                list[idx] = try cloneOwnedExprDepth(allocator, item, depth + 1);
+                list[idx] = try cloneExprDepth(owned_strings, allocator, item, depth + 1);
                 listCount += 1;
             }
             return .{ .inList = .{ .expr = target, .list = list, .negated = il.negated } };
@@ -505,36 +543,36 @@ fn cloneOwnedExprDepth(allocator: std.mem.Allocator, expr: Expr, depth: usize) (
         .inSubquery => |is| {
             const target = try allocator.create(Expr);
             errdefer allocator.destroy(target);
-            target.* = try cloneOwnedExprDepth(allocator, is.expr.*, depth + 1);
-            errdefer freeOwnedExpr(allocator, target.*);
-            const sub = try allocator.dupe(u8, is.subquery);
+            target.* = try cloneExprDepth(owned_strings, allocator, is.expr.*, depth + 1);
+            errdefer freeClonePartial(owned_strings, allocator, target.*);
+            const sub = try cloneString(owned_strings, allocator, is.subquery);
             return .{ .inSubquery = .{ .expr = target, .subquery = sub, .negated = is.negated } };
         },
-        .scalarSubquery => |s| return .{ .scalarSubquery = try allocator.dupe(u8, s) },
-        .existsSubquery => |s| return .{ .existsSubquery = try allocator.dupe(u8, s) },
+        .scalarSubquery => |s| return .{ .scalarSubquery = try cloneString(owned_strings, allocator, s) },
+        .existsSubquery => |s| return .{ .existsSubquery = try cloneString(owned_strings, allocator, s) },
         .window => |w| {
-            const ownedName = try allocator.dupe(u8, w.funcName);
-            errdefer allocator.free(ownedName);
+            const ownedName = try cloneString(owned_strings, allocator, w.funcName);
+            errdefer if (owned_strings) allocator.free(ownedName);
             var arg1: ?*const Expr = null;
             if (w.argument) |a1| {
                 const node = try allocator.create(Expr);
                 errdefer allocator.destroy(node);
-                node.* = try cloneOwnedExprDepth(allocator, a1.*, depth + 1);
+                node.* = try cloneExprDepth(owned_strings, allocator, a1.*, depth + 1);
                 arg1 = node;
             }
             errdefer if (arg1) |n| {
-                freeOwnedExpr(allocator, @constCast(n).*);
+                freeClonePartial(owned_strings, allocator, @constCast(n).*);
                 allocator.destroy(n);
             };
             var arg2: ?*const Expr = null;
             if (w.argument2) |a2| {
                 const node = try allocator.create(Expr);
                 errdefer allocator.destroy(node);
-                node.* = try cloneOwnedExprDepth(allocator, a2.*, depth + 1);
+                node.* = try cloneExprDepth(owned_strings, allocator, a2.*, depth + 1);
                 arg2 = node;
             }
             errdefer if (arg2) |n| {
-                freeOwnedExpr(allocator, @constCast(n).*);
+                freeClonePartial(owned_strings, allocator, @constCast(n).*);
                 allocator.destroy(n);
             };
             var extraArgs: []Expr = &.{};
@@ -542,11 +580,11 @@ fn cloneOwnedExprDepth(allocator: std.mem.Allocator, expr: Expr, depth: usize) (
                 const list = try allocator.alloc(Expr, w.extraArgs.len);
                 var count: usize = 0;
                 errdefer {
-                    for (list[0..count]) |item| freeOwnedExpr(allocator, item);
+                    for (list[0..count]) |item| freeClonePartial(owned_strings, allocator, item);
                     allocator.free(list);
                 }
                 for (w.extraArgs, 0..) |item, idx| {
-                    list[idx] = try cloneOwnedExprDepth(allocator, item, depth + 1);
+                    list[idx] = try cloneExprDepth(owned_strings, allocator, item, depth + 1);
                     count += 1;
                 }
                 extraArgs = list;
@@ -556,11 +594,11 @@ fn cloneOwnedExprDepth(allocator: std.mem.Allocator, expr: Expr, depth: usize) (
                 const list = try allocator.alloc(Expr, w.partitionBy.len);
                 var count: usize = 0;
                 errdefer {
-                    for (list[0..count]) |item| freeOwnedExpr(allocator, item);
+                    for (list[0..count]) |item| freeClonePartial(owned_strings, allocator, item);
                     allocator.free(list);
                 }
                 for (w.partitionBy, 0..) |item, idx| {
-                    list[idx] = try cloneOwnedExprDepth(allocator, item, depth + 1);
+                    list[idx] = try cloneExprDepth(owned_strings, allocator, item, depth + 1);
                     count += 1;
                 }
                 parts = list;
@@ -570,12 +608,12 @@ fn cloneOwnedExprDepth(allocator: std.mem.Allocator, expr: Expr, depth: usize) (
                 const list = try allocator.alloc(OrderItem, w.orderBy.len);
                 var count: usize = 0;
                 errdefer {
-                    for (list[0..count]) |item| freeOwnedExpr(allocator, item.expr);
+                    for (list[0..count]) |item| freeClonePartial(owned_strings, allocator, item.expr);
                     allocator.free(list);
                 }
                 for (w.orderBy, 0..) |item, idx| {
                     list[idx] = .{
-                        .expr = try cloneOwnedExprDepth(allocator, item.expr, depth + 1),
+                        .expr = try cloneExprDepth(owned_strings, allocator, item.expr, depth + 1),
                         .descending = item.descending,
                         .nullsFirst = item.nullsFirst,
                     };
@@ -590,10 +628,10 @@ fn cloneOwnedExprDepth(allocator: std.mem.Allocator, expr: Expr, depth: usize) (
                 .extraArgs = extraArgs,
                 .partitionBy = parts,
                 .orderBy = orders,
-                .frame = try cloneFrame(allocator, w.frame, depth),
-                .filter = try cloneOptionalNode(allocator, w.filter, depth),
+                .frame = try cloneFrame(owned_strings, allocator, w.frame, depth),
+                .filter = try cloneOptionalNode(owned_strings, allocator, w.filter, depth),
                 .distinct = w.distinct,
-                .base = if (w.base) |b| try allocator.dupe(u8, b) else null,
+                .base = if (w.base) |b| try cloneString(owned_strings, allocator, b) else null,
             } };
         },
     }

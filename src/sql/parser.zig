@@ -1776,10 +1776,16 @@ pub const Parser = struct {
                 right = try self.parseCollateSuffix(right);
                 left = try self.binaryNode(if (isNot) .isNotOp else .isOp, left, right);
             } else if (self.acceptWord("between")) {
-                const lower = try self.parseCmp();
+                var lower = try self.parseCmp();
+                lower = try self.parseCollateSuffix(lower);
                 try self.requireWord("and");
-                const upper = try self.parseCmp();
-                const leftCopy = try ast.cloneOwnedExpr(self.allocator, left);
+                var upper = try self.parseCmp();
+                upper = try self.parseCollateSuffix(upper);
+                // Structure-only copy: the expansion lives in the borrowed
+                // parse tree, so strings stay shared (an owned clone would
+                // leak them, since `freeExprRec` never frees strings).
+                const leftCopy = try ast.cloneBorrowedExpr(self.allocator, left);
+                errdefer ast.freeExprRec(self.allocator, leftCopy);
                 if (!negated) {
                     const geNode = try self.binaryNode(.greaterEqual, left, lower);
                     const leNode = try self.binaryNode(.lessEqual, leftCopy, upper);
@@ -2197,9 +2203,12 @@ pub const Parser = struct {
                         try conditions.append(self.allocator, .{ .column = column, .op = if (isNot) .isNotValue else .isValue, .value = try self.parseCmp(), .joinOr = joinOr, .leftExpr = leftExpr, .negated = leadingNot, .collate = collate });
                     }
                 } else if (self.acceptWord("between")) {
-                    const lower = try self.parseCmp();
+                    var lower = try self.parseCmp();
+                    lower = try self.parseCollateSuffix(lower);
                     try self.requireWord("and");
-                    try conditions.append(self.allocator, .{ .column = column, .op = .between, .value = lower, .value2 = try self.parseCmp(), .joinOr = joinOr, .leftExpr = leftExpr, .negated = leadingNot, .collate = collate });
+                    var upper = try self.parseCmp();
+                    upper = try self.parseCollateSuffix(upper);
+                    try conditions.append(self.allocator, .{ .column = column, .op = .between, .value = lower, .value2 = upper, .joinOr = joinOr, .leftExpr = leftExpr, .negated = leadingNot, .collate = collate });
                 } else if (self.acceptWord("not")) {
                     if (self.acceptWord("like")) {
                         const pattern = try self.parseCmp();
@@ -2211,9 +2220,12 @@ pub const Parser = struct {
                     } else if (self.acceptWord("match")) {
                         try conditions.append(self.allocator, .{ .column = column, .op = .notMatch, .value = try self.parseCmp(), .joinOr = joinOr, .leftExpr = leftExpr, .negated = leadingNot, .collate = collate });
                     } else if (self.acceptWord("between")) {
-                        const lower = try self.parseCmp();
+                        var lower = try self.parseCmp();
+                        lower = try self.parseCollateSuffix(lower);
                         try self.requireWord("and");
-                        try conditions.append(self.allocator, .{ .column = column, .op = .notBetween, .value = lower, .value2 = try self.parseCmp(), .joinOr = joinOr, .leftExpr = leftExpr, .negated = leadingNot, .collate = collate });
+                        var upper = try self.parseCmp();
+                        upper = try self.parseCollateSuffix(upper);
+                        try conditions.append(self.allocator, .{ .column = column, .op = .notBetween, .value = lower, .value2 = upper, .joinOr = joinOr, .leftExpr = leftExpr, .negated = leadingNot, .collate = collate });
                     } else {
                         try self.requireWord("in");
                         try self.requireTag(.lparen);

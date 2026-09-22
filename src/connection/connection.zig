@@ -3657,7 +3657,8 @@ pub const Connection = struct {
                         for (item.listValues) |candidate| {
                             const candVal = try self.evalContext(tbl, row, candidate, parameters, outer);
                             defer if (evalOwnsResult(candidate)) self.freeConcatText(candVal);
-                            if (compareCollated(current, .equal, candVal, item.collate)) {
+                            const candCollation = item.collate orelse collateOfExpr(candidate);
+                            if (compareCollated(current, .equal, candVal, candCollation)) {
                                 found = true;
                                 break;
                             }
@@ -3670,7 +3671,9 @@ pub const Connection = struct {
                         const upperSrc = item.value2 orelse return error.InvalidSql;
                         const upper = try self.evalContext(tbl, row, upperSrc, parameters, outer);
                         defer if (evalOwnsResult(upperSrc)) self.freeConcatText(upper);
-                        const inRange = compareCollated(current, .greaterEqual, lower, item.collate) and compareCollated(current, .lessEqual, upper, item.collate);
+                        const lowerCollation = item.collate orelse collateOfExpr(item.value);
+                        const upperCollation = item.collate orelse collateOfExpr(upperSrc);
+                        const inRange = compareCollated(current, .greaterEqual, lower, lowerCollation) and compareCollated(current, .lessEqual, upper, upperCollation);
                         break :betweenPattern if (item.op == .between) inRange else !inRange;
                     } else if (item.op == .like or item.op == .notLike) likePattern: {
                         const pattern = try self.evalContext(tbl, row, item.value, parameters, outer);
@@ -3805,17 +3808,11 @@ pub const Connection = struct {
         };
     }
 
-    fn freeBinaryOwned(expr: ast.Expr, value: Value, allocator: std.mem.Allocator) void {
-        if (expr == .binary and (value == .text or value == .blob)) {
-            if (value == .text) allocator.free(value.text) else allocator.free(value.blob);
-        }
-    }
-
     fn evalBinary(self: *Connection, tbl: ?*const Table, row: []const Value, binary: anytype, parameters: []const Value, outer: ?*const OuterRow) anyerror!Value {
         const left = try self.evalContext(tbl, row, binary.left.*, parameters, outer);
         const right = try self.evalContext(tbl, row, binary.right.*, parameters, outer);
-        defer freeBinaryOwned(binary.left.*, left, self.allocator);
-        defer freeBinaryOwned(binary.right.*, right, self.allocator);
+        defer if (evalOwnsResult(binary.left.*)) self.freeConcatText(left);
+        defer if (evalOwnsResult(binary.right.*)) self.freeConcatText(right);
         if (binary.op == .logicalAnd or binary.op == .logicalOr) {
             // SQLite three-valued logic: a decisive non-NULL side wins,
             // otherwise NULL propagates. (Matches sql/expr.zig eval.)
@@ -4279,7 +4276,7 @@ pub const Connection = struct {
             },
             .inSubquery => |inSub| blk: {
                 const target = try self.evalContext(tbl, row, inSub.expr.*, parameters, outer);
-                defer freeBinaryOwned(inSub.expr.*, target, self.allocator);
+                defer if (evalOwnsResult(inSub.expr.*)) self.freeConcatText(target);
                 if (target == .null) break :blk .null;
                 const currentOuter: OuterRow = if (tbl != null and row.len > 0) .{ .table = tbl.?, .alias = if (outer) |o| (if (o.table == tbl.?) o.alias else null) else null, .values = row, .prev = if (outer != null and outer.?.table == tbl.?) outer.?.prev else outer } else if (outer) |o| o.* else .{ .table = undefined, .values = &.{} };
                 const effectiveOuter: ?*const OuterRow = if (tbl != null and row.len > 0) &currentOuter else outer;
@@ -4305,18 +4302,23 @@ pub const Connection = struct {
             },
             .inList => |inL| blk: {
                 const target = try self.evalContext(tbl, row, inL.expr.*, parameters, outer);
-                defer freeBinaryOwned(inL.expr.*, target, self.allocator);
+                defer if (evalOwnsResult(inL.expr.*)) self.freeConcatText(target);
                 if (target == .null) break :blk .null;
+                // LHS collation wins, then the candidate's own wrapper,
+                // else binary (the reference `sqlite3BinaryCompareCollSeq`
+                // rule).
+                const targetCollation = collateOfExpr(inL.expr.*);
                 var found = false;
                 var sawNull = false;
                 for (inL.list) |candidate| {
                     const candidateVal = try self.evalContext(tbl, row, candidate, parameters, outer);
-                    defer freeBinaryOwned(candidate, candidateVal, self.allocator);
+                    defer if (evalOwnsResult(candidate)) self.freeConcatText(candidateVal);
                     if (candidateVal == .null) {
                         sawNull = true;
                         continue;
                     }
-                    if (compare(target, .equal, candidateVal)) {
+                    const candCollation = targetCollation orelse collateOfExpr(candidate);
+                    if (compareCollated(target, .equal, candidateVal, candCollation)) {
                         found = true;
                         break;
                     }
@@ -5441,6 +5443,27 @@ pub const Connection = struct {
             done = index + 1;
         }
         for (value.projections) |projection| try columns.append(self.allocator, projection.alias orelse "?column?");
+        // Sorting one row is a no-op, but unknown ORDER BY keys still fail
+        // like the reference (positional or output-name match only).
+        for (value.orders) |ord| {
+            if (std.fmt.parseInt(usize, ord.column, 10)) |pos| {
+                if (pos < 1 or pos > columns.items.len) return error.UnknownColumn;
+            } else |_| {
+                var found = false;
+                for (columns.items) |colName| if (std.ascii.eqlIgnoreCase(colName, ord.column)) {
+                    found = true;
+                    break;
+                };
+                if (!found) {
+                    const want = splitQualifier(ord.column).column;
+                    for (columns.items) |colName| if (std.ascii.eqlIgnoreCase(splitQualifier(colName).column, want)) {
+                        found = true;
+                        break;
+                    };
+                }
+                if (!found) return error.UnknownColumn;
+            }
+        }
         // A FROM-less SELECT still filters its single row: only a true
         // WHERE keeps it (NULL/false drop it, like the reference), unknown
         // columns fail, and LIMIT 0 / OFFSET past the row empties it.
@@ -15122,6 +15145,12 @@ test "probe cast edges and three valued logic" {
     var exprCollate = try db.exec("SELECT 'a' = 'A' COLLATE NOCASE;");
     defer exprCollate.deinit();
     try std.testing.expectEqual(@as(i64, 1), exprCollate.rows[0][0].integer);
+    var blobCasts = try db.exec("SELECT CAST(x'4142' AS TEXT), hex(CAST(42 AS BLOB)), hex(CAST('hi' AS BLOB)), CAST(x'4142' AS BLOB) IS x'4142';");
+    defer blobCasts.deinit();
+    try std.testing.expectEqualStrings("AB", blobCasts.rows[0][0].text);
+    try std.testing.expectEqualStrings("3432", blobCasts.rows[0][1].text);
+    try std.testing.expectEqualStrings("6869", blobCasts.rows[0][2].text);
+    try std.testing.expectEqual(@as(i64, 1), blobCasts.rows[0][3].integer);
     var isNumeric = try db.exec("SELECT 1 IS 1.0, 1 IS DISTINCT FROM 1.0, 'a' IS 'A', 'a' IS NOT DISTINCT FROM 'a';");
     defer isNumeric.deinit();
     try std.testing.expectEqual(@as(i64, 1), isNumeric.rows[0][0].integer);
@@ -15134,6 +15163,31 @@ test "probe cast edges and three valued logic" {
     var havingFiltered = try db.exec("SELECT CAST(1 AS INTEGER) AS one GROUP BY one HAVING one IS DISTINCT FROM 1;");
     defer havingFiltered.deinit();
     try std.testing.expectEqual(@as(usize, 0), havingFiltered.count());
+}
+
+test "probe fromless order and operand collate corners" {
+    var db = try freshDb("sqlite_zig_probe_order_test.db");
+    defer dropDb(db, "sqlite_zig_probe_order_test.db");
+    var ordered = try db.exec("SELECT 1 AS one ORDER BY 1;");
+    defer ordered.deinit();
+    try std.testing.expectEqual(@as(usize, 1), ordered.count());
+    var named = try db.exec("SELECT 1 AS one ORDER BY one;");
+    defer named.deinit();
+    try std.testing.expectEqual(@as(usize, 1), named.count());
+    try std.testing.expectError(error.UnknownColumn, db.exec("SELECT 1 ORDER BY nope;"));
+    try std.testing.expectError(error.UnknownColumn, db.exec("SELECT 1 ORDER BY 2;"));
+    var inCollate = try db.exec("SELECT 'a' IN ('A' COLLATE NOCASE, 'z');");
+    defer inCollate.deinit();
+    try std.testing.expectEqual(@as(i64, 1), inCollate.rows[0][0].integer);
+    var betweenCollate = try db.exec("SELECT 'B' BETWEEN 'a' COLLATE NOCASE AND 'c';");
+    defer betweenCollate.deinit();
+    try std.testing.expectEqual(@as(i64, 1), betweenCollate.rows[0][0].integer);
+    // Binary collation sorts uppercase before lowercase, so 'B' is out of
+    // range while 'b' is in range (matches the reference).
+    var betweenPlain = try db.exec("SELECT 'B' BETWEEN 'a' AND 'c', 'b' BETWEEN 'a' AND 'c';");
+    defer betweenPlain.deinit();
+    try std.testing.expectEqual(@as(i64, 0), betweenPlain.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 1), betweenPlain.rows[0][1].integer);
 }
 
 test "soundex like glob and json_array_length run as raw sql" {
