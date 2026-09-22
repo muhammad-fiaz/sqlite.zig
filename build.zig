@@ -135,6 +135,7 @@ pub fn build(b: *std.Build) void {
         "69_multi_key_order_by",
         "70_collision_free_dsl",
         "71_instead_of_triggers",
+        "72_scoped_and_explicit_typed",
     };
 
     inline for (examples) |name| {

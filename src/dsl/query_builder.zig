@@ -1091,7 +1091,7 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
         }
 
         fn upsertBase(self: Self) UpsertBuilder(Row, Columns) {
-            return .{
+            var up = UpsertBuilder(Row, Columns){
                 .allocator = self.allocator,
                 .connection = self.connection,
                 .executeFn = self.executeFn,
@@ -1105,6 +1105,12 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
                 .returningCols = self.returningCols,
                 .returningCount = self.returningCount,
             };
+            // Predicates staged before onConflict/doNothing/doUpdate carry
+            // over instead of dropping silently (see delete()).
+            if (self.conditionCount > up.upsertConds.len) @panic("too many upsert predicates");
+            @memcpy(up.upsertConds[0..self.conditionCount], self.conditions[0..self.conditionCount]);
+            up.upsertCondCount = self.conditionCount;
+            return up;
         }
 
         pub fn onConflict(self: Self, target: anytype) UpsertBuilder(Row, Columns) {
@@ -1234,6 +1240,8 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
                 .table = self.table,
                 .schema = self.schema,
                 .operation = .update,
+                .conditions = self.conditions,
+                .conditionCount = self.conditionCount,
                 .cases = self.cases,
                 .caseCount = self.caseCount,
                 .caseWhens = self.caseWhens,
@@ -1284,6 +1292,10 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
             return mutation;
         }
 
+        /// Predicates staged with `where()` before `delete()` carry over, so
+        /// `db.from(User).where(.id.eq(1))` and `db.from(User).where(User.id
+        /// .eq(1))` both delete exactly that row; previously the predicate
+        /// was silently dropped into a full-table delete.
         pub fn delete(self: Self) Mutation {
             return .{
                 .allocator = self.allocator,
@@ -1292,6 +1304,8 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
                 .table = self.table,
                 .schema = self.schema,
                 .operation = .delete,
+                .conditions = self.conditions,
+                .conditionCount = self.conditionCount,
                 .cases = self.cases,
                 .caseCount = self.caseCount,
                 .caseWhens = self.caseWhens,

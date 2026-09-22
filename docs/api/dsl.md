@@ -137,6 +137,80 @@ A predicate can compare two columns (JOIN ON, correlated EXISTS):
 User.id.eq(Order.user_id)
 ```
 
+## Table scope: scoped fields and explicit paths
+
+`db.from(User)` establishes User as the query's root scope. Inside that
+scope, unqualified typed fields resolve against the root table, while
+explicit table paths carry their own identity. Both forms converge on the
+same native column reference; neither generates SQL text.
+
+```zig
+// Scoped: .id means User.id because User is the root table.
+db.from(User).select(.{ .id, .name });
+db.from(User).orderBy(.name).groupBy(.{.id});
+
+// Explicit: qualification survives regardless of scope.
+db.from(User).select(.{ User.id, User.name });
+db.from(User).where(User.id.eq(1));
+```
+
+Column lists accept scoped fields, explicit descriptors, or a mix of both:
+
+```zig
+db.from(User).join(Membership, .inner, User.id.eq(Membership.user_id))
+    .where(User.id.eq(1))
+    .select(.{ .id, Membership.group_id });
+```
+
+Predicate positions (`where`, `having`, join conditions) cannot take a
+bare `.id` — Zig has no syntax for an operator on an unscoped literal —
+so the query exposes its scoped columns as a value:
+
+```zig
+const q = db.from(User);
+q.where(q.c().id.eq(1)).select(.{.name});
+```
+
+Writes accept scoped row structs and explicit qualified assignments:
+
+```zig
+db.from(Membership).insert(.{ .user_id = 1, .group_id = 10 });
+db.from(Membership).insert(.{
+    Membership.user_id.set(1),
+    Membership.group_id.set(10),
+});
+db.from(User).update(.{User.name.set("Alice"), User.age.set(User.age.add(1))});
+```
+
+`set()` payloads are type-checked like row-struct fields (literals coerce
+to the declared Zig type, including range checks); column references,
+arithmetic, `excluded()` (upserts only), and explicit value/default
+markers pass through natively.
+
+Schema objects resolve the same way against the table being defined
+(`.primaryKey = .id`, `.unique = &.{.email}`, `.column = .thing_id`,
+`createIndex(User, "idx", .{.email}, ...)`, `addColumn(User, .nick, ...)`).
+Foreign-key `references` must stay explicit (`Parent.id`): the parent
+scope is unknown there, so a bare field would be a guess. Unknown scoped
+fields and cross-table assigns fail loudly (compile error or
+`UnknownColumn`), never by silent picking.
+
+Aliases never mutate the schema. `sqlite.aliased(User, "u")` rebinds the
+table value's columns to the alias; `db.from(User).as("u")` rebinds a
+query instead, in which case scoped references qualify with the alias
+while explicit `User.id` keeps the real table name. (Zig comptime structs
+cannot carry methods, so a `User.as("u")` method is not expressible; the
+free function is the alias API.)
+
+Each nested query root (`db.from(...)` inside a CTE body reference,
+a derived table, or a correlated `whereExists`) opens its own scope:
+inner `.user_id` binds to the inner table while explicit outer paths
+(`User.id`) still resolve. Typed CTE references are ordinary table
+values over the CTE name (`sqlite.table("lite", LiteRow)`), so they
+scope like any table; CTE bodies themselves and migration version
+scripts stay SQL text by design (frozen, stable over time). See
+`examples/72_scoped_and_explicit_typed.zig`.
+
 ## Queries
 
 ```zig

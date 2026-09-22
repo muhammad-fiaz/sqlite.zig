@@ -9081,6 +9081,40 @@ test "scoped schema objects resolve against their target" {
     try std.testing.expectEqualStrings("al", got.rows[0][1].text);
 }
 
+test "predicates staged before update delete and upsert carry over" {
+    const tableMod = @import("../dsl/table.zig");
+    const Carry = tableMod.table("carry_users", struct { id: i64, name: []const u8 });
+    const path = "sqlite_zig_carry_predicates_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    try db.createTable(Carry, .{ .overWrite = true, .primaryKey = Carry.id });
+    var a = try db.from(Carry).insert(.{ .id = 1, .name = "a" });
+    a.deinit();
+    var b = try db.from(Carry).insert(.{ .id = 2, .name = "b" });
+    b.deinit();
+    // where() before update() narrows the mutation (scoped form too).
+    const q = db.from(Carry);
+    var u = try (try q.where(q.c().id.eq(1)).update(.{ .name = "a2" })).execute();
+    u.deinit();
+    var got = try db.from(Carry).select(Carry.all()).where(Carry.id.eq(2)).fetchOne();
+    defer db.from(Carry).freeRow(&got);
+    try std.testing.expectEqualStrings("b", got.name);
+    // where() before delete() deletes exactly the matched row: previously
+    // the predicate was silently dropped into a full-table delete.
+    var d = try db.from(Carry).where(Carry.id.eq(1)).delete().execute();
+    d.deinit();
+    var left = try db.from(Carry).select(Carry.all()).fetch();
+    defer left.deinit();
+    try std.testing.expectEqual(@as(usize, 1), left.count());
+    try std.testing.expectEqual(@as(i64, 2), left.at(0).id);
+    // where() before onConflict() feeds the upsert's own predicate slot.
+    var up = try (try db.from(Carry).where(Carry.id.eq(2)).onConflict(Carry.id).doUpdate(.{ .name = "b2" })).insert(.{ .id = 2, .name = "ignored" });
+    up.deinit();
+    var after = try db.from(Carry).select(Carry.all()).fetchOne();
+    defer db.from(Carry).freeRow(&after);
+    try std.testing.expectEqualStrings("b2", after.name);
+}
+
 test "scoped upsert returning and delete share one model" {
     const tableMod = @import("../dsl/table.zig");
     const Stock = tableMod.table("dual_stock", struct { id: i64, qty: i64 });

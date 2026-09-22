@@ -229,6 +229,11 @@ fn isMetaFieldName(comptime name: []const u8) bool {
 /// Rebind a table value's columns to `aliasName` (for self-joins), keeping
 /// field types and SQL names. `tableName` is preserved; `tableAlias` becomes
 /// the alias. Comptime alias slice must outlive the result.
+/// This free function (not a `User.as("u")` method) is the alias API by
+/// necessity: table values are comptime-generated `@Struct` types, which
+/// cannot carry methods, and an `as` field could not type its return on the
+/// alias value. Never mutates the schema: the original value keeps its
+/// identity, and only the rebound copy qualifies with the alias.
 pub fn AliasedType(comptime T: type, comptime aliasName: []const u8) type {
     if (!isTableValue(T)) @compileError("aliased() takes a sqlite.table(...) value");
     if (aliasName.len == 0) @compileError("alias must not be empty");
