@@ -146,6 +146,92 @@ test "B-tree cursor seek operations find target keys" {
     try std.testing.expect(!cursor.valid());
 }
 
+test "B-tree cursor tracks a randomized tree in both directions" {
+    // Deterministic seed: 300 puts over a 97-key universe (collisions hit
+    // the replace path), then forward/backward walks plus random seeks
+    // checked against an independent presence set sorted inline. Payloads
+    // stay empty here; payload fidelity is covered by the map workload test.
+    const alloc = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xc07507);
+    const rand = prng.random();
+    var tree = BTree.init(alloc);
+    defer tree.deinit();
+    var present = std.AutoHashMap(u64, void).init(alloc);
+    defer present.deinit();
+    var n: usize = 0;
+    while (n < 300) : (n += 1) {
+        const key = rand.intRangeLessThan(u64, 0, 97);
+        try tree.put(key, "");
+        try present.put(key, {});
+    }
+    const sorted = blk: {
+        var list = std.ArrayList(u64).empty;
+        defer list.deinit(alloc);
+        var it = present.keyIterator();
+        while (it.next()) |k| try list.append(alloc, k.*);
+        const owned = try list.toOwnedSlice(alloc);
+        // Insertion sort: tiny input, no std.sort API surface needed.
+        for (owned, 0..) |_, a| {
+            var b = a;
+            while (b > 0 and owned[b] < owned[b - 1]) : (b -= 1) {
+                const tmp = owned[b];
+                owned[b] = owned[b - 1];
+                owned[b - 1] = tmp;
+            }
+        }
+        break :blk owned;
+    };
+    defer alloc.free(sorted);
+    try std.testing.expectEqual(sorted.len, tree.entries.items.len);
+    var forward = Cursor.first(&tree);
+    var idx: usize = 0;
+    while (forward.valid()) : ({
+        forward.next();
+        idx += 1;
+    }) {
+        try std.testing.expectEqual(sorted[idx], forward.key().?);
+    }
+    try std.testing.expectEqual(sorted.len, idx);
+    var backward = Cursor.last(&tree);
+    var ridx: usize = sorted.len;
+    while (backward.valid()) {
+        ridx -= 1;
+        try std.testing.expectEqual(sorted[ridx], backward.key().?);
+        backward.prev();
+    }
+    try std.testing.expectEqual(@as(usize, 0), ridx);
+    // Random seeks: expected outcomes by linear scan of the sorted keys.
+    var s: usize = 0;
+    while (s < 128) : (s += 1) {
+        const target = rand.intRangeLessThan(u64, 0, 97);
+        var wantGE: ?u64 = null;
+        var wantLE: ?u64 = null;
+        for (sorted) |k| {
+            if (k >= target and wantGE == null) wantGE = k;
+            if (k <= target) wantLE = k;
+        }
+        var ge = Cursor.first(&tree);
+        ge.seekGE(target);
+        if (wantGE) |k| {
+            try std.testing.expect(ge.valid());
+            try std.testing.expectEqual(k, ge.key().?);
+        } else {
+            try std.testing.expect(!ge.valid());
+        }
+        var le = Cursor.first(&tree);
+        le.seekLE(target);
+        if (wantLE) |k| {
+            try std.testing.expect(le.valid());
+            try std.testing.expectEqual(k, le.key().?);
+        } else {
+            try std.testing.expect(!le.valid());
+        }
+        var eq = Cursor.first(&tree);
+        try std.testing.expectEqual(present.contains(target), eq.seekEQ(target));
+        try std.testing.expectEqual(present.contains(target), eq.valid());
+    }
+}
+
 test "B-tree cursor edges stay invalid-safe on empty and boundary trees" {
     var empty = BTree.init(std.testing.allocator);
     defer empty.deinit();

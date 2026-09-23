@@ -218,6 +218,64 @@ test "record decoder rejects reserved serial types and truncation" {
     try std.testing.expectEqual(@as(usize, 2), ok.len);
 }
 
+test "record random rows round-trip exactly" {
+    // Deterministic seed: 512 random 1..6-column rows across NULL/INTEGER
+    // (full-range plus width-boundary cases), REAL (full bit patterns,
+    // including NaN/inf, compared bitwise), and TEXT/BLOB (random bytes,
+    // lengths 0..64 so empty payloads recur). Decoded text/blob borrows the
+    // encoded buffer, so comparisons run while it is alive.
+    const alloc = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x5eedc0de);
+    const rand = prng.random();
+    const intCases = [_]i64{ 0, 1, -1, 127, 128, -129, 32767, 32768, -8388609, std.math.maxInt(i64), std.math.minInt(i64) };
+    var row: usize = 0;
+    while (row < 512) : (row += 1) {
+        const width = rand.intRangeLessThan(usize, 1, 7);
+        const values = try alloc.alloc(Value, width);
+        defer alloc.free(values);
+        for (values) |*v| {
+            switch (rand.intRangeLessThan(u8, 0, 5)) {
+                0 => v.* = .null,
+                1 => v.* = .{ .integer = if (rand.boolean()) rand.int(i64) else intCases[rand.intRangeLessThan(usize, 0, intCases.len)] },
+                2 => v.* = .{ .real = @bitCast(rand.int(u64)) },
+                3 => {
+                    const len = rand.intRangeLessThan(usize, 0, 65);
+                    const buf = try alloc.alloc(u8, len);
+                    rand.bytes(buf);
+                    v.* = .{ .text = buf };
+                },
+                else => {
+                    const len = rand.intRangeLessThan(usize, 0, 65);
+                    const buf = try alloc.alloc(u8, len);
+                    rand.bytes(buf);
+                    v.* = .{ .blob = buf };
+                },
+            }
+        }
+        defer {
+            for (values) |v| switch (v) {
+                .text => |b| alloc.free(b),
+                .blob => |b| alloc.free(b),
+                else => {},
+            };
+        }
+        const bytes = try encode(alloc, values);
+        defer alloc.free(bytes);
+        const decoded = try decode(alloc, bytes);
+        defer alloc.free(decoded);
+        try std.testing.expectEqual(values.len, decoded.len);
+        for (values, decoded) |want, got| {
+            switch (want) {
+                .null => try std.testing.expect(got == .null),
+                .integer => |n| try std.testing.expectEqual(n, got.integer),
+                .real => |r| try std.testing.expectEqual(@as(u64, @bitCast(r)), @as(u64, @bitCast(got.real))),
+                .text => |t| try std.testing.expectEqualStrings(t, got.text),
+                .blob => |b| try std.testing.expect(std.mem.eql(u8, b, got.blob)),
+            }
+        }
+    }
+}
+
 test "record header size counts its own varint at the 127-byte boundary" {
     // 127 one-byte serial types need a 2-byte header-size varint (total 129),
     // the case a naive `lengths + len(lengths)` fixpoint misses by one.

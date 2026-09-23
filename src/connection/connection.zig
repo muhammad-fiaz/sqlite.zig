@@ -5,6 +5,24 @@
 //! Raw SQL, the dynamic DSL, and the typed DSL all run the same path.
 //! `exec` results are caller-owned; `close` rolls back open work,
 //! persists, and frees everything.
+//!
+//! TODO (modularization, tracked in docs/api/compatibility.md): this file is the
+//! remaining interpreter monolith (~16.5k lines incl. integration tests) and
+//! exceeds the 2000-line module target. Split by execution responsibility
+//! into `connection/` submodules (select/join, DML, DDL, pragma/attach,
+//! triggers/views) sharing the single scope/expr core in `dsl/scope.zig`,
+//! `sql/expr.zig`, `connection/compare.zig`, and `connection/pattern.zig`,
+//! moving each group's source-local tests with it. Extracted so far:
+//! `connection/fk_actions.zig` (ON UPDATE/DELETE actions, composite + column
+//! FKs, chained cascades; canonical `compare`/`expr.freeValue` reuse) and
+//! `connection/conflicts.zig` (upsert/REPLACE conflict-row scan plus
+//! `ON CONFLICT(target)` scope validation per `sqlite3UpsertAnalyzeTarget`;
+//! `conflictRowTarget` stays here because it needs the row matcher), and
+//! `connection/fk_actions.zig` further owns deferred-FK COMMIT checks,
+//! `foreign_key_check` violation rows, and referential-action keywords.
+//! Preserve the `Connection` public API and raw/typed/dynamic convergence;
+//! no behavior change vs the SQLite reference (`select.c`, `insert.c`,
+//! `update.c`, `delete.c`, `trigger.c`, `fkey.c`) beyond bug fixes.
 const std = @import("std");
 const DatabaseFile = @import("../storage/file.zig").DatabaseFile;
 const image = @import("../storage/image.zig");
@@ -36,6 +54,8 @@ const limits = @import("../sql/limits.zig");
 const coerce = @import("../sql/coerce.zig");
 const patternLib = @import("pattern.zig");
 const compareBridge = @import("compare.zig");
+const fkActions = @import("fk_actions.zig");
+const conflicts = @import("conflicts.zig");
 
 const maxTriggerDepth: usize = 64;
 
@@ -1120,9 +1140,9 @@ pub const Connection = struct {
     /// Runs postponed FK checks over main, temp, and attached stores.
     /// Read-only; fails `ConstraintViolation` on the first orphan row.
     fn enforceAllDeferredForeignKeys(self: *Connection) !void {
-        try self.enforceDeferredForeignKeys(&self.store);
-        try self.enforceDeferredForeignKeys(&self.tempStore);
-        for (self.attached.items) |*db| try self.enforceDeferredForeignKeys(&db.store);
+        try fkActions.enforceDeferredForeignKeys(&self.store);
+        try fkActions.enforceDeferredForeignKeys(&self.tempStore);
+        for (self.attached.items) |*db| try fkActions.enforceDeferredForeignKeys(&db.store);
     }
 
     /// Autocommit statement-end deferred check: each top-level DML statement
@@ -1779,16 +1799,6 @@ pub const Connection = struct {
         return .{ .file = &self.file, .store = &self.store };
     }
 
-    fn fkActionName(action: ast.ReferentialAction) []const u8 {
-        return switch (action) {
-            .cascade => "CASCADE",
-            .restrict => "RESTRICT",
-            .setNull => "SET NULL",
-            .setDefault => "SET DEFAULT",
-            .noAction => "NO ACTION",
-        };
-    }
-
     fn defaultValueSql(self: *Connection, value: Value) !?[]u8 {
         return switch (value) {
             .null => null,
@@ -2061,8 +2071,8 @@ pub const Connection = struct {
                         row[2] = .{ .text = try self.allocator.dupe(u8, foreignTable) };
                         row[3] = .{ .text = try self.allocator.dupe(u8, column.name) };
                         row[4] = if (column.foreignColumn) |foreignColumn| .{ .text = try self.allocator.dupe(u8, foreignColumn) } else .null;
-                        row[5] = .{ .text = try self.allocator.dupe(u8, fkActionName(column.onUpdate)) };
-                        row[6] = .{ .text = try self.allocator.dupe(u8, fkActionName(column.onDelete)) };
+                        row[5] = .{ .text = try self.allocator.dupe(u8, fkActions.fkActionName(column.onUpdate)) };
+                        row[6] = .{ .text = try self.allocator.dupe(u8, fkActions.fkActionName(column.onDelete)) };
                         row[7] = .{ .text = try self.allocator.dupe(u8, "NONE") };
                         try rows.append(self.allocator, row);
                         id += 1;
@@ -2080,8 +2090,8 @@ pub const Connection = struct {
                             if (position < constraint.referencedColumns.len) {
                                 row[4] = .{ .text = try self.allocator.dupe(u8, constraint.referencedColumns[position]) };
                             } else row[4] = .null;
-                            row[5] = .{ .text = try self.allocator.dupe(u8, fkActionName(constraint.onUpdate)) };
-                            row[6] = .{ .text = try self.allocator.dupe(u8, fkActionName(constraint.onDelete)) };
+                            row[5] = .{ .text = try self.allocator.dupe(u8, fkActions.fkActionName(constraint.onUpdate)) };
+                            row[6] = .{ .text = try self.allocator.dupe(u8, fkActions.fkActionName(constraint.onDelete)) };
                             row[7] = .{ .text = try self.allocator.dupe(u8, "NONE") };
                             try rows.append(self.allocator, row);
                         }
@@ -2548,7 +2558,7 @@ pub const Connection = struct {
                             break;
                         }
                     }
-                    if (!found) try self.foreignKeyViolation(&rowList, tbl, rowIndex, foreignTableName, fkid);
+                    if (!found) try fkActions.foreignKeyViolation(self.allocator, &rowList, tbl, rowIndex, foreignTableName, fkid);
                 }
                 for (tbl.constraints) |*constraint| {
                     if (constraint.kind != .foreignKey) continue;
@@ -2575,103 +2585,12 @@ pub const Connection = struct {
                             break;
                         }
                     }
-                    if (!found) try self.foreignKeyViolation(&rowList, tbl, rowIndex, foreignTableName, fkid);
+                    if (!found) try fkActions.foreignKeyViolation(self.allocator, &rowList, tbl, rowIndex, foreignTableName, fkid);
                 }
             }
         }
         const rows = try rowList.toOwnedSlice(self.allocator);
         return .{ .allocator = self.allocator, .columns = columns, .rows = rows };
-    }
-
-    /// True when `store` holds any FK whose check may have been postponed:
-    /// a `DEFERRABLE INITIALLY DEFERRED` constraint, or anything at all
-    /// while `defer_foreign_keys` is on. Read-only scan, never fails.
-    fn storeNeedsDeferredCheck(_: *const Connection, store: *const Schema) bool {
-        if (store.deferForeignKeys) {
-            for (store.tables.items) |tbl| {
-                for (tbl.columns) |column| if (column.foreignTable != null) return true;
-                for (tbl.constraints) |constraint| if (constraint.kind == .foreignKey) return true;
-            }
-            return false;
-        }
-        for (store.tables.items) |tbl| {
-            for (tbl.columns) |column| if (column.foreignTable != null and column.fkDeferrable and column.fkInitiallyDeferred) return true;
-            for (tbl.constraints) |constraint| if (constraint.kind == .foreignKey and constraint.deferrable and constraint.initiallyDeferred) return true;
-        }
-        return false;
-    }
-
-    /// Deferred FK enforcement for COMMIT and autocommit statement ends.
-    /// Re-scans postponed constraints (skipped by `validateConstraints`);
-    /// the first orphan row fails `ConstraintViolation`. Respects
-    /// `foreignKeysEnabled`; immediate-only constraints were already checked.
-    fn enforceDeferredForeignKeys(self: *Connection, store: *const Schema) !void {
-        if (!store.foreignKeysEnabled) return;
-        if (!self.storeNeedsDeferredCheck(store)) return;
-        for (store.tables.items) |tbl| {
-            if (tbl.virtualModule != null) continue;
-            for (tbl.rows.items) |row| {
-                if (row.values.len != tbl.columns.len) continue;
-                for (tbl.columns, 0..) |column, childIndex| {
-                    const foreignTableName = column.foreignTable orelse continue;
-                    if (!store.fkCheckDeferred(column.fkDeferrable, column.fkInitiallyDeferred)) continue;
-                    const parent = store.findConst(foreignTableName) orelse return error.ConstraintViolation;
-                    const foreignColumnName = column.foreignColumn orelse return error.ConstraintViolation;
-                    const parentIndex = columnIndex(parent, foreignColumnName) catch return error.ConstraintViolation;
-                    if (row.values[childIndex] == .null) continue;
-                    var found = false;
-                    for (parent.rows.items) |parentRow| {
-                        if (parentRow.values.len != parent.columns.len) continue;
-                        if (@import("../catalog/schema.zig").valuesEqual(parentRow.values[parentIndex], row.values[childIndex])) {
-                            found = true;
-                            break;
-                        }
-                    }
-                    if (!found) return error.ConstraintViolation;
-                }
-                for (tbl.constraints) |constraint| {
-                    if (constraint.kind != .foreignKey) continue;
-                    if (!store.fkCheckDeferred(constraint.deferrable, constraint.initiallyDeferred)) continue;
-                    const foreignTableName = constraint.foreignTable orelse return error.ConstraintViolation;
-                    const parent = store.findConst(foreignTableName) orelse return error.ConstraintViolation;
-                    var hasNull = false;
-                    for (constraint.columns) |childName| {
-                        const childIndex = columnIndex(tbl, childName) catch return error.ConstraintViolation;
-                        if (row.values[childIndex] == .null) hasNull = true;
-                    }
-                    if (hasNull) continue;
-                    var found = false;
-                    for (parent.rows.items) |parentRow| {
-                        if (parentRow.values.len != parent.columns.len) continue;
-                        var matched = true;
-                        for (constraint.columns, constraint.referencedColumns) |childName, parentName| {
-                            const childIndex = columnIndex(tbl, childName) catch return error.ConstraintViolation;
-                            const parentIndex = columnIndex(parent, parentName) catch return error.ConstraintViolation;
-                            if (!@import("../catalog/schema.zig").valuesEqual(row.values[childIndex], parentRow.values[parentIndex])) matched = false;
-                        }
-                        if (matched) {
-                            found = true;
-                            break;
-                        }
-                    }
-                    if (!found) return error.ConstraintViolation;
-                }
-            }
-        }
-    }
-
-    fn foreignKeyViolation(self: *Connection, rows: *std.ArrayList([]Value), tbl: *const Table, rowIndex: usize, parentName: []const u8, fkid: i64) !void {
-        const row = try self.allocator.alloc(Value, 4);
-        row[0] = .null;
-        row[1] = .null;
-        row[2] = .null;
-        row[3] = .null;
-        errdefer self.freeCompoundRow(row);
-        row[0] = .{ .text = try self.allocator.dupe(u8, tbl.name) };
-        row[1] = if (tbl.withoutRowid) .null else .{ .integer = @intCast(rowIndex + 1) };
-        row[2] = .{ .text = try self.allocator.dupe(u8, parentName) };
-        row[3] = .{ .integer = fkid };
-        try rows.append(self.allocator, row);
     }
 
     fn explainQueryPlan(self: *Connection, sql: []const u8) anyerror!Result {
@@ -4559,7 +4478,7 @@ pub const Connection = struct {
         // Explicit ON CONFLICT targets must resolve to a real unique
         // constraint (partial indexes need a matching WHERE); anything
         // else fails before any row is written, like the reference.
-        try self.checkConflictTarget(store, tbl, value);
+        try conflicts.checkConflictTarget(store, tbl, value);
         var nonGenCount: usize = 0;
         for (tbl.columns) |c| if (c.generatedExpr == null) {
             nonGenCount += 1;
@@ -4872,145 +4791,9 @@ pub const Connection = struct {
         return .{ .allocator = self.allocator, .columns = try self.ownedColumns(columns.items), .rows = try rows.toOwnedSlice(self.allocator) };
     }
 
-    fn conflictRow(self: *Connection, store: *Schema, tbl: *const Table, values: []const Value, ignoreIndex: ?usize) anyerror!?usize {
-        for (tbl.rows.items, 0..) |existing, rowIndex| {
-            if (ignoreIndex != null and ignoreIndex.? == rowIndex) continue;
-            var matched = false;
-            for (tbl.columns, 0..) |column, columnIdx| if ((column.primaryKey or column.unique) and values[columnIdx] != .null and sameValue(existing.values[columnIdx], values[columnIdx])) {
-                matched = true;
-                break;
-            };
-            if (matched) return rowIndex;
-            for (tbl.constraints) |constraint| {
-                if (constraint.kind == .foreignKey) continue;
-                var valid = true;
-                var hasNull = false;
-                for (constraint.columns) |name| {
-                    const columnIdx = columnIndex(tbl, name) catch {
-                        valid = false;
-                        break;
-                    };
-                    if (values[columnIdx] == .null) hasNull = true;
-                    if (!sameValue(existing.values[columnIdx], values[columnIdx])) valid = false;
-                }
-                if (valid and (constraint.kind == .primaryKey or !hasNull)) return rowIndex;
-            }
-            for (store.indexes.items) |index| if (index.unique and std.ascii.eqlIgnoreCase(index.table, tbl.name)) {
-                var colNames: ?[][]const u8 = null;
-                defer if (colNames) |names| self.allocator.free(names);
-                var valid = true;
-                var hasNull = false;
-                for (index.columns, 0..) |name, position| {
-                    if (index.keyExpr(position) != null) {
-                        if (colNames == null) {
-                            const names = try self.allocator.alloc([]const u8, tbl.columns.len);
-                            for (tbl.columns, 0..) |tableColumn, idx| names[idx] = tableColumn.name;
-                            colNames = names;
-                        }
-                        const leftVal = try exprEvaluator.eval(self.allocator, colNames.?, existing.values, index.keyExpr(position).?);
-                        defer exprEvaluator.freeValue(self.allocator, leftVal);
-                        const rightVal = try exprEvaluator.eval(self.allocator, colNames.?, values, index.keyExpr(position).?);
-                        defer exprEvaluator.freeValue(self.allocator, rightVal);
-                        if (leftVal == .null or rightVal == .null) {
-                            valid = false;
-                            break;
-                        }
-                        if (!leftVal.sameValue(rightVal)) valid = false;
-                        continue;
-                    }
-                    const columnIdx = columnIndex(tbl, name) catch {
-                        valid = false;
-                        break;
-                    };
-                    if (values[columnIdx] == .null) hasNull = true;
-                    if (!sameValue(existing.values[columnIdx], values[columnIdx])) valid = false;
-                }
-                if (!valid or hasNull) continue;
-                if (!try store.indexPredicateHolds(tbl, &index, values)) continue;
-                if (!try store.indexPredicateHolds(tbl, &index, existing.values)) continue;
-                return rowIndex;
-            };
-        }
-        return null;
-    }
-
-    /// True when two column lists hold the same names regardless of order
-    /// (ASCII case-insensitive); the reference requires equal cardinality
-    /// between conflict targets and index keys, so lengths must agree.
-    fn conflictColumnsMatch(left: []const []const u8, right: []const []const u8) bool {
-        if (left.len != right.len) return false;
-        for (left) |a| {
-            var found = false;
-            for (right) |b| if (std.ascii.eqlIgnoreCase(a, b)) {
-                found = true;
-                break;
-            };
-            if (!found) return false;
-        }
-        return true;
-    }
-
-    /// Validates an explicit `ON CONFLICT(target)` clause against the
-    /// table's unique constraints, mirroring the reference inference
-    /// (`sqlite3UpsertAnalyzeTarget`): the target set must match the rowid,
-    /// a PRIMARY KEY/UNIQUE group, or a UNIQUE index — and a partial index
-    /// additionally needs a WHERE implying its predicate. Anything else
-    /// fails `InvalidSql` instead of silently inserting.
-    fn checkConflictTarget(self: *Connection, store: *const Schema, tbl: *const Table, value: anytype) !void {
-        if (value.conflictTargetColumns.len == 0) return;
-        if (value.conflict != .update and value.conflict != .ignore) return;
-        const target = value.conflictTargetColumns;
-        if (target.len == 1 and !tbl.withoutRowid) {
-            if (std.ascii.eqlIgnoreCase(target[0], "rowid") or std.ascii.eqlIgnoreCase(target[0], "_rowid_") or std.ascii.eqlIgnoreCase(target[0], "oid")) return;
-        }
-        if (target.len == 1) {
-            if (Schema.rowidAliasColumn(tbl)) |alias| {
-                if (std.ascii.eqlIgnoreCase(tbl.columns[alias].name, target[0])) return;
-            }
-            for (tbl.columns) |column| {
-                if (!column.unique or !std.ascii.eqlIgnoreCase(column.name, target[0])) continue;
-                if (self.inCompositePk(tbl, column.name)) continue;
-                return;
-            }
-        }
-        for (tbl.constraints) |constraint| {
-            if (constraint.kind == .foreignKey or constraint.kind == .check) continue;
-            if (conflictColumnsMatch(constraint.columns, target)) return;
-        }
-        for (store.indexes.items) |index| {
-            if (!index.unique or !std.ascii.eqlIgnoreCase(index.table, tbl.name)) continue;
-            // Expression indexes need expression targets, which the
-            // word-only target list cannot name; keep looking.
-            var hasExpr = false;
-            for (index.columns, 0..) |_, position| if (index.keyExpr(position) != null) {
-                hasExpr = true;
-                break;
-            };
-            if (hasExpr) continue;
-            if (!conflictColumnsMatch(index.columns, target)) continue;
-            if (index.whereExpr) |predicate| {
-                const whereConds = value.conflictTargetWhere orelse return error.InvalidSql;
-                if (!exprEvaluator.partialPredicateImpliedBy(predicate, whereConds)) continue;
-            }
-            return;
-        }
-        return error.InvalidSql;
-    }
-
-    /// True when `column` belongs to a composite (multi-column) table-level
-    /// PRIMARY KEY group (single-column members match on their own).
-    fn inCompositePk(self: *Connection, tbl: *const Table, column: []const u8) bool {
-        _ = self;
-        for (tbl.constraints) |constraint| {
-            if (constraint.kind != .primaryKey or constraint.columns.len < 2) continue;
-            for (constraint.columns) |name| if (std.ascii.eqlIgnoreCase(name, column)) return true;
-        }
-        return false;
-    }
-
     fn conflictRowTarget(self: *Connection, store: *Schema, tbl: *const Table, values: []const Value, targetColumns: []const []const u8, targetWhere: ?ast.Conditions, parameters: []const Value) anyerror!?usize {
         if (targetColumns.len == 0) {
-            const rowIdx = (try self.conflictRow(store, tbl, values, null)) orelse return null;
+            const rowIdx = (try conflicts.conflictRow(self.allocator, store, tbl, values, null)) orelse return null;
             if (targetWhere) |whereCond| {
                 if (!try self.matches(tbl, tbl.rows.items[rowIdx].values, whereCond, parameters)) return null;
             }
@@ -5131,7 +4914,7 @@ pub const Connection = struct {
         try self.recomputeGeneratedColumns(tbl, candidate, false);
         try self.fireTriggers(store, tbl, .before, .update, candidate, oldSnapshot, columns);
         try store.validateUpdate(tbl, rowIndex, candidate);
-        try self.applyUpdateActions(store, tbl.name, row.values, candidate);
+        try fkActions.applyUpdateActions(self.allocator, store, tbl.name, row.values, candidate);
         for (columns, expressions) |name, expression| {
             const index = try columnIndex(tbl, name);
             var newValue = try self.evalContext(tbl, row.values, expression, parameters, &excludedOuter);
@@ -5167,7 +4950,7 @@ pub const Connection = struct {
     }
 
     fn deleteRowAt(self: *Connection, store: *Schema, tbl: *Table, rowIndex: usize) !void {
-        try self.applyDeleteActions(store, tbl.name, tbl.rows.items[rowIndex].values);
+        try fkActions.applyDeleteActions(self.allocator, store, tbl.name, tbl.rows.items[rowIndex].values);
         try self.fireTriggers(store, tbl, .before, .delete, null, tbl.rows.items[rowIndex].values, &.{});
         const removed = tbl.rows.orderedRemove(rowIndex);
         try self.fireTriggers(store, tbl, .after, .delete, null, removed.values, &.{});
@@ -5176,7 +4959,7 @@ pub const Connection = struct {
     }
 
     fn replaceConflict(self: *Connection, store: *Schema, tbl: *Table, values: []const Value) anyerror!bool {
-        const rowIndex = (try self.conflictRow(store, tbl, values, null)) orelse return false;
+        const rowIndex = (try conflicts.conflictRow(self.allocator, store, tbl, values, null)) orelse return false;
         try self.deleteRowAt(store, tbl, rowIndex);
         return true;
     }
@@ -6705,7 +6488,7 @@ pub const Connection = struct {
                     if (value.conflict == .ignore) continue;
                     return err;
                 };
-                self.applyUpdateActions(store, tbl.name, row.values, candidate) catch |err| {
+                fkActions.applyUpdateActions(self.allocator, store, tbl.name, row.values, candidate) catch |err| {
                     if (err != error.ConstraintViolation) return err;
                     if (value.conflict == .ignore) continue;
                     return err;
@@ -6808,7 +6591,7 @@ pub const Connection = struct {
                 switch (value.conflict) {
                     .ignore => continue :outer,
                     .replace => {
-                        while (try self.conflictRow(store, tbl, candidate, rowIndex)) |bad| {
+                        while (try conflicts.conflictRow(self.allocator, store, tbl, candidate, rowIndex)) |bad| {
                             try self.deleteRowAt(store, tbl, bad);
                             if (bad < rowIndex) rowIndex -= 1;
                             if (rowIndex >= tbl.rows.items.len) continue :outer;
@@ -6820,7 +6603,7 @@ pub const Connection = struct {
                     else => return err,
                 }
             };
-            self.applyUpdateActions(store, tbl.name, row.values, candidate) catch |err| {
+            fkActions.applyUpdateActions(self.allocator, store, tbl.name, row.values, candidate) catch |err| {
                 if (err != error.ConstraintViolation) return err;
                 switch (value.conflict) {
                     .ignore => continue :outer,
@@ -6883,254 +6666,6 @@ pub const Connection = struct {
         return compareBridge.sameValue(left, right);
     }
 
-    fn compositeMatches(self: *Connection, child: *const Table, childValues: []const Value, parent: *const Table, parentValues: []const Value, constraint: anytype) !bool {
-        _ = self;
-        for (constraint.columns, constraint.referencedColumns) |childName, parentName| {
-            const childIndex = try columnIndex(child, childName);
-            const parentIndex = try columnIndex(parent, parentName);
-            if (!sameValue(childValues[childIndex], parentValues[parentIndex])) return false;
-        }
-        return true;
-    }
-
-    fn applyCompositeUpdateActions(self: *Connection, store: *Schema, parentName: []const u8, oldValues: []const Value, newValues: []const Value) anyerror!void {
-        const parent = store.findConst(parentName) orelse return error.ConstraintViolation;
-        for (store.tables.items) |childTable| {
-            var childRowIndex: usize = 0;
-            while (childRowIndex < childTable.rows.items.len) : (childRowIndex += 1) {
-                var constraintIndex: usize = 0;
-                while (constraintIndex < childTable.constraints.len) : (constraintIndex += 1) {
-                    const constraint = childTable.constraints[constraintIndex];
-                    if (constraint.kind != .foreignKey or !std.ascii.eqlIgnoreCase(constraint.foreignTable.?, parentName)) continue;
-                    var changed = false;
-                    for (constraint.referencedColumns) |parentColumn| {
-                        const parentIndex = try columnIndex(parent, parentColumn);
-                        if (!sameValue(oldValues[parentIndex], newValues[parentIndex])) changed = true;
-                    }
-                    if (!changed or !try self.compositeMatches(childTable, childTable.rows.items[childRowIndex].values, parent, oldValues, constraint)) continue;
-                    switch (constraint.onUpdate) {
-                        .restrict, .noAction => if (store.fkCheckDeferred(constraint.deferrable, constraint.initiallyDeferred)) continue else return error.ConstraintViolation,
-                        .setNull => {
-                            for (constraint.columns) |childColumn| {
-                                const childIndex = try columnIndex(childTable, childColumn);
-                                if (childTable.columns[childIndex].notNull) return error.ConstraintViolation;
-                            }
-                            for (constraint.columns) |childColumn| {
-                                const childIndex = try columnIndex(childTable, childColumn);
-                                const old = childTable.rows.items[childRowIndex].values[childIndex];
-                                if (old == .text) self.allocator.free(old.text) else if (old == .blob) self.allocator.free(old.blob);
-                                childTable.rows.items[childRowIndex].values[childIndex] = .null;
-                            }
-                        },
-                        .setDefault => {
-                            for (constraint.columns) |childColumn| {
-                                const childIndex = try columnIndex(childTable, childColumn);
-                                const def = childTable.columns[childIndex].defaultValue orelse .null;
-                                if (childTable.columns[childIndex].notNull and def == .null) return error.ConstraintViolation;
-                            }
-                            for (constraint.columns) |childColumn| {
-                                const childIndex = try columnIndex(childTable, childColumn);
-                                const def = childTable.columns[childIndex].defaultValue orelse .null;
-                                const old = childTable.rows.items[childRowIndex].values[childIndex];
-                                if (old == .text) self.allocator.free(old.text) else if (old == .blob) self.allocator.free(old.blob);
-                                childTable.rows.items[childRowIndex].values[childIndex] = .null;
-                                childTable.rows.items[childRowIndex].values[childIndex] = try self.copyValue(def);
-                            }
-                        },
-                        .cascade => {
-                            const row = &childTable.rows.items[childRowIndex];
-                            const candidate = try self.allocator.alloc(Value, row.values.len);
-                            for (row.values, 0..) |item, index| candidate[index] = try self.copyValue(item);
-                            for (constraint.columns, constraint.referencedColumns) |childColumn, parentColumn| {
-                                const childIndex = try columnIndex(childTable, childColumn);
-                                const parentIndex = try columnIndex(parent, parentColumn);
-                                if (candidate[childIndex] == .text) self.allocator.free(candidate[childIndex].text) else if (candidate[childIndex] == .blob) self.allocator.free(candidate[childIndex].blob);
-                                candidate[childIndex] = try self.copyValue(newValues[parentIndex]);
-                            }
-                            try self.applyUpdateActions(store, childTable.name, row.values, candidate);
-                            for (row.values) |item| if (item == .text) self.allocator.free(item.text) else if (item == .blob) self.allocator.free(item.blob);
-                            self.allocator.free(row.values);
-                            row.values = candidate;
-                        },
-                    }
-                }
-            }
-        }
-    }
-
-    fn applyCompositeDeleteActions(self: *Connection, store: *Schema, parentName: []const u8, parentValues: []const Value) anyerror!void {
-        const parent = store.findConst(parentName) orelse return error.ConstraintViolation;
-        for (store.tables.items) |childTable| {
-            var childRowIndex = childTable.rows.items.len;
-            while (childRowIndex > 0) {
-                childRowIndex -= 1;
-                for (childTable.constraints) |constraint| {
-                    if (constraint.kind != .foreignKey or !std.ascii.eqlIgnoreCase(constraint.foreignTable.?, parentName)) continue;
-                    if (!try self.compositeMatches(childTable, childTable.rows.items[childRowIndex].values, parent, parentValues, constraint)) continue;
-                    switch (constraint.onDelete) {
-                        .restrict, .noAction => if (store.fkCheckDeferred(constraint.deferrable, constraint.initiallyDeferred)) continue else return error.ConstraintViolation,
-                        .setNull => {
-                            for (constraint.columns) |childColumn| {
-                                const childIndex = try columnIndex(childTable, childColumn);
-                                if (childTable.columns[childIndex].notNull) return error.ConstraintViolation;
-                            }
-                            for (constraint.columns) |childColumn| {
-                                const childIndex = try columnIndex(childTable, childColumn);
-                                const old = childTable.rows.items[childRowIndex].values[childIndex];
-                                if (old == .text) self.allocator.free(old.text) else if (old == .blob) self.allocator.free(old.blob);
-                                childTable.rows.items[childRowIndex].values[childIndex] = .null;
-                            }
-                        },
-                        .setDefault => {
-                            for (constraint.columns) |childColumn| {
-                                const childIndex = try columnIndex(childTable, childColumn);
-                                const def = childTable.columns[childIndex].defaultValue orelse .null;
-                                if (childTable.columns[childIndex].notNull and def == .null) return error.ConstraintViolation;
-                            }
-                            for (constraint.columns) |childColumn| {
-                                const childIndex = try columnIndex(childTable, childColumn);
-                                const def = childTable.columns[childIndex].defaultValue orelse .null;
-                                const old = childTable.rows.items[childRowIndex].values[childIndex];
-                                if (old == .text) self.allocator.free(old.text) else if (old == .blob) self.allocator.free(old.blob);
-                                childTable.rows.items[childRowIndex].values[childIndex] = .null;
-                                childTable.rows.items[childRowIndex].values[childIndex] = try self.copyValue(def);
-                            }
-                        },
-                        .cascade => {
-                            try self.applyDeleteActions(store, childTable.name, childTable.rows.items[childRowIndex].values);
-                            const removed = childTable.rows.orderedRemove(childRowIndex);
-                            for (removed.values) |item| if (item == .text) self.allocator.free(item.text) else if (item == .blob) self.allocator.free(item.blob);
-                            self.allocator.free(removed.values);
-                        },
-                    }
-                }
-            }
-        }
-    }
-
-    fn applyUpdateActions(self: *Connection, store: *Schema, parentName: []const u8, oldValues: []const Value, newValues: []const Value) anyerror!void {
-        if (!store.foreignKeysEnabled) return;
-        try self.applyCompositeUpdateActions(store, parentName, oldValues, newValues);
-        const parent = store.findConst(parentName) orelse return error.ConstraintViolation;
-        var childTableIndex: usize = 0;
-        while (childTableIndex < store.tables.items.len) : (childTableIndex += 1) {
-            const childTable = store.tables.items[childTableIndex];
-            var childColumnIndex: usize = 0;
-            while (childColumnIndex < childTable.columns.len) : (childColumnIndex += 1) {
-                const childColumn = childTable.columns[childColumnIndex];
-                const foreignTable = childColumn.foreignTable orelse continue;
-                if (!std.ascii.eqlIgnoreCase(foreignTable, parentName)) continue;
-                const referenced = childColumn.foreignColumn orelse return error.ConstraintViolation;
-                const parentColumnIndex = try columnIndex(parent, referenced);
-                if (sameValue(oldValues[parentColumnIndex], newValues[parentColumnIndex])) continue;
-
-                var childRowIndex: usize = 0;
-                while (childRowIndex < childTable.rows.items.len) : (childRowIndex += 1) {
-                    const childRow = &childTable.rows.items[childRowIndex];
-                    if (!sameValue(oldValues[parentColumnIndex], childRow.values[childColumnIndex])) continue;
-                    switch (childColumn.onUpdate) {
-                        .restrict, .noAction => if (store.fkCheckDeferred(childColumn.fkDeferrable, childColumn.fkInitiallyDeferred)) continue else return error.ConstraintViolation,
-                        .setNull => {
-                            if (childColumn.notNull) return error.ConstraintViolation;
-                            const old = childRow.values[childColumnIndex];
-                            if (old == .text) self.allocator.free(old.text) else if (old == .blob) self.allocator.free(old.blob);
-                            childRow.values[childColumnIndex] = .null;
-                        },
-                        .setDefault => {
-                            const def = childColumn.defaultValue orelse .null;
-                            if (childColumn.notNull and def == .null) return error.ConstraintViolation;
-                            const old = childRow.values[childColumnIndex];
-                            if (old == .text) self.allocator.free(old.text) else if (old == .blob) self.allocator.free(old.blob);
-                            childRow.values[childColumnIndex] = .null;
-                            childRow.values[childColumnIndex] = try self.copyValue(def);
-                        },
-                        .cascade => {
-                            const candidate = try self.allocator.alloc(Value, childRow.values.len);
-                            errdefer self.allocator.free(candidate);
-                            for (childRow.values, 0..) |item, index| candidate[index] = try self.copyValue(item);
-                            const replacement = try self.copyValue(newValues[parentColumnIndex]);
-                            if (candidate[childColumnIndex] == .text) self.allocator.free(candidate[childColumnIndex].text) else if (candidate[childColumnIndex] == .blob) self.allocator.free(candidate[childColumnIndex].blob);
-                            candidate[childColumnIndex] = replacement;
-                            try self.applyUpdateActions(store, childTable.name, childRow.values, candidate);
-                            for (childRow.values) |item| if (item == .text) self.allocator.free(item.text) else if (item == .blob) self.allocator.free(item.blob);
-                            self.allocator.free(childRow.values);
-                            childRow.values = candidate;
-                        },
-                    }
-                }
-            }
-        }
-    }
-
-    /// Resolve the parent column index for one child FK column, or fail when
-    /// the FK metadata names an unknown column. Shared by both delete passes.
-    fn deleteFkParentIndex(store: *Schema, parentName: []const u8, column: anytype) !usize {
-        const parentTable = store.findConst(parentName) orelse return error.ConstraintViolation;
-        const referenced = column.foreignColumn orelse return error.ConstraintViolation;
-        for (parentTable.columns, 0..) |parentColumn, index| {
-            if (std.ascii.eqlIgnoreCase(parentColumn.name, referenced)) return index;
-        }
-        return error.ConstraintViolation;
-    }
-
-    fn applyDeleteActions(self: *Connection, store: *Schema, parentName: []const u8, parentValues: []const Value) anyerror!void {
-        if (!store.foreignKeysEnabled) return;
-        try self.applyCompositeDeleteActions(store, parentName, parentValues);
-        var childTableIndex: usize = 0;
-        while (childTableIndex < store.tables.items.len) : (childTableIndex += 1) {
-            const childTable = store.tables.items[childTableIndex];
-            // Pass 1: every independent FK to this parent is examined — never
-            // just the first matching column. Any immediate RESTRICT/NO ACTION
-            // violation fails before any cascade/set effect fires.
-            for (childTable.columns, 0..) |column, columnIdx| {
-                const foreignTable = column.foreignTable orelse continue;
-                if (!std.ascii.eqlIgnoreCase(foreignTable, parentName)) continue;
-                if (column.onDelete != .restrict and column.onDelete != .noAction) continue;
-                if (store.fkCheckDeferred(column.fkDeferrable, column.fkInitiallyDeferred)) continue;
-                const parentColumnIndex = try deleteFkParentIndex(store, parentName, column);
-                var childRowIndex = childTable.rows.items.len;
-                while (childRowIndex > 0) {
-                    childRowIndex -= 1;
-                    if (compare(parentValues[parentColumnIndex], .equal, childTable.rows.items[childRowIndex].values[columnIdx])) return error.ConstraintViolation;
-                }
-            }
-            // Pass 2: apply SET NULL / SET DEFAULT / CASCADE per FK.
-            for (childTable.columns, 0..) |column, columnIdx| {
-                const foreignTable = column.foreignTable orelse continue;
-                if (!std.ascii.eqlIgnoreCase(foreignTable, parentName)) continue;
-                const parentColumnIndex = try deleteFkParentIndex(store, parentName, column);
-                var childRowIndex = childTable.rows.items.len;
-                while (childRowIndex > 0) {
-                    childRowIndex -= 1;
-                    if (!compare(parentValues[parentColumnIndex], .equal, childTable.rows.items[childRowIndex].values[columnIdx])) continue;
-                    switch (column.onDelete) {
-                        .restrict, .noAction => {},
-                        .setNull => {
-                            if (column.notNull) return error.ConstraintViolation;
-                            const old = childTable.rows.items[childRowIndex].values[columnIdx];
-                            if (old == .text) self.allocator.free(old.text) else if (old == .blob) self.allocator.free(old.blob);
-                            childTable.rows.items[childRowIndex].values[columnIdx] = .null;
-                        },
-                        .setDefault => {
-                            const def = column.defaultValue orelse .null;
-                            if (column.notNull and def == .null) return error.ConstraintViolation;
-                            const old = childTable.rows.items[childRowIndex].values[columnIdx];
-                            if (old == .text) self.allocator.free(old.text) else if (old == .blob) self.allocator.free(old.blob);
-                            childTable.rows.items[childRowIndex].values[columnIdx] = .null;
-                            childTable.rows.items[childRowIndex].values[columnIdx] = try self.copyValue(def);
-                        },
-                        .cascade => {
-                            try self.applyDeleteActions(store, childTable.name, childTable.rows.items[childRowIndex].values);
-                            const removed = childTable.rows.orderedRemove(childRowIndex);
-                            for (removed.values) |item| if (item == .text) self.allocator.free(item.text) else if (item == .blob) self.allocator.free(item.blob);
-                            self.allocator.free(removed.values);
-                        },
-                    }
-                }
-            }
-        }
-    }
-
     fn delete(self: *Connection, value: anytype, parameters: []const Value) !Result {
         if (self.cteActive(value.table)) return error.InvalidSql;
         const resolved = self.resolveTableName(value.table) orelse {
@@ -7153,7 +6688,7 @@ pub const Connection = struct {
         while (index < tbl.rows.items.len) {
             if (try self.matches(tbl, tbl.rows.items[index].values, value.condition, parameters)) {
                 try self.fireTriggers(store, tbl, .before, .delete, null, tbl.rows.items[index].values, &.{});
-                try self.applyDeleteActions(store, tbl.name, tbl.rows.items[index].values);
+                try fkActions.applyDeleteActions(self.allocator, store, tbl.name, tbl.rows.items[index].values);
                 const row = tbl.rows.orderedRemove(index);
                 try self.fireTriggers(store, tbl, .after, .delete, null, row.values, &.{});
                 if (value.returning.len > 0) {

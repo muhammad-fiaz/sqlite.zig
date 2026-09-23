@@ -448,6 +448,204 @@ test "page formatters fail closed on unfittable and short pages" {
     try std.testing.expectEqual(@as(u32, 9), (try PageHeader.decode(&interiorIdx, 2)).rightChild.?);
 }
 
+test "B-tree map survives a randomized workload against a reference model" {
+    // Deterministic seed: 8192 PRNG ops (60% put / 25% get / 15% remove)
+    // over a 64-key universe so replaces and removals recur, plus periodic
+    // u64 edge keys. The reference is an independent hash map (no shared
+    // code with the binary-searched entry list); every get/remove result
+    // must agree, and the tree must stay strictly sorted with exactly the
+    // reference's entries and payloads.
+    const alloc = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x62ee0001);
+    const rand = prng.random();
+    var tree = BTree.init(alloc);
+    defer tree.deinit();
+    var model = std.AutoHashMap(u64, []u8).init(alloc);
+    defer {
+        var it = model.iterator();
+        while (it.next()) |e| alloc.free(e.value_ptr.*);
+        model.deinit();
+    }
+    var i: usize = 0;
+    while (i < 8192) : (i += 1) {
+        if (i % 1024 == 0) {
+            try tree.put(0, "zero");
+            const z = try model.getOrPut(0);
+            if (z.found_existing) alloc.free(z.value_ptr.*);
+            z.value_ptr.* = try alloc.dupe(u8, "zero");
+            try tree.put(std.math.maxInt(u64), "max");
+            const m = try model.getOrPut(std.math.maxInt(u64));
+            if (m.found_existing) alloc.free(m.value_ptr.*);
+            m.value_ptr.* = try alloc.dupe(u8, "max");
+        }
+        const op = rand.intRangeLessThan(u8, 0, 100);
+        const key = rand.intRangeLessThan(u64, 0, 64);
+        if (op < 60) {
+            const len = rand.intRangeLessThan(usize, 0, 17);
+            const buf = try alloc.alloc(u8, len);
+            defer alloc.free(buf);
+            rand.bytes(buf);
+            try tree.put(key, buf);
+            const gop = try model.getOrPut(key);
+            if (gop.found_existing) alloc.free(gop.value_ptr.*);
+            gop.value_ptr.* = try alloc.dupe(u8, buf);
+        } else if (op < 85) {
+            const got = tree.get(key);
+            if (model.get(key)) |want| {
+                try std.testing.expect(got != null);
+                try std.testing.expectEqualStrings(want, got.?);
+            } else {
+                try std.testing.expect(got == null);
+            }
+        } else {
+            if (model.fetchRemove(key)) |removed| {
+                alloc.free(removed.value);
+                try std.testing.expect(tree.remove(key));
+            } else {
+                try std.testing.expect(!tree.remove(key));
+            }
+        }
+    }
+    try std.testing.expectEqual(model.count(), tree.entries.items.len);
+    var prev: ?u64 = null;
+    for (tree.entries.items) |entry| {
+        if (prev) |p| try std.testing.expect(p < entry.key);
+        prev = entry.key;
+        const want = model.get(entry.key);
+        try std.testing.expect(want != null);
+        try std.testing.expectEqualStrings(want.?, entry.payload);
+    }
+}
+
+test "page formatters chain cells contiguously with exact pointers" {
+    // Deterministic seed. For random leaf cell sets on 512/1024/4096-byte
+    // pages (page 1 exercises the 100-byte header reservation), pointers
+    // must chain exactly (ptr[i] + len[i] == ptr[i-1] or pageSize), every
+    // region must equal the input cell bytes, and the decoded header must
+    // agree on kind, count, and content start. Zero-length cells (equal
+    // adjacent pointers) recur by construction. Cell budgets are
+    // precomputed so every case must fit: PageOverflow here is a failure.
+    const alloc = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xf7a9e5);
+    const rand = prng.random();
+    const readU16 = struct {
+        fn run(page: []const u8, at: usize) u16 {
+            return (@as(u16, page[at]) << 8) | page[at + 1];
+        }
+    }.run;
+    for ([_]usize{ 512, 1024, 4096 }) |pageSize| {
+        for ([_]u32{ 1, 2 }) |pageNo| {
+            const hOff = PageHeader.headerOffset(pageNo);
+            var round: usize = 0;
+            while (round < 48) : (round += 1) {
+                const tableLeaf = rand.boolean();
+                const nCells = rand.intRangeLessThan(usize, 0, 17);
+                const overhead = hOff + 8 + nCells * 2;
+                var remaining = pageSize - overhead;
+                var cells = std.ArrayList([]u8).empty;
+                defer {
+                    for (cells.items) |c| alloc.free(c);
+                    cells.deinit(alloc);
+                }
+                for (0..nCells) |_| {
+                    const len = rand.intRangeLessThan(usize, 0, @min(49, remaining + 1));
+                    remaining -= len;
+                    const buf = try alloc.alloc(u8, len);
+                    rand.bytes(buf);
+                    try cells.append(alloc, buf);
+                }
+                var page = try alloc.alloc(u8, pageSize);
+                defer alloc.free(page);
+                @memset(page, 0);
+                if (tableLeaf) {
+                    try formatLeafTablePage(page, pageNo, cells.items, pageSize);
+                } else {
+                    try formatLeafIndexPage(page, pageNo, cells.items, pageSize);
+                }
+                const h = try PageHeader.decode(page, pageNo);
+                try std.testing.expectEqual(if (tableLeaf) PageType.leafTable else PageType.leafIndex, h.pageType);
+                try std.testing.expectEqual(@as(u16, @intCast(nCells)), h.cellCount);
+                var expectEnd = pageSize;
+                for (cells.items, 0..) |cell, i| {
+                    const ptr = readU16(page, hOff + 8 + i * 2);
+                    try std.testing.expectEqual(expectEnd - cell.len, ptr);
+                    try std.testing.expectEqualSlices(u8, cell, page[ptr .. ptr + cell.len]);
+                    expectEnd = ptr;
+                }
+                const wantStart: u16 = if (nCells == 0) 0 else @intCast(expectEnd);
+                try std.testing.expectEqual(wantStart, h.cellContentStart);
+            }
+        }
+    }
+}
+
+test "interior formatters frame children with exact cells" {
+    // Deterministic seed. Random interior pages (table: child + varint key;
+    // index: child + varint length + payload) must decode back to the exact
+    // children/keys/payloads at chained, non-overlapping offsets, with the
+    // header agreeing on count and right child.
+    const alloc = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x1e7017);
+    const rand = prng.random();
+    const readU16 = struct {
+        fn run(page: []const u8, at: usize) u16 {
+            return (@as(u16, page[at]) << 8) | page[at + 1];
+        }
+    }.run;
+    var round: usize = 0;
+    while (round < 48) : (round += 1) {
+        const tableInterior = rand.boolean();
+        const nCells = rand.intRangeLessThan(usize, 0, 9);
+        var kids = std.ArrayList(u32).empty;
+        defer kids.deinit(alloc);
+        var keys = std.ArrayList(u64).empty;
+        defer keys.deinit(alloc);
+        var payloads = std.ArrayList([]u8).empty;
+        defer {
+            for (payloads.items) |p| alloc.free(p);
+            payloads.deinit(alloc);
+        }
+        for (0..nCells) |_| {
+            try kids.append(alloc, rand.int(u32));
+            try keys.append(alloc, rand.int(u64));
+            const len = rand.intRangeLessThan(usize, 0, 33);
+            const buf = try alloc.alloc(u8, len);
+            rand.bytes(buf);
+            try payloads.append(alloc, buf);
+        }
+        const right: u32 = rand.int(u32);
+        var page = [_]u8{0} ** 4096;
+        if (tableInterior) {
+            try formatInteriorTablePage(&page, 2, kids.items, keys.items, right, 4096);
+        } else {
+            try formatInteriorIndexPage(&page, 2, kids.items, payloads.items, right, 4096);
+        }
+        const h = try PageHeader.decode(&page, 2);
+        try std.testing.expectEqual(if (tableInterior) PageType.interiorTable else PageType.interiorIndex, h.pageType);
+        try std.testing.expectEqual(@as(u16, @intCast(nCells)), h.cellCount);
+        try std.testing.expectEqual(right, h.rightChild.?);
+        var expectEnd: usize = 4096;
+        for (0..nCells) |i| {
+            const ptr = readU16(&page, 12 + i * 2);
+            const child = std.mem.readInt(u32, page[ptr..][0..4], .big);
+            try std.testing.expectEqual(kids.items[i], child);
+            if (tableInterior) {
+                const key = try varint.decode(page[ptr + 4 ..]);
+                try std.testing.expectEqual(keys.items[i], key.value);
+                try std.testing.expectEqual(expectEnd - (4 + key.length), ptr);
+                expectEnd = ptr;
+            } else {
+                const lenPart = try varint.decode(page[ptr + 4 ..]);
+                try std.testing.expectEqual(@as(u64, @intCast(payloads.items[i].len)), lenPart.value);
+                const cellLen = 4 + lenPart.length + payloads.items[i].len;
+                try std.testing.expectEqual(expectEnd - cellLen, ptr);
+                try std.testing.expectEqualSlices(u8, payloads.items[i], page[ptr + 4 + lenPart.length ..][0..payloads.items[i].len]);
+                expectEnd = ptr;
+            }
+        }
+    }
+}
+
 test "B-tree map handles miss, extremes, and removal" {
     var tree = BTree.init(std.testing.allocator);
     defer tree.deinit();

@@ -7,6 +7,7 @@
 const std = @import("std");
 const columnMod = @import("column.zig");
 const queryBuilder = @import("query_builder.zig");
+const mutationMod = @import("mutation.zig");
 const astBuilder = @import("ast_builder.zig");
 const dslExpr = @import("expr.zig");
 
@@ -15,9 +16,9 @@ pub const DynamicColumn = columnMod.DynamicColumn;
 /// Untyped SELECT builder over the dynamic table; see `query_builder.zig`.
 pub const DynamicQuery = queryBuilder.DynamicQuery;
 /// Untyped UPDATE/DELETE builder; execution owns the returned `Result`.
-pub const DynamicMutation = queryBuilder.Mutation;
+pub const DynamicMutation = mutationMod.Mutation;
 /// Untyped UPSERT builder.
-pub const DynamicUpsert = queryBuilder.UpsertBuilder(void, void);
+pub const DynamicUpsert = mutationMod.UpsertBuilder(void, void);
 /// Runtime result alias: owned `connection/result.zig` value; caller deinits.
 pub const DynamicResult = @import("../connection/result.zig").Result;
 

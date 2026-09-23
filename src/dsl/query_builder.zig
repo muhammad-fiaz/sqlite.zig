@@ -3,6 +3,16 @@
 //! Builders are copies that borrow names; `fetch`/`execute` return owned results.
 //! The connection must outlive every builder and result.
 //! Overflow panics; execution returns engine errors.
+//!
+//! TODO (modularization, tracked in docs/api/compatibility.md): this file exceeds
+//! the 2000-line module target (~2.2k lines after extracting
+//! `dsl/mutation.zig`). The remaining `Builder`/`CompoundBuilder` methods
+//! cannot leave their generic types, so further splits need a builder-type
+//! redesign (out of scope for mechanical extraction). `UpsertBuilder`,
+//! `Mutation`, and the shared predicate/assignment/join-target helpers now
+//! live in `dsl/mutation.zig`, imported one-directionally; `dynamic.zig`
+//! re-exports the dynamic aliases from there. No DSL semantic change; DSL
+//! convergence tests in examples 15/48/72/73 must stay green.
 
 const std = @import("std");
 const dslExpr = @import("expr.zig");
@@ -20,6 +30,8 @@ const scopeMod = @import("scope.zig");
 const Result = @import("../connection/result.zig").Result;
 
 const tableMod = @import("table.zig");
+
+const mutationMod = @import("mutation.zig");
 
 /// Typed SELECT builder for a `sqlite.table(...)` value type. Compile-errors
 /// on non-table inputs (use `db.table("name")` for runtime tables).
@@ -52,47 +64,13 @@ const Cte = struct {
     recursive: ?[]const u8 = null,
 };
 
-fn isTypedColumnInstance(comptime T: type) bool {
-    if (@typeInfo(T) != .@"struct") return false;
-    return @hasDecl(T, "isDslColumn") and T.isDslColumn;
-}
-
-fn toProjection(item: anytype) Projection {
-    const T = @TypeOf(item);
-    if (T == Projection) return item;
-    if (T == columnMod.DynamicColumn) return item.projection();
-    if (comptime tableMod.isAllProjectionType(T)) return .{ .kind = .star };
-    if (T == dslExpr.Order) @compileError("select() takes columns, not orders; pass col.asc()/col.desc() to orderBy()");
-    if (comptime isTypedColumnInstance(T)) return item.projection();
-    @compileError("select() takes column descriptors (User.id / table.column(\"x\")) or their aggregates");
-}
-
-/// Root-scope qualifier for column resolution: the table name (or alias)
-/// carried by the columns descriptor. Empty for untyped builders.
-fn rootScopeName(comptime Columns: type) []const u8 {
-    if (Columns == void) return "";
-    const info = @typeInfo(Columns);
-    if (info != .@"struct") return "";
-    for (info.@"struct".fields) |field| {
-        if (@hasDecl(field.type, "dslTable")) return field.type.dslTable;
-    }
-    return "";
-}
-
-/// True when an all-columns marker names the builder's own scope: the
-/// mapped star path stays. Anything else expands to that side's explicit
-/// qualified columns (see `appendMarkerColumns`).
-fn allMatchesRoot(comptime Columns: type, comptime Marker: type) bool {
-    return std.ascii.eqlIgnoreCase(rootScopeName(Columns), Marker.qualifierName);
-}
-
 /// True when `T` is (or contains, for tuples/arrays/pointers) an
 /// all-columns marker naming a scope other than the builder's own.
 fn tupleHasForeignAll(comptime Columns: type, comptime T: type) bool {
     const info = @typeInfo(T);
     if (info == .pointer) return tupleHasForeignAll(Columns, info.pointer.child);
     if (info == .array) return tupleHasForeignAll(Columns, info.array.child);
-    if (comptime tableMod.isAllProjectionType(T)) return !allMatchesRoot(Columns, T);
+    if (comptime tableMod.isAllProjectionType(T)) return !mutationMod.allMatchesRoot(Columns, T);
     if (info == .@"struct" and info.@"struct".is_tuple) {
         inline for (info.@"struct".fields) |field| {
             if (comptime tupleHasForeignAll(Columns, field.type)) return true;
@@ -101,22 +79,10 @@ fn tupleHasForeignAll(comptime Columns: type, comptime T: type) bool {
     return false;
 }
 
-/// Append one all-columns marker's side as explicit qualified column
-/// references (native `ColumnRef`s in declaration order, never SQL text).
-/// The marker carries its own columns descriptor, so the qualifier is
-/// always the side the marker was built from (table name or alias).
-fn appendMarkerColumns(projections: []Projection, count: *usize, comptime Marker: type) void {
-    inline for (@typeInfo(Marker.Columns).@"struct".fields) |field| {
-        if (count.* >= projections.len) @panic("too many DSL projections");
-        projections[count.*] = toProjection(field.type{});
-        count.* += 1;
-    }
-}
-
 fn toRef(item: anytype) ColumnRef {
     const T = @TypeOf(item);
     if (T == columnMod.DynamicColumn) return columnMod.dynRef(item);
-    if (comptime isTypedColumnInstance(T)) return .{ .table = columnMod.qualifiedTable(item), .name = T.dslName };
+    if (comptime mutationMod.isTypedColumnInstance(T)) return .{ .table = columnMod.qualifiedTable(item), .name = T.dslName };
     @compileError("expected a column descriptor (User.id or table.column(\"x\"))");
 }
 
@@ -124,185 +90,8 @@ fn toOrder(item: anytype) Order {
     const T = @TypeOf(item);
     if (T == Order) return item;
     if (T == columnMod.DynamicColumn) return .{ .column = columnMod.dynRef(item) };
-    if (comptime isTypedColumnInstance(T)) return .{ .column = .{ .table = columnMod.qualifiedTable(item), .name = T.dslName } };
+    if (comptime mutationMod.isTypedColumnInstance(T)) return .{ .column = .{ .table = columnMod.qualifiedTable(item), .name = T.dslName } };
     @compileError("orderBy() takes a column order such as col.asc()/col.desc(), a bare column, or a scoped field such as .name");
-}
-
-/// True for one assign-tuple element: a typed `Column.set(...)` assign or
-/// a dynamic `column(...).set(...)` assign.
-fn isAssignItem(comptime T: type) bool {
-    return columnMod.isAssignValue(T) or columnMod.isDynAssignValue(T);
-}
-
-/// True when `assigns` is an explicit-assignment tuple: every element is an
-/// assign carrying its own table identity (see `column.zig.Assign` and
-/// `column.zig.DynAssign`). Empty tuples are rows, not assigns.
-fn isAssignList(comptime T: type) bool {
-    const info = @typeInfo(T);
-    if (info != .@"struct" or !info.@"struct".is_tuple) return false;
-    if (info.@"struct".fields.len == 0) return false;
-    inline for (info.@"struct".fields) |field| {
-        if (!isAssignItem(field.type)) return false;
-    }
-    return true;
-}
-
-/// Runtime duplicate-target guard shared by typed and dynamic assigns
-/// (covers mixed tuples, where comptime names are unavailable).
-fn checkDuplicateName(names: []const []const u8, dest: []const u8) !void {
-    for (names) |existing| if (std.mem.eql(u8, existing, dest)) return error.InvalidSql;
-}
-
-/// Runtime scope check for one dynamic assign: a set qualifier must be the
-/// statement's table (real name or alias); empty qualifiers bind to the
-/// target table by SQLite's own single-table rules.
-fn checkDynAssignScope(item: anytype, table: []const u8, tableAlias: ?[]const u8) !void {
-    if (item.table.len == 0) return;
-    if (std.mem.eql(u8, item.table, table)) return;
-    if (tableAlias) |alias| if (std.mem.eql(u8, item.table, alias)) return;
-    return error.UnknownColumn;
-}
-
-/// Runtime membership check for one dynamic assign on a typed target: the
-/// SQL name must be a column of the statement target. Dynamic targets
-/// (`Columns == void`) stay unchecked by design.
-fn checkDynAssignColumn(comptime Columns: type, name: []const u8) !void {
-    if (Columns == void) return;
-    inline for (@typeInfo(Columns).@"struct".fields) |field| {
-        if (std.mem.eql(u8, field.type.dslName, name)) return;
-    }
-    return error.UnknownColumn;
-}
-
-/// Comptime membership test for one explicit assignment: its SQL name must
-/// be a column of the statement target. Cross-table assigns with disjoint
-/// names fail at the call site. NOTE: callers must gate on
-/// `if (comptime ...)` explicitly — a runtime `if (eql) return` does not
-/// prune a trailing `@compileError` during analysis.
-fn hasAssignColumn(comptime Col: type, comptime Columns: type) bool {
-    if (Columns == void) return true;
-    inline for (@typeInfo(Columns).@"struct".fields) |field| {
-        if (std.mem.eql(u8, field.type.dslName, Col.dslName)) return true;
-    }
-    return false;
-}
-
-/// Comptime duplicate test for assign tuple element `index`: true when an
-/// earlier *typed* element targets the same SQL column. Dynamic elements
-/// carry runtime names, so they (and mixed pairs) are covered by the
-/// runtime `checkDuplicateName`/inline sweeps at each use site instead.
-/// Callers gate explicitly.
-fn hasDuplicateAssign(comptime Tuple: type, comptime index: usize) bool {
-    const fields = @typeInfo(Tuple).@"struct".fields;
-    const needleT = fields[index].type;
-    if (comptime !columnMod.isAssignValue(needleT)) return false;
-    const needle = needleT.assignColumn.dslName;
-    inline for (0..index) |prev| {
-        const candT = fields[prev].type;
-        if (comptime !columnMod.isAssignValue(candT)) continue;
-        if (std.mem.eql(u8, candT.assignColumn.dslName, needle)) return true;
-    }
-    return false;
-}
-
-/// Runtime scope check for one explicit assignment: its table identity must
-/// be the statement's table (by real name or by the builder's alias).
-/// Same-named columns of other tables fail here, never binding silently.
-fn checkAssignScope(comptime Col: type, table: []const u8, tableAlias: ?[]const u8) !void {
-    if (std.mem.eql(u8, Col.dslTable, table)) return;
-    if (tableAlias) |alias| if (std.mem.eql(u8, Col.dslTable, alias)) return;
-    return error.UnknownColumn;
-}
-
-/// Append one predicate to a condition slice with the given OR-join flag.
-/// The first element's flag is engine-ignored; callers keep the historical
-/// shape (false) so existing single-predicate behavior is untouched.
-fn appendCond(conds: []ConditionEntry, count: *usize, expr: Expr, joinOr: bool) void {
-    if (count.* >= conds.len) @panic("too many DSL predicates");
-    conds[count.*] = .{ .expr = expr, .joinOr = if (count.* == 0) false else joinOr };
-    count.* += 1;
-}
-
-/// Distribute `L AND (a OR b)` over the existing AND-groups of a condition
-/// slice as `(L1 AND a) OR (L1 AND b) OR ...`, valid in Kleene three-valued
-/// logic, so SQL AND-binds-tighter precedence evaluates the intended
-/// grouping. DSL predicates are pure, so duplicating them is side-effect
-/// free. Panics on overflow like every other condition-limit path.
-fn distributeOr(conds: []ConditionEntry, count: *usize, pair: dslExpr.ExprPair) void {
-    var starts: [17]usize = undefined;
-    var ngroups: usize = 1;
-    starts[0] = 0;
-    var i: usize = 1;
-    while (i < count.*) : (i += 1) {
-        if (conds[i].joinOr) {
-            if (ngroups >= starts.len - 1) @panic("too many DSL predicates");
-            starts[ngroups] = i;
-            ngroups += 1;
-        }
-    }
-    var tmp: [16]ConditionEntry = undefined;
-    var n: usize = 0;
-    const members = [_]Expr{ pair.first, pair.second };
-    var gi: usize = 0;
-    while (gi < ngroups) : (gi += 1) {
-        const gend = if (gi + 1 < ngroups) starts[gi + 1] else count.*;
-        for (members) |pm| {
-            const boundary = n != 0;
-            var k: usize = starts[gi];
-            while (k < gend) : (k += 1) {
-                if (n >= conds.len) @panic("too many DSL predicates");
-                tmp[n] = .{ .expr = conds[k].expr, .joinOr = boundary and k == starts[gi] };
-                n += 1;
-            }
-            if (n >= conds.len) @panic("too many DSL predicates");
-            tmp[n] = .{ .expr = pm, .joinOr = boundary and gend == starts[gi] };
-            n += 1;
-        }
-    }
-    std.mem.copyForwards(ConditionEntry, conds[0..n], tmp[0..n]);
-    count.* = n;
-}
-
-/// Append one predicate-or-pair in an AND-context (`andWhere`): AND-pairs
-/// append directly (associative, always sound); OR-pairs distribute.
-fn appendAnd(conds: []ConditionEntry, count: *usize, cond: anytype) void {
-    const T = @TypeOf(cond);
-    if (T == dslExpr.ExprPair) {
-        if (!cond.joinOr) {
-            appendCond(conds, count, cond.first, false);
-            appendCond(conds, count, cond.second, false);
-        } else {
-            distributeOr(conds, count, cond);
-        }
-        return;
-    }
-    if (T == Expr) {
-        appendCond(conds, count, cond, false);
-        return;
-    }
-    @compileError("where() takes a predicate such as User.id.eq(1) or an and/or pair");
-}
-
-/// Append one predicate-or-pair in an OR-context (`orWhere`): SQL
-/// precedence keeps AND-pairs grouped, so straight appends are sound.
-fn appendOr(conds: []ConditionEntry, count: *usize, cond: anytype) void {
-    const T = @TypeOf(cond);
-    if (T == dslExpr.ExprPair) {
-        appendCond(conds, count, cond.first, true);
-        appendCond(conds, count, cond.second, cond.joinOr);
-        return;
-    }
-    if (T == Expr) {
-        appendCond(conds, count, cond, true);
-        return;
-    }
-    @compileError("where() takes a predicate such as User.id.eq(1) or an and/or pair");
-}
-
-/// Reset a condition slice to one predicate-or-pair (`where` semantics).
-fn storeWhere(conds: []ConditionEntry, count: *usize, cond: anytype) void {
-    count.* = 0;
-    appendAnd(conds, count, cond);
 }
 
 fn destSqlFor(comptime Columns: type, want: []const u8) ?[]const u8 {
@@ -312,17 +101,6 @@ fn destSqlFor(comptime Columns: type, want: []const u8) ?[]const u8 {
     return null;
 }
 
-fn insertFieldOf(value: anytype) Value {
-    const T = @TypeOf(value);
-    if (comptime @typeInfo(T) == .@"struct" and @hasDecl(T, "isExplicitValue")) {
-        return value.value;
-    }
-    return columnMod.toValue(value);
-}
-
-fn isExplicitDefault(comptime T: type) bool {
-    return @typeInfo(T) == .@"struct" and @hasDecl(T, "isExplicitDefault");
-}
 fn setValueOf(value: anytype) dslExpr.SetValue {
     const T = @TypeOf(value);
     if (comptime @typeInfo(T) == .@"struct" and @hasDecl(T, "isExplicitValue")) {
@@ -332,24 +110,9 @@ fn setValueOf(value: anytype) dslExpr.SetValue {
         return value.toSetValue();
     }
     if (T == columnMod.DynamicColumn) return .{ .column = columnMod.dynRef(value) };
-    if (comptime isTypedColumnInstance(T)) return .{ .column = .{ .table = columnMod.qualifiedTable(value), .name = T.dslName } };
+    if (comptime mutationMod.isTypedColumnInstance(T)) return .{ .column = .{ .table = columnMod.qualifiedTable(value), .name = T.dslName } };
     return .{ .literal = columnMod.toValue(value) };
 }
-
-/// Borrowed table name of a join target (typed value, type, string, or
-/// `DynamicTable`). Returned slice is borrowed from the target.
-pub fn tableNameOf(other: anytype) []const u8 {
-    const T = @TypeOf(other);
-    if (comptime @import("table.zig").isTableValue(T)) return other.tableName;
-    if (T == type) {
-        if (!@hasDecl(other, "tableName")) @compileError("join target must be a typed table or a table-name string");
-        return other.tableName;
-    }
-    return other;
-}
-
-/// Borrowed join target identity: name plus optional schema/alias.
-pub const JoinTarget = struct { name: []const u8, schema: []const u8 = "", alias: ?[]const u8 = null };
 
 /// One chained join leg on a `Builder`: borrowed table identity plus the
 /// join condition in exactly one form (`on` predicate, `usingCols`,
@@ -370,19 +133,6 @@ pub const JoinSpec = struct {
 /// Maximum chained joins per query builder (matches snapshot capacity).
 pub const maxJoins = 4;
 
-/// Resolve a join target value into a borrowed `JoinTarget`. Accepts typed
-/// table values, `DynamicTable`s, table types, and plain name strings.
-pub fn joinTargetOf(other: anytype) JoinTarget {
-    const T = @TypeOf(other);
-    if (comptime T != type and @typeInfo(T) == .@"struct" and @hasDecl(T, "isDynamicTable")) {
-        return .{ .name = other.name, .schema = other.schema, .alias = if (other.alias.len != 0) other.alias else null };
-    }
-    if (comptime @import("table.zig").isTableValue(T)) {
-        return .{ .name = other.tableName, .alias = if (other.tableAlias.len != 0) other.tableAlias else null };
-    }
-    return .{ .name = tableNameOf(other) };
-}
-
 fn containsAllMarker(comptime T: type) bool {
     if (comptime tableMod.isAllProjectionType(T)) return true;
     const info = @typeInfo(T);
@@ -401,7 +151,7 @@ fn containsAllMarker(comptime T: type) bool {
 /// when a marker names a foreign scope (those expand to explicit columns),
 /// unmapped otherwise.
 pub fn SelectOut(comptime Row: type, comptime Columns: type, comptime T: type) type {
-    if (comptime tableMod.isAllProjectionType(T)) return Builder(Row, Columns, allMatchesRoot(Columns, T));
+    if (comptime tableMod.isAllProjectionType(T)) return Builder(Row, Columns, mutationMod.allMatchesRoot(Columns, T));
     if (comptime containsAllMarker(T)) {
         if (comptime tupleHasForeignAll(Columns, T)) return Builder(Row, Columns, false);
         return Builder(Row, Columns, true);
@@ -436,15 +186,6 @@ fn tryHavingCond(cond: anytype) ?dslExpr.HavingCond {
     if (T == dslExpr.HavingCond) return cond;
     if (T == dslExpr.Expr) return havingCondFromExpr(cond);
     @compileError("having() takes an aggregate/scalar comparison such as col.count().gt(1) or a column predicate");
-}
-
-fn storeCaseProjection(cases: *[2]CaseBuilder, caseCount: *usize, out: []Projection, outCount: *usize, item: CaseBuilder) void {
-    if (caseCount.* >= cases.len) @panic("too many DSL case expressions");
-    if (outCount.* >= out.len) @panic("too many DSL projections");
-    cases[caseCount.*] = item;
-    out[outCount.*] = .{ .kind = .caseExpr, .caseSlot = @intCast(caseCount.*) };
-    caseCount.* += 1;
-    outCount.* += 1;
 }
 
 fn storeWindowProjection(windows: []WindowBuilder, windowCount: *usize, out: []Projection, outCount: *usize, item: WindowBuilder) void {
@@ -634,7 +375,7 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
             // Single qualified marker: this scope keeps the mapped star,
             // a foreign scope expands (recurse as an explicit list).
             if (comptime tableMod.isAllProjectionType(T)) {
-                if (comptime allMatchesRoot(Columns, T)) return self.selectAll();
+                if (comptime mutationMod.allMatchesRoot(Columns, T)) return self.selectAll();
                 return self.select(.{cols});
             }
             if (comptime containsAllMarker(T) and !tupleHasForeignAll(Columns, T)) {
@@ -654,7 +395,7 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
             if (T == scopeMod.EnumLiteral and comptime scopeMod.isScopedAll(T, Row, cols)) {
                 return copy.selectOneStar();
             }
-            if (T == Projection or T == columnMod.DynamicColumn or comptime isTypedColumnInstance(T) or T == CaseBuilder or T == WindowBuilder) {
+            if (T == Projection or T == columnMod.DynamicColumn or comptime mutationMod.isTypedColumnInstance(T) or T == CaseBuilder or T == WindowBuilder) {
                 return copy.selectOne(cols);
             }
             // Scoped single field (`select(.id)`): resolves against the
@@ -665,7 +406,7 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
             const items = if (@typeInfo(T) == .pointer) cols.* else cols;
             inline for (items) |item| {
                 if (@TypeOf(item) == CaseBuilder) {
-                    storeCaseProjection(&copy.cases, &copy.caseCount, copy.projections[0..], &copy.projectionCount, item);
+                    mutationMod.storeCaseProjection(&copy.cases, &copy.caseCount, copy.projections[0..], &copy.projectionCount, item);
                     continue;
                 }
                 if (@TypeOf(item) == WindowBuilder) {
@@ -677,7 +418,7 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
                 // explicit qualified references (exact one-side projection,
                 // never star bleed into other join sides).
                 if (comptime tableMod.isAllProjectionType(@TypeOf(item))) {
-                    appendMarkerColumns(copy.projections[0..], &copy.projectionCount, @TypeOf(item));
+                    mutationMod.appendMarkerColumns(copy.projections[0..], &copy.projectionCount, @TypeOf(item));
                     continue;
                 }
                 // A scoped `.all` anywhere in the list appends the native
@@ -692,7 +433,7 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
                 if (Row != void and comptime scopeMod.isScopedItem(@TypeOf(item), Row)) {
                     copy.projections[copy.projectionCount] = copy.scopedProjection(item);
                 } else {
-                    copy.projections[copy.projectionCount] = toProjection(item);
+                    copy.projections[copy.projectionCount] = mutationMod.toProjection(item);
                 }
                 copy.projectionCount += 1;
             }
@@ -711,14 +452,14 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
         fn selectOne(self: Builder(Row, Columns, false), col: anytype) Builder(Row, Columns, false) {
             var copy = self;
             if (@TypeOf(col) == CaseBuilder) {
-                storeCaseProjection(&copy.cases, &copy.caseCount, copy.projections[0..], &copy.projectionCount, col);
+                mutationMod.storeCaseProjection(&copy.cases, &copy.caseCount, copy.projections[0..], &copy.projectionCount, col);
                 return copy;
             }
             if (@TypeOf(col) == WindowBuilder) {
                 storeWindowProjection(&copy.windows, &copy.windowCount, copy.projections[0..], &copy.projectionCount, col);
                 return copy;
             }
-            copy.projections[copy.projectionCount] = toProjection(col);
+            copy.projections[copy.projectionCount] = mutationMod.toProjection(col);
             copy.projectionCount += 1;
             return copy;
         }
@@ -745,13 +486,13 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
             const T = @TypeOf(cols);
             // A foreign-scope marker expands as an explicit list; a
             // root-scope marker keeps the native star below.
-            if (comptime tableMod.isAllProjectionType(T) and !allMatchesRoot(Columns, T)) {
+            if (comptime tableMod.isAllProjectionType(T) and !mutationMod.allMatchesRoot(Columns, T)) {
                 return self.returning(.{cols});
             }
             // Single items (a bare column, star marker, or scoped field)
             // project exactly one RETURNING expression.
-            if (T == Projection or T == columnMod.DynamicColumn or comptime tableMod.isAllProjectionType(T) or isTypedColumnInstance(T)) {
-                copy.returningCols[0] = toProjection(cols);
+            if (T == Projection or T == columnMod.DynamicColumn or comptime tableMod.isAllProjectionType(T) or mutationMod.isTypedColumnInstance(T)) {
+                copy.returningCols[0] = mutationMod.toProjection(cols);
                 copy.returningCount = 1;
                 return copy;
             }
@@ -772,7 +513,7 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
             const items = if (@typeInfo(T) == .pointer) cols.* else cols;
             inline for (items) |item| {
                 if (@TypeOf(item) == CaseBuilder) {
-                    storeCaseProjection(&copy.cases, &copy.caseCount, copy.returningCols[0..], &copy.returningCount, item);
+                    mutationMod.storeCaseProjection(&copy.cases, &copy.caseCount, copy.returningCols[0..], &copy.returningCount, item);
                     continue;
                 }
                 if (@TypeOf(item) == WindowBuilder) @panic("window functions are not supported in RETURNING");
@@ -780,7 +521,7 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
                 // A qualified marker expands to its own side's explicit
                 // qualified references (exact one-side projection).
                 if (comptime tableMod.isAllProjectionType(@TypeOf(item))) {
-                    appendMarkerColumns(copy.returningCols[0..], &copy.returningCount, @TypeOf(item));
+                    mutationMod.appendMarkerColumns(copy.returningCols[0..], &copy.returningCount, @TypeOf(item));
                     continue;
                 }
                 if (@TypeOf(item) == scopeMod.EnumLiteral and comptime scopeMod.isScopedAll(@TypeOf(item), Row, item)) {
@@ -788,7 +529,7 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
                 } else if (Row != void and comptime scopeMod.isScopedItem(@TypeOf(item), Row)) {
                     copy.returningCols[copy.returningCount] = copy.scopedProjection(item);
                 } else {
-                    copy.returningCols[copy.returningCount] = toProjection(item);
+                    copy.returningCols[copy.returningCount] = mutationMod.toProjection(item);
                 }
                 copy.returningCount += 1;
             }
@@ -809,7 +550,7 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
         /// (`a.and(b)` → `a AND b`; `a.or(b)` → `a OR b`).
         pub fn where(self: Self, condition: anytype) Self {
             var copy = self;
-            storeWhere(copy.conditions[0..], &copy.conditionCount, condition);
+            mutationMod.storeWhere(copy.conditions[0..], &copy.conditionCount, condition);
             return copy;
         }
 
@@ -818,7 +559,7 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
         /// `x AND (a OR b)` under SQL precedence.
         pub fn andWhere(self: Self, condition: anytype) Self {
             var copy = self;
-            appendAnd(copy.conditions[0..], &copy.conditionCount, condition);
+            mutationMod.appendAnd(copy.conditions[0..], &copy.conditionCount, condition);
             return copy;
         }
 
@@ -826,7 +567,7 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
         /// SQL precedence (`x OR (a AND b)`), so straight appends are sound.
         pub fn orWhere(self: Self, condition: anytype) Self {
             var copy = self;
-            appendOr(copy.conditions[0..], &copy.conditionCount, condition);
+            mutationMod.appendOr(copy.conditions[0..], &copy.conditionCount, condition);
             return copy;
         }
 
@@ -883,7 +624,7 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
         /// belongs to `other`.
         pub fn whereInQuery(self: Self, col: anytype, other: anytype, otherCol: anytype) Self {
             var copy = self;
-            const target = joinTargetOf(other);
+            const target = mutationMod.joinTargetOf(other);
             const outer: ColumnRef = if (Row != void and comptime scopeMod.isScopedItem(@TypeOf(col), Row)) copy.scopedRef(col) else toRef(col);
             copy.inQuery = .{ .column = outer, .table = target.name, .schema = target.schema, .subcolumn = toRef(otherCol) };
             return copy;
@@ -891,7 +632,7 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
 
         pub fn whereNotInQuery(self: Self, col: anytype, other: anytype, otherCol: anytype) Self {
             var copy = self;
-            const target = joinTargetOf(other);
+            const target = mutationMod.joinTargetOf(other);
             const outer: ColumnRef = if (Row != void and comptime scopeMod.isScopedItem(@TypeOf(col), Row)) copy.scopedRef(col) else toRef(col);
             copy.inQuery = .{ .column = outer, .table = target.name, .schema = target.schema, .subcolumn = toRef(otherCol), .negated = true };
             return copy;
@@ -899,14 +640,14 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
 
         pub fn whereExists(self: Self, other: anytype, on: ?Expr) Self {
             var copy = self;
-            const target = joinTargetOf(other);
+            const target = mutationMod.joinTargetOf(other);
             copy.existsQuery = .{ .table = target.name, .schema = target.schema, .on = on };
             return copy;
         }
 
         pub fn whereNotExists(self: Self, other: anytype, on: ?Expr) Self {
             var copy = self;
-            const target = joinTargetOf(other);
+            const target = mutationMod.joinTargetOf(other);
             copy.existsQuery = .{ .table = target.name, .schema = target.schema, .on = on, .negated = true };
             return copy;
         }
@@ -1041,7 +782,7 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
 
         pub fn crossJoin(self: Self, other: anytype) Self {
             var copy = self;
-            const target = joinTargetOf(other);
+            const target = mutationMod.joinTargetOf(other);
             _ = copy.appendJoin(.{
                 .table = target.name,
                 .schema = target.schema,
@@ -1053,7 +794,7 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
 
         fn joinAs(self: Self, other: anytype, on: Expr, kind: JoinKind) Self {
             var copy = self;
-            const target = joinTargetOf(other);
+            const target = mutationMod.joinTargetOf(other);
             _ = copy.appendJoin(.{
                 .table = target.name,
                 .schema = target.schema,
@@ -1079,7 +820,7 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
 
         fn joinUsingAs(self: Self, other: anytype, col: anytype, kind: JoinKind) Self {
             var copy = self;
-            const target = joinTargetOf(other);
+            const target = mutationMod.joinTargetOf(other);
             const leg = copy.appendJoin(.{
                 .table = target.name,
                 .schema = target.schema,
@@ -1090,7 +831,7 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
             if (T == columnMod.DynamicColumn) {
                 leg.usingCols[0] = columnMod.dynRef(col).name;
                 leg.usingCount = 1;
-            } else if (comptime isTypedColumnInstance(T)) {
+            } else if (comptime mutationMod.isTypedColumnInstance(T)) {
                 leg.usingCols[0] = T.dslName;
                 leg.usingCount = 1;
             } else if (Row != void and comptime scopeMod.isScopedItem(T, Row)) {
@@ -1104,7 +845,7 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
                     const IT = @TypeOf(item);
                     if (IT == columnMod.DynamicColumn) {
                         leg.usingCols[leg.usingCount] = columnMod.dynRef(item).name;
-                    } else if (comptime isTypedColumnInstance(IT)) {
+                    } else if (comptime mutationMod.isTypedColumnInstance(IT)) {
                         leg.usingCols[leg.usingCount] = IT.dslName;
                     } else if (Row != void and comptime scopeMod.isScopedItem(IT, Row)) {
                         leg.usingCols[leg.usingCount] = copy.scopedRef(item).name;
@@ -1135,7 +876,7 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
 
         fn naturalAs(self: Self, other: anytype, kind: JoinKind) Self {
             var copy = self;
-            const target = joinTargetOf(other);
+            const target = mutationMod.joinTargetOf(other);
             _ = copy.appendJoin(.{
                 .table = target.name,
                 .schema = target.schema,
@@ -1253,7 +994,7 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
                         ),
                     }
                 else
-                    toProjection(mapValue);
+                    mutationMod.toProjection(mapValue);
                 proj.alias = destSql;
                 projs[count] = proj;
                 count += 1;
@@ -1340,8 +1081,8 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
             return .{ .allocator = self.allocator, .columns = outColumns, .rows = rows, .changes = changes };
         }
 
-        fn upsertBase(self: Self) UpsertBuilder(Row, Columns) {
-            var up = UpsertBuilder(Row, Columns){
+        fn upsertBase(self: Self) mutationMod.UpsertBuilder(Row, Columns) {
+            var up = mutationMod.UpsertBuilder(Row, Columns){
                 .allocator = self.allocator,
                 .connection = self.connection,
                 .executeFn = self.executeFn,
@@ -1363,13 +1104,13 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
             return up;
         }
 
-        pub fn onConflict(self: Self, target: anytype) UpsertBuilder(Row, Columns) {
+        pub fn onConflict(self: Self, target: anytype) mutationMod.UpsertBuilder(Row, Columns) {
             var up = self.upsertBase();
             const T = @TypeOf(target);
             if (T == columnMod.DynamicColumn) {
                 up.targetCols[0] = columnMod.dynRef(target).name;
                 up.targetCount = 1;
-            } else if (comptime isTypedColumnInstance(T)) {
+            } else if (comptime mutationMod.isTypedColumnInstance(T)) {
                 up.targetCols[0] = T.dslName;
                 up.targetCount = 1;
             } else if (Row != void and comptime scopeMod.isScopedItem(T, Row)) {
@@ -1383,7 +1124,7 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
                     const IT = @TypeOf(item);
                     if (IT == columnMod.DynamicColumn) {
                         up.targetCols[up.targetCount] = columnMod.dynRef(item).name;
-                    } else if (comptime isTypedColumnInstance(IT)) {
+                    } else if (comptime mutationMod.isTypedColumnInstance(IT)) {
                         up.targetCols[up.targetCount] = IT.dslName;
                     } else if (Row != void and comptime scopeMod.isScopedItem(IT, Row)) {
                         up.targetCols[up.targetCount] = scopeMod.resolveRef(Row, Columns, self.scope(), item).name;
@@ -1399,13 +1140,13 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
             return up;
         }
 
-        pub fn doNothing(self: Self) UpsertBuilder(Row, Columns) {
+        pub fn doNothing(self: Self) mutationMod.UpsertBuilder(Row, Columns) {
             var up = self.upsertBase();
             up.action = .nothing;
             return up;
         }
 
-        pub fn doUpdate(self: Self, assignments: anytype) !UpsertBuilder(Row, Columns) {
+        pub fn doUpdate(self: Self, assignments: anytype) !mutationMod.UpsertBuilder(Row, Columns) {
             var up = self.upsertBase();
             try up.extractSets(assignments);
             up.action = .update;
@@ -1425,29 +1166,29 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
                 // Dynamic assigns resolve at setup time against the same
                 // target contract; typed assigns resolve at compile time.
                 if (comptime columnMod.isDynAssignValue(@TypeOf(item))) {
-                    try checkDynAssignScope(item, self.table, self.tableAlias);
-                    try checkDynAssignColumn(Columns, item.name);
-                    if (comptime isExplicitDefault(@TypeOf(item.value))) continue;
+                    try mutationMod.checkDynAssignScope(item, self.table, self.tableAlias);
+                    try mutationMod.checkDynAssignColumn(Columns, item.name);
+                    if (comptime mutationMod.isExplicitDefault(@TypeOf(item.value))) continue;
                     if (@TypeOf(item.value) == columnMod.ExcludedColumn) @compileError("excluded() is only valid in UPSERT assignments");
                     if (count >= names.len) return error.InvalidSql;
-                    try checkDuplicateName(names[0..count], item.name);
+                    try mutationMod.checkDuplicateName(names[0..count], item.name);
                     names[count] = item.name;
-                    vals[count] = .{ .literal = insertFieldOf(item.value) };
+                    vals[count] = .{ .literal = mutationMod.insertFieldOf(item.value) };
                     count += 1;
                     continue;
                 }
                 const Col = @TypeOf(item).assignColumn;
-                if (comptime !hasAssignColumn(Col, Columns)) @compileError("assignment column is not a column of the statement target table");
+                if (comptime !mutationMod.hasAssignColumn(Col, Columns)) @compileError("assignment column is not a column of the statement target table");
                 // Same column twice is most likely a copy/paste slip; SQL
                 // rejects duplicate targets, so fail loudly here too.
-                if (comptime hasDuplicateAssign(AssignsType, index)) @compileError("duplicate assignment to one column in an explicit assign list");
-                try checkAssignScope(Col, self.table, self.tableAlias);
-                if (comptime isExplicitDefault(@TypeOf(item.value))) continue;
+                if (comptime mutationMod.hasDuplicateAssign(AssignsType, index)) @compileError("duplicate assignment to one column in an explicit assign list");
+                try mutationMod.checkAssignScope(Col, self.table, self.tableAlias);
+                if (comptime mutationMod.isExplicitDefault(@TypeOf(item.value))) continue;
                 if (@TypeOf(item.value) == columnMod.ExcludedColumn) @compileError("excluded() is only valid in UPSERT assignments");
                 if (count >= names.len) return error.InvalidSql;
-                try checkDuplicateName(names[0..count], Col.dslName);
+                try mutationMod.checkDuplicateName(names[0..count], Col.dslName);
                 names[count] = Col.dslName;
-                vals[count] = .{ .literal = insertFieldOf(item.value) };
+                vals[count] = .{ .literal = mutationMod.insertFieldOf(item.value) };
                 count += 1;
             }
             if (count == 0) return error.InvalidSql;
@@ -1459,10 +1200,10 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
         fn insertWithMode(self: Self, row: anytype, comptime mode: []const u8) !Result {
             const conflict: ast.ConflictPolicy = if (comptime std.mem.eql(u8, mode, "")) .none else if (comptime std.mem.eql(u8, mode, "OR IGNORE")) .ignore else if (comptime std.mem.eql(u8, mode, "OR REPLACE")) .replace else if (comptime std.mem.eql(u8, mode, "OR ABORT")) .abort else if (comptime std.mem.eql(u8, mode, "OR FAIL")) .fail else if (comptime std.mem.eql(u8, mode, "OR ROLLBACK")) .rollback else @compileError("unknown insert mode");
             const RowType = @TypeOf(row);
-            if (comptime isAssignList(RowType)) return self.insertAssigns(row, conflict);
+            if (comptime mutationMod.isAssignList(RowType)) return self.insertAssigns(row, conflict);
             // Bare single assign (`insert(User.name.set("x"))`) behaves
             // like a one element tuple, mirroring select(.id).
-            if (comptime isAssignItem(RowType)) return self.insertAssigns(.{row}, conflict);
+            if (comptime mutationMod.isAssignItem(RowType)) return self.insertAssigns(.{row}, conflict);
             validateRow(RowType);
             if (Columns == void) {
                 const fields = @typeInfo(RowType).@"struct".fields;
@@ -1470,9 +1211,9 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
                 var vals: [fields.len]dslExpr.SetValue = undefined;
                 var count: usize = 0;
                 inline for (fields) |field| {
-                    if (comptime isExplicitDefault(@TypeOf(@field(row, field.name)))) continue;
+                    if (comptime mutationMod.isExplicitDefault(@TypeOf(@field(row, field.name)))) continue;
                     names[count] = field.name;
-                    vals[count] = .{ .literal = insertFieldOf(@field(row, field.name)) };
+                    vals[count] = .{ .literal = mutationMod.insertFieldOf(@field(row, field.name)) };
                     count += 1;
                 }
                 if (count == 0) return error.InvalidSql;
@@ -1486,9 +1227,9 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
                 var count: usize = 0;
                 inline for (colFields) |colField| {
                     if (@hasField(RowType, colField.name)) {
-                        if (comptime isExplicitDefault(@TypeOf(@field(row, colField.name)))) continue;
+                        if (comptime mutationMod.isExplicitDefault(@TypeOf(@field(row, colField.name)))) continue;
                         names[count] = colField.type.dslName;
-                        vals[count] = .{ .literal = insertFieldOf(@field(row, colField.name)) };
+                        vals[count] = .{ .literal = mutationMod.insertFieldOf(@field(row, colField.name)) };
                         count += 1;
                     }
                 }
@@ -1499,9 +1240,9 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
             }
         }
 
-        pub fn update(self: Self, assignments: anytype) !Mutation {
+        pub fn update(self: Self, assignments: anytype) !mutationMod.Mutation {
             const RowType = @TypeOf(assignments);
-            var mutation = Mutation{
+            var mutation = mutationMod.Mutation{
                 .allocator = self.allocator,
                 .connection = self.connection,
                 .executeFn = self.executeFn,
@@ -1521,29 +1262,29 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
             // User.age.set(User.age.add(1)) })`): targets carry table
             // identity; expressions distinguish target from value natively.
             // Bare singles (`update(User.name.set("x"))`) act as 1-tuples.
-            if (comptime isAssignItem(RowType)) return self.update(.{assignments});
-            if (comptime isAssignList(RowType)) {
+            if (comptime mutationMod.isAssignItem(RowType)) return self.update(.{assignments});
+            if (comptime mutationMod.isAssignList(RowType)) {
                 inline for (assignments, 0..) |item, index| {
                     if (comptime columnMod.isDynAssignValue(@TypeOf(item))) {
-                        try checkDynAssignScope(item, self.table, self.tableAlias);
-                        try checkDynAssignColumn(Columns, item.name);
-                        if (comptime isExplicitDefault(@TypeOf(item.value))) continue;
+                        try mutationMod.checkDynAssignScope(item, self.table, self.tableAlias);
+                        try mutationMod.checkDynAssignColumn(Columns, item.name);
+                        if (comptime mutationMod.isExplicitDefault(@TypeOf(item.value))) continue;
                         if (@TypeOf(item.value) == columnMod.ExcludedColumn) @compileError("excluded() is only valid in UPSERT assignments");
                         if (mutation.setCount >= mutation.setNames.len) return error.InvalidSql;
-                        try checkDuplicateName(mutation.setNames[0..mutation.setCount], item.name);
+                        try mutationMod.checkDuplicateName(mutation.setNames[0..mutation.setCount], item.name);
                         mutation.setNames[mutation.setCount] = item.name;
                         mutation.setValues[mutation.setCount] = setValueOf(item.value);
                         mutation.setCount += 1;
                         continue;
                     }
                     const Col = @TypeOf(item).assignColumn;
-                    if (comptime !hasAssignColumn(Col, Columns)) @compileError("assignment column is not a column of the statement target table");
-                    if (comptime hasDuplicateAssign(RowType, index)) @compileError("duplicate assignment to one column in an explicit assign list");
-                    try checkAssignScope(Col, self.table, self.tableAlias);
-                    if (comptime isExplicitDefault(@TypeOf(item.value))) continue;
+                    if (comptime !mutationMod.hasAssignColumn(Col, Columns)) @compileError("assignment column is not a column of the statement target table");
+                    if (comptime mutationMod.hasDuplicateAssign(RowType, index)) @compileError("duplicate assignment to one column in an explicit assign list");
+                    try mutationMod.checkAssignScope(Col, self.table, self.tableAlias);
+                    if (comptime mutationMod.isExplicitDefault(@TypeOf(item.value))) continue;
                     if (@TypeOf(item.value) == columnMod.ExcludedColumn) @compileError("excluded() is only valid in UPSERT assignments");
                     if (mutation.setCount >= mutation.setNames.len) return error.InvalidSql;
-                    try checkDuplicateName(mutation.setNames[0..mutation.setCount], Col.dslName);
+                    try mutationMod.checkDuplicateName(mutation.setNames[0..mutation.setCount], Col.dslName);
                     mutation.setNames[mutation.setCount] = Col.dslName;
                     mutation.setValues[mutation.setCount] = setValueOf(item.value);
                     mutation.setCount += 1;
@@ -1554,7 +1295,7 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
             validateRow(RowType);
             if (Columns == void) {
                 inline for (@typeInfo(RowType).@"struct".fields) |field| {
-                    if (comptime isExplicitDefault(@TypeOf(@field(assignments, field.name)))) continue;
+                    if (comptime mutationMod.isExplicitDefault(@TypeOf(@field(assignments, field.name)))) continue;
                     if (mutation.setCount >= mutation.setNames.len) return error.InvalidSql;
                     mutation.setNames[mutation.setCount] = field.name;
                     mutation.setValues[mutation.setCount] = setValueOf(@field(assignments, field.name));
@@ -1563,7 +1304,7 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
             } else {
                 inline for (@typeInfo(Columns).@"struct".fields) |colField| {
                     if (@hasField(RowType, colField.name)) {
-                        if (comptime isExplicitDefault(@TypeOf(@field(assignments, colField.name)))) continue;
+                        if (comptime mutationMod.isExplicitDefault(@TypeOf(@field(assignments, colField.name)))) continue;
                         if (mutation.setCount >= mutation.setNames.len) return error.InvalidSql;
                         mutation.setNames[mutation.setCount] = colField.type.dslName;
                         mutation.setValues[mutation.setCount] = setValueOf(@field(assignments, colField.name));
@@ -1579,7 +1320,7 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
         /// `db.from(User).where(.id.eq(1))` and `db.from(User).where(User.id
         /// .eq(1))` both delete exactly that row; previously the predicate
         /// was silently dropped into a full-table delete.
-        pub fn delete(self: Self) Mutation {
+        pub fn delete(self: Self) mutationMod.Mutation {
             return .{
                 .allocator = self.allocator,
                 .connection = self.connection,
@@ -2275,456 +2016,6 @@ test "typed and dynamic builders share one engine" {
     try std.testing.expect(Query(@TypeOf(T)).isTyped);
 }
 
-/// Value-semantic UPSERT builder (`onConflict(...).doUpdate(...).insert(row)`).
-/// Conflict targets, SET list, and filters are borrowed; `insert()` lowers to
-/// native AST via `ast_builder` and returns an owned `Result` (caller deinits).
-pub fn UpsertBuilder(comptime Row: type, comptime Columns: type) type {
-    return struct {
-        const Self = @This();
-        pub const isTyped = Row != void;
-
-        allocator: std.mem.Allocator,
-        connection: *anyopaque,
-        executeFn: astBuilder.ExecFn,
-        table: []const u8,
-        schema: []const u8 = "",
-        tableAlias: ?[]const u8 = null,
-        targetCols: [8][]const u8 = undefined,
-        targetCount: usize = 0,
-        targetWhere: ?Expr = null,
-        action: enum { none, nothing, update } = .none,
-        sets: [16]astBuilder.UpsertSet = undefined,
-        setCount: usize = 0,
-        upsertConds: [8]ConditionEntry = undefined,
-        upsertCondCount: usize = 0,
-        caseWhens: [2]astBuilder.CaseWhereArgs = undefined,
-        caseWhenCount: usize = 0,
-        cases: [2]CaseBuilder = undefined,
-        caseCount: usize = 0,
-        returningCols: [16]Projection = undefined,
-        returningCount: usize = 0,
-
-        pub fn onConflictWhere(self: Self, condition: Expr) Self {
-            var copy = self;
-            copy.targetWhere = condition;
-            return copy;
-        }
-
-        pub fn doNothing(self: Self) Self {
-            var copy = self;
-            copy.action = .nothing;
-            return copy;
-        }
-
-        pub fn doUpdate(self: Self, assignments: anytype) !Self {
-            var copy = self;
-            try copy.extractSets(assignments);
-            copy.action = .update;
-            return copy;
-        }
-
-        pub fn where(self: Self, condition: anytype) Self {
-            var copy = self;
-            storeWhere(copy.upsertConds[0..], &copy.upsertCondCount, condition);
-            return copy;
-        }
-
-        pub fn andWhere(self: Self, condition: anytype) Self {
-            var copy = self;
-            appendAnd(copy.upsertConds[0..], &copy.upsertCondCount, condition);
-            return copy;
-        }
-
-        pub fn orWhere(self: Self, condition: anytype) Self {
-            var copy = self;
-            appendOr(copy.upsertConds[0..], &copy.upsertCondCount, condition);
-            return copy;
-        }
-
-        pub fn whereCase(self: Self, case: CaseBuilder, value: anytype) Self {
-            var copy = self;
-            copy.caseWhens[0] = .{ .case = case, .value = columnMod.toRhs(value) };
-            copy.caseWhenCount = 1;
-            return copy;
-        }
-
-        pub fn andWhereCase(self: Self, case: CaseBuilder, value: anytype) Self {
-            var copy = self;
-            if (copy.caseWhenCount >= copy.caseWhens.len) @panic("too many DSL case filters");
-            copy.caseWhens[copy.caseWhenCount] = .{ .case = case, .value = columnMod.toRhs(value), .joinOr = copy.caseWhenCount != 0 or copy.upsertCondCount != 0 };
-            copy.caseWhenCount += 1;
-            return copy;
-        }
-
-        pub fn orWhereCase(self: Self, case: CaseBuilder, value: anytype) Self {
-            var copy = self;
-            if (copy.caseWhenCount >= copy.caseWhens.len) @panic("too many DSL case filters");
-            copy.caseWhens[copy.caseWhenCount] = .{ .case = case, .value = columnMod.toRhs(value), .joinOr = true };
-            copy.caseWhenCount += 1;
-            return copy;
-        }
-
-        pub fn returning(self: Self, cols: anytype) Self {
-            if (comptime tableMod.isAllOpFn(@TypeOf(cols))) @compileError("use User.all() (call it) for RETURNING all columns");
-            var copy = self;
-            copy.returningCount = 0;
-            const T = @TypeOf(cols);
-            // A foreign-scope marker expands as an explicit list; a
-            // root-scope marker keeps the native star below.
-            if (comptime tableMod.isAllProjectionType(T) and !allMatchesRoot(Columns, T)) {
-                return self.returning(.{cols});
-            }
-            // Single items project exactly one RETURNING expression.
-            if (T == Projection or T == columnMod.DynamicColumn or comptime tableMod.isAllProjectionType(T) or isTypedColumnInstance(T)) {
-                copy.returningCols[0] = toProjection(cols);
-                copy.returningCount = 1;
-                return copy;
-            }
-            // Scoped star (`returning(.all)`) wins over plain scoped fields.
-            if (T == scopeMod.EnumLiteral and comptime scopeMod.isScopedAll(T, Row, cols)) {
-                copy.returningCols[0] = .{ .kind = .star };
-                copy.returningCount = 1;
-                return copy;
-            }
-            // Scoped single field (`returning(.id)`): resolves against the
-            // upsert's target table.
-            if (Row != void and comptime scopeMod.isScopedItem(T, Row)) {
-                copy.returningCols[0] = .{ .kind = .column, .column = scopeMod.resolveRef(Row, Columns, scopeMod.builderScope(self.table, self.tableAlias), cols) };
-                copy.returningCount = 1;
-                return copy;
-            }
-            const items = if (@typeInfo(T) == .pointer) cols.* else cols;
-            inline for (items) |item| {
-                if (@TypeOf(item) == CaseBuilder) {
-                    storeCaseProjection(&copy.cases, &copy.caseCount, copy.returningCols[0..], &copy.returningCount, item);
-                    continue;
-                }
-                if (@TypeOf(item) == WindowBuilder) @panic("window functions are not supported in RETURNING");
-                if (copy.returningCount >= copy.returningCols.len) @panic("too many DSL returning columns");
-                // A qualified marker expands to its own side's explicit
-                // qualified references (exact one-side projection).
-                if (comptime tableMod.isAllProjectionType(@TypeOf(item))) {
-                    appendMarkerColumns(copy.returningCols[0..], &copy.returningCount, @TypeOf(item));
-                    continue;
-                }
-                if (@TypeOf(item) == scopeMod.EnumLiteral and comptime scopeMod.isScopedAll(@TypeOf(item), Row, item)) {
-                    copy.returningCols[copy.returningCount] = .{ .kind = .star };
-                } else if (Row != void and comptime scopeMod.isScopedItem(@TypeOf(item), Row)) {
-                    copy.returningCols[copy.returningCount] = .{ .kind = .column, .column = scopeMod.resolveRef(Row, Columns, scopeMod.builderScope(self.table, self.tableAlias), item) };
-                } else {
-                    copy.returningCols[copy.returningCount] = toProjection(item);
-                }
-                copy.returningCount += 1;
-            }
-            if (copy.returningCount == 0) @panic("returning() requires at least one column");
-            return copy;
-        }
-
-        fn extractSets(self: *Self, assignments: anytype) !void {
-            const RowType = @TypeOf(assignments);
-            if (@typeInfo(RowType) != .@"struct") @compileError("DSL row must be a struct");
-            // Explicit UPSERT assignments (`doUpdate(.{ User.name.set("x"),
-            // User.age.set(db.excluded("age")) })`): `excluded()` markers,
-            // arithmetic, and column references all pass through natively.
-            // Bare singles act as 1-tuples, mirroring insert/update.
-            if (comptime isAssignItem(RowType)) {
-                try self.extractSets(.{assignments});
-                return;
-            }
-            if (comptime isAssignList(RowType)) {
-                self.setCount = 0;
-                inline for (assignments, 0..) |item, index| {
-                    if (comptime columnMod.isDynAssignValue(@TypeOf(item))) {
-                        try checkDynAssignScope(item, self.table, self.tableAlias);
-                        try checkDynAssignColumn(Columns, item.name);
-                        if (comptime isExplicitDefault(@TypeOf(item.value))) continue;
-                        if (self.setCount >= self.sets.len) return error.InvalidSql;
-                        for (self.sets[0..self.setCount]) |existing| if (std.mem.eql(u8, existing.name, item.name)) return error.InvalidSql;
-                        self.sets[self.setCount] = .{ .name = item.name, .value = upsertValueOf(item.value) };
-                        self.setCount += 1;
-                        continue;
-                    }
-                    const Col = @TypeOf(item).assignColumn;
-                    if (comptime !hasAssignColumn(Col, Columns)) @compileError("assignment column is not a column of the statement target table");
-                    if (comptime hasDuplicateAssign(RowType, index)) @compileError("duplicate assignment to one column in an explicit assign list");
-                    try checkAssignScope(Col, self.table, self.tableAlias);
-                    if (comptime isExplicitDefault(@TypeOf(item.value))) continue;
-                    if (self.setCount >= self.sets.len) return error.InvalidSql;
-                    for (self.sets[0..self.setCount]) |existing| if (std.mem.eql(u8, existing.name, Col.dslName)) return error.InvalidSql;
-                    self.sets[self.setCount] = .{ .name = Col.dslName, .value = upsertValueOf(item.value) };
-                    self.setCount += 1;
-                }
-                if (self.setCount == 0) return error.InvalidSql;
-                return;
-            }
-            if (isTyped) {
-                inline for (@typeInfo(RowType).@"struct".fields) |field| {
-                    if (!@hasField(Row, field.name)) @compileError("DSL row contains an unknown table column");
-                }
-            }
-            self.setCount = 0;
-            if (Columns == void) {
-                inline for (@typeInfo(RowType).@"struct".fields) |field| {
-                    if (comptime isExplicitDefault(@TypeOf(@field(assignments, field.name)))) continue;
-                    if (self.setCount >= self.sets.len) return error.InvalidSql;
-                    self.sets[self.setCount] = .{ .name = field.name, .value = upsertValueOf(@field(assignments, field.name)) };
-                    self.setCount += 1;
-                }
-            } else {
-                inline for (@typeInfo(Columns).@"struct".fields) |colField| {
-                    if (@hasField(RowType, colField.name)) {
-                        if (comptime isExplicitDefault(@TypeOf(@field(assignments, colField.name)))) continue;
-                        if (self.setCount >= self.sets.len) return error.InvalidSql;
-                        self.sets[self.setCount] = .{ .name = colField.type.dslName, .value = upsertValueOf(@field(assignments, colField.name)) };
-                        self.setCount += 1;
-                    }
-                }
-            }
-            if (self.setCount == 0) return error.InvalidSql;
-        }
-
-        pub fn insert(self: Self, row: anytype) !Result {
-            if (self.action == .none) return error.InvalidSql;
-            const conflict: ast.ConflictPolicy = switch (self.action) {
-                .nothing => .ignore,
-                .update => .update,
-                .none => return error.InvalidSql,
-            };
-            const RowType = @TypeOf(row);
-            if (@typeInfo(RowType) != .@"struct") @compileError("DSL row must be a struct");
-            if (isTyped) {
-                inline for (@typeInfo(RowType).@"struct".fields) |field| {
-                    if (!@hasField(Row, field.name)) @compileError("DSL row contains an unknown table column");
-                }
-            }
-            if (Columns == void) {
-                const fields = @typeInfo(RowType).@"struct".fields;
-                var names: [fields.len][]const u8 = undefined;
-                var vals: [fields.len]dslExpr.SetValue = undefined;
-                var count: usize = 0;
-                inline for (fields) |field| {
-                    if (comptime isExplicitDefault(@TypeOf(@field(row, field.name)))) continue;
-                    names[count] = field.name;
-                    vals[count] = .{ .literal = insertFieldOf(@field(row, field.name)) };
-                    count += 1;
-                }
-                if (count == 0) return error.InvalidSql;
-                var built = try astBuilder.buildInsert(self.allocator, self.table, self.schema, names[0..count], vals[0..count], conflict, self.returningCols[0..self.returningCount], self.cases[0..self.caseCount], .{
-                    .targets = self.targetCols[0..self.targetCount],
-                    .targetWhere = self.targetWhere,
-                    .sets = self.sets[0..self.setCount],
-                    .upsertWhere = self.upsertConds[0..self.upsertCondCount],
-                    .caseWhens = self.caseWhens[0..self.caseWhenCount],
-                });
-                defer built.deinit();
-                return self.executeFn(self.connection, &built.stmt, &.{}, false);
-            } else {
-                const colFields = @typeInfo(Columns).@"struct".fields;
-                var names: [colFields.len][]const u8 = undefined;
-                var vals: [colFields.len]dslExpr.SetValue = undefined;
-                var count: usize = 0;
-                inline for (colFields) |colField| {
-                    if (@hasField(RowType, colField.name)) {
-                        if (comptime isExplicitDefault(@TypeOf(@field(row, colField.name)))) continue;
-                        names[count] = colField.type.dslName;
-                        vals[count] = .{ .literal = insertFieldOf(@field(row, colField.name)) };
-                        count += 1;
-                    }
-                }
-                if (count == 0) return error.InvalidSql;
-                var built = try astBuilder.buildInsert(self.allocator, self.table, self.schema, names[0..count], vals[0..count], conflict, self.returningCols[0..self.returningCount], self.cases[0..self.caseCount], .{
-                    .targets = self.targetCols[0..self.targetCount],
-                    .targetWhere = self.targetWhere,
-                    .sets = self.sets[0..self.setCount],
-                    .upsertWhere = self.upsertConds[0..self.upsertCondCount],
-                    .caseWhens = self.caseWhens[0..self.caseWhenCount],
-                });
-                defer built.deinit();
-                return self.executeFn(self.connection, &built.stmt, &.{}, false);
-            }
-        }
-    };
-}
-
-fn upsertValueOf(value: anytype) astBuilder.UpsertValue {
-    const T = @TypeOf(value);
-    if (T == columnMod.ExcludedColumn) return .{ .excluded = value.name };
-    if (comptime @typeInfo(T) == .@"struct" and @hasDecl(T, "isExplicitValue")) {
-        return .{ .literal = value.value };
-    }
-    if (comptime @typeInfo(T) == .@"struct" and @hasDecl(T, "isArithExpr")) return .{ .set = value.toSetValue() };
-    if (T == columnMod.DynamicColumn) return .{ .set = .{ .column = columnMod.dynRef(value) } };
-    if (comptime isTypedColumnInstance(T)) return .{ .set = .{ .column = .{ .table = columnMod.qualifiedTable(value), .name = T.dslName } } };
-    return .{ .literal = columnMod.toValue(value) };
-}
-
-/// Value-semantic UPDATE/DELETE mutation. Chain `.where(...)` then call
-/// `execute()` for an owned `Result` (caller `deinit`s). `updateFrom` joins a
-/// second table for UPDATEs. Borrowed names/conditions; connection must
-/// outlive the mutation.
-pub const Mutation = struct {
-    allocator: std.mem.Allocator,
-    connection: *anyopaque,
-    executeFn: astBuilder.ExecFn,
-    table: []const u8,
-    schema: []const u8 = "",
-    operation: enum { update, delete },
-    setNames: [32][]const u8 = undefined,
-    setValues: [32]dslExpr.SetValue = undefined,
-    setCount: usize = 0,
-    conditions: [16]ConditionEntry = undefined,
-    conditionCount: usize = 0,
-    caseWhens: [2]astBuilder.CaseWhereArgs = undefined,
-    caseWhenCount: usize = 0,
-    cases: [2]CaseBuilder = undefined,
-    caseCount: usize = 0,
-    returningCols: [16]Projection = undefined,
-    returningCount: usize = 0,
-    fromTable: ?[]const u8 = null,
-    fromSchema: []const u8 = "",
-    fromLeft: dslExpr.ColumnRef = .{ .name = "" },
-    fromRight: dslExpr.ColumnRef = .{ .name = "" },
-
-    pub fn updateFrom(self: Mutation, other: anytype, on: Expr) Mutation {
-        var copy = self;
-        const target = joinTargetOf(other);
-        copy.fromTable = target.name;
-        copy.fromSchema = target.schema;
-        if (on.operator != .equal) @panic("updateFrom requires an equality predicate");
-        const rightRef = switch (on.rhs) {
-            .column => |ref| ref,
-            .value => @panic("updateFrom requires a column-to-column equality predicate"),
-        };
-        copy.fromLeft = on.column;
-        copy.fromRight = rightRef;
-        return copy;
-    }
-
-    pub fn where(self: Mutation, condition: anytype) Mutation {
-        var copy = self;
-        storeWhere(copy.conditions[0..], &copy.conditionCount, condition);
-        return copy;
-    }
-
-    pub fn andWhere(self: Mutation, condition: anytype) Mutation {
-        var copy = self;
-        appendAnd(copy.conditions[0..], &copy.conditionCount, condition);
-        return copy;
-    }
-
-    pub fn orWhere(self: Mutation, condition: anytype) Mutation {
-        var copy = self;
-        appendOr(copy.conditions[0..], &copy.conditionCount, condition);
-        return copy;
-    }
-
-    pub fn whereCase(self: Mutation, case: CaseBuilder, value: anytype) Mutation {
-        var copy = self;
-        copy.caseWhens[0] = .{ .case = case, .value = columnMod.toRhs(value) };
-        copy.caseWhenCount = 1;
-        return copy;
-    }
-
-    pub fn andWhereCase(self: Mutation, case: CaseBuilder, value: anytype) Mutation {
-        var copy = self;
-        if (copy.caseWhenCount >= copy.caseWhens.len) @panic("too many DSL case filters");
-        copy.caseWhens[copy.caseWhenCount] = .{ .case = case, .value = columnMod.toRhs(value), .joinOr = copy.caseWhenCount != 0 or copy.conditionCount != 0 };
-        copy.caseWhenCount += 1;
-        return copy;
-    }
-
-    pub fn orWhereCase(self: Mutation, case: CaseBuilder, value: anytype) Mutation {
-        var copy = self;
-        if (copy.caseWhenCount >= copy.caseWhens.len) @panic("too many DSL case filters");
-        copy.caseWhens[copy.caseWhenCount] = .{ .case = case, .value = columnMod.toRhs(value), .joinOr = true };
-        copy.caseWhenCount += 1;
-        return copy;
-    }
-
-    pub fn returning(self: Mutation, cols: anytype) Mutation {
-        if (comptime tableMod.isAllOpFn(@TypeOf(cols))) @compileError("use User.all() (call it) for RETURNING all columns");
-        var copy = self;
-        copy.returningCount = 0;
-        const T = @TypeOf(cols);
-        // Mutations are untyped: the root scope is the runtime target
-        // table. A marker naming it keeps the native star; anything else
-        // expands to that side's explicit qualified references.
-        if (comptime tableMod.isAllProjectionType(T)) {
-            if (std.ascii.eqlIgnoreCase(copy.table, T.qualifierName)) {
-                copy.returningCols[0] = .{ .kind = .star };
-                copy.returningCount = 1;
-            } else {
-                appendMarkerColumns(copy.returningCols[0..], &copy.returningCount, T);
-            }
-            if (copy.returningCount == 0) @panic("returning() requires at least one column");
-            return copy;
-        }
-        const items = if (@typeInfo(T) == .pointer) cols.* else cols;
-        inline for (items) |item| {
-            if (@TypeOf(item) == CaseBuilder) {
-                storeCaseProjection(&copy.cases, &copy.caseCount, copy.returningCols[0..], &copy.returningCount, item);
-                continue;
-            }
-            if (@TypeOf(item) == WindowBuilder) @panic("window functions are not supported in RETURNING");
-            if (copy.returningCount >= copy.returningCols.len) @panic("too many DSL returning columns");
-            if (comptime tableMod.isAllProjectionType(@TypeOf(item))) {
-                if (std.ascii.eqlIgnoreCase(copy.table, @TypeOf(item).qualifierName)) {
-                    copy.returningCols[copy.returningCount] = .{ .kind = .star };
-                    copy.returningCount += 1;
-                } else {
-                    appendMarkerColumns(copy.returningCols[0..], &copy.returningCount, @TypeOf(item));
-                }
-                continue;
-            }
-            copy.returningCols[copy.returningCount] = toProjection(item);
-            copy.returningCount += 1;
-        }
-        if (copy.returningCount == 0) @panic("returning() requires at least one column");
-        return copy;
-    }
-
-    pub fn execute(self: Mutation) !Result {
-        if (self.operation == .update) {
-            const fromSpec: ?ast.UpdateFrom = if (self.fromTable) |source| .{ .table = source, .tableSchema = self.fromSchema, .leftTable = self.fromLeft.table, .leftColumn = self.fromLeft.name, .rightTable = self.fromRight.table, .rightColumn = self.fromRight.name } else null;
-            var built = try astBuilder.buildUpdate(self.allocator, self.table, self.schema, self.setNames[0..self.setCount], self.setValues[0..self.setCount], self.conditions[0..self.conditionCount], self.returningCols[0..self.returningCount], self.cases[0..self.caseCount], self.caseWhens[0..self.caseWhenCount], fromSpec);
-            defer built.deinit();
-            return self.executeFn(self.connection, &built.stmt, &.{}, false);
-        } else {
-            if (self.fromTable != null) return error.InvalidSql;
-            var built = try astBuilder.buildDelete(self.allocator, self.table, self.schema, self.conditions[0..self.conditionCount], self.returningCols[0..self.returningCount], self.cases[0..self.caseCount], self.caseWhens[0..self.caseWhenCount]);
-            defer built.deinit();
-            return self.executeFn(self.connection, &built.stmt, &.{}, false);
-        }
-    }
-};
-
-test "orderBy accepts single orders and tuples of orders" {
-    const conn = @as(*anyopaque, @ptrFromInt(0x1000));
-    const base = DynamicQuery.initRaw(std.testing.allocator, conn, "t", undefined, undefined, undefined);
-    const colA = columnMod.DynamicColumn{ .name = "a" };
-    const colB = columnMod.DynamicColumn{ .name = "b" };
-    const single = base.orderBy(colA.asc());
-    try std.testing.expectEqual(@as(usize, 1), single.orderCount);
-    try std.testing.expectEqualStrings("a", single.orders[0].column.name);
-    try std.testing.expect(!single.orders[0].descending);
-    const pair = .{ colA.desc(), colB.asc() };
-    const multi = base.orderBy(pair);
-    try std.testing.expectEqual(@as(usize, 2), multi.orderCount);
-    try std.testing.expectEqualStrings("a", multi.orders[0].column.name);
-    try std.testing.expect(multi.orders[0].descending);
-    try std.testing.expectEqualStrings("b", multi.orders[1].column.name);
-    try std.testing.expect(!multi.orders[1].descending);
-    const chained = base.orderBy(colA.asc()).orderBy(colB.desc());
-    try std.testing.expectEqual(@as(usize, 2), chained.orderCount);
-    try std.testing.expect(!chained.orders[0].descending);
-    try std.testing.expect(chained.orders[1].descending);
-    const compound = CompoundBuilder(void, void, false){ .allocator = std.testing.allocator, .connection = conn, .compoundExecuteFn = undefined };
-    const compoundOrdered = compound.orderBy(pair);
-    try std.testing.expectEqual(@as(usize, 2), compoundOrdered.orderCount);
-    try std.testing.expect(compoundOrdered.orders[0].descending);
-    try std.testing.expect(!compoundOrdered.orders[1].descending);
-}
-
 test "select preserves projection order and AllColumns routing" {
     const conn = @as(*anyopaque, @ptrFromInt(0x1000));
     const base = DynamicQuery.initRaw(std.testing.allocator, conn, "t", undefined, undefined, undefined);
@@ -2898,4 +2189,31 @@ test "qualified all() markers expand to their own side" {
         try std.testing.expect(proj.kind == .column);
         try std.testing.expectEqualStrings("qa_b", proj.column.table);
     }
+}
+
+test "orderBy accepts single orders and tuples of orders" {
+    const conn = @as(*anyopaque, @ptrFromInt(0x1000));
+    const base = DynamicQuery.initRaw(std.testing.allocator, conn, "t", undefined, undefined, undefined);
+    const colA = columnMod.DynamicColumn{ .name = "a" };
+    const colB = columnMod.DynamicColumn{ .name = "b" };
+    const single = base.orderBy(colA.asc());
+    try std.testing.expectEqual(@as(usize, 1), single.orderCount);
+    try std.testing.expectEqualStrings("a", single.orders[0].column.name);
+    try std.testing.expect(!single.orders[0].descending);
+    const pair = .{ colA.desc(), colB.asc() };
+    const multi = base.orderBy(pair);
+    try std.testing.expectEqual(@as(usize, 2), multi.orderCount);
+    try std.testing.expectEqualStrings("a", multi.orders[0].column.name);
+    try std.testing.expect(multi.orders[0].descending);
+    try std.testing.expectEqualStrings("b", multi.orders[1].column.name);
+    try std.testing.expect(!multi.orders[1].descending);
+    const chained = base.orderBy(colA.asc()).orderBy(colB.desc());
+    try std.testing.expectEqual(@as(usize, 2), chained.orderCount);
+    try std.testing.expect(!chained.orders[0].descending);
+    try std.testing.expect(chained.orders[1].descending);
+    const compound = CompoundBuilder(void, void, false){ .allocator = std.testing.allocator, .connection = conn, .compoundExecuteFn = undefined };
+    const compoundOrdered = compound.orderBy(pair);
+    try std.testing.expectEqual(@as(usize, 2), compoundOrdered.orderCount);
+    try std.testing.expect(compoundOrdered.orders[0].descending);
+    try std.testing.expect(!compoundOrdered.orders[1].descending);
 }

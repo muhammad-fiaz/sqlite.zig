@@ -172,7 +172,9 @@ pub const Value = union(enum) {
     }
 
     /// Total order: NULL < numeric (int/real intermixed) < TEXT < BLOB.
-    /// Text honors `collation`; NaN sorts after non-NaN numerics.
+    /// Text honors `collation`; NaN sorts before non-NaN numerics
+    /// (NULL-like, matching `sqlite3IntFloatCompare` in `vdbeaux.c`: every
+    /// integer is greater than NaN).
     pub fn order(self: Value, other: Value, collation: Collation) std.math.Order {
         const ca = self.typeClass();
         const cb = other.typeClass();
@@ -257,6 +259,61 @@ test "sqlite values support full signed 64-bit integer range" {
     try std.testing.expectEqual(std.math.maxInt(i64), maxVal.integer);
     try std.testing.expect(minVal.compare(.less, maxVal, .binary));
     try std.testing.expect(!maxVal.compare(.less, minVal, .binary));
+}
+
+/// One deterministic PRNG draw over every `Value` class for the order
+/// property test below. `bytes` backs text/blob payloads (caller-owned
+/// stack storage is fine: values never escape the iteration).
+fn randomTestValue(rand: std.Random, bytes: []u8) Value {
+    return switch (rand.intRangeLessThan(u8, 0, 6)) {
+        0 => .null,
+        1 => .{ .integer = rand.int(i64) },
+        2 => .{ .real = @bitCast(rand.int(u64)) },
+        3 => .{ .text = bytes },
+        4 => .{ .blob = bytes },
+        else => .{ .integer = 0 },
+    };
+}
+
+test "value order is reflexive and antisymmetric over random values" {
+    // Deterministic seed: 2048 random pairs (full-range integers, full-bit
+    // reals including NaN/inf, random text/blob bytes) under every collation.
+    // NaN is included deliberately: total-order properties must hold for
+    // every pair however NaN is placed.
+    var prng = std.Random.DefaultPrng.init(0x9e3779b9);
+    const rand = prng.random();
+    const collations = [_]Collation{ .binary, .nocase, .rtrim };
+    // Directed: NULL < numeric < TEXT < BLOB across collations, plus the
+    // SQLite-consistent NaN placement (`sqlite3IntFloatCompare` in
+    // `vdbeaux.c` treats NaN as NULL-like: every integer exceeds NaN).
+    for (collations) |c| {
+        const nullVal: Value = .null;
+        const negOne: Value = .{ .integer = -1 };
+        const zero: Value = .{ .integer = 0 };
+        const emptyText: Value = .{ .text = "" };
+        const emptyBlob: Value = .{ .blob = "" };
+        try std.testing.expectEqual(std.math.Order.lt, nullVal.order(zero, c));
+        try std.testing.expectEqual(std.math.Order.lt, negOne.order(emptyText, c));
+        try std.testing.expectEqual(std.math.Order.lt, emptyText.order(emptyBlob, c));
+        const nan: Value = .{ .real = std.math.nan(f64) };
+        try std.testing.expectEqual(std.math.Order.gt, zero.order(nan, c));
+        try std.testing.expectEqual(std.math.Order.lt, nan.order(zero, c));
+        try std.testing.expectEqual(std.math.Order.eq, nan.order(nan, c));
+    }
+    var i: usize = 0;
+    while (i < 2048) : (i += 1) {
+        var abuf: [32]u8 = undefined;
+        var bbuf: [32]u8 = undefined;
+        rand.bytes(&abuf);
+        rand.bytes(&bbuf);
+        const a = randomTestValue(rand, abuf[0..rand.intRangeLessThan(usize, 0, 33)]);
+        const b = randomTestValue(rand, bbuf[0..rand.intRangeLessThan(usize, 0, 33)]);
+        for (collations) |c| {
+            try std.testing.expectEqual(std.math.Order.eq, a.order(a, c));
+            try std.testing.expectEqual(std.math.Order.eq, b.order(b, c));
+            try std.testing.expectEqual(a.order(b, c), b.order(a, c).invert());
+        }
+    }
 }
 
 test "sqlite total ordering puts nulls first then numeric then text then blob" {

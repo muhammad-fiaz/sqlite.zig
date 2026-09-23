@@ -99,6 +99,7 @@ test {
     _ = @import("sql/lexer.zig");
     _ = @import("sql/ast.zig");
     _ = @import("sql/parser.zig");
+    _ = @import("sql/parser/common.zig");
     _ = @import("sql/limits.zig");
     _ = @import("sql/coerce.zig");
     _ = @import("sql/expr.zig");
@@ -110,11 +111,15 @@ test {
     _ = @import("dsl/keys.zig");
     _ = @import("dsl/table.zig");
     _ = @import("dsl/query_builder.zig");
+    _ = @import("dsl/mutation.zig");
     _ = @import("dsl/ast_builder.zig");
     _ = @import("dsl/dynamic.zig");
     _ = @import("migration/migration.zig");
     _ = @import("migration/runner.zig");
     _ = @import("catalog/schema.zig");
+    _ = @import("catalog/strict.zig");
+    _ = @import("catalog/sequence.zig");
+    _ = @import("catalog/stats.zig");
     _ = @import("catalog/type_affinity.zig");
     _ = @import("btree/btree.zig");
     _ = @import("btree/cursor.zig");
@@ -127,6 +132,8 @@ test {
     _ = @import("txn/locking.zig");
     _ = @import("connection/pattern.zig");
     _ = @import("connection/compare.zig");
+    _ = @import("connection/fk_actions.zig");
+    _ = @import("connection/conflicts.zig");
     _ = @import("version.zig");
 }
 

@@ -33,6 +33,10 @@ differential harness against SQLite and no fault-injection runner;
    `generated`, `INSTEAD`, `DEFERR`.
 3. Mapped every hit to its owning Zig module and to a test location.
    Absence of hits is reported as `Not Implemented`.
+4. Applied the pipeline rule: a family counts as supported only when
+   lexer → parser → AST → resolver → planner → VM → storage/transaction
+   → result/error → tests all work. Parser-only acceptance never counts
+   as supported.
 
 ## Legend
 
@@ -59,7 +63,7 @@ differential harness against SQLite and no fault-injection runner;
 | 9 | Triggers (BEFORE/AFTER/INSTEAD OF INSERT/UPDATE/DELETE, WHEN, NEW/OLD) | `catalog/schema.zig` (`Trigger`), `connection/connection.zig` (`fireTriggers`, `fireViewTriggers`, `renderTriggerBody`, `runTriggerBody`) | `connection.zig` trigger + instead-of tests; `examples/23,57` | Partial | `TODO(trigger)`: recursion policy; `UPDATE..FROM` on views unsupported |
 | 10 | Views (CREATE VIEW, read path, updatable subset) | `catalog/schema.zig` (`View`), `connection/connection.zig` (`createViewCommand`) | `connection.zig` view tests; `examples/22` | Partial | `TODO(view)`: writable views limited to `viewTargetsSingleTable`; `TEMP` scoping |
 | 11 | Indexes (UNIQUE, partial, expression, EXPLAIN QUERY PLAN) | `catalog/schema.zig` (`Index`), `storage/sqlite_image.zig` (index root pages), `plan/planner.zig`, `connection/connection.zig` (`plannedIndices`) | source-local `plan` tests; `examples/21,33,68` | Covered | `TODO(index)`: covering-index fast path, multi-index AND/OR planning |
-| 12 | Foreign keys (CASCADE/SET NULL/SET DEFAULT/RESTRICT, composite, DEFERRABLE) | `catalog/schema.zig` (FK constraints, `fkCheckDeferred`), `connection/connection.zig` (`apply*Actions`, `pragmaForeignKey*`, `enforceDeferredForeignKeys`) | `connection.zig` FK + deferrable tests; `examples/26,28,31,62` | Covered | none: immediate, `INITIALLY DEFERRED/IMMEDIATE`, and `defer_foreign_keys` verified |
+| 12 | Foreign keys (CASCADE/SET NULL/SET DEFAULT/RESTRICT, composite, DEFERRABLE) | `catalog/schema.zig` (FK constraints, `fkCheckDeferred`), `connection/connection.zig` (`apply*Actions`, `pragmaForeignKey*`, `enforceDeferredForeignKeys`), `connection/fk_actions.zig` (ON UPDATE/ON DELETE actions, chained cascades, deferred COMMIT checks, `foreign_key_check` rows) | `connection.zig` + `fk_actions.zig` FK + deferrable tests; `examples/26,28,31,62,74` | Covered | none: immediate, `INITIALLY DEFERRED/IMMEDIATE`, and `defer_foreign_keys` verified |
 | 13 | Transactions and savepoints (BEGIN/COMMIT/ROLLBACK, SAVEPOINT) | `connection/connection.zig` (`begin*`, `savepoint*`, statement atomicity), `txn/transaction.zig`, `txn/locking.zig` | `connection.zig` txn tests; `examples/03` | Covered | `TODO(txn)`: cross-process lock coordination untested |
 | 14 | Pager / B-tree (page cache, balancing, cursors) | `storage/pager.zig`, `btree/btree.zig`, `btree/cursor.zig`, `btree/balance.zig`, `storage/file.zig` | source-local `btree`/`pager` tests; `examples/07,17` | Partial | `TODO(pager)`: in-memory first; cache-spill, overflow, freelist incomplete |
 | 15 | Journal / WAL (rollback journal header, WAL apply, checkpoint) | `storage/journal.zig` (header codec only), `storage/wal.zig`, `storage/file.zig` (`journalMode`, `checkpointWal`) | `journal.zig`/`wal.zig` unit tests; `examples/35` | Partial | `TODO(wal)`: no page-record journal writes yet; crash-recovery replay and cross-process locking untested |
@@ -67,10 +71,10 @@ differential harness against SQLite and no fault-injection runner;
 | 17 | File format (DB header, pages, image read/write) | `format/header.zig`, `format/page.zig`, `storage/image.zig`, `storage/sqlite_image.zig`, `storage/file.zig` | source-local `format` tests; `examples/07,08,17` | Partial | `TODO(filefmt)`: auto-vacuum pages, overflow chains, freelist trunks |
 | 18 | Varint / record encoding | `format/varint.zig`, `format/record.zig` | source-local `varint`/`record` tests | Covered | none: 9-byte extremes and short-buffer errors covered |
 | 19 | Type affinity and collations (NUMERIC/TEXT/BLOB, NOCASE/RTRIM) | `catalog/type_affinity.zig`, `vm/value.zig`, `connection/compare.zig` | `type_affinity` + `value` + `compare` tests; `examples/47,66` | Covered | One consolidated `COLLATE` sweep test covers every supported surface (`connection.zig` collate sweep) |
-| 20 | STRICT tables | `catalog/schema.zig` (`strict`, `coerceStrict`), `sql/coerce.zig` (`affinityNumeric`, `realAffinityInt`), `connection/connection.zig` (typed create paths) | `schema.zig` coercion tests; `connection.zig` strict tests; `examples/66` | Partial | `TODO(strict)`: VIRTUAL generated columns skip the check in the reference (`OP_TypeCheck`); affinity matrix itself verified |
+| 20 | STRICT tables | `catalog/schema.zig` (`strict`, `coerceStrict`), `catalog/strict.zig` (STRICT coercion module), `sql/coerce.zig` (`affinityNumeric`, `realAffinityInt`), `connection/connection.zig` (typed create paths) | `schema.zig` + `strict.zig` coercion tests; `connection.zig` strict tests; `examples/66` | Partial | `TODO(strict)`: VIRTUAL generated columns skip the check in the reference (`OP_TypeCheck`); affinity matrix itself verified |
 | 21 | WITHOUT ROWID tables | `catalog/schema.zig` (`withoutRowid`), `storage/sqlite_image.zig` (DDL round-trip), `plan/planner.zig` (PK lookup text) | `plan` PK text tests; `connection.zig` alias-error and composite probes; `examples/67` | Covered | none: PK routing, `rowid` alias errors, and single/composite/scan `EXPLAIN` text verified |
 | 22 | Generated columns (STORED recompute, VIRTUAL guards) | `catalog/schema.zig` (`generatedExpr`), `connection/connection.zig` (`recomputeGeneratedColumns`) | `connection.zig` generated tests; `examples/65` | Partial | `TODO(gencol)`: VIRTUAL-vs-STORED persistence parity |
-| 23 | UPSERT (`ON CONFLICT`) and `RETURNING` | `connection/connection.zig` (`applyUpsert`, `conflictRowTarget`, `checkConflictTarget`, `evaluateReturning`) | `connection.zig` tests incl. partial-index inference; `examples/38,39,40,41,55,56` | Covered | none: target inference, partial-index `WHERE` rule, and `excluded.*` corners verified |
+| 23 | UPSERT (`ON CONFLICT`) and `RETURNING` | `connection/connection.zig` (`applyUpsert`, `conflictRowTarget`, `checkConflictTarget`, `evaluateReturning`), `connection/conflicts.zig` (conflict-row scan, `ON CONFLICT(target)` validation) | `connection.zig` + `conflicts.zig` tests incl. partial-index inference; `examples/38,39,40,41,55,56` | Covered | none: target inference, partial-index `WHERE` rule, and `excluded.*` corners verified |
 | 24 | VACUUM (`VACUUM`, `VACUUM INTO`) | `connection/connection.zig` (`vacuumCommand`), `migration/runner.zig` (txn guard) | parser `VACUUM main INTO` tests; `VACUUM INTO` command tests | Partial | `TODO(vacuum)`: auto-vacuum stubs |
 | 25 | ANALYZE (schema statistics) | `connection/connection.zig` (`analyzeDatabase*`, `analyzeScope*`) | parser `ANALYZE [target]` tests; scope tests; planner stats tests | Partial | `TODO(analyze)`: histogram and multi-column stats not yet collected |
 | 26 | REINDEX (all target forms refresh statistics) | `connection/connection.zig` (`analyzeTarget`), `sql/parser.zig`, `sql/ast.zig` | parser + engine reindex tests in `connection.zig` | Covered | none: table/index/database/schema targets verified |
@@ -135,12 +139,67 @@ Coverage comes from source-local `test` blocks plus the `examples/`
 behavioural suite. Future fuzz work should start with varint/record
 property tests, then page-image hostile inputs.
 
+## Module layout (modularization status)
+
+`src/connection/connection.zig` (~16.3k lines incl. integration tests)
+exceeds the 2000-line module target. It is one coherent interpreter today;
+the planned split is `connection/` execution submodules (select/join, dml,
+ddl, pragma/attach, triggers/views) sharing one scope/expr core. Extracted
+so far, with no semantics change and no import cycles:
+
+- `connection/fk_actions.zig` — FK `ON UPDATE`/`ON DELETE` actions,
+  composite + column-level, chained cascades, two-pass delete RESTRICT,
+  deferred-FK COMMIT checks, `foreign_key_check` rows.
+- `connection/conflicts.zig` — conflict-row scan across PK/UNIQUE/table
+  constraints/UNIQUE expression+partial indexes, plus
+  `ON CONFLICT(target)` validation.
+- `catalog/{strict,sequence,stats}.zig` — STRICT coercion,
+  `sqlite_sequence`, `sqlite_stat1`; `schema.zig` is back under target
+  (~1900 lines) with thin `Schema` wrappers preserving the public API.
+- `dsl/mutation.zig` — `UpsertBuilder`, `Mutation`, shared
+  predicate/assignment/join-target helpers; `query_builder.zig` imports it
+  one-directionally.
+- `sql/parser/common.zig` — error set, limits, window-spec types, AST
+  copy/free helpers, named-window resolution, pure grammar classifiers.
+  The rest of `parser.zig` (~3.1k lines) is one mutually-recursive grammar
+  unit; its planned split is `{common,expression,select,ddl,dml,window}.zig`
+  behind the existing `Parser` API with no grammar behavior change.
+
+Known interpreter-only gaps (source-local TODOs, not parser gaps — every
+accepted statement executes): `vm/compiler.zig` lowers SELECT only
+(DML/DDL return `Unsupported` and run through the connection interpreter);
+`vm/vm.zig` has no automatic per-execution join indexes yet (table scans
+are the fallback).
+
+## Randomized testing
+
+Seeded, reproducible PRNG sweeps (no flaky CI) live with their modules:
+
+- `format/varint.zig`: 4096-value sweep (full-range u64, exact length
+  boundaries, saturating deltas, small values) asserting minimal re-encode
+  plus exact decode round-trip.
+- `btree/btree.zig`: 8192-op put/get/remove workload over a 64-key universe
+  (plus periodic u64 edge keys) against an independent hash-map reference;
+  page-framing tests assert exact pointer chaining and header agreement on
+  512/1024/4096-byte pages (verified by mutation: a 1-byte pointer shift
+  fails the suite).
+- `btree/cursor.zig`: forward/backward walks plus random
+  seekGE/seekLE/seekEQ probes over a randomized tree, checked against an
+  independently sorted presence set.
+- `format/record.zig`: 512 random 1..6-column rows across NULL/INTEGER
+  (full-range plus width boundaries), REAL (full bit patterns incl.
+  NaN/inf, compared bitwise), TEXT/BLOB (random bytes, lengths 0..64).
+- `vm/value.zig`: 2048 random value pairs under binary/nocase/rtrim
+  asserting `order` reflexivity and antisymmetry, plus directed
+  NULL < numeric < TEXT < BLOB and NaN placement checks.
+
 ## Test layers used above
 
 - Source-local: `test` blocks at the bottom of each `src/**/*.zig`
   module, run via `zig build test` through `src/sqlite.zig`.
-- Behavioural: `examples/01–70` (joins, CTEs, FK actions, window DSL,
-  strict/without-rowid, partial/expression indexes, pragma checks).
+- Behavioural: `examples/01-74` (joins, CTEs, FK actions, window DSL,
+  strict/without-rowid, partial/expression indexes, pragma checks,
+  scoped/dual-form DSL, relationships).
 - Interop: SQLite file-image round-trip (`storage/sqlite_image.zig`,
   `examples/07,08,17`).
 
@@ -158,6 +217,9 @@ modules and to tests that exercise it (`rg` keywords like `VACUUM`,
 `STRICT`, `SAVEPOINT`, `journal_mode`, `RETURNING`, `upsert`,
 `generated`, `INSTEAD`, `DEFERR` find both sides). Absence of an
 implementation is reported as `Not Implemented`.
+
+Gates: `zig fmt .`, `zig build`, `zig build test` (577 tests),
+`zig build check`, `zig build run-all-examples` (all 74 examples).
 
 ## Maintaining this matrix
 

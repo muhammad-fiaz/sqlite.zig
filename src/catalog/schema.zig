@@ -12,6 +12,9 @@ const ast = @import("../sql/ast.zig");
 const exprEvaluator = @import("../sql/expr.zig");
 const functions = @import("../sql/functions.zig");
 const coerce = @import("../sql/coerce.zig");
+const strictMod = @import("strict.zig");
+const sequenceMod = @import("sequence.zig");
+const statsMod = @import("stats.zig");
 
 /// Owned column descriptor. `name`/`typeName`/FK strings are schema-owned
 /// dupes; `defaultValue` owns its text/blob payload; `checkExpr`/
@@ -127,11 +130,8 @@ pub const Schema = struct {
     }
 
     fn freeValue(allocator: std.mem.Allocator, value: Value) void {
-        switch (value) {
-            .text => |v| allocator.free(v),
-            .blob => |v| allocator.free(v),
-            else => {},
-        }
+        // Canonical value free lives in sql/expr.zig; do not duplicate it here.
+        exprEvaluator.freeValue(allocator, value);
     }
     fn copyValue(self: *Schema, value: Value) !Value {
         return switch (value) {
@@ -416,71 +416,19 @@ pub const Schema = struct {
 
     /// True for the six STRICT table types (INT/INTEGER/REAL/TEXT/BLOB/ANY),
     /// case-insensitive. Borrowed input; never fails.
+    /// True for the five STRICT storage types plus ANY. Canonical
+    /// implementation lives in `strict.zig`; this wrapper preserves the
+    /// `Schema.` API for existing callers.
     pub fn isValidStrictType(typeName: []const u8) bool {
-        if (std.ascii.eqlIgnoreCase(typeName, "INT")) return true;
-        if (std.ascii.eqlIgnoreCase(typeName, "INTEGER")) return true;
-        if (std.ascii.eqlIgnoreCase(typeName, "REAL")) return true;
-        if (std.ascii.eqlIgnoreCase(typeName, "TEXT")) return true;
-        if (std.ascii.eqlIgnoreCase(typeName, "BLOB")) return true;
-        if (std.ascii.eqlIgnoreCase(typeName, "ANY")) return true;
-        return false;
+        return strictMod.isValidStrictType(typeName);
     }
 
-    /// Coerce a borrowed `Value` to a STRICT type, passing NULL through.
-    /// INT/INTEGER accept ints and integral reals; REAL widens ints; TEXT/BLOB
-    /// accept only their kind; ANY passes through. Fails `ConstraintViolation`.
-    /// STRICT single-value check with affinity conversion first, mirroring
-    /// the reference `OP_TypeCheck`: each type applies its affinity, then
-    /// the converted storage class must match. INTEGER affinity converts
-    /// well-formed text numerals and lossless reals; REAL keeps small
-    /// integers as integers (`IntReal`) and widens the rest past 2**47;
-    /// TEXT renders numbers but never blobs; BLOB converts nothing. Blobs
-    /// (not strings) skip numeric affinity entirely. NULL passes through
-    /// (`NOT NULL` rejects separately).
+    /// Coerce a borrowed `Value` to a STRICT type. Canonical implementation
+    /// lives in `strict.zig` (mirrors `OP_TypeCheck`); this wrapper preserves
+    /// the `Schema.` API. NULL passes through; failures are
+    /// `ConstraintViolation`; TEXT renders allocate and are caller-owned.
     pub fn coerceStrict(allocator: std.mem.Allocator, typeName: []const u8, value: Value) !Value {
-        if (value == .null) return .null;
-        if (std.ascii.eqlIgnoreCase(typeName, "INT") or std.ascii.eqlIgnoreCase(typeName, "INTEGER")) {
-            return switch (value) {
-                .integer => value,
-                .real => |r| if (coerce.realAffinityInt(r)) |i| .{ .integer = i } else error.ConstraintViolation,
-                .text => |t| switch (coerce.affinityNumeric(t) orelse return error.ConstraintViolation) {
-                    .int => |i| Value{ .integer = i },
-                    .real => |r| if (coerce.realAffinityInt(r)) |i| .{ .integer = i } else error.ConstraintViolation,
-                    .none => error.ConstraintViolation,
-                },
-                else => error.ConstraintViolation,
-            };
-        }
-        if (std.ascii.eqlIgnoreCase(typeName, "REAL")) {
-            return switch (value) {
-                .real => |r| if (coerce.realAffinityInt(r)) |i| .{ .integer = i } else value,
-                .integer => |i| if (i <= 140737488355327 and i >= -140737488355328) value else .{ .real = @floatFromInt(i) },
-                .text => |t| switch (coerce.affinityNumeric(t) orelse return error.ConstraintViolation) {
-                    .int => |i| if (i <= 140737488355327 and i >= -140737488355328) Value{ .integer = i } else .{ .real = @floatFromInt(i) },
-                    .real => |r| .{ .real = r },
-                    .none => error.ConstraintViolation,
-                },
-                else => error.ConstraintViolation,
-            };
-        }
-        if (std.ascii.eqlIgnoreCase(typeName, "TEXT")) {
-            return switch (value) {
-                .text => value,
-                .integer => |i| .{ .text = try std.fmt.allocPrint(allocator, "{d}", .{i}) },
-                .real => |r| .{ .text = try coerce.formatReal(allocator, r) },
-                else => error.ConstraintViolation,
-            };
-        }
-        if (std.ascii.eqlIgnoreCase(typeName, "BLOB")) {
-            return switch (value) {
-                .blob => value,
-                else => error.ConstraintViolation,
-            };
-        }
-        if (std.ascii.eqlIgnoreCase(typeName, "ANY")) {
-            return value;
-        }
-        return error.ConstraintViolation;
+        return strictMod.coerceStrict(allocator, typeName, value);
     }
 
     /// DDL flags for `createTableWithOptions`. WITHOUT ROWID requires a PK;
@@ -1379,7 +1327,10 @@ pub const Schema = struct {
         table.columns = newColumns;
     }
 
-    fn columnIndex(self: *const Schema, table: *const Table, name: []const u8) ?usize {
+    /// Position of `name` in `table.columns` (case-insensitive), or null.
+    /// Public so `stats.zig` and other catalog submodules reuse the one
+    /// canonical lookup instead of duplicating the scan.
+    pub fn columnIndex(self: *const Schema, table: *const Table, name: []const u8) ?usize {
         _ = self;
         for (table.columns, 0..) |column, index| if (std.ascii.eqlIgnoreCase(column.name, name)) return index;
         return null;
@@ -1669,233 +1620,58 @@ pub const Schema = struct {
         return self.find("sqlite_stat1");
     }
 
-    /// Ensure the `sqlite_stat1(tbl, idx, stat)` table exists with the exact
-    /// shape, creating it when absent. Returns a schema-owned borrow. Fails
-    /// `SchemaMismatch` on a wrong-shaped existing table.
+    /// Ensure the `sqlite_stat1(tbl, idx, stat)` table exists. Canonical
+    /// implementation lives in `stats.zig`; this wrapper preserves the
+    /// `Schema.` API for existing callers (connection, planner).
     pub fn ensureStatTable(self: *Schema) !*Table {
-        if (self.find("sqlite_stat1")) |existing| {
-            if (existing.columns.len != 3) return error.SchemaMismatch;
-            for (existing.columns, 0..) |column, index| {
-                const expected: []const u8 = if (index == 0) "tbl" else if (index == 1) "idx" else "stat";
-                if (!std.ascii.eqlIgnoreCase(column.name, expected)) return error.SchemaMismatch;
-            }
-            return existing;
-        }
-        const definitions = [_]ast.ColumnDef{
-            .{ .name = "tbl", .typeName = "TEXT" },
-            .{ .name = "idx", .typeName = "TEXT" },
-            .{ .name = "stat", .typeName = "TEXT" },
-        };
-        try self.createTable("sqlite_stat1", &definitions, &.{});
-        return self.find("sqlite_stat1").?;
+        return statsMod.ensureStatTable(self);
     }
 
-    /// Delete stat rows for a table (optionally one index). `null` table
-    /// clears all; `null` index with a table clears the table scope. No-op
-    /// when the stat table is absent. Never fails.
+    /// Delete stat rows for a table (optionally one index). Canonical
+    /// implementation lives in `stats.zig`; never fails.
     pub fn clearStatScope(self: *Schema, tableName: ?[]const u8, indexName: ?[]const u8) void {
-        const stat = self.find("sqlite_stat1") orelse return;
-        var position = stat.rows.items.len;
-        while (position > 0) {
-            position -= 1;
-            const row = stat.rows.items[position];
-            if (row.values.len != 3) continue;
-            if (tableName) |wanted| {
-                if (row.values[0] != .text or !std.ascii.eqlIgnoreCase(row.values[0].text, wanted)) continue;
-                if (indexName) |wantedIndex| {
-                    if (row.values[1] != .text or !std.ascii.eqlIgnoreCase(row.values[1].text, wantedIndex)) continue;
-                }
-            } else if (indexName != null) {
-                continue;
-            }
-            const removed = stat.rows.orderedRemove(position);
-            for (removed.values) |value| freeValue(self.allocator, value);
-            self.allocator.free(removed.values);
-        }
+        statsMod.clearStatScope(self, tableName, indexName);
     }
 
-    /// Table row count from the stat table (`tbl` row with NULL `idx`), or
-    /// null when absent/unparseable. Borrowed name; never fails.
+    /// Table row count from the stat table, or null when absent. Canonical
+    /// implementation lives in `stats.zig`; borrowed name, never fails.
     pub fn statRowCount(self: *const Schema, tableName: []const u8) ?usize {
-        const stat = self.findConst("sqlite_stat1") orelse return null;
-        var tableIdx: ?usize = null;
-        var idxIdx: ?usize = null;
-        var statIdx: ?usize = null;
-        for (stat.columns, 0..) |column, index| {
-            if (std.ascii.eqlIgnoreCase(column.name, "tbl")) tableIdx = index;
-            if (std.ascii.eqlIgnoreCase(column.name, "idx")) idxIdx = index;
-            if (std.ascii.eqlIgnoreCase(column.name, "stat")) statIdx = index;
-        }
-        const tIdx = tableIdx orelse return null;
-        const iIdx = idxIdx orelse return null;
-        const sIdx = statIdx orelse return null;
-        for (stat.rows.items) |row| {
-            if (row.values.len != stat.columns.len) continue;
-            if (row.values[tIdx] != .text) continue;
-            if (!std.ascii.eqlIgnoreCase(row.values[tIdx].text, tableName)) continue;
-            if (row.values[iIdx] != .null) continue;
-            if (row.values[sIdx] != .text) continue;
-            const count = std.fmt.parseInt(usize, std.mem.trim(u8, row.values[sIdx].text, " \t"), 10) catch continue;
-            return count;
-        }
-        return null;
+        return statsMod.statRowCount(self, tableName);
     }
 
-    /// Ensure the `sqlite_sequence(name, seq)` table exists. Idempotent.
+    /// Ensure the `sqlite_sequence(name, seq)` table exists. Canonical
+    /// implementation lives in `sequence.zig`; idempotent.
     pub fn ensureSequenceTable(self: *Schema) anyerror!void {
-        if (self.find("sqlite_sequence") != null) return;
-        const definitions = [_]ast.ColumnDef{
-            .{ .name = "name", .typeName = "TEXT" },
-            .{ .name = "seq", .typeName = "INTEGER" },
-        };
-        try self.createTable("sqlite_sequence", &definitions, &.{});
+        return sequenceMod.ensureSequenceTable(self);
     }
 
-    /// Current AUTOINCREMENT sequence for a table, or 0 when absent. Borrowed
-    /// name; never fails.
+    /// Current AUTOINCREMENT sequence for a table, or 0 when absent.
+    /// Canonical implementation lives in `sequence.zig`; never fails.
     pub fn sequenceValue(self: *const Schema, tableName: []const u8) i64 {
-        const sequence = self.findConst("sqlite_sequence") orelse return 0;
-        if (sequence.columns.len < 2) return 0;
-        for (sequence.rows.items) |row| {
-            if (row.values.len != sequence.columns.len) continue;
-            if (row.values[0] != .text) continue;
-            if (!std.ascii.eqlIgnoreCase(row.values[0].text, tableName)) continue;
-            if (row.values[1] == .integer) return row.values[1].integer;
-            return 0;
-        }
-        return 0;
+        return sequenceMod.sequenceValue(self, tableName);
     }
 
-    /// Set the AUTOINCREMENT sequence, creating the row when absent. Borrowed
-    /// name; dupes the name for new rows.
+    /// Set the AUTOINCREMENT sequence, creating the row when absent.
+    /// Canonical implementation lives in `sequence.zig`.
     pub fn setSequenceValue(self: *Schema, tableName: []const u8, next: i64) anyerror!void {
-        try self.ensureSequenceTable();
-        const sequence = self.find("sqlite_sequence").?;
-        for (sequence.rows.items) |*row| {
-            if (row.values.len != sequence.columns.len) continue;
-            if (row.values[0] != .text) continue;
-            if (!std.ascii.eqlIgnoreCase(row.values[0].text, tableName)) continue;
-            freeValue(self.allocator, row.values[1]);
-            row.values[1] = .{ .integer = next };
-            return;
-        }
-        const nameValue = Value{ .text = tableName };
-        const seqValue = Value{ .integer = next };
-        try self.appendRow(sequence, &.{ nameValue, seqValue });
+        return sequenceMod.setSequenceValue(self, tableName, next);
     }
 
     fn applyAutoincrement(self: *Schema, table: *const Table, values: []Value) anyerror!void {
-        var columnIdx: ?usize = null;
-        for (table.columns, 0..) |column, index| if (column.autoincrement) {
-            if (columnIdx != null) return error.InvalidSql;
-            columnIdx = index;
-        };
-        const alias = columnIdx orelse return;
-        switch (values[alias]) {
-            .null => {
-                var max = self.sequenceValue(table.name);
-                for (table.rows.items) |existing| {
-                    switch (existing.values[alias]) {
-                        .integer => |current| {
-                            if (current > max) max = current;
-                        },
-                        else => {},
-                    }
-                }
-                if (max == std.math.maxInt(i64)) return error.ConstraintViolation;
-                const next = max + 1;
-                try self.setSequenceValue(table.name, next);
-                values[alias] = .{ .integer = next };
-            },
-            .integer => |explicit| {
-                if (explicit > self.sequenceValue(table.name)) try self.setSequenceValue(table.name, explicit);
-            },
-            else => return error.ConstraintViolation,
-        }
+        // Canonical AUTOINCREMENT assignment lives in `sequence.zig`.
+        return sequenceMod.applyAutoincrement(self, table, values);
     }
 
-    fn statKeyValue(self: *const Schema, table: *const Table, index: *const Index, colNames: []const []const u8, position: usize, values: []const Value) !Value {
-        if (index.keyExpr(position)) |key| return exprEvaluator.eval(self.allocator, colNames, values, key);
-        const columnIdx = self.columnIndex(table, index.columns[position]) orelse return error.UnknownColumn;
-        return switch (values[columnIdx]) {
-            .text => |text| .{ .text = try self.allocator.dupe(u8, text) },
-            .blob => |blob| .{ .blob = try self.allocator.dupe(u8, blob) },
-            else => |value| value,
-        };
-    }
-
-    fn statPrefixDistinct(self: *const Schema, table: *const Table, index: *const Index, colNames: []const []const u8, rows: []const Row, prefixLen: usize) !usize {
-        var distinct: usize = 0;
-        for (rows, 0..) |row, rowIndex| {
-            var seen = false;
-            for (rows[0..rowIndex]) |other| {
-                var same = true;
-                for (0..prefixLen) |position| {
-                    const left = try self.statKeyValue(table, index, colNames, position, row.values);
-                    defer exprEvaluator.freeValue(self.allocator, left);
-                    const right = try self.statKeyValue(table, index, colNames, position, other.values);
-                    defer exprEvaluator.freeValue(self.allocator, right);
-                    if (left == .null or right == .null) {
-                        if (left != .null or right != .null) same = false;
-                        continue;
-                    }
-                    if (!valuesEqual(left, right)) same = false;
-                }
-                if (same) {
-                    seen = true;
-                    break;
-                }
-            }
-            if (!seen) distinct += 1;
-        }
-        return distinct;
-    }
-
-    /// Append a table row-count entry to `sqlite_stat1`. Borrowed table;
-    /// dupes names/payloads into the stat table.
+    /// Append a table row-count entry to `sqlite_stat1`. Canonical
+    /// implementation lives in `stats.zig`; borrowed table.
     pub fn collectTableStats(self: *Schema, table: *const Table) !void {
-        const stat = try self.ensureStatTable();
-        const countText = try std.fmt.allocPrint(self.allocator, "{d}", .{table.rows.items.len});
-        defer self.allocator.free(countText);
-        const row = [_]Value{ .{ .text = table.name }, .null, .{ .text = countText } };
-        try self.appendRow(stat, &row);
+        return statsMod.collectTableStats(self, table);
     }
 
-    /// Append an index selectivity entry (`count avg-per-prefix...`) for rows
-    /// matching the partial predicate. Borrowed inputs; transient evaluation
-    /// values freed internally.
+    /// Append an index selectivity entry for rows matching the partial
+    /// predicate. Canonical implementation lives in `stats.zig`.
     pub fn collectIndexStats(self: *Schema, table: *const Table, index: *const Index) !void {
-        const stat = try self.ensureStatTable();
-        var colNames = try self.allocator.alloc([]const u8, table.columns.len);
-        defer self.allocator.free(colNames);
-        for (table.columns, 0..) |col, idx| colNames[idx] = col.name;
-        var matched = std.ArrayList(Row).empty;
-        defer matched.deinit(self.allocator);
-        for (table.rows.items) |row| {
-            if (try self.indexPredicateHolds(table, index, row.values)) try matched.append(self.allocator, row);
-        }
-        var text = std.ArrayList(u8).empty;
-        defer text.deinit(self.allocator);
-        const countText = try std.fmt.allocPrint(self.allocator, "{d}", .{matched.items.len});
-        defer self.allocator.free(countText);
-        try text.appendSlice(self.allocator, countText);
-        for (0..index.columns.len) |prefixLen| {
-            const distinct = try self.statPrefixDistinct(table, index, colNames, matched.items, prefixLen + 1);
-            var average: usize = 0;
-            if (distinct != 0) average = (matched.items.len + distinct / 2) / distinct;
-            if (positionIsUnique(index, prefixLen)) average = 1;
-            const averageText = try std.fmt.allocPrint(self.allocator, " {d}", .{average});
-            defer self.allocator.free(averageText);
-            try text.appendSlice(self.allocator, averageText);
-        }
-        const statText = try text.toOwnedSlice(self.allocator);
-        defer self.allocator.free(statText);
-        const row = [_]Value{ .{ .text = table.name }, .{ .text = index.name }, .{ .text = statText } };
-        try self.appendRow(stat, &row);
-    }
-
-    fn positionIsUnique(index: *const Index, position: usize) bool {
-        return index.unique and position + 1 == index.columns.len;
+        return statsMod.collectIndexStats(self, table, index);
     }
 
     /// Deep copy: tables (descriptors + rows), non-auto indexes, views, and
@@ -1961,27 +1737,10 @@ pub const Schema = struct {
 
 /// Borrowed value equality: NULL==NULL, ints by value, reals numerically
 /// (int/real mix compares as floats), texts/blobs by bytes. Never fails.
+/// Canonical implementation lives in `stats.zig`; this wrapper preserves the
+/// existing `schema.valuesEqual` API for constraint checks.
 pub fn valuesEqual(left: Value, right: Value) bool {
-    return switch (left) {
-        .null => right == .null,
-        .integer => |value| switch (right) {
-            .integer => |other| value == other,
-            else => false,
-        },
-        .real => |value| switch (right) {
-            .real => |other| value == other,
-            .integer => |other| value == @as(f64, @floatFromInt(other)),
-            else => false,
-        },
-        .text => |value| switch (right) {
-            .text => |other| std.mem.eql(u8, value, other),
-            else => false,
-        },
-        .blob => |value| switch (right) {
-            .blob => |other| std.mem.eql(u8, value, other),
-            else => false,
-        },
-    };
+    return statsMod.valuesEqual(left, right);
 }
 
 fn indexValuesEqual(table: *const Table, left: []const Value, right: []const Value, columns: []const []const u8) bool {
@@ -2039,39 +1798,6 @@ test "schema enforces uniqueness strictness and renames" {
     try std.testing.expect(!valuesEqual(.null, .{ .integer = 1 }));
     try std.testing.expect(valuesEqual(.{ .real = 1.0 }, .{ .integer = 1 }));
     try std.testing.expect(!valuesEqual(.{ .text = "a" }, .{ .text = "b" }));
-}
-
-test "strict coercion applies affinity before the type check" {
-    const alloc = std.testing.allocator;
-    // Well-formed text numerals convert; junk stays TEXT and fails.
-    const fromText = try Schema.coerceStrict(alloc, "INT", .{ .text = "123" });
-    try std.testing.expectEqual(@as(i64, 123), fromText.integer);
-    try std.testing.expectError(error.ConstraintViolation, Schema.coerceStrict(alloc, "INT", .{ .text = "12x" }));
-    try std.testing.expectError(error.ConstraintViolation, Schema.coerceStrict(alloc, "INT", .{ .text = "1.5" }));
-    const floatText = try Schema.coerceStrict(alloc, "INT", .{ .text = "48.00" });
-    try std.testing.expectEqual(@as(i64, 48), floatText.integer);
-    const toReal = try Schema.coerceStrict(alloc, "REAL", .{ .text = "2.5" });
-    try std.testing.expectEqual(@as(f64, 2.5), toReal.real);
-    // Small integers stay integers in REAL columns (IntReal); large ones widen.
-    const intReal = try Schema.coerceStrict(alloc, "REAL", .{ .integer = 42 });
-    try std.testing.expectEqual(@as(i64, 42), intReal.integer);
-    const wide = try Schema.coerceStrict(alloc, "REAL", .{ .integer = std.math.maxInt(i64) });
-    try std.testing.expect(wide == .real);
-    // Lossless reals become integers; the rest (and huge magnitudes) fail
-    // for INT without trapping.
-    const lossless = try Schema.coerceStrict(alloc, "INT", .{ .real = 50.0 });
-    try std.testing.expectEqual(@as(i64, 50), lossless.integer);
-    try std.testing.expectError(error.ConstraintViolation, Schema.coerceStrict(alloc, "INT", .{ .real = 1e30 }));
-    try std.testing.expectError(error.ConstraintViolation, Schema.coerceStrict(alloc, "INT", .{ .real = 1.5 }));
-    // Numbers render to TEXT; blobs never convert.
-    const rendered = try Schema.coerceStrict(alloc, "TEXT", .{ .integer = 999 });
-    defer alloc.free(rendered.text);
-    try std.testing.expectEqualStrings("999", rendered.text);
-    try std.testing.expectError(error.ConstraintViolation, Schema.coerceStrict(alloc, "TEXT", .{ .blob = "x" }));
-    try std.testing.expectError(error.ConstraintViolation, Schema.coerceStrict(alloc, "BLOB", .{ .integer = 1 }));
-    try std.testing.expectError(error.ConstraintViolation, Schema.coerceStrict(alloc, "BLOB", .{ .text = "x" }));
-    const anyBlob = try Schema.coerceStrict(alloc, "ANY", .{ .blob = "x" });
-    try std.testing.expect(anyBlob == .blob);
 }
 
 test "addColumn stages fully before committing" {

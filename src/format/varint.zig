@@ -123,6 +123,35 @@ test "sqlite varint decoder rejects truncation without panic or overread" {
     try std.testing.expectEqual(@as(u64, 0x204081020408101), decoded.value);
 }
 
+test "sqlite varints random sweep round-trips with minimal lengths" {
+    // Deterministic seed: a reproducible 4096-value PRNG sweep (full-range,
+    // exact boundaries, boundary neighbors via saturating +-delta, and small
+    // values), not flaky CI. Every value must re-encode minimally and decode
+    // to itself at the reported length.
+    var prng = std.Random.DefaultPrng.init(0x1b3ad5e7);
+    const rand = prng.random();
+    const bounds = [_]u64{ 0x7f, 0x3fff, 0x1fffff, 0xfffffff, 0x7ffffffff, 0x3ffffffffff, 0x1ffffffffffff, 0xffffffffffffff, std.math.maxInt(u64) };
+    var i: usize = 0;
+    while (i < 4096) : (i += 1) {
+        const value = switch (i % 4) {
+            0 => rand.int(u64),
+            1 => bounds[rand.intRangeLessThan(usize, 0, bounds.len)],
+            2 => blk: {
+                const b = bounds[rand.intRangeLessThan(usize, 0, bounds.len)];
+                const delta = rand.intRangeLessThan(u64, 0, 129);
+                break :blk if (rand.boolean()) b +| delta else b -| delta;
+            },
+            else => rand.intRangeLessThan(u64, 0, 65536),
+        };
+        var buffer: [9]u8 = undefined;
+        const length = try encode(value, &buffer);
+        try std.testing.expectEqual(encodedLength(value), length);
+        const decoded = try decode(buffer[0..length]);
+        try std.testing.expectEqual(length, decoded.length);
+        try std.testing.expectEqual(value, decoded.value);
+    }
+}
+
 test "sqlite varint 9-byte extremes and short-buffer errors" {
     // Normal + boundary: largest 8-byte value vs smallest 9-byte value.
     var buf: [9]u8 = undefined;

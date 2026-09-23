@@ -6,6 +6,15 @@
 //! partial AST. Callers free the statement with `ast.deinit`, then the
 //! parser with `Parser.deinit`. Budgets from `limits.zig` fail `SqlTooBig`;
 //! nesting depth is capped so hostile input cannot overflow the stack.
+//!
+//! TODO (modularization, tracked in docs/api/compatibility.md): this file exceeds
+//! the 2000-line module target (~3.1k lines after extracting
+//! `sql/parser/common.zig`). The remaining grammar is one mutually-recursive
+//! unit (expressions <-> subqueries <-> SELECT), so further splits by family
+//! (`expression,select,ddl,dml,window`) need lazy cross-module recursion or
+//! stay whole; extract the next Parser-independent cluster (DDL column/type
+//! parsing) before attempting grammar-family modules. Grammar behavior must
+//! stay identical vs `sqlite/src/parse.y` plus `tokenize.c`.
 
 const std = @import("std");
 const Token = @import("token.zig").Token;
@@ -15,375 +24,14 @@ const limits = @import("limits.zig");
 const ast = @import("ast.zig");
 const Value = @import("../vm/value.zig").Value;
 
-fn freeParserExpr(allocator: std.mem.Allocator, expr: ast.Expr) void {
-    switch (expr) {
-        .function => |call| {
-            freeParserExpr(allocator, call.argument.*);
-            allocator.destroy(call.argument);
-            if (call.argument2) |argument| {
-                freeParserExpr(allocator, argument.*);
-                allocator.destroy(argument);
-            }
-            if (call.argument3) |argument| {
-                freeParserExpr(allocator, argument.*);
-                allocator.destroy(argument);
-            }
-            for (call.extraArgs) |argument| {
-                freeParserExpr(allocator, argument);
-            }
-            if (call.extraArgs.len != 0) allocator.free(call.extraArgs);
-            if (call.filter) |filter| {
-                freeParserExpr(allocator, filter.*);
-                allocator.destroy(filter);
-            }
-        },
-        .binary => |binary| {
-            freeParserExpr(allocator, binary.left.*);
-            freeParserExpr(allocator, binary.right.*);
-            allocator.destroy(binary.left);
-            allocator.destroy(binary.right);
-        },
-        .unary => |unary| {
-            freeParserExpr(allocator, unary.expr.*);
-            allocator.destroy(unary.expr);
-        },
-        .caseExpr => |caseBlock| {
-            if (caseBlock.base) |base| {
-                freeParserExpr(allocator, base.*);
-                allocator.destroy(base);
-            }
-            for (caseBlock.whens) |when| {
-                freeParserExpr(allocator, when.condition);
-                freeParserExpr(allocator, when.result);
-            }
-            allocator.free(caseBlock.whens);
-            if (caseBlock.otherwise) |otherwise| {
-                freeParserExpr(allocator, otherwise.*);
-                allocator.destroy(otherwise);
-            }
-        },
-        .patternMatch => |match| {
-            freeParserExpr(allocator, match.value.*);
-            allocator.destroy(match.value);
-            freeParserExpr(allocator, match.pattern.*);
-            allocator.destroy(match.pattern);
-            if (match.escape) |escape| {
-                freeParserExpr(allocator, escape.*);
-                allocator.destroy(escape);
-            }
-        },
-        .collate => |node| {
-            freeParserExpr(allocator, node.expr.*);
-            allocator.destroy(node.expr);
-        },
-        .inSubquery => |inSub| {
-            freeParserExpr(allocator, inSub.expr.*);
-            allocator.destroy(inSub.expr);
-        },
-        .inList => |inL| {
-            freeParserExpr(allocator, inL.expr.*);
-            allocator.destroy(inL.expr);
-            for (inL.list) |item| freeParserExpr(allocator, item);
-            if (inL.list.len != 0) allocator.free(inL.list);
-        },
-        .window => |w| {
-            if (w.argument) |arg| {
-                freeParserExpr(allocator, arg.*);
-                allocator.destroy(arg);
-            }
-            if (w.argument2) |arg| {
-                freeParserExpr(allocator, arg.*);
-                allocator.destroy(arg);
-            }
-            for (w.extraArgs) |arg| {
-                freeParserExpr(allocator, arg);
-            }
-            if (w.extraArgs.len != 0) allocator.free(w.extraArgs);
-            for (w.partitionBy) |item| freeParserExpr(allocator, item);
-            if (w.partitionBy.len != 0) allocator.free(w.partitionBy);
-            for (w.orderBy) |item| freeParserExpr(allocator, item.expr);
-            if (w.orderBy.len != 0) allocator.free(w.orderBy);
-            if (w.frame) |fr| {
-                if (fr.startOffset) |off| {
-                    freeParserExpr(allocator, off.*);
-                    allocator.destroy(off);
-                }
-                if (fr.endOffset) |off| {
-                    freeParserExpr(allocator, off.*);
-                    allocator.destroy(off);
-                }
-            }
-            if (w.filter) |filter| {
-                freeParserExpr(allocator, filter.*);
-                allocator.destroy(filter);
-            }
-        },
-        else => {},
-    }
-}
+const common = @import("parser/common.zig");
 
-/// Deep-copy one parser-arena expression (nodes via `create`, strings via
-/// `copy` so `Parser.deinit` still owns everything). Used to expand a named
-/// window spec into each `OVER` use; every use owns its copy, so later
-/// `freeParserExpr`/`ast.deinit` calls never double-free shared nodes.
-fn copyParserExpr(self: *Parser, expr: ast.Expr) std.mem.Allocator.Error!ast.Expr {
-    return switch (expr) {
-        .literal => |lit| .{ .literal = switch (lit) {
-            .text => |t| .{ .text = try self.copy(t) },
-            .blob => |b| blk: {
-                const owned = try self.allocator.alloc(u8, b.len);
-                errdefer self.allocator.free(owned);
-                @memcpy(owned, b);
-                try self.allocations.append(self.allocator, owned);
-                break :blk .{ .blob = owned };
-            },
-            else => lit,
-        } },
-        .identifier => |id| .{ .identifier = try self.copy(id) },
-        .parameter => |p| .{ .parameter = p },
-        .wildcard => .wildcard,
-        .function => |call| {
-            const argument = try self.allocator.create(ast.Expr);
-            errdefer self.allocator.destroy(argument);
-            argument.* = try copyParserExpr(self, call.argument.*);
-            errdefer freeParserExpr(self.allocator, argument.*);
-            var argument2: ?*const ast.Expr = null;
-            if (call.argument2) |a2| {
-                const node = try self.allocator.create(ast.Expr);
-                errdefer self.allocator.destroy(node);
-                node.* = try copyParserExpr(self, a2.*);
-                argument2 = node;
-            }
-            errdefer if (argument2) |n| {
-                freeParserExpr(self.allocator, n.*);
-                self.allocator.destroy(n);
-            };
-            var argument3: ?*const ast.Expr = null;
-            if (call.argument3) |a3| {
-                const node = try self.allocator.create(ast.Expr);
-                errdefer self.allocator.destroy(node);
-                node.* = try copyParserExpr(self, a3.*);
-                argument3 = node;
-            }
-            errdefer if (argument3) |n| {
-                freeParserExpr(self.allocator, n.*);
-                self.allocator.destroy(n);
-            };
-            var extraArgs: []ast.Expr = &.{};
-            if (call.extraArgs.len != 0) {
-                const list = try self.allocator.alloc(ast.Expr, call.extraArgs.len);
-                var count: usize = 0;
-                errdefer {
-                    for (list[0..count]) |item| freeParserExpr(self.allocator, item);
-                    self.allocator.free(list);
-                }
-                for (call.extraArgs, 0..) |item, idx| {
-                    list[idx] = try copyParserExpr(self, item);
-                    count += 1;
-                }
-                extraArgs = list;
-            }
-            const filter = try copyOptionalParserExpr(self, call.filter);
-            errdefer if (filter) |n| {
-                freeParserExpr(self.allocator, n.*);
-                self.allocator.destroy(n);
-            };
-            return .{ .function = .{ .name = try self.copy(call.name), .argument = argument, .argument2 = argument2, .argument3 = argument3, .extraArgs = extraArgs, .distinct = call.distinct, .filter = filter } };
-        },
-        .binary => |bin| {
-            const left = try self.allocator.create(ast.Expr);
-            errdefer self.allocator.destroy(left);
-            left.* = try copyParserExpr(self, bin.left.*);
-            errdefer freeParserExpr(self.allocator, left.*);
-            const right = try self.allocator.create(ast.Expr);
-            errdefer self.allocator.destroy(right);
-            right.* = try copyParserExpr(self, bin.right.*);
-            return .{ .binary = .{ .op = bin.op, .left = left, .right = right } };
-        },
-        .unary => |un| {
-            const inner = try self.allocator.create(ast.Expr);
-            errdefer self.allocator.destroy(inner);
-            inner.* = try copyParserExpr(self, un.expr.*);
-            return .{ .unary = .{ .op = un.op, .expr = inner } };
-        },
-        .caseExpr => |caseBlock| {
-            var base: ?*const ast.Expr = null;
-            if (caseBlock.base) |b| {
-                const node = try self.allocator.create(ast.Expr);
-                errdefer self.allocator.destroy(node);
-                node.* = try copyParserExpr(self, b.*);
-                base = node;
-            }
-            errdefer if (base) |n| {
-                freeParserExpr(self.allocator, n.*);
-                self.allocator.destroy(n);
-            };
-            var whens: []ast.CaseWhen = &.{};
-            if (caseBlock.whens.len != 0) {
-                const list = try self.allocator.alloc(ast.CaseWhen, caseBlock.whens.len);
-                var count: usize = 0;
-                errdefer {
-                    for (list[0..count]) |item| {
-                        freeParserExpr(self.allocator, item.condition);
-                        freeParserExpr(self.allocator, item.result);
-                    }
-                    self.allocator.free(list);
-                }
-                for (caseBlock.whens, 0..) |item, idx| {
-                    list[idx] = .{ .condition = try copyParserExpr(self, item.condition), .result = try copyParserExpr(self, item.result) };
-                    count += 1;
-                }
-                whens = list;
-            }
-            const otherwise = try copyOptionalParserExpr(self, caseBlock.otherwise);
-            return .{ .caseExpr = .{ .base = base, .whens = whens, .otherwise = otherwise } };
-        },
-        .patternMatch => |match| {
-            const value = try self.allocator.create(ast.Expr);
-            errdefer self.allocator.destroy(value);
-            value.* = try copyParserExpr(self, match.value.*);
-            errdefer freeParserExpr(self.allocator, value.*);
-            const pattern = try self.allocator.create(ast.Expr);
-            errdefer self.allocator.destroy(pattern);
-            pattern.* = try copyParserExpr(self, match.pattern.*);
-            const escape = try copyOptionalParserExpr(self, match.escape);
-            return .{ .patternMatch = .{ .value = value, .pattern = pattern, .escape = escape, .negated = match.negated, .glob = match.glob, .isRegexp = match.isRegexp, .isMatch = match.isMatch } };
-        },
-        .collate => |node| {
-            const inner = try self.allocator.create(ast.Expr);
-            errdefer self.allocator.destroy(inner);
-            inner.* = try copyParserExpr(self, node.expr.*);
-            return .{ .collate = .{ .expr = inner, .name = try self.copy(node.name) } };
-        },
-        .scalarSubquery => |sub| .{ .scalarSubquery = try self.copy(sub) },
-        .existsSubquery => |sub| .{ .existsSubquery = try self.copy(sub) },
-        .inSubquery => |inSub| {
-            const target = try self.allocator.create(ast.Expr);
-            errdefer self.allocator.destroy(target);
-            target.* = try copyParserExpr(self, inSub.expr.*);
-            return .{ .inSubquery = .{ .expr = target, .subquery = try self.copy(inSub.subquery), .negated = inSub.negated } };
-        },
-        .inList => |inL| {
-            const target = try self.allocator.create(ast.Expr);
-            errdefer self.allocator.destroy(target);
-            target.* = try copyParserExpr(self, inL.expr.*);
-            errdefer freeParserExpr(self.allocator, target.*);
-            var list: []ast.Expr = &.{};
-            if (inL.list.len != 0) {
-                const owned = try self.allocator.alloc(ast.Expr, inL.list.len);
-                var count: usize = 0;
-                errdefer {
-                    for (owned[0..count]) |item| freeParserExpr(self.allocator, item);
-                    self.allocator.free(owned);
-                }
-                for (inL.list, 0..) |item, idx| {
-                    owned[idx] = try copyParserExpr(self, item);
-                    count += 1;
-                }
-                list = owned;
-            }
-            return .{ .inList = .{ .expr = target, .list = list, .negated = inL.negated } };
-        },
-        .window => |w| {
-            const argument = try copyOptionalParserExpr(self, w.argument);
-            errdefer if (argument) |n| {
-                freeParserExpr(self.allocator, n.*);
-                self.allocator.destroy(n);
-            };
-            const argument2 = try copyOptionalParserExpr(self, w.argument2);
-            errdefer if (argument2) |n| {
-                freeParserExpr(self.allocator, n.*);
-                self.allocator.destroy(n);
-            };
-            var extraArgs: []ast.Expr = &.{};
-            if (w.extraArgs.len != 0) {
-                const list = try self.allocator.alloc(ast.Expr, w.extraArgs.len);
-                var count: usize = 0;
-                errdefer {
-                    for (list[0..count]) |item| freeParserExpr(self.allocator, item);
-                    self.allocator.free(list);
-                }
-                for (w.extraArgs, 0..) |item, idx| {
-                    list[idx] = try copyParserExpr(self, item);
-                    count += 1;
-                }
-                extraArgs = list;
-            }
-            var parts: []ast.Expr = &.{};
-            if (w.partitionBy.len != 0) {
-                const list = try self.allocator.alloc(ast.Expr, w.partitionBy.len);
-                var count: usize = 0;
-                errdefer {
-                    for (list[0..count]) |item| freeParserExpr(self.allocator, item);
-                    self.allocator.free(list);
-                }
-                for (w.partitionBy, 0..) |item, idx| {
-                    list[idx] = try copyParserExpr(self, item);
-                    count += 1;
-                }
-                parts = list;
-            }
-            var orders: []ast.OrderItem = &.{};
-            if (w.orderBy.len != 0) {
-                const list = try self.allocator.alloc(ast.OrderItem, w.orderBy.len);
-                var count: usize = 0;
-                errdefer {
-                    for (list[0..count]) |item| freeParserExpr(self.allocator, item.expr);
-                    self.allocator.free(list);
-                }
-                for (w.orderBy, 0..) |item, idx| {
-                    list[idx] = .{ .expr = try copyParserExpr(self, item.expr), .descending = item.descending, .nullsFirst = item.nullsFirst };
-                    count += 1;
-                }
-                orders = list;
-            }
-            const frame = try copyParserFrame(self, w.frame);
-            errdefer if (frame) |fr| freeParserFrame(self, fr);
-            const filter = try copyOptionalParserExpr(self, w.filter);
-            const base = if (w.base) |b| try self.copy(b) else null;
-            return .{ .window = .{ .funcName = try self.copy(w.funcName), .argument = argument, .argument2 = argument2, .extraArgs = extraArgs, .partitionBy = parts, .orderBy = orders, .frame = frame, .filter = filter, .distinct = w.distinct, .base = base } };
-        },
-    };
-}
-
-/// Copy one optional heap expression node for `copyParserExpr`.
-fn copyOptionalParserExpr(self: *Parser, node: ?*const ast.Expr) std.mem.Allocator.Error!?*const ast.Expr {
-    const src = node orelse return null;
-    const owned = try self.allocator.create(ast.Expr);
-    errdefer self.allocator.destroy(owned);
-    owned.* = try copyParserExpr(self, src.*);
-    return owned;
-}
-
-/// Deep-copy a window frame (offset expressions included) for named-window expansion.
-fn copyParserFrame(self: *Parser, frame: ?ast.WindowFrame) std.mem.Allocator.Error!?ast.WindowFrame {
-    var fr = frame orelse return null;
-    fr.startOffset = try copyOptionalParserExpr(self, fr.startOffset);
-    errdefer if (fr.startOffset) |n| {
-        freeParserExpr(self.allocator, n.*);
-        self.allocator.destroy(n);
-    };
-    fr.endOffset = try copyOptionalParserExpr(self, fr.endOffset);
-    return fr;
-}
-
-/// Free one parser-arena window frame's offset structure (strings stay arena-owned).
-fn freeParserFrame(self: *Parser, frame: ast.WindowFrame) void {
-    if (frame.startOffset) |off| {
-        freeParserExpr(self.allocator, off.*);
-        self.allocator.destroy(off);
-    }
-    if (frame.endOffset) |off| {
-        freeParserExpr(self.allocator, off.*);
-        self.allocator.destroy(off);
-    }
-}
-
-/// Parser failure modes: grammar errors plus unioned lexer/allocator errors.
-pub const Error = error{ InvalidSql, UnexpectedToken, OutOfMemory, Unsupported, TooDeep } || std.mem.Allocator.Error || lexer.Error || std.fmt.ParseIntError || std.fmt.ParseFloatError;
-
-/// Maximum nesting depth for expressions/subqueries; hostile input fails closed.
-pub const max_parse_depth: usize = 200;
+pub const Error = common.Error;
+pub const max_parse_depth = common.max_parse_depth;
+const WindowSpec = common.WindowSpec;
+const NamedWindowDef = common.NamedWindowDef;
+const DeferralClause = common.DeferralClause;
+const BoundResult = common.BoundResult;
 
 /// Single-statement recursive-descent parser over a token slice.
 pub const Parser = struct {
@@ -454,154 +102,6 @@ pub const Parser = struct {
         return self.advance().text;
     }
 
-    /// Aggregate/window names that may carry OVER or DISTINCT; delegates to
-    /// the single function registry so parser, evaluator, and DSL cannot drift.
-    fn isAggregateName(name: []const u8) bool {
-        const functions = @import("functions.zig");
-        if (functions.aggregate.AggKind.fromName(name) != null) return true;
-        return std.ascii.eqlIgnoreCase(name, "min") or std.ascii.eqlIgnoreCase(name, "max");
-    }
-
-    /// Window-only function names (rank, lag, ...); with `isAggregateName`
-    /// this covers every name that may carry OVER.
-    fn isWindowOnlyName(name: []const u8) bool {
-        return @import("functions.zig").isWindowOnly(name);
-    }
-
-    /// Free one parsed window spec's node structure (strings stay arena-owned).
-    fn freeWindowSpec(self: *Parser, spec: WindowSpec) void {
-        for (spec.partitionBy) |item| freeParserExpr(self.allocator, item);
-        if (spec.partitionBy.len != 0) self.allocator.free(spec.partitionBy);
-        for (spec.orderBy) |item| freeParserExpr(self.allocator, item.expr);
-        if (spec.orderBy.len != 0) self.allocator.free(spec.orderBy);
-        if (spec.frame) |fr| freeParserFrame(self, fr);
-    }
-
-    /// One `WINDOW name AS (spec)` definition pending resolution.
-    const NamedWindowDef = struct { name: []const u8, spec: WindowSpec };
-
-    /// Find a WINDOW-clause definition by name (case-insensitive).
-    fn findNamedWindow(defs: []const NamedWindowDef, name: []const u8) ?WindowSpec {
-        for (defs) |def| if (std.ascii.eqlIgnoreCase(def.name, name)) return def.spec;
-        return null;
-    }
-
-    /// Merge an OVER overlay onto a named base spec. Overlay slices are
-    /// adopted (caller surrenders them); base parts are deep-copied so the
-    /// stored definition stays intact for other uses. An overlay PARTITION
-    /// is always InvalidSql; overlay ORDER BY or frame is InvalidSql when
-    /// the base already sets the same clause, matching the reference
-    /// ("cannot override ... of window").
-    fn resolveWindowBase(self: *Parser, overlay: WindowSpec, base: WindowSpec) !WindowSpec {
-        if (overlay.partitionBy.len != 0) return Error.InvalidSql;
-        if (overlay.orderBy.len != 0 and base.orderBy.len != 0) return Error.InvalidSql;
-        if (overlay.frame != null and base.frame != null) return Error.InvalidSql;
-        var baseParts: []ast.Expr = &.{};
-        var baseOrders: []ast.OrderItem = &.{};
-        var baseFrame: ?ast.WindowFrame = null;
-        errdefer self.freeWindowSpec(.{ .partitionBy = baseParts, .orderBy = baseOrders, .frame = baseFrame });
-        if (overlay.partitionBy.len == 0 and base.partitionBy.len != 0) {
-            const list = try self.allocator.alloc(ast.Expr, base.partitionBy.len);
-            var count: usize = 0;
-            errdefer {
-                for (list[0..count]) |item| freeParserExpr(self.allocator, item);
-                self.allocator.free(list);
-            }
-            for (base.partitionBy, 0..) |item, idx| {
-                list[idx] = try copyParserExpr(self, item);
-                count += 1;
-            }
-            baseParts = list;
-        }
-        if (overlay.orderBy.len == 0 and base.orderBy.len != 0) {
-            const list = try self.allocator.alloc(ast.OrderItem, base.orderBy.len);
-            var count: usize = 0;
-            errdefer {
-                for (list[0..count]) |item| freeParserExpr(self.allocator, item.expr);
-                self.allocator.free(list);
-            }
-            for (base.orderBy, 0..) |item, idx| {
-                list[idx] = .{ .expr = try copyParserExpr(self, item.expr), .descending = item.descending, .nullsFirst = item.nullsFirst };
-                count += 1;
-            }
-            baseOrders = list;
-        }
-        if (overlay.frame == null) baseFrame = try copyParserFrame(self, base.frame);
-        return .{
-            .partitionBy = if (overlay.partitionBy.len != 0) overlay.partitionBy else baseParts,
-            .orderBy = if (overlay.orderBy.len != 0) overlay.orderBy else baseOrders,
-            .frame = overlay.frame orelse baseFrame,
-        };
-    }
-
-    /// Resolve every `OVER name` use inside one expression against the
-    /// SELECT's WINDOW clause. The parser owns the whole tree, so mutation
-    /// through const children is sound (single owner, pre-publication).
-    fn resolveWindowRefs(self: *Parser, expr: *ast.Expr, defs: []const NamedWindowDef) !void {
-        switch (expr.*) {
-            .function => |*call| {
-                try self.resolveWindowRefs(@constCast(call.argument), defs);
-                if (call.argument2) |a2| try self.resolveWindowRefs(@constCast(a2), defs);
-                if (call.argument3) |a3| try self.resolveWindowRefs(@constCast(a3), defs);
-                for (0..call.extraArgs.len) |idx| try self.resolveWindowRefs(@constCast(&call.extraArgs[idx]), defs);
-                if (call.filter) |f| try self.resolveWindowRefs(@constCast(f), defs);
-            },
-            .binary => |*bin| {
-                try self.resolveWindowRefs(@constCast(bin.left), defs);
-                try self.resolveWindowRefs(@constCast(bin.right), defs);
-            },
-            .unary => |*un| try self.resolveWindowRefs(@constCast(un.expr), defs),
-            .caseExpr => |*caseBlock| {
-                if (caseBlock.base) |b| try self.resolveWindowRefs(@constCast(b), defs);
-                for (caseBlock.whens) |*item| {
-                    try self.resolveWindowRefs(&item.condition, defs);
-                    try self.resolveWindowRefs(&item.result, defs);
-                }
-                if (caseBlock.otherwise) |o| try self.resolveWindowRefs(@constCast(o), defs);
-            },
-            .patternMatch => |*match| {
-                try self.resolveWindowRefs(@constCast(match.value), defs);
-                try self.resolveWindowRefs(@constCast(match.pattern), defs);
-                if (match.escape) |e| try self.resolveWindowRefs(@constCast(e), defs);
-            },
-            .collate => |*node| try self.resolveWindowRefs(@constCast(node.expr), defs),
-            .inSubquery => |*inSub| try self.resolveWindowRefs(@constCast(inSub.expr), defs),
-            .inList => |*inL| {
-                try self.resolveWindowRefs(@constCast(inL.expr), defs);
-                for (0..inL.list.len) |idx| try self.resolveWindowRefs(@constCast(&inL.list[idx]), defs);
-            },
-            .window => |*w| {
-                if (w.argument) |a| try self.resolveWindowRefs(@constCast(a), defs);
-                if (w.argument2) |a2| try self.resolveWindowRefs(@constCast(a2), defs);
-                for (0..w.extraArgs.len) |idx| try self.resolveWindowRefs(@constCast(&w.extraArgs[idx]), defs);
-                for (0..w.partitionBy.len) |idx| try self.resolveWindowRefs(@constCast(&w.partitionBy[idx]), defs);
-                for (0..w.orderBy.len) |idx| try self.resolveWindowRefs(@constCast(&w.orderBy[idx].expr), defs);
-                if (w.filter) |f| try self.resolveWindowRefs(@constCast(f), defs);
-                const baseName = w.base orelse return;
-                const base = findNamedWindow(defs, baseName) orelse return Error.InvalidSql;
-                const overlay = WindowSpec{ .partitionBy = w.partitionBy, .orderBy = w.orderBy, .frame = w.frame };
-                const merged = try self.resolveWindowBase(overlay, base);
-                w.partitionBy = merged.partitionBy;
-                w.orderBy = merged.orderBy;
-                w.frame = merged.frame;
-                w.base = null;
-            },
-            else => {},
-        }
-    }
-
-    /// Resolve named-window uses inside a WHERE condition list.
-    fn resolveWindowRefsInConditions(self: *Parser, conditions: []const ast.Condition, defs: []const NamedWindowDef) !void {
-        for (0..conditions.len) |idx| {
-            const mutable: *ast.Condition = @constCast(&conditions[idx]);
-            if (mutable.leftExpr) |*left| try self.resolveWindowRefs(left, defs);
-            try self.resolveWindowRefs(&mutable.value, defs);
-            if (mutable.value2) |*second| try self.resolveWindowRefs(second, defs);
-            if (mutable.escape) |*escape| try self.resolveWindowRefs(escape, defs);
-            for (0..mutable.listValues.len) |itemIdx| try self.resolveWindowRefs(@constCast(&mutable.listValues[itemIdx]), defs);
-        }
-    }
-
     fn qualifiedName(self: *Parser) !struct { table: []const u8, column: []const u8 } {
         const first = try self.word();
         if (!self.acceptTag(.dot)) return .{ .table = "", .column = first };
@@ -621,7 +121,10 @@ pub const Parser = struct {
         defer self.allocator.free(combined);
         return self.copy(combined);
     }
-    fn copy(self: *Parser, bytes: []const u8) ![]const u8 {
+    /// Retain a string copy owned until `deinit`. Public so the shared
+    /// parser support in `parser/common.zig` (AST copies, window-spec
+    /// merges) retains through the same allocation list.
+    pub fn copy(self: *Parser, bytes: []const u8) ![]const u8 {
         const result = try self.allocator.dupe(u8, bytes);
         try self.allocations.append(self.allocator, result);
         return result;
@@ -650,14 +153,6 @@ pub const Parser = struct {
         const combined = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ sign, text });
         defer self.allocator.free(combined);
         return self.copy(combined);
-    }
-
-    fn asParserError(err: anyerror) Error {
-        return switch (err) {
-            error.OutOfMemory => error.OutOfMemory,
-            error.UnexpectedToken => Error.UnexpectedToken,
-            else => Error.InvalidSql,
-        };
     }
 
     /// Parse exactly one statement plus optional `;`; reject trailing tokens.
@@ -835,15 +330,11 @@ pub const Parser = struct {
         return .{ .withSelect = .{ .ctes = try ctes.toOwnedSlice(self.allocator), .bodySql = try self.copy(self.source[bodyStart..bodyEnd]), .recursive = recursive } };
     }
 
-    fn isTypeNameStop(text: []const u8) bool {
-        return std.ascii.eqlIgnoreCase(text, "primary") or std.ascii.eqlIgnoreCase(text, "foreign") or std.ascii.eqlIgnoreCase(text, "not") or std.ascii.eqlIgnoreCase(text, "unique") or std.ascii.eqlIgnoreCase(text, "autoincrement") or std.ascii.eqlIgnoreCase(text, "check") or std.ascii.eqlIgnoreCase(text, "default") or std.ascii.eqlIgnoreCase(text, "generated") or std.ascii.eqlIgnoreCase(text, "as") or std.ascii.eqlIgnoreCase(text, "references") or std.ascii.eqlIgnoreCase(text, "collate") or std.ascii.eqlIgnoreCase(text, "constraint");
-    }
-
     fn parseColumnTypeName(self: *Parser) ![]const u8 {
-        if (self.current().tag != .word or isTypeNameStop(self.current().text)) return "";
+        if (self.current().tag != .word or common.isTypeNameStop(self.current().text)) return "";
         var parts = std.ArrayList([]const u8).empty;
         defer parts.deinit(self.allocator);
-        while (self.current().tag == .word and !isTypeNameStop(self.current().text)) {
+        while (self.current().tag == .word and !common.isTypeNameStop(self.current().text)) {
             try parts.append(self.allocator, try self.word());
         }
         if (parts.items.len == 1 and self.current().tag != .lparen) return parts.items[0];
@@ -876,12 +367,6 @@ pub const Parser = struct {
         return self.copy(names);
     }
 
-    /// Parses `[NOT] DEFERRABLE [INITIALLY DEFERRED|IMMEDIATE]` after a
-    /// REFERENCES clause. Bare `DEFERRABLE` means initially deferred;
-    /// `NOT DEFERRABLE INITIALLY DEFERRED` and a lone `INITIALLY` fail.
-    /// Peeks before consuming: a bare `NOT` may start a following column
-    /// constraint (`REFERENCES t(c) NOT NULL`), which is left untouched.
-    const DeferralClause = struct { deferrable: bool = false, initiallyDeferred: bool = false };
     fn parseDeferralClause(self: *Parser) !DeferralClause {
         const first = self.current();
         if (first.tag != .word or first.quoted) return .{};
@@ -1063,7 +548,7 @@ pub const Parser = struct {
                     self.allocator.free(foreignKey.columns);
                     self.allocator.free(foreignKey.referencedColumns);
                 },
-                .check => |chk| freeParserExpr(self.allocator, chk),
+                .check => |chk| common.freeParserExpr(self.allocator, chk),
             };
             constraints.deinit(self.allocator);
         }
@@ -1171,7 +656,7 @@ pub const Parser = struct {
         errdefer columns.deinit(self.allocator);
         var keyExprs = std.ArrayList(?ast.Expr).empty;
         errdefer {
-            for (keyExprs.items) |maybeKey| if (maybeKey) |key| freeParserExpr(self.allocator, key);
+            for (keyExprs.items) |maybeKey| if (maybeKey) |key| common.freeParserExpr(self.allocator, key);
             keyExprs.deinit(self.allocator);
         }
         while (true) {
@@ -1181,7 +666,7 @@ pub const Parser = struct {
             } else {
                 const start = self.current().position;
                 try keyExprs.append(self.allocator, try self.parseExpr());
-                errdefer if (keyExprs.pop()) |maybeKey| if (maybeKey) |key| freeParserExpr(self.allocator, key);
+                errdefer if (keyExprs.pop()) |maybeKey| if (maybeKey) |key| common.freeParserExpr(self.allocator, key);
                 try columns.append(self.allocator, try self.copy(self.source[start..self.current().position]));
             }
             if (!self.acceptTag(.comma)) break;
@@ -1278,11 +763,6 @@ pub const Parser = struct {
         return Error.UnexpectedToken;
     }
 
-    const BoundResult = struct {
-        bound: ast.WindowFrameBound,
-        offset: ?*const ast.Expr = null,
-    };
-
     fn parseWindowBound(self: *Parser) !BoundResult {
         if (self.acceptWord("unbounded")) {
             if (self.acceptWord("preceding")) return .{ .bound = .unboundedPreceding };
@@ -1299,7 +779,7 @@ pub const Parser = struct {
         const node = try self.allocator.create(ast.Expr);
         errdefer self.allocator.destroy(node);
         node.* = try self.parseExpr();
-        errdefer freeParserExpr(self.allocator, node.*);
+        errdefer common.freeParserExpr(self.allocator, node.*);
         if (self.acceptWord("preceding")) return .{ .bound = .preceding, .offset = node };
         if (self.acceptWord("following")) return .{ .bound = .following, .offset = node };
         return Error.UnexpectedToken;
@@ -1354,15 +834,10 @@ pub const Parser = struct {
         const node = try self.allocator.create(ast.Expr);
         errdefer self.allocator.destroy(node);
         node.* = try self.parseExpr();
-        errdefer freeParserExpr(self.allocator, node.*);
+        errdefer common.freeParserExpr(self.allocator, node.*);
         try self.requireTag(.rparen);
         return node;
     }
-
-    /// Window spec with an optional base-window name (`OVER w` keeps the
-    /// name; `OVER (w ...)` merges the overlay onto the named base).
-    /// Returned slices are parser-owned; resolution copies them per use.
-    const WindowSpec = struct { base: ?[]const u8 = null, partitionBy: []const ast.Expr = &.{}, orderBy: []const ast.OrderItem = &.{}, frame: ?ast.WindowFrame = null };
 
     fn parseWindowSpec(self: *Parser) !WindowSpec {
         try self.requireTag(.lparen);
@@ -1378,7 +853,7 @@ pub const Parser = struct {
         }
         var partitionBy = std.ArrayList(ast.Expr).empty;
         errdefer {
-            for (partitionBy.items) |item| freeParserExpr(self.allocator, item);
+            for (partitionBy.items) |item| common.freeParserExpr(self.allocator, item);
             partitionBy.deinit(self.allocator);
         }
         if (self.acceptWord("partition")) {
@@ -1390,7 +865,7 @@ pub const Parser = struct {
         }
         var orderBy = std.ArrayList(ast.OrderItem).empty;
         errdefer {
-            for (orderBy.items) |item| freeParserExpr(self.allocator, item.expr);
+            for (orderBy.items) |item| common.freeParserExpr(self.allocator, item.expr);
             orderBy.deinit(self.allocator);
         }
         if (self.acceptWord("order")) {
@@ -1427,7 +902,7 @@ pub const Parser = struct {
             if (self.current().tag == .word and !self.current().quoted and std.ascii.eqlIgnoreCase(self.current().text, "select")) {
                 const start = self.current().position;
                 _ = self.advance();
-                var sub = self.parseSelectOrCompound() catch |err| return asParserError(err);
+                var sub = self.parseSelectOrCompound() catch |err| return common.asParserError(err);
                 defer ast.deinit(self.allocator, &sub);
                 const end = self.current().position;
                 try self.requireTag(.rparen);
@@ -1441,7 +916,7 @@ pub const Parser = struct {
             try self.requireTag(.lparen);
             const start = self.current().position;
             try self.requireWord("select");
-            var sub = self.parseSelectOrCompound() catch |err| return asParserError(err);
+            var sub = self.parseSelectOrCompound() catch |err| return common.asParserError(err);
             defer ast.deinit(self.allocator, &sub);
             const end = self.current().position;
             try self.requireTag(.rparen);
@@ -1517,7 +992,7 @@ pub const Parser = struct {
                 var argCount: usize = 0;
                 if (!self.acceptTag(.rparen)) {
                     distinct = self.acceptWord("distinct");
-                    if (distinct and !isAggregateName(name)) return Error.UnexpectedToken;
+                    if (distinct and !common.isAggregateName(name)) return Error.UnexpectedToken;
                     const first = try self.allocator.create(ast.Expr);
                     errdefer self.allocator.destroy(first);
                     first.* = try self.parseExpr();
@@ -1564,15 +1039,15 @@ pub const Parser = struct {
                 // with aggregate window functions").
                 var filter: ?*const ast.Expr = null;
                 errdefer if (filter) |f| {
-                    freeParserExpr(self.allocator, f.*);
+                    common.freeParserExpr(self.allocator, f.*);
                     self.allocator.destroy(f);
                 };
                 if (self.current().tag == .word and !self.current().quoted and std.ascii.eqlIgnoreCase(self.current().text, "filter")) {
-                    if (!isAggregateName(name)) return Error.InvalidSql;
+                    if (!common.isAggregateName(name)) return Error.InvalidSql;
                     filter = try self.parseFilterClause();
                 }
                 if (self.acceptWord("over")) {
-                    if (!isAggregateName(name) and !isWindowOnlyName(name)) return Error.InvalidSql;
+                    if (!common.isAggregateName(name) and !common.isWindowOnlyName(name)) return Error.InvalidSql;
                     // `OVER name` reuses a WINDOW-clause definition; `OVER (...)`
                     // may start from one (`OVER (w ORDER BY ...)`) or stand alone.
                     // Names resolve in parseSelect; the window keeps `base` until then.
@@ -1585,7 +1060,7 @@ pub const Parser = struct {
                     } else {
                         base = try self.word();
                     }
-                    errdefer if (ownsSpec) self.freeWindowSpec(spec);
+                    errdefer if (ownsSpec) common.freeWindowSpec(self, spec);
                     var winExtra = std.ArrayList(ast.Expr).empty;
                     defer winExtra.deinit(self.allocator);
                     if (argument3) |a3| {
@@ -1630,13 +1105,13 @@ pub const Parser = struct {
     fn binaryNode(self: *Parser, op: ast.BinaryOp, left: ast.Expr, right: ast.Expr) !ast.Expr {
         const leftNode = try self.allocator.create(ast.Expr);
         errdefer {
-            freeParserExpr(self.allocator, left);
+            common.freeParserExpr(self.allocator, left);
             self.allocator.destroy(leftNode);
         }
         leftNode.* = left;
         const rightNode = try self.allocator.create(ast.Expr);
         errdefer {
-            freeParserExpr(self.allocator, right);
+            common.freeParserExpr(self.allocator, right);
             self.allocator.destroy(rightNode);
         }
         rightNode.* = right;
@@ -1646,7 +1121,7 @@ pub const Parser = struct {
     fn unaryNode(self: *Parser, op: ast.UnaryOp, expr: ast.Expr) !ast.Expr {
         const node = try self.allocator.create(ast.Expr);
         errdefer {
-            freeParserExpr(self.allocator, expr);
+            common.freeParserExpr(self.allocator, expr);
             self.allocator.destroy(node);
         }
         node.* = expr;
@@ -1683,19 +1158,19 @@ pub const Parser = struct {
     fn patternNodeFull(self: *Parser, value: ast.Expr, pattern: ast.Expr, escape: ?ast.Expr, negated: bool, glob: bool, isRegexp: bool, isMatch: bool) !ast.Expr {
         const valueNode = try self.allocator.create(ast.Expr);
         errdefer {
-            freeParserExpr(self.allocator, value);
+            common.freeParserExpr(self.allocator, value);
             self.allocator.destroy(valueNode);
         }
         valueNode.* = value;
         const patternExpr = try self.allocator.create(ast.Expr);
         errdefer {
-            freeParserExpr(self.allocator, pattern);
+            common.freeParserExpr(self.allocator, pattern);
             self.allocator.destroy(patternExpr);
         }
         patternExpr.* = pattern;
         var escapeNode: ?*const ast.Expr = null;
         errdefer if (escapeNode) |node| {
-            if (escape) |expr| freeParserExpr(self.allocator, expr);
+            if (escape) |expr| common.freeParserExpr(self.allocator, expr);
             self.allocator.destroy(node);
         };
         if (escape) |expr| {
@@ -1709,7 +1184,7 @@ pub const Parser = struct {
     fn collateNode(self: *Parser, inner: ast.Expr, name: []const u8) !ast.Expr {
         const node = try self.allocator.create(ast.Expr);
         errdefer {
-            freeParserExpr(self.allocator, inner);
+            common.freeParserExpr(self.allocator, inner);
             self.allocator.destroy(node);
         }
         node.* = inner;
@@ -1742,7 +1217,7 @@ pub const Parser = struct {
                 if (self.current().tag == .word and !self.current().quoted and std.ascii.eqlIgnoreCase(self.current().text, "select")) {
                     const start = self.current().position;
                     _ = self.advance();
-                    var sub = self.parseSelectOrCompound() catch |err| return asParserError(err);
+                    var sub = self.parseSelectOrCompound() catch |err| return common.asParserError(err);
                     defer ast.deinit(self.allocator, &sub);
                     const end = self.current().position;
                     try self.requireTag(.rparen);
@@ -1753,7 +1228,7 @@ pub const Parser = struct {
                 } else {
                     var list = std.ArrayList(ast.Expr).empty;
                     errdefer {
-                        for (list.items) |item| freeParserExpr(self.allocator, item);
+                        for (list.items) |item| common.freeParserExpr(self.allocator, item);
                         list.deinit(self.allocator);
                     }
                     while (true) {
@@ -1904,7 +1379,7 @@ pub const Parser = struct {
             const saved = self.index;
             var depth: usize = 0;
             while (self.current().tag == .lparen) : (depth += 1) _ = self.advance();
-            if (self.current().tag == .number and isMinIntMagnitude(self.current().text)) {
+            if (self.current().tag == .number and common.isMinIntMagnitude(self.current().text)) {
                 _ = self.advance();
                 var closed: usize = 0;
                 while (closed < depth and self.current().tag == .rparen) : (closed += 1) _ = self.advance();
@@ -1918,18 +1393,10 @@ pub const Parser = struct {
         return self.parseLiteral();
     }
 
-    fn isMinIntMagnitude(text: []const u8) bool {
-        var digits = text;
-        while (digits.len != 0 and digits[0] == '0') digits = digits[1..];
-        if (digits.len == 0) return false;
-        if (digits.len != 19) return false;
-        return std.mem.eql(u8, digits, "9223372036854775808");
-    }
-
     fn parseCase(self: *Parser) !ast.Expr {
         var base: ?*const ast.Expr = null;
         errdefer if (base) |node| {
-            freeParserExpr(self.allocator, node.*);
+            common.freeParserExpr(self.allocator, node.*);
             self.allocator.destroy(node);
         };
         if (!(self.current().tag == .word and std.ascii.eqlIgnoreCase(self.current().text, "when"))) {
@@ -1941,23 +1408,23 @@ pub const Parser = struct {
         var whens = std.ArrayList(ast.CaseWhen).empty;
         errdefer {
             for (whens.items) |item| {
-                freeParserExpr(self.allocator, item.condition);
-                freeParserExpr(self.allocator, item.result);
+                common.freeParserExpr(self.allocator, item.condition);
+                common.freeParserExpr(self.allocator, item.result);
             }
             whens.deinit(self.allocator);
         }
         while (self.acceptWord("when")) {
             const condition = try self.parseExpr();
-            errdefer freeParserExpr(self.allocator, condition);
+            errdefer common.freeParserExpr(self.allocator, condition);
             try self.requireWord("then");
             const result = try self.parseExpr();
-            errdefer freeParserExpr(self.allocator, result);
+            errdefer common.freeParserExpr(self.allocator, result);
             try whens.append(self.allocator, .{ .condition = condition, .result = result });
         }
         if (whens.items.len == 0) return Error.UnexpectedToken;
         var otherwise: ?*const ast.Expr = null;
         errdefer if (otherwise) |node| {
-            freeParserExpr(self.allocator, node.*);
+            common.freeParserExpr(self.allocator, node.*);
             self.allocator.destroy(node);
         };
         if (self.acceptWord("else")) {
@@ -1974,7 +1441,7 @@ pub const Parser = struct {
         if (!self.acceptWord("returning")) return &.{};
         var projections = std.ArrayList(ast.Projection).empty;
         errdefer {
-            for (projections.items) |item| freeParserExpr(self.allocator, item.expr);
+            for (projections.items) |item| common.freeParserExpr(self.allocator, item.expr);
             projections.deinit(self.allocator);
         }
         while (true) {
@@ -2232,7 +1699,7 @@ pub const Parser = struct {
                         if (self.current().tag == .word and !self.current().quoted and std.ascii.eqlIgnoreCase(self.current().text, "select")) {
                             const start = self.current().position;
                             try self.requireWord("select");
-                            var subquery = self.parseSelectOrCompound() catch |err| return asParserError(err);
+                            var subquery = self.parseSelectOrCompound() catch |err| return common.asParserError(err);
                             defer ast.deinit(self.allocator, &subquery);
                             const end = self.current().position;
                             try self.requireTag(.rparen);
@@ -2240,7 +1707,7 @@ pub const Parser = struct {
                         } else {
                             var values = std.ArrayList(ast.Expr).empty;
                             errdefer {
-                                for (values.items) |item| freeParserExpr(self.allocator, item);
+                                for (values.items) |item| common.freeParserExpr(self.allocator, item);
                                 values.deinit(self.allocator);
                             }
                             while (true) {
@@ -2256,7 +1723,7 @@ pub const Parser = struct {
                     if (self.current().tag == .word and !self.current().quoted and std.ascii.eqlIgnoreCase(self.current().text, "select")) {
                         const start = self.current().position;
                         try self.requireWord("select");
-                        var subquery = self.parseSelectOrCompound() catch |err| return asParserError(err);
+                        var subquery = self.parseSelectOrCompound() catch |err| return common.asParserError(err);
                         defer ast.deinit(self.allocator, &subquery);
                         const end = self.current().position;
                         try self.requireTag(.rparen);
@@ -2264,7 +1731,7 @@ pub const Parser = struct {
                     } else {
                         var values = std.ArrayList(ast.Expr).empty;
                         errdefer {
-                            for (values.items) |item| freeParserExpr(self.allocator, item);
+                            for (values.items) |item| common.freeParserExpr(self.allocator, item);
                             values.deinit(self.allocator);
                         }
                         while (true) {
@@ -2338,33 +1805,10 @@ pub const Parser = struct {
         return try self.parseCmp();
     }
 
-    fn isReservedQueryKeyword(text: []const u8) bool {
-        return std.ascii.eqlIgnoreCase(text, "where") or
-            std.ascii.eqlIgnoreCase(text, "group") or
-            std.ascii.eqlIgnoreCase(text, "having") or
-            std.ascii.eqlIgnoreCase(text, "order") or
-            std.ascii.eqlIgnoreCase(text, "limit") or
-            std.ascii.eqlIgnoreCase(text, "offset") or
-            std.ascii.eqlIgnoreCase(text, "inner") or
-            std.ascii.eqlIgnoreCase(text, "left") or
-            std.ascii.eqlIgnoreCase(text, "right") or
-            std.ascii.eqlIgnoreCase(text, "full") or
-            std.ascii.eqlIgnoreCase(text, "cross") or
-            std.ascii.eqlIgnoreCase(text, "join") or
-            std.ascii.eqlIgnoreCase(text, "natural") or
-            std.ascii.eqlIgnoreCase(text, "union") or
-            std.ascii.eqlIgnoreCase(text, "intersect") or
-            std.ascii.eqlIgnoreCase(text, "except") or
-            std.ascii.eqlIgnoreCase(text, "on") or
-            std.ascii.eqlIgnoreCase(text, "using") or
-            std.ascii.eqlIgnoreCase(text, "returning") or
-            std.ascii.eqlIgnoreCase(text, "window");
-    }
-
     fn parseSelect(self: *Parser) !ast.Statement {
         var projections = std.ArrayList(ast.Projection).empty;
         errdefer {
-            for (projections.items) |item| freeParserExpr(self.allocator, item.expr);
+            for (projections.items) |item| common.freeParserExpr(self.allocator, item.expr);
             projections.deinit(self.allocator);
         }
         const distinct = self.acceptWord("distinct");
@@ -2375,7 +1819,7 @@ pub const Parser = struct {
             var alias: ?[]const u8 = null;
             if (self.acceptWord("as")) {
                 alias = try self.word();
-            } else if (self.current().tag == .word and (self.current().quoted or !isReservedQueryKeyword(self.current().text)) and self.current().tag != .semicolon and (self.current().quoted or !std.ascii.eqlIgnoreCase(self.current().text, "from"))) {
+            } else if (self.current().tag == .word and (self.current().quoted or !common.isReservedQueryKeyword(self.current().text)) and self.current().tag != .semicolon and (self.current().quoted or !std.ascii.eqlIgnoreCase(self.current().text, "from"))) {
                 alias = try self.word();
             }
             try projections.append(self.allocator, .{ .expr = expr, .alias = alias });
@@ -2398,7 +1842,7 @@ pub const Parser = struct {
                 fromSubquery = try self.copy(std.mem.trim(u8, self.source[subStart..subEnd], " \t\r\n"));
                 if (self.acceptWord("as")) {
                     tableAlias = try self.word();
-                } else if (self.current().tag == .word and (self.current().quoted or !isReservedQueryKeyword(self.current().text)) and self.current().tag != .semicolon) {
+                } else if (self.current().tag == .word and (self.current().quoted or !common.isReservedQueryKeyword(self.current().text)) and self.current().tag != .semicolon) {
                     tableAlias = try self.word();
                 }
                 table = tableAlias orelse "__subquery__";
@@ -2406,7 +1850,7 @@ pub const Parser = struct {
                 table = try self.tableName();
                 if (self.acceptWord("as")) {
                     tableAlias = try self.word();
-                } else if (self.current().tag == .word and (self.current().quoted or !isReservedQueryKeyword(self.current().text)) and self.current().tag != .semicolon) {
+                } else if (self.current().tag == .word and (self.current().quoted or !common.isReservedQueryKeyword(self.current().text)) and self.current().tag != .semicolon) {
                     tableAlias = try self.word();
                 }
             }
@@ -2437,7 +1881,7 @@ pub const Parser = struct {
                 var joinedAlias: ?[]const u8 = null;
                 if (self.acceptWord("as")) {
                     joinedAlias = try self.word();
-                } else if (self.current().tag == .word and (self.current().quoted or !isReservedQueryKeyword(self.current().text)) and self.current().tag != .semicolon) {
+                } else if (self.current().tag == .word and (self.current().quoted or !common.isReservedQueryKeyword(self.current().text)) and self.current().tag != .semicolon) {
                     joinedAlias = try self.word();
                 }
                 const effectiveKind: ast.JoinKind = kind orelse .inner;
@@ -2492,8 +1936,8 @@ pub const Parser = struct {
         var havingItems = std.ArrayList(ast.HavingItem).empty;
         errdefer {
             for (havingItems.items) |item| {
-                freeParserExpr(self.allocator, item.left);
-                freeParserExpr(self.allocator, item.right);
+                common.freeParserExpr(self.allocator, item.left);
+                common.freeParserExpr(self.allocator, item.right);
             }
             havingItems.deinit(self.allocator);
         }
@@ -2545,8 +1989,8 @@ pub const Parser = struct {
         var having: ?ast.Having = null;
         errdefer if (having) |items| {
             for (items) |item| {
-                freeParserExpr(self.allocator, item.left);
-                freeParserExpr(self.allocator, item.right);
+                common.freeParserExpr(self.allocator, item.left);
+                common.freeParserExpr(self.allocator, item.right);
             }
             self.allocator.free(items);
         };
@@ -2557,7 +2001,7 @@ pub const Parser = struct {
         // a full spec copy, then the definitions are freed.
         var namedWindows = std.ArrayList(NamedWindowDef).empty;
         defer {
-            for (namedWindows.items) |def| self.freeWindowSpec(def.spec);
+            for (namedWindows.items) |def| common.freeWindowSpec(self, def.spec);
             namedWindows.deinit(self.allocator);
         }
         if (self.acceptWord("window")) {
@@ -2565,11 +2009,11 @@ pub const Parser = struct {
                 const defName = try self.word();
                 try self.requireWord("as");
                 var spec = try self.parseWindowSpec();
-                errdefer self.freeWindowSpec(spec);
+                errdefer common.freeWindowSpec(self, spec);
                 if (spec.base) |baseName| {
-                    const base = findNamedWindow(namedWindows.items, baseName) orelse return Error.InvalidSql;
+                    const base = common.findNamedWindow(namedWindows.items, baseName) orelse return Error.InvalidSql;
                     const overlay = spec;
-                    spec = try self.resolveWindowBase(overlay, base);
+                    spec = try common.resolveWindowBase(self, overlay, base);
                 }
                 try namedWindows.append(self.allocator, .{ .name = defName, .spec = spec });
                 if (!self.acceptTag(.comma)) break;
@@ -2577,16 +2021,16 @@ pub const Parser = struct {
             if (self.acceptWord("window")) return Error.InvalidSql;
         }
         for (projections.items) |*proj| {
-            try self.resolveWindowRefs(&proj.expr, namedWindows.items);
+            try common.resolveWindowRefs(self, &proj.expr, namedWindows.items);
         }
         if (having) |arms| {
             for (0..arms.len) |idx| {
                 const item: *ast.HavingItem = @constCast(&arms[idx]);
-                try self.resolveWindowRefs(&item.left, namedWindows.items);
-                try self.resolveWindowRefs(&item.right, namedWindows.items);
+                try common.resolveWindowRefs(self, &item.left, namedWindows.items);
+                try common.resolveWindowRefs(self, &item.right, namedWindows.items);
             }
         }
-        if (condition) |conds| try self.resolveWindowRefsInConditions(conds, namedWindows.items);
+        if (condition) |conds| try common.resolveWindowRefsInConditions(self, conds, namedWindows.items);
         var orders = std.ArrayList(ast.Order).empty;
         errdefer orders.deinit(self.allocator);
         if (self.acceptWord("order")) {
