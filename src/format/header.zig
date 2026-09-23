@@ -12,8 +12,9 @@ pub const magic = "SQLite format 3\x00";
 
 /// In-memory view of the 100-byte database header.
 pub const Header = struct {
-    /// Database page size in bytes (1 encodes 65536 on disk).
-    pageSize: u16 = 4096,
+    /// Database page size in bytes. A `u32` because 65536 does not fit the
+    /// on-disk `u16`: per the file format, value 1 on disk encodes 65536.
+    pageSize: u32 = 4096,
     /// File-format write version (1 = legacy rollback journal).
     writeVersion: u8 = 1,
     /// File-format read version (1 = legacy rollback journal).
@@ -52,7 +53,8 @@ pub const Header = struct {
     pub fn encode(self: Header, out: *[size]u8) void {
         @memset(out, 0);
         @memcpy(out[0..16], magic);
-        std.mem.writeInt(u16, out[16..18], self.pageSize, .big);
+        const diskSize: u16 = if (self.pageSize == 65536) 1 else @intCast(self.pageSize);
+        std.mem.writeInt(u16, out[16..18], diskSize, .big);
         out[18] = self.writeVersion;
         out[19] = self.readVersion;
         out[20] = self.reservedBytes;
@@ -71,10 +73,14 @@ pub const Header = struct {
     }
 
     /// Parses a header, rejecting bad magic with `InvalidHeader`.
+    /// A stored page size of 1 decodes to 65536 per the file format.
+    /// Size validity (power of two in 512..65536) is checked by the file
+    /// opener, not here, so readers stay permissive.
     pub fn decode(bytes: *const [size]u8) error{InvalidHeader}!Header {
         if (!std.mem.eql(u8, bytes[0..16], magic)) return error.InvalidHeader;
+        const raw = std.mem.readInt(u16, bytes[16..18], .big);
         return .{
-            .pageSize = std.mem.readInt(u16, bytes[16..18], .big),
+            .pageSize = if (raw == 1) 65536 else raw,
             .writeVersion = bytes[18],
             .readVersion = bytes[19],
             .reservedBytes = bytes[20],
@@ -101,6 +107,20 @@ test "database header round trip" {
     const decoded = try Header.decode(&bytes);
     try std.testing.expectEqual(original.pageSize, decoded.pageSize);
     try std.testing.expectEqual(original.databaseSizePages, decoded.databaseSizePages);
+}
+
+test "database header maps 65536 to on-disk 1 both ways" {
+    // Reference file format: a 65536-byte page size is stored as u16 1.
+    var bytes: [size]u8 = undefined;
+    (Header{ .pageSize = 65536 }).encode(&bytes);
+    try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, bytes[16..18], .big));
+    const decoded = try Header.decode(&bytes);
+    try std.testing.expectEqual(@as(u32, 65536), decoded.pageSize);
+    // Ordinary sizes pass through untouched.
+    var small: [size]u8 = undefined;
+    (Header{ .pageSize = 512 }).encode(&small);
+    try std.testing.expectEqual(@as(u16, 512), std.mem.readInt(u16, small[16..18], .big));
+    try std.testing.expectEqual(@as(u32, 512), (try Header.decode(&small)).pageSize);
 }
 
 test "database header rejects bad magic" {

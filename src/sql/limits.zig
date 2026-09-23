@@ -1,8 +1,14 @@
 //! Shared SQL resource limits: one budget table for the whole frontend.
 //!
+//! Values track `sqlite/src/sqliteLimit.h` defaults where the engine can
+//! honor them. Two deliberate deviations: the parser depth cap (200 vs
+//! SQLite's 2500) and the trigger depth cap (64 vs 1000) bound
+//! recursive-descent call-stack and trigger-execution recursion, where
+//! SQLite's LALR heap stack has no such pressure; hostile input still
+//! fails closed either way. Expression nesting shares the parser depth
+//! cap (SQLite splits `MAX_EXPR_DEPTH`=1000 from the parser stack).
 //! Caps hostile or runaway SQL before it can force unbounded allocation.
-//! Over-budget input fails with `error.SqlTooBig`. Nesting stays capped
-//! separately (parser depth 200, trigger depth 64).
+//! Over-budget input fails with `error.SqlTooBig`.
 
 const std = @import("std");
 
@@ -39,6 +45,21 @@ pub const max_like_pattern_length: usize = 50000;
 /// Enforced on `?NNN` and anonymous `?` numbering while parsing.
 pub const max_variables: usize = 32766;
 
+/// Maximum statements in one trigger body (`SQLITE_MAX_TRIGGER_STEPS`).
+/// Enforced when a trigger body executes, not for general multi-statement
+/// scripts (migrations stay unbounded). SQLite rejects the oversized
+/// `CREATE TRIGGER`; this engine fails the firing statement instead —
+/// observable behavior matches for every trigger that can legally exist.
+pub const max_trigger_steps: usize = 65000;
+
+/// Maximum database page size in bytes (`SQLITE_MAX_PAGE_SIZE`).
+/// Page sizes are powers of two in 512..65536; 65536 encodes as 1 on disk.
+pub const max_page_size: usize = 65536;
+
+/// Default database page size in bytes (`SQLITE_DEFAULT_PAGE_SIZE`).
+/// Fresh databases are created with this size.
+pub const default_page_size: usize = 4096;
+
 /// Maximum distinct values tracked by one DISTINCT aggregate.
 /// Past this, accumulation fails `SqlTooBig` instead of growing without
 /// bound (per-group state, so ordinary queries never approach it).
@@ -56,4 +77,7 @@ test "limits pin the documented budgets" {
     try std.testing.expectEqual(@as(usize, 50000), max_like_pattern_length);
     try std.testing.expectEqual(@as(usize, 32766), max_variables);
     try std.testing.expectEqual(@as(usize, 1_000_000), max_distinct_values);
+    try std.testing.expectEqual(@as(usize, 65000), max_trigger_steps);
+    try std.testing.expectEqual(@as(usize, 65536), max_page_size);
+    try std.testing.expectEqual(@as(usize, 4096), default_page_size);
 }

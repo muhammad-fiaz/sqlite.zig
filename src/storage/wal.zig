@@ -4,6 +4,7 @@
 //! Bad framing or checksums fail closed; recovery output is capped.
 
 const std = @import("std");
+const limits = @import("../sql/limits.zig");
 
 /// WAL header length in bytes.
 pub const headerSize = 32;
@@ -17,7 +18,7 @@ pub const magic: u32 = 0x377f0682;
 /// In-memory view of the 32-byte WAL header.
 /// Decoded checksums are verified values; bad headers never decode.
 pub const WalHeader = struct {
-    /// Database page size framed by this WAL (512..32768, power of two).
+    /// Database page size framed by this WAL (512..`limits.max_page_size`, power of two).
     pageSize: u32,
     /// Checkpoint sequence counter (informational for recovery ordering).
     checkpointSequence: u32 = 0,
@@ -53,7 +54,7 @@ pub const WalHeader = struct {
         if (std.mem.readInt(u32, bytes[0..4], .big) != magic) return error.InvalidWal;
         if (std.mem.readInt(u32, bytes[4..8], .big) != formatVersion) return error.InvalidWal;
         const pageSize = std.mem.readInt(u32, bytes[8..12], .big);
-        if (pageSize < 512 or pageSize > 32768 or (pageSize & (pageSize - 1)) != 0) return error.InvalidWal;
+        if (pageSize < 512 or pageSize > limits.max_page_size or (pageSize & (pageSize - 1)) != 0) return error.InvalidWal;
         const sums = checksum(0, 0, bytes[0..24]);
         if (sums[0] != std.mem.readInt(u32, bytes[24..28], .big) or sums[1] != std.mem.readInt(u32, bytes[28..32], .big)) return error.InvalidWal;
         return .{
@@ -112,7 +113,7 @@ pub fn checksum(seed1: u32, seed2: u32, bytes: []const u8) [2]u32 {
 /// Encodes `image` as a header plus one frame per page.
 /// Needs valid geometry and a non-empty multiple of `pageSize`.
 pub fn encodeImage(allocator: std.mem.Allocator, image: []const u8, pageSize: usize) ![]u8 {
-    if (pageSize < 512 or pageSize > 32768 or (pageSize & (pageSize - 1)) != 0 or image.len == 0 or image.len % pageSize != 0) return error.InvalidPageSize;
+    if (pageSize < 512 or pageSize > limits.max_page_size or (pageSize & (pageSize - 1)) != 0 or image.len == 0 or image.len % pageSize != 0) return error.InvalidPageSize;
     const pageCount: u32 = @intCast(image.len / pageSize);
     var header: [headerSize]u8 = undefined;
     (WalHeader{ .pageSize = @intCast(pageSize) }).encode(&header);

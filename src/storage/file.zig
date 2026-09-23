@@ -8,9 +8,10 @@ const std = @import("std");
 const Io = std.Io;
 const Header = @import("../format/header.zig").Header;
 const headerSize = @import("../format/header.zig").size;
+const limits = @import("../sql/limits.zig");
 const wal = @import("wal.zig");
 /// Page size used when creating a brand-new database file.
-const pageSizeDefault: usize = 4096;
+const pageSizeDefault: usize = limits.default_page_size;
 /// Upper bound for any single image/WAL/payload allocation.
 ///
 /// Why capped: these buffers are sized from on-disk lengths, so an unchecked
@@ -47,9 +48,9 @@ pub const DatabaseFile = struct {
     ///
     /// A zero-length file is initialized with a fresh header + one empty
     /// table-leaf page. Otherwise the stored header is decoded and its page
-    /// size validated (power of two, 512..32768); anything else returns
-    /// `InvalidHeader`/`InvalidPageSize`. The returned struct owns its path
-    /// copy and IO context — call `close` exactly once.
+    /// size validated (power of two, 512..`limits.max_page_size`); anything
+    /// else returns `InvalidHeader`/`InvalidPageSize`. The returned struct
+    /// owns its path copy and IO context — call `close` exactly once.
     pub fn open(allocator: std.mem.Allocator, path: []const u8) !DatabaseFile {
         var threaded: Io.Threaded = .init(allocator, .{});
         errdefer threaded.deinit();
@@ -77,7 +78,7 @@ pub const DatabaseFile = struct {
             const n = try file.readPositional(io, &.{bytes[0..]}, 0);
             if (n != headerSize) return error.InvalidHeader;
             const header = try Header.decode(&bytes);
-            if (header.pageSize < 512 or header.pageSize > 32768 or (header.pageSize & (header.pageSize - 1)) != 0) return error.InvalidPageSize;
+            if (header.pageSize < 512 or header.pageSize > limits.max_page_size or (header.pageSize & (header.pageSize - 1)) != 0) return error.InvalidPageSize;
             result.pageSize = header.pageSize;
             result.userVersion = header.userVersion;
             result.applicationId = header.applicationId;
@@ -351,6 +352,43 @@ test "database file creates a SQLite header" {
     var db = try DatabaseFile.open(std.testing.allocator, path);
     defer db.close();
     try std.testing.expectEqual(@as(usize, 4096), db.pageSize);
+}
+
+test "database file opens 65536 byte pages" {
+    const path = "sqlite_zig_file_64k_test.db";
+    defer Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    // Craft a header-only file declaring 64K pages (stored as u16 1).
+    var threaded: Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    {
+        var raw = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+        defer raw.close(io);
+        var bytes: [headerSize]u8 = undefined;
+        (Header{ .pageSize = 65536 }).encode(&bytes);
+        try raw.writePositionalAll(io, &bytes, 0);
+    }
+    var db = try DatabaseFile.open(std.testing.allocator, path);
+    defer db.close();
+    try std.testing.expectEqual(@as(usize, 65536), db.pageSize);
+}
+
+test "database file rejects non power of two page sizes" {
+    const path = "sqlite_zig_file_badps_test.db";
+    defer Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    var threaded: Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    {
+        var raw = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+        defer raw.close(io);
+        var bytes: [headerSize]u8 = undefined;
+        (Header{}).encode(&bytes);
+        // 40000 is in range but not a power of two.
+        std.mem.writeInt(u16, bytes[16..18], 40000, .big);
+        try raw.writePositionalAll(io, &bytes, 0);
+    }
+    try std.testing.expectError(error.InvalidPageSize, DatabaseFile.open(std.testing.allocator, path));
 }
 
 test "database file page zero and short reads fail closed" {

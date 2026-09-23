@@ -428,6 +428,14 @@ pub const Connection = struct {
     /// `deinit`s). Unrestricted entry point — no struct needed. Errors are
     /// structured (`InvalidSql`, `ConstraintViolation`, ...).
     pub fn exec(self: *Connection, sql: []const u8) !Result {
+        return self.execBudgeted(sql, null);
+    }
+
+    /// `exec` with an optional cap on executed statements. Trigger bodies
+    /// pass `limits.max_trigger_steps`; general scripts (migrations, user
+    /// batches) stay unbounded by passing null. Over-budget input fails
+    /// `SqlTooBig` before the offending statement runs.
+    fn execBudgeted(self: *Connection, sql: []const u8, maxSteps: ?usize) !Result {
         var last: ?Result = null;
         errdefer if (last) |*result| result.deinit();
         var start: usize = 0;
@@ -435,6 +443,7 @@ pub const Connection = struct {
         var quote: u8 = 0;
         var triggerDefinition = false;
         var triggerDepth: usize = 0;
+        var steps: usize = 0;
         while (index < sql.len) : (index += 1) {
             const byte = sql[index];
             if (quote != 0) {
@@ -461,6 +470,10 @@ pub const Connection = struct {
             if (byte == ';' and triggerDepth == 0) {
                 const statementSql = std.mem.trim(u8, sql[start..index], " \t\r\n");
                 if (statementSql.len != 0) {
+                    if (maxSteps) |cap| {
+                        if (steps >= cap) return error.SqlTooBig;
+                    }
+                    steps += 1;
                     if (last) |*result| result.deinit();
                     last = try self.execute(statementSql, &.{});
                 }
@@ -470,6 +483,9 @@ pub const Connection = struct {
         }
         const remainder = std.mem.trim(u8, sql[start..], " \t\r\n");
         if (remainder.len != 0) {
+            if (maxSteps) |cap| {
+                if (steps >= cap) return error.SqlTooBig;
+            }
             if (last) |*result| result.deinit();
             last = try self.execute(remainder, &.{});
         }
@@ -1603,7 +1619,7 @@ pub const Connection = struct {
             if (value.argument != null) return error.InvalidSql;
             if (value.value) |text| {
                 const size = std.fmt.parseInt(usize, text, 10) catch return error.InvalidSql;
-                if (size < 512 or size > 32768 or (size & (size - 1)) != 0) return error.InvalidSql;
+                if (size < 512 or size > limits.max_page_size or (size & (size - 1)) != 0) return error.InvalidSql;
                 target.file.pageSize = size;
                 try self.persistSchema(target.file, target.store);
             }
@@ -3392,8 +3408,9 @@ pub const Connection = struct {
 
     /// Runs one rendered trigger body under the recursion guard: re-entry
     /// runs only with `recursiveTriggers`, past `maxTriggerDepth` fails.
-    /// Bodies run through `exec`, so multi-statement bodies work for table
-    /// and INSTEAD OF triggers alike. Shared by both trigger paths.
+    /// Bodies run through budgeted `exec`, so multi-statement bodies work
+    /// for table and INSTEAD OF triggers alike while oversized bodies fail
+    /// `SqlTooBig` (`limits.max_trigger_steps`). Shared by both paths.
     fn runTriggerBody(self: *Connection, name: []const u8, sql: []const u8) !void {
         if (self.triggerOnStack(name)) {
             if (!self.recursiveTriggers) return;
@@ -3403,7 +3420,7 @@ pub const Connection = struct {
         }
         const owned = try self.allocator.dupe(u8, name);
         try self.triggerStack.append(self.allocator, owned);
-        var result = self.exec(sql) catch |err| {
+        var result = self.execBudgeted(sql, limits.max_trigger_steps) catch |err| {
             const dropped = self.triggerStack.pop() orelse unreachable;
             self.allocator.free(dropped);
             return err;
@@ -16303,4 +16320,21 @@ test "limit offset and transactions behave in every form" {
     var cnt = try db.exec("SELECT count(*) FROM lim_t;");
     defer cnt.deinit();
     try std.testing.expectEqual(@as(i64, 5), cnt.rows[0][0].integer);
+}
+
+test "statement step budget caps trigger bodies only" {
+    const path = "sqlite_zig_exec_budget_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    // Five simple statements: capped below the count fails, at the count
+    // succeeds, and empty segments never count as steps.
+    const script = "SELECT 1; SELECT 2; ; SELECT 3; SELECT 4; SELECT 5;";
+    try std.testing.expectError(error.SqlTooBig, db.execBudgeted(script, 3));
+    var ok = try db.execBudgeted(script, 5);
+    ok.deinit();
+    // Unbudgeted exec (migrations, user batches) stays unbounded.
+    var plain = try db.exec(script);
+    plain.deinit();
+    // A zero cap rejects even one statement.
+    try std.testing.expectError(error.SqlTooBig, db.execBudgeted("SELECT 1;", 0));
 }

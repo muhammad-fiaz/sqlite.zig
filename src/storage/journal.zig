@@ -4,6 +4,7 @@
 //! Bad magic or geometry fails with `InvalidJournal`.
 
 const std = @import("std");
+const limits = @import("../sql/limits.zig");
 
 /// Journal header length in bytes.
 pub const headerSize = 28;
@@ -50,8 +51,11 @@ pub const JournalHeader = struct {
         const dbSize = std.mem.readInt(u32, bytes[16..20], .big);
         const sectorSize = std.mem.readInt(u32, bytes[20..24], .big);
         const pageSize = std.mem.readInt(u32, bytes[24..28], .big);
-        if (pageSize < 512 or pageSize > 32768 or (pageSize & (pageSize - 1)) != 0) return error.InvalidJournal;
-        if (sectorSize != 0 and (sectorSize < 512 or sectorSize > 65536 or (sectorSize & (sectorSize - 1)) != 0)) return error.InvalidJournal;
+        if (pageSize < 512 or pageSize > limits.max_page_size or (pageSize & (pageSize - 1)) != 0) return error.InvalidJournal;
+        // Sector sizes follow the reference (`readJournalHdr` in `pager.c`):
+        // powers of two in 32..65536. Zero stays accepted as this engine's
+        // "no constraint" marker (the reference writer never emits it).
+        if (sectorSize != 0 and (sectorSize < 32 or sectorSize > 65536 or (sectorSize & (sectorSize - 1)) != 0)) return error.InvalidJournal;
         return .{ .pageCount = pageCount, .nonce = nonce, .dbSize = dbSize, .sectorSize = sectorSize, .pageSize = pageSize };
     }
 };
@@ -106,21 +110,21 @@ test "rollback journal header covers sector-size edges and page counts" {
     try std.testing.expectEqual(@as(u32, 3), parsedZero.pageCount);
     try std.testing.expectEqual(@as(u32, 1024), parsedZero.pageSize);
     // Boundary: every valid page size round-trips; neighbors are rejected.
-    const validSizes = [_]u32{ 512, 1024, 4096, 32768 };
+    const validSizes = [_]u32{ 512, 1024, 4096, 32768, 65536 };
     for (validSizes) |ps| {
         var buf: [headerSize]u8 = undefined;
         (JournalHeader{ .pageSize = ps }).encode(&buf);
         try std.testing.expectEqual(ps, (try JournalHeader.decode(&buf)).pageSize);
     }
-    const invalidSizes = [_]u32{ 0, 100, 511, 513, 1000, 32769, 65536 };
+    const invalidSizes = [_]u32{ 0, 100, 511, 513, 1000, 32769, 131072 };
     for (invalidSizes) |ps| {
         var buf: [headerSize]u8 = undefined;
         (JournalHeader{}).encode(&buf);
         std.mem.writeInt(u32, buf[24..28], ps, .big);
         try std.testing.expectError(error.InvalidJournal, JournalHeader.decode(&buf));
     }
-    // Boundary: sector sizes accept 0 and powers of two in 512..65536 only.
-    const validSectors = [_]u32{ 0, 512, 4096, 65536 };
+    // Boundary: sector sizes accept 0 and powers of two in 32..65536 only.
+    const validSectors = [_]u32{ 0, 32, 64, 512, 4096, 65536 };
     for (validSectors) |ss| {
         var buf: [headerSize]u8 = undefined;
         (JournalHeader{ .sectorSize = ss }).encode(&buf);
@@ -130,4 +134,8 @@ test "rollback journal header covers sector-size edges and page counts" {
     (JournalHeader{}).encode(&badSector);
     std.mem.writeInt(u32, badSector[20..24], 70000, .big);
     try std.testing.expectError(error.InvalidJournal, JournalHeader.decode(&badSector));
+    var smallSector: [headerSize]u8 = undefined;
+    (JournalHeader{}).encode(&smallSector);
+    std.mem.writeInt(u32, smallSector[20..24], 16, .big);
+    try std.testing.expectError(error.InvalidJournal, JournalHeader.decode(&smallSector));
 }
