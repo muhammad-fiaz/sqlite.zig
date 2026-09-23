@@ -56,4 +56,3 @@ const User = sqlite.table("users", struct {
 | [Migration](/api/migration) | Schema migrations — sets and runner |
 | [Errors](/api/errors) | Error values and handling |
 | [Version](/api/version) | Library version |
-| [Compatibility](/api/compatibility) | SQLite coverage matrix — family-by-family support status |
