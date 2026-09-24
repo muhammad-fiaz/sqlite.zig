@@ -69,6 +69,7 @@
 - **Tree-sitter** — For Tree-sitter parsing and syntax-tree support, check out [tree-sitter.zig](https://github.com/muhammad-fiaz/tree-sitter.zig).
 
 </details>
+
 ---
 
 <details>
