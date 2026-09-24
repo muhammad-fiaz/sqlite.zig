@@ -7,7 +7,7 @@ const std = @import("std");
 const Value = @import("../vm/value.zig").Value;
 
 /// WHERE/HAVING comparison operators, including SQLite-only predicates.
-pub const CompareOp = enum { equal, notEqual, less, lessEqual, greater, greaterEqual, like, notLike, glob, notGlob, regexp, notRegexp, match, notMatch, isNull, isNotNull, isValue, isNotValue, isDistinct, isNotDistinct, between, notBetween, in, notIn, exists, notExists, isTrue };
+pub const CompareOp = enum { equal, notEqual, less, lessEqual, greater, greaterEqual, like, notLike, glob, notGlob, regexp, notRegexp, match, notMatch, isNull, isNotNull, isValue, isNotValue, isDistinct, isNotDistinct, between, notBetween, in, notIn, exists, notExists, isTrue, isNotTrue, isFalse, isNotFalse };
 
 /// One ORDER BY / window-ORDER-BY key: expression plus direction/null placement.
 pub const OrderItem = struct {
@@ -62,7 +62,7 @@ pub const Expr = union(enum) {
     window: struct { funcName: []const u8, argument: ?*const Expr = null, argument2: ?*const Expr = null, extraArgs: []const Expr = &.{}, partitionBy: []const Expr = &.{}, orderBy: []const OrderItem = &.{}, frame: ?WindowFrame = null, filter: ?*const Expr = null, distinct: bool = false, base: ?[]const u8 = null },
 };
 /// Binary expression operators (arithmetic, bitwise, concat, comparison, logic).
-pub const BinaryOp = enum { add, subtract, multiply, divide, modulo, concat, bitAnd, bitOr, shiftLeft, shiftRight, equal, notEqual, less, lessEqual, greater, greaterEqual, logicalAnd, logicalOr, isOp, isNotOp };
+pub const BinaryOp = enum { add, subtract, multiply, divide, modulo, concat, jsonArrow, jsonArrowText, bitAnd, bitOr, shiftLeft, shiftRight, equal, notEqual, less, lessEqual, greater, greaterEqual, logicalAnd, logicalOr, isOp, isNotOp, isTrue, isNotTrue, isFalse, isNotFalse };
 /// Unary operators; `logicalNot` is three-valued (NULL stays NULL).
 pub const UnaryOp = enum { negate, positive, bitNot, logicalNot };
 /// One `WHEN cond THEN result` arm of a `CASE`.
@@ -88,7 +88,9 @@ pub const Order = struct { column: []const u8, descending: bool, collate: ?[]con
 /// Join flavor; `cross` and bare `natural` carry empty join keys.
 pub const JoinKind = enum { inner, left, right, full, cross };
 /// One JOIN arm; USING(single-col) lowers to left/right column pair.
-pub const Join = struct { kind: JoinKind, table: []const u8, tableAlias: ?[]const u8 = null, leftTable: []const u8, leftColumn: []const u8, rightTable: []const u8, rightColumn: []const u8, mergeOutput: bool = false, usingColumns: []const []const u8 = &.{} };
+/// `onExpr` carries a general ON predicate (expression form) when the join
+/// is not a simple `a.col = b.col` pair; `left/rightColumn` then stay "".
+pub const Join = struct { kind: JoinKind, table: []const u8, tableAlias: ?[]const u8 = null, leftTable: []const u8, leftColumn: []const u8, rightTable: []const u8, rightColumn: []const u8, mergeOutput: bool = false, usingColumns: []const []const u8 = &.{}, onExpr: ?Conditions = null };
 /// SELECT output item with optional alias.
 pub const Projection = struct { expr: Expr, alias: ?[]const u8 = null };
 /// Inline `REFERENCES t(c)` column constraint. `deferrable` with
@@ -98,12 +100,20 @@ pub const ForeignKeyDef = struct { table: []const u8, column: []const u8, onDele
 /// FK referential actions; default `.restrict` matches the parser default.
 pub const ReferentialAction = enum { restrict, cascade, setNull, setDefault, noAction };
 /// Column definition; `typeName` may be "" (untyped affinity) or multi-word.
-pub const ColumnDef = struct { name: []const u8, typeName: []const u8, primaryKey: bool = false, notNull: bool = false, unique: bool = false, autoincrement: bool = false, foreignKey: ?ForeignKeyDef = null, defaultValue: ?Value = null, checkExpr: ?Expr = null, generatedExpr: ?Expr = null, generatedStored: bool = false };
+/// `defaultExpr` holds non-literal DEFAULTs (parenthesized exprs, CURRENT_*);
+/// literal DEFAULTs stay in `defaultValue`.
+pub const ColumnDef = struct { name: []const u8, typeName: []const u8, primaryKey: bool = false, notNull: bool = false, unique: bool = false, autoincrement: bool = false, foreignKey: ?ForeignKeyDef = null, defaultValue: ?Value = null, defaultExpr: ?Expr = null, checkExpr: ?Expr = null, generatedExpr: ?Expr = null, generatedStored: bool = false, collate: ?[]const u8 = null, conflict: ConflictPolicy = .none };
 /// Table-level `FOREIGN KEY (cols) REFERENCES t(cols)` constraint.
 /// Deferral semantics match `ForeignKeyDef`.
 pub const TableForeignKeyDef = struct { columns: []const []const u8, table: []const u8, referencedColumns: []const []const u8, onDelete: ReferentialAction = .restrict, onUpdate: ReferentialAction = .restrict, deferrable: bool = false, initiallyDeferred: bool = false };
 /// Table-level constraints (PK/UNIQUE/FK/CHECK).
-pub const TableConstraint = union(enum) { primaryKey: []const []const u8, unique: []const []const u8, foreignKey: TableForeignKeyDef, check: Expr };
+/// PK/UNIQUE/CHECK carry an optional `ON CONFLICT ...` clause.
+pub const TableConstraint = union(enum) {
+    primaryKey: struct { columns: []const []const u8, conflict: ConflictPolicy = .none },
+    unique: struct { columns: []const []const u8, conflict: ConflictPolicy = .none },
+    foreignKey: TableForeignKeyDef,
+    check: struct { expr: Expr, conflict: ConflictPolicy = .none },
+};
 /// CREATE INDEX payload; `keyExprs` parallels `columns` (null = plain column).
 pub const IndexDef = struct { name: []const u8, table: []const u8, columns: []const []const u8, keyExprs: []const ?Expr = &.{}, unique: bool = false, ifNotExists: bool = false, whereExpr: ?Expr = null, whereSql: ?[]const u8 = null };
 /// Trigger DML event.
@@ -111,7 +121,9 @@ pub const TriggerEvent = enum { insert, update, delete };
 /// Trigger firing time; `insteadOf` fires on views in place of the write.
 pub const TriggerTiming = enum { before, after, insteadOf };
 /// CREATE TRIGGER payload; `body`/`whenSql` are retained source slices.
-pub const TriggerDef = struct { name: []const u8, table: []const u8, timing: TriggerTiming = .after, event: TriggerEvent, updateOf: []const []const u8 = &.{}, whenSql: ?[]const u8 = null, body: []const u8, ifNotExists: bool = false, temporary: bool = false };
+/// `eachRow` is true for `FOR EACH ROW` (SQLite default for BEFORE/AFTER);
+/// false for explicit `FOR EACH STATEMENT`.
+pub const TriggerDef = struct { name: []const u8, table: []const u8, timing: TriggerTiming = .after, event: TriggerEvent, updateOf: []const []const u8 = &.{}, whenSql: ?[]const u8 = null, body: []const u8, ifNotExists: bool = false, temporary: bool = false, eachRow: bool = true };
 /// CREATE VIRTUAL TABLE payload; args are raw token texts.
 pub const VirtualTableDef = struct { name: []const u8, module: []const u8, arguments: []const []const u8, ifNotExists: bool = false };
 /// One WITH arm; queries kept as source SQL for lazy re-parse by connection.
@@ -135,17 +147,18 @@ pub const AlterTable = union(enum) {
 /// Compound SELECT operators (`UNION [ALL]` / `INTERSECT` / `EXCEPT`).
 pub const CompoundOp = enum { unionOp, unionAllOp, intersectOp, exceptOp };
 /// Compound select kept as source slices plus trailing ORDER/LIMIT for lazy execution.
-pub const CompoundSelect = struct { leftSql: []const u8, op: CompoundOp, rightSql: []const u8, orders: []const Order = &.{}, limit: ?usize = null, offset: ?usize = null };
+pub const CompoundSelect = struct { leftSql: []const u8, op: CompoundOp, rightSql: []const u8, orders: []const Order = &.{}, limit: ?usize = null, offset: ?usize = null, limitExpr: ?Expr = null, offsetExpr: ?Expr = null };
 
 /// Top-level statement union produced by `Parser.parse`.
 pub const Statement = union(enum) {
-    createTable: struct { name: []const u8, columns: []ColumnDef, constraints: []TableConstraint = &.{}, ifNotExists: bool = false, strict: bool = false, withoutRowid: bool = false, temporary: bool = false },
+    createTable: struct { name: []const u8, columns: []ColumnDef, constraints: []TableConstraint = &.{}, ifNotExists: bool = false, strict: bool = false, withoutRowid: bool = false, temporary: bool = false, asSelectSql: ?[]const u8 = null },
     createIndex: IndexDef,
     createView: struct { name: []const u8, sql: []const u8, ifNotExists: bool = false, temporary: bool = false },
     createTrigger: TriggerDef,
     createVirtualTable: VirtualTableDef,
     withSelect: WithSelect,
     compoundSelect: CompoundSelect,
+    explain: []const u8,
     explainQueryPlan: []const u8,
     pragma: struct { name: []const u8, value: ?[]const u8 = null, argument: ?[]const u8 = null, schema: ?[]const u8 = null },
     alterTable: AlterTable,
@@ -154,7 +167,7 @@ pub const Statement = union(enum) {
     dropView: struct { name: []const u8, ifExists: bool = false },
     dropTrigger: struct { name: []const u8, ifExists: bool = false },
     insert: struct { table: []const u8, columns: []const []const u8, rows: []const []const Expr, selectSql: ?[]const u8 = null, conflict: ConflictPolicy = .none, conflictTargetColumns: []const []const u8 = &.{}, conflictTargetWhere: ?Conditions = null, upsertColumns: []const []const u8 = &.{}, upsertValues: []const Expr = &.{}, upsertWhere: ?Conditions = null, returning: []const Projection = &.{} },
-    select: struct { projections: []const Projection, table: ?[]const u8, tableAlias: ?[]const u8 = null, fromSubquery: ?[]const u8 = null, joins: []const Join = &.{}, condition: ?Conditions, groupBy: ?[]const u8 = null, having: ?Having = null, orders: []const Order = &.{}, limit: ?usize, offset: ?usize = null, distinct: bool = false },
+    select: struct { projections: []const Projection, table: ?[]const u8, tableAlias: ?[]const u8 = null, fromSubquery: ?[]const u8 = null, joins: []const Join = &.{}, condition: ?Conditions, groupBy: ?[]const u8 = null, groupByExprs: []const Expr = &.{}, having: ?Having = null, orders: []const Order = &.{}, limit: ?usize, offset: ?usize = null, limitExpr: ?Expr = null, offsetExpr: ?Expr = null, distinct: bool = false },
     update: struct { table: []const u8, columns: []const []const u8, values: []const Expr, condition: ?Conditions, from: ?UpdateFrom = null, conflict: ConflictPolicy = .none, returning: []const Projection = &.{} },
     delete: struct { table: []const u8, condition: ?Conditions, returning: []const Projection = &.{} },
     begin,
@@ -171,7 +184,7 @@ pub const Statement = union(enum) {
 
     /// True for read-like statements (select/with/compound/explain/pragma).
     pub fn isQuery(self: Statement) bool {
-        return self == .select or self == .withSelect or self == .compoundSelect or self == .explainQueryPlan or self == .pragma;
+        return self == .select or self == .withSelect or self == .compoundSelect or self == .explainQueryPlan or self == .explain or self == .pragma;
     }
 };
 
@@ -775,18 +788,19 @@ pub fn deinit(allocator: anytype, statement: *Statement) void {
     switch (statement.*) {
         .createTable => |value| {
             for (value.columns) |column| {
+                if (column.defaultExpr) |de| freeExpr(allocator, de);
                 if (column.checkExpr) |chk| freeExpr(allocator, chk);
                 if (column.generatedExpr) |gen| freeExpr(allocator, gen);
             }
             allocator.free(value.columns);
             for (value.constraints) |constraint| switch (constraint) {
-                .primaryKey => |columns| allocator.free(columns),
-                .unique => |columns| allocator.free(columns),
+                .primaryKey => |payload| allocator.free(payload.columns),
+                .unique => |payload| allocator.free(payload.columns),
                 .foreignKey => |foreignKey| {
                     allocator.free(foreignKey.columns);
                     allocator.free(foreignKey.referencedColumns);
                 },
-                .check => |chk| freeExpr(allocator, chk),
+                .check => |payload| freeExpr(allocator, payload.expr),
             };
             allocator.free(value.constraints);
         },
@@ -807,7 +821,10 @@ pub fn deinit(allocator: anytype, statement: *Statement) void {
         },
         .compoundSelect => |value| {
             if (value.orders.len != 0) allocator.free(value.orders);
+            if (value.limitExpr) |expr| freeExpr(allocator, expr);
+            if (value.offsetExpr) |expr| freeExpr(allocator, expr);
         },
+        .explain => {},
         .explainQueryPlan => {},
         .pragma => {},
         .insert => |value| {
@@ -818,51 +835,27 @@ pub fn deinit(allocator: anytype, statement: *Statement) void {
             }
             allocator.free(value.rows);
             if (value.conflictTargetColumns.len != 0) allocator.free(value.conflictTargetColumns);
-            if (value.conflictTargetWhere) |conditions| {
-                for (conditions) |condition| {
-                    if (condition.leftExpr) |left| freeExpr(allocator, left);
-                    freeExpr(allocator, condition.value);
-                    if (condition.value2) |second| freeExpr(allocator, second);
-                    if (condition.escape) |escape| freeExpr(allocator, escape);
-                    for (condition.listValues) |item| freeExpr(allocator, item);
-                    if (condition.listValues.len != 0) allocator.free(condition.listValues);
-                    if (condition.tableScan) |ts| if (ts.conditions) |inner| freeConditions(allocator, inner);
-                }
-                allocator.free(conditions);
-            }
+            if (value.conflictTargetWhere) |conditions| freeConditions(allocator, conditions);
             allocator.free(value.upsertColumns);
             for (value.upsertValues) |expr| freeExpr(allocator, expr);
             allocator.free(value.upsertValues);
-            if (value.upsertWhere) |conditions| {
-                for (conditions) |condition| {
-                    if (condition.leftExpr) |left| freeExpr(allocator, left);
-                    freeExpr(allocator, condition.value);
-                    if (condition.value2) |second| freeExpr(allocator, second);
-                    if (condition.escape) |escape| freeExpr(allocator, escape);
-                    for (condition.listValues) |item| freeExpr(allocator, item);
-                    if (condition.listValues.len != 0) allocator.free(condition.listValues);
-                    if (condition.tableScan) |ts| if (ts.conditions) |inner| freeConditions(allocator, inner);
-                }
-                allocator.free(conditions);
-            }
+            if (value.upsertWhere) |conditions| freeConditions(allocator, conditions);
             for (value.returning) |proj| freeExpr(allocator, proj.expr);
             if (value.returning.len != 0) allocator.free(value.returning);
         },
         .select => |value| {
             for (value.projections) |projection| freeExpr(allocator, projection.expr);
             allocator.free(value.projections);
-            if (value.condition) |conditions| {
-                for (conditions) |condition| {
-                    if (condition.leftExpr) |left| freeExpr(allocator, left);
-                    freeExpr(allocator, condition.value);
-                    if (condition.value2) |second| freeExpr(allocator, second);
-                    if (condition.escape) |escape| freeExpr(allocator, escape);
-                    for (condition.listValues) |item| freeExpr(allocator, item);
-                    if (condition.listValues.len != 0) allocator.free(condition.listValues);
-                    if (condition.tableScan) |ts| if (ts.conditions) |inner| freeConditions(allocator, inner);
-                }
-                allocator.free(conditions);
+            if (value.condition) |conditions| freeConditions(allocator, conditions);
+            for (value.groupByExprs) |expr| freeExpr(allocator, expr);
+            if (value.groupByExprs.len != 0) allocator.free(value.groupByExprs);
+            for (value.joins) |join| {
+                if (join.onExpr) |on| freeConditions(allocator, on);
+                if (join.usingColumns.len != 0) allocator.free(join.usingColumns);
             }
+            if (value.joins.len != 0) allocator.free(value.joins);
+            if (value.limitExpr) |expr| freeExpr(allocator, expr);
+            if (value.offsetExpr) |expr| freeExpr(allocator, expr);
             if (value.having) |items| {
                 for (items) |item| {
                     freeExpr(allocator, item.left);
@@ -871,41 +864,17 @@ pub fn deinit(allocator: anytype, statement: *Statement) void {
                 allocator.free(items);
             }
             if (value.orders.len != 0) allocator.free(value.orders);
-            for (value.joins) |join| if (join.usingColumns.len != 0) allocator.free(join.usingColumns);
-            if (value.joins.len != 0) allocator.free(value.joins);
         },
         .update => |value| {
             allocator.free(value.columns);
             for (value.values) |expr| freeExpr(allocator, expr);
             allocator.free(value.values);
-            if (value.condition) |conditions| {
-                for (conditions) |condition| {
-                    if (condition.leftExpr) |left| freeExpr(allocator, left);
-                    freeExpr(allocator, condition.value);
-                    if (condition.value2) |second| freeExpr(allocator, second);
-                    if (condition.escape) |escape| freeExpr(allocator, escape);
-                    for (condition.listValues) |item| freeExpr(allocator, item);
-                    if (condition.listValues.len != 0) allocator.free(condition.listValues);
-                    if (condition.tableScan) |ts| if (ts.conditions) |inner| freeConditions(allocator, inner);
-                }
-                allocator.free(conditions);
-            }
+            if (value.condition) |conditions| freeConditions(allocator, conditions);
             for (value.returning) |proj| freeExpr(allocator, proj.expr);
             if (value.returning.len != 0) allocator.free(value.returning);
         },
         .delete => |value| {
-            if (value.condition) |conditions| {
-                for (conditions) |condition| {
-                    if (condition.leftExpr) |left| freeExpr(allocator, left);
-                    freeExpr(allocator, condition.value);
-                    if (condition.value2) |second| freeExpr(allocator, second);
-                    if (condition.escape) |escape| freeExpr(allocator, escape);
-                    for (condition.listValues) |item| freeExpr(allocator, item);
-                    if (condition.listValues.len != 0) allocator.free(condition.listValues);
-                    if (condition.tableScan) |ts| if (ts.conditions) |inner| freeConditions(allocator, inner);
-                }
-                allocator.free(conditions);
-            }
+            if (value.condition) |conditions| freeConditions(allocator, conditions);
             for (value.returning) |proj| freeExpr(allocator, proj.expr);
             if (value.returning.len != 0) allocator.free(value.returning);
         },

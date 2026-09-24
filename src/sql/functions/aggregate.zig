@@ -21,6 +21,8 @@ pub const AggKind = enum {
     max,
     groupConcat,
     stringAgg,
+    jsonGroupArray,
+    jsonGroupObject,
 
     /// Case-insensitive name lookup; `average` maps to `avg`, else null.
     pub fn fromName(name: []const u8) ?AggKind {
@@ -32,6 +34,8 @@ pub const AggKind = enum {
         if (std.ascii.eqlIgnoreCase(name, "max")) return .max;
         if (std.ascii.eqlIgnoreCase(name, "group_concat")) return .groupConcat;
         if (std.ascii.eqlIgnoreCase(name, "string_agg")) return .stringAgg;
+        if (std.ascii.eqlIgnoreCase(name, "json_group_array")) return .jsonGroupArray;
+        if (std.ascii.eqlIgnoreCase(name, "json_group_object")) return .jsonGroupObject;
         return null;
     }
 };
@@ -112,6 +116,10 @@ pub const AggState = struct {
     separator: []const u8 = ",",
     /// Owned string pieces for concat (freed by `deinit`; joined by `final`).
     concatPieces: std.ArrayList([]const u8),
+    /// Owned JSON element fragments for `json_group_array`/`json_group_object`.
+    jsonPieces: std.ArrayList([]const u8),
+    /// Pending key for `json_group_object` (pair steps: key then value).
+    pendingJsonObjectKey: ?Value = null,
     /// Owned DISTINCT key set (hash dedup; text/blob payloads duped).
     seenValues: std.HashMap(DistinctKey, void, DistinctContext, 80),
 
@@ -129,6 +137,7 @@ pub const AggState = struct {
             .maxVal = null,
             .separator = sep orelse ",",
             .concatPieces = std.ArrayList([]const u8).empty,
+            .jsonPieces = std.ArrayList([]const u8).empty,
             .seenValues = std.HashMap(DistinctKey, void, DistinctContext, 80).init(allocator),
         };
     }
@@ -139,6 +148,18 @@ pub const AggState = struct {
             self.allocator.free(piece);
         }
         self.concatPieces.deinit(self.allocator);
+        for (self.jsonPieces.items) |piece| {
+            self.allocator.free(piece);
+        }
+        self.jsonPieces.deinit(self.allocator);
+        if (self.pendingJsonObjectKey) |k| {
+            switch (k) {
+                .text => |t| self.allocator.free(t),
+                .blob => |b| self.allocator.free(b),
+                else => {},
+            }
+            self.pendingJsonObjectKey = null;
+        }
         var keyIterator = self.seenValues.keyIterator();
         while (keyIterator.next()) |key| {
             switch (key.*) {
@@ -271,7 +292,43 @@ pub const AggState = struct {
                 }
                 try self.concatPieces.append(self.allocator, strPiece);
             },
+            .jsonGroupArray => {
+                if (val == .null) return;
+                const frag = try jsonValueFragment(self.allocator, val);
+                try self.jsonPieces.append(self.allocator, frag);
+            },
+            .jsonGroupObject => {
+                // json_group_object steps two values at a time via successive
+                // calls: key then value. Keys must be text; non-text keys fail.
+                // Values append as `"key":value` pairs built when both present.
+                if (val == .null) return;
+                try self.jsonObjectStep(val);
+            },
         }
+    }
+
+    /// Pair key/value steps for `json_group_object`.
+    fn jsonObjectStep(self: *AggState, val: Value) !void {
+        if (self.pendingJsonObjectKey == null) {
+            if (val != .text) return error.InvalidArgument;
+            self.pendingJsonObjectKey = try val.clone(self.allocator);
+            return;
+        }
+        const key = self.pendingJsonObjectKey.?;
+        self.pendingJsonObjectKey = null;
+        defer switch (key) {
+            .text => |t| self.allocator.free(t),
+            .blob => |b| self.allocator.free(b),
+            else => {},
+        };
+        const keyText = switch (key) {
+            .text => |t| t,
+            else => return error.InvalidArgument,
+        };
+        const valJson = try jsonValueJson(self.allocator, val);
+        defer self.allocator.free(valJson);
+        const piece = try std.fmt.allocPrint(self.allocator, "\"{s}\":{s}", .{ keyText, valJson });
+        try self.jsonPieces.append(self.allocator, piece);
     }
 
     /// Alias for `final` kept for call-site compatibility.
@@ -321,9 +378,92 @@ pub const AggState = struct {
                 }
                 return .{ .text = out };
             },
+            .jsonGroupArray => {
+                var total: usize = 2;
+                for (self.jsonPieces.items, 0..) |piece, i| {
+                    total = total +| piece.len;
+                    if (i + 1 < self.jsonPieces.items.len) total = total +| 1;
+                }
+                const out = try self.allocator.alloc(u8, total);
+                var idx: usize = 0;
+                out[idx] = '[';
+                idx += 1;
+                for (self.jsonPieces.items, 0..) |piece, i| {
+                    if (i > 0) {
+                        out[idx] = ',';
+                        idx += 1;
+                    }
+                    @memcpy(out[idx .. idx + piece.len], piece);
+                    idx += piece.len;
+                }
+                out[idx] = ']';
+                return .{ .text = out };
+            },
+            .jsonGroupObject => {
+                if (self.jsonPieces.items.len == 0) return .{ .text = try self.allocator.dupe(u8, "{}") };
+                var total: usize = 2;
+                for (self.jsonPieces.items, 0..) |piece, i| {
+                    total = total +| piece.len;
+                    if (i + 1 < self.jsonPieces.items.len) total = total +| 1;
+                }
+                const out = try self.allocator.alloc(u8, total);
+                var idx: usize = 0;
+                out[idx] = '{';
+                idx += 1;
+                for (self.jsonPieces.items, 0..) |piece, i| {
+                    if (i > 0) {
+                        out[idx] = ',';
+                        idx += 1;
+                    }
+                    @memcpy(out[idx .. idx + piece.len], piece);
+                    idx += piece.len;
+                }
+                out[idx] = '}';
+                return .{ .text = out };
+            },
         }
     }
 };
+
+/// Format one SQL value as a JSON fragment for `json_group_array`.
+fn jsonValueFragment(allocator: std.mem.Allocator, val: Value) ![]const u8 {
+    return switch (val) {
+        .null => try allocator.dupe(u8, "null"),
+        .integer => |i| try std.fmt.allocPrint(allocator, "{d}", .{i}),
+        .real => |r| try std.fmt.allocPrint(allocator, "{d}", .{r}),
+        .text => |t| try encodeJsonText(allocator, t),
+        .blob => try allocator.dupe(u8, "null"),
+    };
+}
+
+/// Format one SQL value as JSON for embedding inside an object member.
+fn jsonValueJson(allocator: std.mem.Allocator, val: Value) ![]const u8 {
+    return jsonValueFragment(allocator, val);
+}
+
+/// JSON-string encode (quotes + escapes).
+fn encodeJsonText(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try out.append(allocator, '"');
+    for (text) |c| switch (c) {
+        '"' => try out.appendSlice(allocator, "\\\""),
+        '\\' => try out.appendSlice(allocator, "\\\\"),
+        '\n' => try out.appendSlice(allocator, "\\n"),
+        '\r' => try out.appendSlice(allocator, "\\r"),
+        '\t' => try out.appendSlice(allocator, "\\t"),
+        else => if (c < 0x20) {
+            var buf: [6]u8 = undefined;
+            if (std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{c})) |formatted| {
+                try out.appendSlice(allocator, formatted);
+            } else |_| {
+                try out.appendSlice(allocator, "\\u0000");
+            }
+        } else try out.append(allocator, c),
+    };
+    try out.append(allocator, '"');
+    return out.toOwnedSlice(allocator);
+}
 
 test "aggregate normal behavior" {
     const alloc = std.testing.allocator;

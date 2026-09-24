@@ -1,18 +1,4 @@
 //! Value-semantic query and mutation builders over the native AST.
-//!
-//! Builders are copies that borrow names; `fetch`/`execute` return owned results.
-//! The connection must outlive every builder and result.
-//! Overflow panics; execution returns engine errors.
-//!
-//! TODO (modularization, tracked in docs/api/compatibility.md): this file exceeds
-//! the 2000-line module target (~2.2k lines after extracting
-//! `dsl/mutation.zig`). The remaining `Builder`/`CompoundBuilder` methods
-//! cannot leave their generic types, so further splits need a builder-type
-//! redesign (out of scope for mechanical extraction). `UpsertBuilder`,
-//! `Mutation`, and the shared predicate/assignment/join-target helpers now
-//! live in `dsl/mutation.zig`, imported one-directionally; `dynamic.zig`
-//! re-exports the dynamic aliases from there. No DSL semantic change; DSL
-//! convergence tests in examples 15/48/72/73 must stay green.
 
 const std = @import("std");
 const dslExpr = @import("expr.zig");
@@ -569,6 +555,176 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
             var copy = self;
             mutationMod.appendOr(copy.conditions[0..], &copy.conditionCount, condition);
             return copy;
+        }
+
+        fn resolveCol(self: *const Self, col: anytype) struct { ref: ColumnRef, func: ?dslExpr.FuncCall } {
+            const T = @TypeOf(col);
+            if (Row != void and comptime scopeMod.isScopedItem(T, Row)) {
+                return .{ .ref = self.scopedRef(col), .func = null };
+            }
+            if (T == columnMod.DynamicColumn) {
+                return .{ .ref = columnMod.dynRef(col), .func = col.func };
+            }
+            if (comptime mutationMod.isTypedColumnInstance(T)) {
+                return .{ .ref = .{ .table = columnMod.qualifiedTable(col), .name = T.dslName }, .func = col.func };
+            }
+            @compileError("expected a column descriptor (User.id or table.column(\"x\"))");
+        }
+
+        pub fn whereNull(self: Self, col: anytype) Self {
+            const r = self.resolveCol(col);
+            return self.where(Expr{ .column = r.ref, .operator = .isNull, .function = r.func });
+        }
+
+        pub fn andWhereNull(self: Self, col: anytype) Self {
+            const r = self.resolveCol(col);
+            return self.andWhere(Expr{ .column = r.ref, .operator = .isNull, .function = r.func });
+        }
+
+        pub fn orWhereNull(self: Self, col: anytype) Self {
+            const r = self.resolveCol(col);
+            return self.orWhere(Expr{ .column = r.ref, .operator = .isNull, .function = r.func });
+        }
+
+        pub fn whereNotNull(self: Self, col: anytype) Self {
+            const r = self.resolveCol(col);
+            return self.where(Expr{ .column = r.ref, .operator = .isNotNull, .function = r.func });
+        }
+
+        pub fn andWhereNotNull(self: Self, col: anytype) Self {
+            const r = self.resolveCol(col);
+            return self.andWhere(Expr{ .column = r.ref, .operator = .isNotNull, .function = r.func });
+        }
+
+        pub fn orWhereNotNull(self: Self, col: anytype) Self {
+            const r = self.resolveCol(col);
+            return self.orWhere(Expr{ .column = r.ref, .operator = .isNotNull, .function = r.func });
+        }
+
+        pub fn whereTrue(self: Self, col: anytype) Self {
+            const r = self.resolveCol(col);
+            return self.where(Expr{ .column = r.ref, .operator = .isTrue, .function = r.func });
+        }
+
+        pub fn andWhereTrue(self: Self, col: anytype) Self {
+            const r = self.resolveCol(col);
+            return self.andWhere(Expr{ .column = r.ref, .operator = .isTrue, .function = r.func });
+        }
+
+        pub fn orWhereTrue(self: Self, col: anytype) Self {
+            const r = self.resolveCol(col);
+            return self.orWhere(Expr{ .column = r.ref, .operator = .isTrue, .function = r.func });
+        }
+
+        pub fn whereFalse(self: Self, col: anytype) Self {
+            const r = self.resolveCol(col);
+            return self.where(Expr{ .column = r.ref, .operator = .isFalse, .function = r.func });
+        }
+
+        pub fn andWhereFalse(self: Self, col: anytype) Self {
+            const r = self.resolveCol(col);
+            return self.andWhere(Expr{ .column = r.ref, .operator = .isFalse, .function = r.func });
+        }
+
+        pub fn orWhereFalse(self: Self, col: anytype) Self {
+            const r = self.resolveCol(col);
+            return self.orWhere(Expr{ .column = r.ref, .operator = .isFalse, .function = r.func });
+        }
+
+        pub fn whereNotTrue(self: Self, col: anytype) Self {
+            const r = self.resolveCol(col);
+            return self.where(Expr{ .column = r.ref, .operator = .isNotTrue, .function = r.func });
+        }
+
+        pub fn andWhereNotTrue(self: Self, col: anytype) Self {
+            const r = self.resolveCol(col);
+            return self.andWhere(Expr{ .column = r.ref, .operator = .isNotTrue, .function = r.func });
+        }
+
+        pub fn orWhereNotTrue(self: Self, col: anytype) Self {
+            const r = self.resolveCol(col);
+            return self.orWhere(Expr{ .column = r.ref, .operator = .isNotTrue, .function = r.func });
+        }
+
+        pub fn whereNotFalse(self: Self, col: anytype) Self {
+            const r = self.resolveCol(col);
+            return self.where(Expr{ .column = r.ref, .operator = .isNotFalse, .function = r.func });
+        }
+
+        pub fn andWhereNotFalse(self: Self, col: anytype) Self {
+            const r = self.resolveCol(col);
+            return self.andWhere(Expr{ .column = r.ref, .operator = .isNotFalse, .function = r.func });
+        }
+
+        pub fn orWhereNotFalse(self: Self, col: anytype) Self {
+            const r = self.resolveCol(col);
+            return self.orWhere(Expr{ .column = r.ref, .operator = .isNotFalse, .function = r.func });
+        }
+
+        pub fn whereBetween(self: Self, col: anytype, lo: anytype, hi: anytype) Self {
+            const r = self.resolveCol(col);
+            return self.where(Expr{
+                .column = r.ref,
+                .operator = .between,
+                .rhs = columnMod.toRhs(lo),
+                .rhs2 = columnMod.toRhs(hi),
+                .function = r.func,
+            });
+        }
+
+        pub fn andWhereBetween(self: Self, col: anytype, lo: anytype, hi: anytype) Self {
+            const r = self.resolveCol(col);
+            return self.andWhere(Expr{
+                .column = r.ref,
+                .operator = .between,
+                .rhs = columnMod.toRhs(lo),
+                .rhs2 = columnMod.toRhs(hi),
+                .function = r.func,
+            });
+        }
+
+        pub fn orWhereBetween(self: Self, col: anytype, lo: anytype, hi: anytype) Self {
+            const r = self.resolveCol(col);
+            return self.orWhere(Expr{
+                .column = r.ref,
+                .operator = .between,
+                .rhs = columnMod.toRhs(lo),
+                .rhs2 = columnMod.toRhs(hi),
+                .function = r.func,
+            });
+        }
+
+        pub fn whereNotBetween(self: Self, col: anytype, lo: anytype, hi: anytype) Self {
+            const r = self.resolveCol(col);
+            return self.where(Expr{
+                .column = r.ref,
+                .operator = .notBetween,
+                .rhs = columnMod.toRhs(lo),
+                .rhs2 = columnMod.toRhs(hi),
+                .function = r.func,
+            });
+        }
+
+        pub fn andWhereNotBetween(self: Self, col: anytype, lo: anytype, hi: anytype) Self {
+            const r = self.resolveCol(col);
+            return self.andWhere(Expr{
+                .column = r.ref,
+                .operator = .notBetween,
+                .rhs = columnMod.toRhs(lo),
+                .rhs2 = columnMod.toRhs(hi),
+                .function = r.func,
+            });
+        }
+
+        pub fn orWhereNotBetween(self: Self, col: anytype, lo: anytype, hi: anytype) Self {
+            const r = self.resolveCol(col);
+            return self.orWhere(Expr{
+                .column = r.ref,
+                .operator = .notBetween,
+                .rhs = columnMod.toRhs(lo),
+                .rhs2 = columnMod.toRhs(hi),
+                .function = r.func,
+            });
         }
 
         pub fn whereCase(self: Self, case: CaseBuilder, value: anytype) Self {
@@ -2216,4 +2372,37 @@ test "orderBy accepts single orders and tuples of orders" {
     try std.testing.expectEqual(@as(usize, 2), compoundOrdered.orderCount);
     try std.testing.expect(compoundOrdered.orders[0].descending);
     try std.testing.expect(!compoundOrdered.orders[1].descending);
+}
+
+test "whereNull, whereNotNull, whereBetween, whereNotBetween helper methods" {
+    const conn = @as(*anyopaque, @ptrFromInt(0x1000));
+    const T = tableMod.table("items", struct { id: i64, price: f64, note: ?[]const u8 });
+    const base = Query(@TypeOf(T)).initRaw(std.testing.allocator, conn, "items", undefined, undefined, undefined);
+
+    const qNull = base.whereNull(.note);
+    try std.testing.expectEqual(@as(usize, 1), qNull.conditionCount);
+    try std.testing.expect(qNull.conditions[0].expr.operator == .isNull);
+    try std.testing.expectEqualStrings("note", qNull.conditions[0].expr.column.name);
+
+    const qNotNull = base.whereNotNull(T.note);
+    try std.testing.expectEqual(@as(usize, 1), qNotNull.conditionCount);
+    try std.testing.expect(qNotNull.conditions[0].expr.operator == .isNotNull);
+    try std.testing.expectEqualStrings("note", qNotNull.conditions[0].expr.column.name);
+
+    const qBetween = base.whereBetween(T.price, 10.0, 50.0);
+    try std.testing.expectEqual(@as(usize, 1), qBetween.conditionCount);
+    try std.testing.expect(qBetween.conditions[0].expr.operator == .between);
+    try std.testing.expectEqualStrings("price", qBetween.conditions[0].expr.column.name);
+
+    const qNotBetween = base.whereNotBetween(.id, 1, 100);
+    try std.testing.expectEqual(@as(usize, 1), qNotBetween.conditionCount);
+    try std.testing.expect(qNotBetween.conditions[0].expr.operator == .notBetween);
+    try std.testing.expectEqualStrings("id", qNotBetween.conditions[0].expr.column.name);
+
+    const qChained = base.whereNull(.note).andWhereBetween(.id, 5, 10).orWhereNotNull(T.note);
+    try std.testing.expectEqual(@as(usize, 3), qChained.conditionCount);
+    try std.testing.expect(qChained.conditions[0].expr.operator == .isNull);
+    try std.testing.expect(qChained.conditions[1].expr.operator == .between);
+    try std.testing.expect(qChained.conditions[2].expr.operator == .isNotNull);
+    try std.testing.expect(qChained.conditions[2].joinOr);
 }

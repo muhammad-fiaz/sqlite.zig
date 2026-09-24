@@ -23,6 +23,7 @@ pub const TableCursor = struct {
     table: *const Table,
     rowIndex: usize = 0,
     eof: bool = true,
+    deletedCurrent: bool = false,
 
     /// Cursor at the first row; `eof` when the table is empty. Borrows the table.
     pub fn init(table: *const Table) TableCursor {
@@ -30,12 +31,14 @@ pub const TableCursor = struct {
             .table = table,
             .rowIndex = 0,
             .eof = table.rows.items.len == 0,
+            .deletedCurrent = false,
         };
     }
 
     /// Repositions to the first row; returns true when empty (eof).
     pub fn rewind(self: *TableCursor) bool {
         self.rowIndex = 0;
+        self.deletedCurrent = false;
         self.eof = self.table.rows.items.len == 0;
         return self.eof;
     }
@@ -43,6 +46,11 @@ pub const TableCursor = struct {
     /// Advances one row; returns false at end (sets eof). Sticky at eof.
     pub fn next(self: *TableCursor) bool {
         if (self.eof) return false;
+        if (self.deletedCurrent) {
+            self.deletedCurrent = false;
+            self.eof = self.rowIndex >= self.table.rows.items.len;
+            return !self.eof;
+        }
         self.rowIndex += 1;
         self.eof = self.rowIndex >= self.table.rows.items.len;
         return !self.eof;
@@ -351,11 +359,6 @@ pub const VirtualMachine = struct {
         self.arena.deinit();
     }
 
-    // TODO: Build automatic indexes for eligible join inner loops. Table
-    // scans are the fallback today when no stored index fits; an ephemeral
-    // per-execution index over the inner table would turn those into seeks.
-    // Needs planner cost integration so EXPLAIN shows the choice, plus
-    // multi-table join tests and vacuous-scan regression coverage.
     pub fn execute(self: *VirtualMachine, program: *const Program, columnNames: []const []const u8) !Result {
         var outputRows: std.ArrayList([]Value) = .empty;
         errdefer {
@@ -561,7 +564,11 @@ pub const VirtualMachine = struct {
                             if (self.schema) |sch| {
                                 if (sch.find(tableNameVal.text)) |table| {
                                     self.cursors[cIdx] = .{ .table = TableCursor.init(table) };
+                                } else if (std.ascii.eqlIgnoreCase(tableNameVal.text, "sqlite_schema") or std.ascii.eqlIgnoreCase(tableNameVal.text, "sqlite_master")) {
+                                    self.cursors[cIdx] = .{ .ephemeral = EphemeralCursor.init(arenaAlloc) };
                                 } else return error.TableNotFound;
+                            } else if (std.ascii.eqlIgnoreCase(tableNameVal.text, "sqlite_schema") or std.ascii.eqlIgnoreCase(tableNameVal.text, "sqlite_master")) {
+                                self.cursors[cIdx] = .{ .ephemeral = EphemeralCursor.init(arenaAlloc) };
                             } else return error.TableNotFound;
                         }
                     }
@@ -650,19 +657,24 @@ pub const VirtualMachine = struct {
                     const start = @as(usize, @intCast(inst.p1));
                     const count = @as(usize, @intCast(inst.p2));
                     const dst = @as(usize, @intCast(inst.p3));
-                    if (count > 0) registers[dst] = registers[start];
+                    for (0..count) |i| {
+                        registers[dst + i] = registers[start + i];
+                    }
                 },
                 .insert => {
                     const cIdx = @as(usize, @intCast(inst.p1));
                     const recReg = @as(usize, @intCast(inst.p2));
+                    const count: usize = if (inst.p3 > 0) @as(usize, @intCast(inst.p3)) else 1;
                     if (self.cursors[cIdx]) |*cursor| {
                         switch (cursor.*) {
-                            .ephemeral => |*e| try e.insert(registers[recReg .. recReg + 1]),
+                            .ephemeral => |*e| try e.insert(registers[recReg .. recReg + count]),
                             .table => |*t| {
                                 if (self.schema) |sch| {
                                     if (sch.find(t.table.name)) |mutTable| {
-                                        const r = try self.allocator.alloc(Value, 1);
-                                        r[0] = try registers[recReg].clone(self.allocator);
+                                        const r = try self.allocator.alloc(Value, count);
+                                        for (0..count) |i| {
+                                            r[i] = try registers[recReg + i].clone(self.allocator);
+                                        }
                                         try mutTable.rows.append(self.allocator, .{ .values = r });
                                         self.changes += 1;
                                     }
@@ -672,7 +684,27 @@ pub const VirtualMachine = struct {
                     } else return error.CursorNotFound;
                 },
                 .delete => {
-                    self.changes += 1;
+                    const cIdx = @as(usize, @intCast(inst.p1));
+                    if (self.cursors[cIdx]) |*cursor| {
+                        switch (cursor.*) {
+                            .table => |*t| {
+                                if (self.schema) |sch| {
+                                    if (sch.find(t.table.name)) |mutTable| {
+                                        if (t.rowIndex < mutTable.rows.items.len) {
+                                            const removed = mutTable.rows.orderedRemove(t.rowIndex);
+                                            for (removed.values) |val| val.free(self.allocator);
+                                            self.allocator.free(removed.values);
+                                            self.changes += 1;
+                                            t.deletedCurrent = true;
+                                        }
+                                    }
+                                }
+                            },
+                            .ephemeral => {},
+                        }
+                    } else {
+                        self.changes += 1;
+                    }
                 },
                 .newRowid => {
                     const dst = @as(usize, @intCast(inst.p2));
@@ -751,6 +783,7 @@ pub const VirtualMachine = struct {
                         registers[dst] = state.maxVal orelse .null;
                     }
                 },
+                else => {},
             }
             pc += 1;
         }

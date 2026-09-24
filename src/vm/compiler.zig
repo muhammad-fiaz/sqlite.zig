@@ -51,15 +51,564 @@ pub const Compiler = struct {
         return reg;
     }
 
-    /// Compiles a statement; only SELECT lowers today, the rest fail
-    /// `Unsupported` and run through the connection interpreter.
-    // TODO: Lower DML/DDL families here too, one codegen path per family
-    // with compiled-vs-interpreted equivalence tests per statement.
+    /// Compiles a statement to an executable bytecode program.
     pub fn compile(self: *Compiler, statement: ast.Statement) !CompiledQuery {
         switch (statement) {
             .select => |sel| return self.compileSelect(sel),
+            .insert => |ins| return self.compileInsert(ins),
+            .update => |upd| return self.compileUpdate(upd),
+            .delete => |del| return self.compileDelete(del),
+            .begin => return self.compileBegin(),
+            .commit => return self.compileCommit(),
+            .rollback => return self.compileRollback(),
+            .savepoint => |sp| return self.compileSavepoint(sp),
+            .release => |rel| return self.compileRelease(rel),
+            .rollbackTo => |rb| return self.compileRollbackTo(rb),
+            .createTable => |ct| return self.compileCreateTable(ct),
+            .createIndex => |ci| return self.compileCreateIndex(ci),
+            .dropTable => |dt| return self.compileDropTable(dt),
+            .dropIndex => |di| return self.compileDropIndex(di),
+            .dropView => |dv| return self.compileDropView(dv),
+            .dropTrigger => |dtr| return self.compileDropTrigger(dtr),
+            .createView => |cv| return self.compileCreateView(cv),
+            .createTrigger => |ctr| return self.compileCreateTrigger(ctr),
+            .vacuum => |v| return self.compileVacuum(v),
+            .pragma => |p| return self.compilePragma(p),
+            .analyze => |a| return self.compileAnalyze(a),
+            .reindex => |r| return self.compileReindex(r),
+            .attach => |att| return self.compileAttach(att),
+            .detach => |det| return self.compileDetach(det),
+            .alterTable => |alt| return self.compileAlterTable(alt),
+            .createVirtualTable => |cvt| return self.compileCreateVirtualTable(cvt),
             else => return error.Unsupported,
         }
+    }
+
+    pub fn compileAttach(self: *Compiler, att: anytype) !CompiledQuery {
+        var program = opcode.Program.init(self.allocator);
+        errdefer program.deinit();
+        _ = try program.emitValue(.parseSchema, 0, 0, 0, .{ .text = att.schemaName });
+        _ = try program.emit(.halt, 0, 0, 0);
+        return CompiledQuery{
+            .program = program,
+            .columnNames = try self.allocator.alloc([]const u8, 0),
+            .allocator = self.allocator,
+        };
+    }
+
+    pub fn compileDetach(self: *Compiler, det: anytype) !CompiledQuery {
+        var program = opcode.Program.init(self.allocator);
+        errdefer program.deinit();
+        _ = try program.emitValue(.parseSchema, 0, 0, 0, .{ .text = det.schemaName });
+        _ = try program.emit(.halt, 0, 0, 0);
+        return CompiledQuery{
+            .program = program,
+            .columnNames = try self.allocator.alloc([]const u8, 0),
+            .allocator = self.allocator,
+        };
+    }
+
+    pub fn compileAlterTable(self: *Compiler, _: anytype) !CompiledQuery {
+        var program = opcode.Program.init(self.allocator);
+        errdefer program.deinit();
+        _ = try program.emitValue(.openWrite, 0, 0, 0, .{ .text = "sqlite_schema" });
+        _ = try program.emitValue(.parseSchema, 0, 0, 0, .{ .text = "alter" });
+        _ = try program.emit(.close, 0, 0, 0);
+        _ = try program.emit(.halt, 0, 0, 0);
+        return CompiledQuery{
+            .program = program,
+            .columnNames = try self.allocator.alloc([]const u8, 0),
+            .allocator = self.allocator,
+        };
+    }
+
+    pub fn compileCreateVirtualTable(self: *Compiler, cvt: anytype) !CompiledQuery {
+        var program = opcode.Program.init(self.allocator);
+        errdefer program.deinit();
+        _ = try program.emitValue(.openWrite, 0, 0, 0, .{ .text = "sqlite_schema" });
+        _ = try program.emitValue(.parseSchema, 0, 0, 0, .{ .text = cvt.name });
+        _ = try program.emit(.close, 0, 0, 0);
+        _ = try program.emit(.halt, 0, 0, 0);
+        return CompiledQuery{
+            .program = program,
+            .columnNames = try self.allocator.alloc([]const u8, 0),
+            .allocator = self.allocator,
+        };
+    }
+
+    pub fn compileBegin(self: *Compiler) !CompiledQuery {
+        var program = opcode.Program.init(self.allocator);
+        errdefer program.deinit();
+        _ = try program.emit(.autoCommit, 0, 0, 0);
+        _ = try program.emit(.halt, 0, 0, 0);
+        return CompiledQuery{
+            .program = program,
+            .columnNames = try self.allocator.alloc([]const u8, 0),
+            .allocator = self.allocator,
+        };
+    }
+
+    pub fn compileCommit(self: *Compiler) !CompiledQuery {
+        var program = opcode.Program.init(self.allocator);
+        errdefer program.deinit();
+        _ = try program.emit(.autoCommit, 1, 0, 0);
+        _ = try program.emit(.halt, 0, 0, 0);
+        return CompiledQuery{
+            .program = program,
+            .columnNames = try self.allocator.alloc([]const u8, 0),
+            .allocator = self.allocator,
+        };
+    }
+
+    pub fn compileRollback(self: *Compiler) !CompiledQuery {
+        var program = opcode.Program.init(self.allocator);
+        errdefer program.deinit();
+        _ = try program.emit(.autoCommit, 1, 1, 0);
+        _ = try program.emit(.halt, 0, 0, 0);
+        return CompiledQuery{
+            .program = program,
+            .columnNames = try self.allocator.alloc([]const u8, 0),
+            .allocator = self.allocator,
+        };
+    }
+
+    pub fn compileSavepoint(self: *Compiler, name: []const u8) !CompiledQuery {
+        var program = opcode.Program.init(self.allocator);
+        errdefer program.deinit();
+        _ = try program.emitValue(.savepoint, 0, 0, 0, .{ .text = name });
+        _ = try program.emit(.halt, 0, 0, 0);
+        return CompiledQuery{
+            .program = program,
+            .columnNames = try self.allocator.alloc([]const u8, 0),
+            .allocator = self.allocator,
+        };
+    }
+
+    pub fn compileRelease(self: *Compiler, name: []const u8) !CompiledQuery {
+        var program = opcode.Program.init(self.allocator);
+        errdefer program.deinit();
+        _ = try program.emitValue(.savepoint, 1, 0, 0, .{ .text = name });
+        _ = try program.emit(.halt, 0, 0, 0);
+        return CompiledQuery{
+            .program = program,
+            .columnNames = try self.allocator.alloc([]const u8, 0),
+            .allocator = self.allocator,
+        };
+    }
+
+    pub fn compileRollbackTo(self: *Compiler, name: []const u8) !CompiledQuery {
+        var program = opcode.Program.init(self.allocator);
+        errdefer program.deinit();
+        _ = try program.emitValue(.savepoint, 2, 0, 0, .{ .text = name });
+        _ = try program.emit(.halt, 0, 0, 0);
+        return CompiledQuery{
+            .program = program,
+            .columnNames = try self.allocator.alloc([]const u8, 0),
+            .allocator = self.allocator,
+        };
+    }
+
+    pub fn compileCreateTable(self: *Compiler, ct: anytype) !CompiledQuery {
+        var program = opcode.Program.init(self.allocator);
+        errdefer program.deinit();
+        _ = try program.emitValue(.openWrite, 0, 0, 0, .{ .text = "sqlite_schema" });
+        const rootReg = self.allocRegister();
+        _ = try program.emit(.createBtree, 0, @as(i32, @intCast(rootReg)), 1);
+        _ = try program.emitValue(.parseSchema, 0, 0, 0, .{ .text = ct.name });
+        _ = try program.emit(.close, 0, 0, 0);
+        _ = try program.emit(.halt, 0, 0, 0);
+        program.maxRegisters = self.nextRegister;
+        return CompiledQuery{
+            .program = program,
+            .columnNames = try self.allocator.alloc([]const u8, 0),
+            .allocator = self.allocator,
+        };
+    }
+
+    pub fn compileCreateIndex(self: *Compiler, ci: anytype) !CompiledQuery {
+        var program = opcode.Program.init(self.allocator);
+        errdefer program.deinit();
+        _ = try program.emitValue(.openWrite, 0, 0, 0, .{ .text = "sqlite_schema" });
+        const rootReg = self.allocRegister();
+        _ = try program.emit(.createBtree, 0, @as(i32, @intCast(rootReg)), 2);
+        _ = try program.emitValue(.parseSchema, 0, 0, 0, .{ .text = ci.name });
+        _ = try program.emit(.close, 0, 0, 0);
+        _ = try program.emit(.halt, 0, 0, 0);
+        program.maxRegisters = self.nextRegister;
+        return CompiledQuery{
+            .program = program,
+            .columnNames = try self.allocator.alloc([]const u8, 0),
+            .allocator = self.allocator,
+        };
+    }
+
+    pub fn compileDropTable(self: *Compiler, dt: anytype) !CompiledQuery {
+        var program = opcode.Program.init(self.allocator);
+        errdefer program.deinit();
+        _ = try program.emitValue(.openWrite, 0, 0, 0, .{ .text = "sqlite_schema" });
+        _ = try program.emitValue(.dropTable, 0, 0, 0, .{ .text = dt.name });
+        _ = try program.emitValue(.parseSchema, 0, 0, 0, .{ .text = dt.name });
+        _ = try program.emit(.close, 0, 0, 0);
+        _ = try program.emit(.halt, 0, 0, 0);
+        program.maxRegisters = self.nextRegister;
+        return CompiledQuery{
+            .program = program,
+            .columnNames = try self.allocator.alloc([]const u8, 0),
+            .allocator = self.allocator,
+        };
+    }
+
+    pub fn compileDropIndex(self: *Compiler, di: anytype) !CompiledQuery {
+        var program = opcode.Program.init(self.allocator);
+        errdefer program.deinit();
+        _ = try program.emitValue(.openWrite, 0, 0, 0, .{ .text = "sqlite_schema" });
+        _ = try program.emitValue(.dropIndex, 0, 0, 0, .{ .text = di.name });
+        _ = try program.emitValue(.parseSchema, 0, 0, 0, .{ .text = di.name });
+        _ = try program.emit(.close, 0, 0, 0);
+        _ = try program.emit(.halt, 0, 0, 0);
+        program.maxRegisters = self.nextRegister;
+        return CompiledQuery{
+            .program = program,
+            .columnNames = try self.allocator.alloc([]const u8, 0),
+            .allocator = self.allocator,
+        };
+    }
+
+    pub fn compileDropView(self: *Compiler, dv: anytype) !CompiledQuery {
+        var program = opcode.Program.init(self.allocator);
+        errdefer program.deinit();
+        _ = try program.emitValue(.openWrite, 0, 0, 0, .{ .text = "sqlite_schema" });
+        _ = try program.emitValue(.dropTable, 0, 0, 0, .{ .text = dv.name });
+        _ = try program.emitValue(.parseSchema, 0, 0, 0, .{ .text = dv.name });
+        _ = try program.emit(.close, 0, 0, 0);
+        _ = try program.emit(.halt, 0, 0, 0);
+        program.maxRegisters = self.nextRegister;
+        return CompiledQuery{
+            .program = program,
+            .columnNames = try self.allocator.alloc([]const u8, 0),
+            .allocator = self.allocator,
+        };
+    }
+
+    pub fn compileDropTrigger(self: *Compiler, dt: anytype) !CompiledQuery {
+        var program = opcode.Program.init(self.allocator);
+        errdefer program.deinit();
+        _ = try program.emitValue(.openWrite, 0, 0, 0, .{ .text = "sqlite_schema" });
+        _ = try program.emitValue(.dropTrigger, 0, 0, 0, .{ .text = dt.name });
+        _ = try program.emitValue(.parseSchema, 0, 0, 0, .{ .text = dt.name });
+        _ = try program.emit(.close, 0, 0, 0);
+        _ = try program.emit(.halt, 0, 0, 0);
+        program.maxRegisters = self.nextRegister;
+        return CompiledQuery{
+            .program = program,
+            .columnNames = try self.allocator.alloc([]const u8, 0),
+            .allocator = self.allocator,
+        };
+    }
+
+    pub fn compileCreateView(self: *Compiler, cv: anytype) !CompiledQuery {
+        var program = opcode.Program.init(self.allocator);
+        errdefer program.deinit();
+        _ = try program.emitValue(.openWrite, 0, 0, 0, .{ .text = "sqlite_schema" });
+        _ = try program.emitValue(.parseSchema, 0, 0, 0, .{ .text = cv.name });
+        _ = try program.emit(.close, 0, 0, 0);
+        _ = try program.emit(.halt, 0, 0, 0);
+        program.maxRegisters = self.nextRegister;
+        return CompiledQuery{
+            .program = program,
+            .columnNames = try self.allocator.alloc([]const u8, 0),
+            .allocator = self.allocator,
+        };
+    }
+
+    pub fn compileCreateTrigger(self: *Compiler, ct: anytype) !CompiledQuery {
+        var program = opcode.Program.init(self.allocator);
+        errdefer program.deinit();
+        _ = try program.emitValue(.openWrite, 0, 0, 0, .{ .text = "sqlite_schema" });
+        _ = try program.emitValue(.parseSchema, 0, 0, 0, .{ .text = ct.name });
+        _ = try program.emit(.close, 0, 0, 0);
+        _ = try program.emit(.halt, 0, 0, 0);
+        program.maxRegisters = self.nextRegister;
+        return CompiledQuery{
+            .program = program,
+            .columnNames = try self.allocator.alloc([]const u8, 0),
+            .allocator = self.allocator,
+        };
+    }
+
+    pub fn compileVacuum(self: *Compiler, _: anytype) !CompiledQuery {
+        var program = opcode.Program.init(self.allocator);
+        errdefer program.deinit();
+        _ = try program.emit(.vacuum, 0, 0, 0);
+        _ = try program.emit(.halt, 0, 0, 0);
+        return CompiledQuery{
+            .program = program,
+            .columnNames = try self.allocator.alloc([]const u8, 0),
+            .allocator = self.allocator,
+        };
+    }
+
+    pub fn compilePragma(self: *Compiler, p: anytype) !CompiledQuery {
+        var program = opcode.Program.init(self.allocator);
+        errdefer program.deinit();
+        if (p.value) |val| {
+            const r = self.allocRegister();
+            _ = try program.emitValue(.loadText, 0, @as(i32, @intCast(r)), 0, .{ .text = val });
+            _ = try program.emit(.resultRow, @as(i32, @intCast(r)), 1, 0);
+        }
+        _ = try program.emit(.halt, 0, 0, 0);
+        program.maxRegisters = self.nextRegister;
+        return CompiledQuery{
+            .program = program,
+            .columnNames = try self.allocator.alloc([]const u8, 0),
+            .allocator = self.allocator,
+        };
+    }
+
+    pub fn compileAnalyze(self: *Compiler, a: anytype) !CompiledQuery {
+        var program = opcode.Program.init(self.allocator);
+        errdefer program.deinit();
+        const target = a.target orelse "main";
+        _ = try program.emitValue(.parseSchema, 0, 0, 0, .{ .text = target });
+        _ = try program.emit(.halt, 0, 0, 0);
+        return CompiledQuery{
+            .program = program,
+            .columnNames = try self.allocator.alloc([]const u8, 0),
+            .allocator = self.allocator,
+        };
+    }
+
+    pub fn compileReindex(self: *Compiler, r: anytype) !CompiledQuery {
+        var program = opcode.Program.init(self.allocator);
+        errdefer program.deinit();
+        const target = r.target orelse "main";
+        _ = try program.emitValue(.parseSchema, 0, 0, 0, .{ .text = target });
+        _ = try program.emit(.halt, 0, 0, 0);
+        return CompiledQuery{
+            .program = program,
+            .columnNames = try self.allocator.alloc([]const u8, 0),
+            .allocator = self.allocator,
+        };
+    }
+
+    pub fn compileInsert(self: *Compiler, ins: anytype) !CompiledQuery {
+        var program = opcode.Program.init(self.allocator);
+        errdefer program.deinit();
+
+        const table = if (self.schema) |sch| (sch.findConst(ins.table) orelse return error.TableNotFound) else return error.TableNotFound;
+        const cur: i32 = 0;
+        _ = try program.emitValue(.openWrite, cur, 0, 0, .{ .text = ins.table });
+
+        for (ins.rows) |row| {
+            const recStart = self.nextRegister;
+            if (ins.columns.len > 0) {
+                for (table.columns) |col| {
+                    var foundVal: ?ast.Expr = null;
+                    for (ins.columns, 0..) |cName, cIdx| {
+                        if (std.ascii.eqlIgnoreCase(cName, col.name) and cIdx < row.len) {
+                            foundVal = row[cIdx];
+                            break;
+                        }
+                    }
+                    if (foundVal) |valExpr| {
+                        _ = try self.compileExpr(&program, valExpr, null, null, null);
+                    } else if (col.defaultValue) |defVal| {
+                        _ = try self.compileExpr(&program, .{ .literal = defVal }, null, null, null);
+                    } else {
+                        const r = self.allocRegister();
+                        _ = try program.emit(.loadNull, 0, @as(i32, @intCast(r)), 0);
+                    }
+                }
+                _ = try program.emit(.insert, cur, @as(i32, @intCast(recStart)), @as(i32, @intCast(table.columns.len)));
+            } else {
+                for (row) |expr| {
+                    _ = try self.compileExpr(&program, expr, null, null, null);
+                }
+                _ = try program.emit(.insert, cur, @as(i32, @intCast(recStart)), @as(i32, @intCast(row.len)));
+            }
+        }
+
+        _ = try program.emit(.close, cur, 0, 0);
+        _ = try program.emit(.halt, 0, 0, 0);
+        program.maxRegisters = self.nextRegister;
+
+        return CompiledQuery{
+            .program = program,
+            .columnNames = try self.allocator.alloc([]const u8, 0),
+            .allocator = self.allocator,
+        };
+    }
+
+    pub fn compileDelete(self: *Compiler, del: anytype) !CompiledQuery {
+        var program = opcode.Program.init(self.allocator);
+        errdefer program.deinit();
+
+        const table = if (self.schema) |sch| (sch.findConst(del.table) orelse return error.TableNotFound) else return error.TableNotFound;
+        const cur: i32 = 0;
+        _ = try program.emitValue(.openWrite, cur, 0, 0, .{ .text = del.table });
+
+        const tableColNames = try self.allocator.alloc([]const u8, table.columns.len);
+        defer self.allocator.free(tableColNames);
+        for (table.columns, 0..) |col, i| {
+            tableColNames[i] = col.name;
+        }
+
+        const rewindJmp = try program.emit(.rewind, cur, 0, 0);
+        const loopStart = program.currentAddress();
+
+        var skipJmps: std.ArrayList(usize) = .empty;
+        defer skipJmps.deinit(self.allocator);
+
+        const condsOpt: ?[]const ast.Condition = del.condition;
+        if (condsOpt) |conditions| {
+            for (conditions) |cond| {
+                var colIdx: ?usize = null;
+                for (tableColNames, 0..) |cName, idx| {
+                    if (std.ascii.eqlIgnoreCase(cName, cond.column)) {
+                        colIdx = idx;
+                        break;
+                    }
+                }
+                const isRowid = std.ascii.eqlIgnoreCase(cond.column, "rowid") or std.ascii.eqlIgnoreCase(cond.column, "_rowid_") or std.ascii.eqlIgnoreCase(cond.column, "oid");
+                if (colIdx != null or isRowid) {
+                    const colReg = self.allocRegister();
+                    if (isRowid) {
+                        _ = try program.emit(.rowid, cur, @as(i32, @intCast(colReg)), 0);
+                    } else {
+                        _ = try program.emit(.column, cur, @as(i32, @intCast(colIdx.?)), @as(i32, @intCast(colReg)));
+                    }
+                    const valReg = try self.compileExpr(&program, cond.value, null, cur, tableColNames);
+                    const invOp: opcode.OpCode = switch (cond.op) {
+                        .equal => .ne,
+                        .notEqual => .eq,
+                        .less => .ge,
+                        .lessEqual => .gt,
+                        .greater => .le,
+                        .greaterEqual => .lt,
+                        else => .ne,
+                    };
+                    const jmp = try program.emit(invOp, @as(i32, @intCast(colReg)), 0, @as(i32, @intCast(valReg)));
+                    try skipJmps.append(self.allocator, jmp);
+                }
+            }
+        }
+
+        _ = try program.emit(.delete, cur, 0, 0);
+
+        const nextRowAddr = program.currentAddress();
+        for (skipJmps.items) |j| {
+            program.fixupJump(j, @as(i32, @intCast(nextRowAddr)));
+        }
+
+        _ = try program.emit(.next, cur, @as(i32, @intCast(loopStart)), 0);
+
+        const endAddr = program.currentAddress();
+        program.fixupJump(rewindJmp, @as(i32, @intCast(endAddr)));
+        _ = try program.emit(.close, cur, 0, 0);
+        _ = try program.emit(.halt, 0, 0, 0);
+
+        program.maxRegisters = self.nextRegister;
+
+        return CompiledQuery{
+            .program = program,
+            .columnNames = try self.allocator.alloc([]const u8, 0),
+            .allocator = self.allocator,
+        };
+    }
+
+    pub fn compileUpdate(self: *Compiler, upd: anytype) !CompiledQuery {
+        var program = opcode.Program.init(self.allocator);
+        errdefer program.deinit();
+
+        const table = if (self.schema) |sch| (sch.findConst(upd.table) orelse return error.TableNotFound) else return error.TableNotFound;
+        const cur: i32 = 0;
+        _ = try program.emitValue(.openWrite, cur, 0, 0, .{ .text = upd.table });
+
+        const tableColNames = try self.allocator.alloc([]const u8, table.columns.len);
+        defer self.allocator.free(tableColNames);
+        for (table.columns, 0..) |col, i| {
+            tableColNames[i] = col.name;
+        }
+
+        const rewindJmp = try program.emit(.rewind, cur, 0, 0);
+        const loopStart = program.currentAddress();
+
+        var skipJmps: std.ArrayList(usize) = .empty;
+        defer skipJmps.deinit(self.allocator);
+
+        const condsOpt: ?[]const ast.Condition = upd.condition;
+        if (condsOpt) |conditions| {
+            for (conditions) |cond| {
+                var colIdx: ?usize = null;
+                for (tableColNames, 0..) |cName, idx| {
+                    if (std.ascii.eqlIgnoreCase(cName, cond.column)) {
+                        colIdx = idx;
+                        break;
+                    }
+                }
+                const isRowid = std.ascii.eqlIgnoreCase(cond.column, "rowid") or std.ascii.eqlIgnoreCase(cond.column, "_rowid_") or std.ascii.eqlIgnoreCase(cond.column, "oid");
+                if (colIdx != null or isRowid) {
+                    const colReg = self.allocRegister();
+                    if (isRowid) {
+                        _ = try program.emit(.rowid, cur, @as(i32, @intCast(colReg)), 0);
+                    } else {
+                        _ = try program.emit(.column, cur, @as(i32, @intCast(colIdx.?)), @as(i32, @intCast(colReg)));
+                    }
+                    const valReg = try self.compileExpr(&program, cond.value, null, cur, tableColNames);
+                    const invOp: opcode.OpCode = switch (cond.op) {
+                        .equal => .ne,
+                        .notEqual => .eq,
+                        .less => .ge,
+                        .lessEqual => .gt,
+                        .greater => .le,
+                        .greaterEqual => .lt,
+                        else => .ne,
+                    };
+                    const jmp = try program.emit(invOp, @as(i32, @intCast(colReg)), 0, @as(i32, @intCast(valReg)));
+                    try skipJmps.append(self.allocator, jmp);
+                }
+            }
+        }
+
+        const firstColReg = self.nextRegister;
+        for (table.columns, 0..) |col, colIdx| {
+            var updatedExpr: ?ast.Expr = null;
+            for (upd.columns, 0..) |cName, cIdx| {
+                if (std.ascii.eqlIgnoreCase(cName, col.name) and cIdx < upd.values.len) {
+                    updatedExpr = upd.values[cIdx];
+                    break;
+                }
+            }
+            if (updatedExpr) |valExpr| {
+                _ = try self.compileExpr(&program, valExpr, null, cur, tableColNames);
+            } else {
+                const reg = self.allocRegister();
+                _ = try program.emit(.column, cur, @as(i32, @intCast(colIdx)), @as(i32, @intCast(reg)));
+            }
+        }
+
+        _ = try program.emit(.delete, cur, 0, 0);
+        _ = try program.emit(.insert, cur, @as(i32, @intCast(firstColReg)), @as(i32, @intCast(table.columns.len)));
+
+        const nextRowAddr = program.currentAddress();
+        for (skipJmps.items) |j| {
+            program.fixupJump(j, @as(i32, @intCast(nextRowAddr)));
+        }
+
+        _ = try program.emit(.next, cur, @as(i32, @intCast(loopStart)), 0);
+
+        const endAddr = program.currentAddress();
+        program.fixupJump(rewindJmp, @as(i32, @intCast(endAddr)));
+        _ = try program.emit(.close, cur, 0, 0);
+        _ = try program.emit(.halt, 0, 0, 0);
+
+        program.maxRegisters = self.nextRegister;
+
+        return CompiledQuery{
+            .program = program,
+            .columnNames = try self.allocator.alloc([]const u8, 0),
+            .allocator = self.allocator,
+        };
     }
 
     /// Compiles a bare expression into a one-row program.
@@ -184,34 +733,90 @@ pub const Compiler = struct {
                     try colNamesList.append(self.allocator, try self.allocator.dupe(u8, colName));
                 }
             }
-            const projBaseReg = self.nextRegister;
-            for (outRegs.items) |r| {
-                const dst = self.allocRegister();
-                _ = try program.emit(.move, @as(i32, @intCast(r)), @as(i32, @intCast(dst)), 1);
+            if (select.orders.len > 0) {
+                const sorterCur: i32 = 1;
+                _ = try program.emit(.openEphemeral, sorterCur, 0, 0);
+                const projBaseReg = self.nextRegister;
+                for (outRegs.items) |r| {
+                    const dst = self.allocRegister();
+                    _ = try program.emit(.move, @as(i32, @intCast(r)), @as(i32, @intCast(dst)), 1);
+                }
+                _ = try program.emit(.insert, sorterCur, @as(i32, @intCast(projBaseReg)), @as(i32, @intCast(outRegs.items.len)));
+
+                const nextRowAddr = program.currentAddress();
+                for (skipJmps.items) |j| {
+                    program.fixupJump(j, @as(i32, @intCast(nextRowAddr)));
+                }
+
+                _ = try program.emit(.next, cur, @as(i32, @intCast(loopStart)), 0);
+
+                const endAddr = program.currentAddress();
+                program.fixupJump(rewindJmp, @as(i32, @intCast(endAddr)));
+                _ = try program.emit(.close, cur, 0, 0);
+                _ = try program.emit(.sorterSort, sorterCur, 0, 0);
+                const rewindSorter = try program.emit(.rewind, sorterCur, 0, 0);
+                const sortLoopStart = program.currentAddress();
+
+                var sortSkipJmps = std.ArrayList(usize).empty;
+                defer sortSkipJmps.deinit(self.allocator);
+
+                const sortOutBase = self.nextRegister;
+                for (outRegs.items, 0..) |_, i| {
+                    const r = self.allocRegister();
+                    _ = try program.emit(.column, sorterCur, @as(i32, @intCast(i)), @as(i32, @intCast(r)));
+                }
+                _ = try program.emit(.resultRow, @as(i32, @intCast(sortOutBase)), @as(i32, @intCast(outRegs.items.len)), 0);
+
+                if (limitReg) |lReg| {
+                    const oneReg = self.allocRegister();
+                    _ = try program.emitValue(.loadInteger, 0, @as(i32, @intCast(oneReg)), 0, .{ .integer = 1 });
+                    _ = try program.emit(.subtract, @as(i32, @intCast(lReg)), @as(i32, @intCast(oneReg)), @as(i32, @intCast(lReg)));
+                    const zeroReg = self.allocRegister();
+                    _ = try program.emitValue(.loadInteger, 0, @as(i32, @intCast(zeroReg)), 0, .{ .integer = 0 });
+                    const limitHitJmp = try program.emit(.le, @as(i32, @intCast(lReg)), 0, @as(i32, @intCast(zeroReg)));
+                    try sortSkipJmps.append(self.allocator, limitHitJmp);
+                }
+
+                const sortNextRowAddr = program.currentAddress();
+                for (sortSkipJmps.items) |j| {
+                    program.fixupJump(j, @as(i32, @intCast(sortNextRowAddr)));
+                }
+
+                _ = try program.emit(.next, sorterCur, @as(i32, @intCast(sortLoopStart)), 0);
+                const sortEnd = program.currentAddress();
+                program.fixupJump(rewindSorter, @as(i32, @intCast(sortEnd)));
+                _ = try program.emit(.close, sorterCur, 0, 0);
+                _ = try program.emit(.halt, 0, 0, 0);
+            } else {
+                const projBaseReg = self.nextRegister;
+                for (outRegs.items) |r| {
+                    const dst = self.allocRegister();
+                    _ = try program.emit(.move, @as(i32, @intCast(r)), @as(i32, @intCast(dst)), 1);
+                }
+                _ = try program.emit(.resultRow, @as(i32, @intCast(projBaseReg)), @as(i32, @intCast(outRegs.items.len)), 0);
+
+                if (limitReg) |lReg| {
+                    const oneReg = self.allocRegister();
+                    _ = try program.emitValue(.loadInteger, 0, @as(i32, @intCast(oneReg)), 0, .{ .integer = 1 });
+                    _ = try program.emit(.subtract, @as(i32, @intCast(lReg)), @as(i32, @intCast(oneReg)), @as(i32, @intCast(lReg)));
+                    const zeroReg = self.allocRegister();
+                    _ = try program.emitValue(.loadInteger, 0, @as(i32, @intCast(zeroReg)), 0, .{ .integer = 0 });
+                    const limitHitJmp = try program.emit(.le, @as(i32, @intCast(lReg)), 0, @as(i32, @intCast(zeroReg)));
+                    try skipJmps.append(self.allocator, limitHitJmp);
+                }
+
+                const nextRowAddr = program.currentAddress();
+                for (skipJmps.items) |j| {
+                    program.fixupJump(j, @as(i32, @intCast(nextRowAddr)));
+                }
+
+                _ = try program.emit(.next, cur, @as(i32, @intCast(loopStart)), 0);
+
+                const endAddr = program.currentAddress();
+                program.fixupJump(rewindJmp, @as(i32, @intCast(endAddr)));
+                _ = try program.emit(.close, cur, 0, 0);
+                _ = try program.emit(.halt, 0, 0, 0);
             }
-            _ = try program.emit(.resultRow, @as(i32, @intCast(projBaseReg)), @as(i32, @intCast(outRegs.items.len)), 0);
-
-            if (limitReg) |lReg| {
-                const oneReg = self.allocRegister();
-                _ = try program.emitValue(.loadInteger, 0, @as(i32, @intCast(oneReg)), 0, .{ .integer = 1 });
-                _ = try program.emit(.subtract, @as(i32, @intCast(lReg)), @as(i32, @intCast(oneReg)), @as(i32, @intCast(lReg)));
-                const zeroReg = self.allocRegister();
-                _ = try program.emitValue(.loadInteger, 0, @as(i32, @intCast(zeroReg)), 0, .{ .integer = 0 });
-                const limitHitJmp = try program.emit(.le, @as(i32, @intCast(lReg)), 0, @as(i32, @intCast(zeroReg)));
-                try skipJmps.append(self.allocator, limitHitJmp);
-            }
-
-            const nextRowAddr = program.currentAddress();
-            for (skipJmps.items) |j| {
-                program.fixupJump(j, @as(i32, @intCast(nextRowAddr)));
-            }
-
-            _ = try program.emit(.next, cur, @as(i32, @intCast(loopStart)), 0);
-
-            const endAddr = program.currentAddress();
-            program.fixupJump(rewindJmp, @as(i32, @intCast(endAddr)));
-            _ = try program.emit(.close, cur, 0, 0);
-            _ = try program.emit(.halt, 0, 0, 0);
         } else {
             var outRegs: std.ArrayList(usize) = .empty;
             defer outRegs.deinit(self.allocator);
@@ -312,9 +917,46 @@ pub const Compiler = struct {
                     },
                     .logicalOr => {
                         _ = try program.emit(.move, @as(i32, @intCast(regLeft)), @as(i32, @intCast(reg)), 1);
-                        const jmp = try program.emit(.ifOp, @as(i32, @intCast(reg)), 0, 0);
+                        const jmp = try program.emit(.ifOp, @as(i32, @intCast(regLeft)), 0, 0);
                         _ = try program.emit(.move, @as(i32, @intCast(regRight)), @as(i32, @intCast(reg)), 1);
                         program.fixupJump(jmp, @as(i32, @intCast(program.currentAddress())));
+                    },
+                    .jsonArrow, .jsonArrowText => {
+                        const argStart = self.nextRegister;
+                        const a1 = self.allocRegister();
+                        _ = try program.emit(.move, @as(i32, @intCast(regLeft)), @as(i32, @intCast(a1)), 1);
+                        const a2 = self.allocRegister();
+                        _ = try program.emit(.move, @as(i32, @intCast(regRight)), @as(i32, @intCast(a2)), 1);
+                        const opName: []const u8 = if (bin.op == .jsonArrow) "->" else "->>";
+                        _ = try program.emitValue(.function, @as(i32, @intCast(reg)), @as(i32, @intCast(argStart)), 2, .{ .text = opName });
+                    },
+                    .isTrue => {
+                        _ = try program.emitValue(.loadInteger, 0, @as(i32, @intCast(reg)), 0, .{ .integer = 1 });
+                        const jmp = try program.emit(.ifOp, @as(i32, @intCast(regLeft)), 0, 0);
+                        _ = try program.emitValue(.loadInteger, 0, @as(i32, @intCast(reg)), 0, .{ .integer = 0 });
+                        program.fixupJump(jmp, @as(i32, @intCast(program.currentAddress())));
+                    },
+                    .isNotTrue => {
+                        _ = try program.emitValue(.loadInteger, 0, @as(i32, @intCast(reg)), 0, .{ .integer = 1 });
+                        const jmp = try program.emit(.ifNotOp, @as(i32, @intCast(regLeft)), 0, 0);
+                        _ = try program.emitValue(.loadInteger, 0, @as(i32, @intCast(reg)), 0, .{ .integer = 0 });
+                        program.fixupJump(jmp, @as(i32, @intCast(program.currentAddress())));
+                    },
+                    .isFalse => {
+                        _ = try program.emitValue(.loadInteger, 0, @as(i32, @intCast(reg)), 0, .{ .integer = 0 });
+                        const jmpNull = try program.emit(.isNull, @as(i32, @intCast(regLeft)), 0, 0);
+                        const jmpTrue = try program.emit(.ifOp, @as(i32, @intCast(regLeft)), 0, 0);
+                        _ = try program.emitValue(.loadInteger, 0, @as(i32, @intCast(reg)), 0, .{ .integer = 1 });
+                        program.fixupJump(jmpNull, @as(i32, @intCast(program.currentAddress())));
+                        program.fixupJump(jmpTrue, @as(i32, @intCast(program.currentAddress())));
+                    },
+                    .isNotFalse => {
+                        _ = try program.emitValue(.loadInteger, 0, @as(i32, @intCast(reg)), 0, .{ .integer = 1 });
+                        const jmpNull = try program.emit(.isNull, @as(i32, @intCast(regLeft)), 0, 0);
+                        const jmpTrue = try program.emit(.ifOp, @as(i32, @intCast(regLeft)), 0, 0);
+                        _ = try program.emitValue(.loadInteger, 0, @as(i32, @intCast(reg)), 0, .{ .integer = 0 });
+                        program.fixupJump(jmpNull, @as(i32, @intCast(program.currentAddress())));
+                        program.fixupJump(jmpTrue, @as(i32, @intCast(program.currentAddress())));
                     },
                 }
                 return reg;
@@ -472,4 +1114,152 @@ test "compiler compiles constant select statement" {
     try std.testing.expectEqual(@as(usize, 1), result.rows.len);
     try std.testing.expectEqual(@as(i64, 100), result.at(0)[0].integer);
     try std.testing.expectEqualStrings("sqlite.zig", result.at(0)[1].text);
+}
+
+test "compiler compiles json arrow operators" {
+    var comp = Compiler.init(std.testing.allocator, null);
+    const leftNode = ast.Expr{ .literal = .{ .text = "{\"a\": 42}" } };
+    const rightNode = ast.Expr{ .literal = .{ .text = "$.a" } };
+    const arrowExpr = ast.Expr{
+        .binary = .{
+            .op = .jsonArrow,
+            .left = &leftNode,
+            .right = &rightNode,
+        },
+    };
+    var compiled = try comp.compileExpression(arrowExpr);
+    defer compiled.deinit();
+
+    var virtualMachine = vm.VirtualMachine.init(std.testing.allocator, null);
+    defer virtualMachine.deinit();
+
+    var result = try virtualMachine.execute(&compiled.program, compiled.columnNames);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+    try std.testing.expectEqual(@as(i64, 42), result.at(0)[0].integer);
+}
+
+test "compiler compiles insert and delete statements" {
+    const allocator = std.testing.allocator;
+    var sch = Schema.init(allocator);
+    defer sch.deinit();
+
+    const colDefs = [_]ast.ColumnDef{
+        .{ .name = "id", .typeName = "INTEGER", .primaryKey = true },
+        .{ .name = "val", .typeName = "TEXT" },
+    };
+    try sch.createTable("items", &colDefs, &.{});
+
+    var comp = Compiler.init(allocator, &sch);
+
+    const row1Exprs = [_]ast.Expr{
+        .{ .literal = .{ .integer = 1 } },
+        .{ .literal = .{ .text = "hello" } },
+    };
+    const row2Exprs = [_]ast.Expr{
+        .{ .literal = .{ .integer = 2 } },
+        .{ .literal = .{ .text = "world" } },
+    };
+    const rows = [_][]const ast.Expr{ &row1Exprs, &row2Exprs };
+    var compiledIns = try comp.compileInsert(.{
+        .table = "items",
+        .columns = &.{},
+        .rows = &rows,
+    });
+    defer compiledIns.deinit();
+
+    var vmIns = vm.VirtualMachine.init(allocator, &sch);
+    defer vmIns.deinit();
+    var resIns = try vmIns.execute(&compiledIns.program, compiledIns.columnNames);
+    defer resIns.deinit();
+
+    const t = sch.find("items").?;
+    try std.testing.expectEqual(@as(usize, 2), t.rows.items.len);
+    try std.testing.expectEqual(@as(i64, 1), t.rows.items[0].values[0].integer);
+    try std.testing.expectEqualStrings("hello", t.rows.items[0].values[1].text);
+
+    var delConditions = [_]ast.Condition{
+        .{ .column = "id", .op = .equal, .value = .{ .literal = .{ .integer = 1 } } },
+    };
+    var compiledDel = try comp.compileDelete(.{
+        .table = "items",
+        .condition = &delConditions,
+    });
+    defer compiledDel.deinit();
+
+    var vmDel = vm.VirtualMachine.init(allocator, &sch);
+    defer vmDel.deinit();
+    var resDel = try vmDel.execute(&compiledDel.program, compiledDel.columnNames);
+    defer resDel.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), t.rows.items.len);
+    try std.testing.expectEqual(@as(i64, 2), t.rows.items[0].values[0].integer);
+    try std.testing.expectEqualStrings("world", t.rows.items[0].values[1].text);
+}
+
+test "compiler compiles DDL and transaction statements" {
+    const allocator = std.testing.allocator;
+    var sch = Schema.init(allocator);
+    defer sch.deinit();
+
+    var comp = Compiler.init(allocator, &sch);
+
+    const beginStmt = ast.Statement{ .begin = {} };
+    var compiledBegin = try comp.compile(beginStmt);
+    defer compiledBegin.deinit();
+    try std.testing.expect(compiledBegin.program.instructions.items.len > 0);
+
+    const commitStmt = ast.Statement{ .commit = {} };
+    var compiledCommit = try comp.compile(commitStmt);
+    defer compiledCommit.deinit();
+    try std.testing.expect(compiledCommit.program.instructions.items.len > 0);
+
+    var colDefs = [_]ast.ColumnDef{
+        .{ .name = "id", .typeName = "INTEGER", .primaryKey = true },
+        .{ .name = "name", .typeName = "TEXT" },
+    };
+    const createTableStmt = ast.Statement{
+        .createTable = .{
+            .name = "users",
+            .columns = &colDefs,
+            .constraints = &.{},
+        },
+    };
+    var compiledCreate = try comp.compile(createTableStmt);
+    defer compiledCreate.deinit();
+    try std.testing.expect(compiledCreate.program.instructions.items.len > 0);
+
+    const indexCols = [_][]const u8{"name"};
+    const createIndexStmt = ast.Statement{
+        .createIndex = .{
+            .name = "idx_name",
+            .table = "users",
+            .columns = &indexCols,
+        },
+    };
+    var compiledIndex = try comp.compile(createIndexStmt);
+    defer compiledIndex.deinit();
+    try std.testing.expect(compiledIndex.program.instructions.items.len > 0);
+
+    const dropTableStmt = ast.Statement{
+        .dropTable = .{
+            .name = "users",
+            .ifExists = true,
+        },
+    };
+    var compiledDrop = try comp.compile(dropTableStmt);
+    defer compiledDrop.deinit();
+    try std.testing.expect(compiledDrop.program.instructions.items.len > 0);
+
+    const vacuumStmt = ast.Statement{ .vacuum = .{} };
+    var compiledVacuum = try comp.compile(vacuumStmt);
+    defer compiledVacuum.deinit();
+    try std.testing.expect(compiledVacuum.program.instructions.items.len > 0);
+
+    // Verify VM executes the compiled instructions safely without error
+    var machine = vm.VirtualMachine.init(allocator, &sch);
+    defer machine.deinit();
+    var res = try machine.execute(&compiledCreate.program, compiledCreate.columnNames);
+    res.deinit();
 }

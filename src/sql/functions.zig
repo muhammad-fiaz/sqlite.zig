@@ -40,18 +40,18 @@ pub const FuncClass = enum {
 /// drift test at the file bottom fails if an arm is added without its name).
 /// `min`/`max` are absent on purpose: their class depends on arity.
 const scalarNames = [_][]const u8{
-    "abs",        "lower",       "upper",        "length",      "round",          "typeof",           "coalesce",          "ifnull",
-    "nullif",     "instr",       "replace",      "substr",      "substring",      "trim",             "ltrim",             "rtrim",
-    "cast",       "hex",         "unhex",        "quote",       "char",           "unicode",          "printf",            "format",
-    "concat",     "concat_ws",   "octet_length", "zeroblob",    "sign",           "iif",              "if",                "unlikely",
-    "likely",     "likelihood",  "random",       "randomblob",  "sqlite_version", "sqlite_source_id", "json_quote",        "unistr",
-    "ceil",       "ceiling",     "floor",        "trunc",       "ln",             "log",              "log10",             "log2",
-    "pow",        "power",       "sqrt",         "sin",         "cos",            "tan",              "asin",              "acos",
-    "atan",       "atan2",       "degrees",      "radians",     "pi",             "exp",              "mod",               "cosh",
-    "sinh",       "tanh",        "acosh",        "asinh",       "atanh",          "date",             "time",              "datetime",
-    "julianday",  "unixepoch",   "strftime",     "timediff",    "json",           "json_valid",       "json_type",         "json_extract",
-    "json_array", "json_object", "json_set",     "json_insert", "json_replace",   "json_remove",      "json_array_length", "soundex",
-    "like",       "glob",        "json_pretty",  "json_patch",
+    "abs",        "lower",       "upper",        "length",      "round",          "typeof",           "coalesce",                  "ifnull",
+    "nullif",     "instr",       "replace",      "substr",      "substring",      "trim",             "ltrim",                     "rtrim",
+    "cast",       "hex",         "unhex",        "quote",       "char",           "unicode",          "printf",                    "format",
+    "concat",     "concat_ws",   "octet_length", "zeroblob",    "sign",           "iif",              "if",                        "unlikely",
+    "likely",     "likelihood",  "random",       "randomblob",  "sqlite_version", "sqlite_source_id", "json_quote",                "unistr",
+    "ceil",       "ceiling",     "floor",        "trunc",       "ln",             "log",              "log10",                     "log2",
+    "pow",        "power",       "sqrt",         "sin",         "cos",            "tan",              "asin",                      "acos",
+    "atan",       "atan2",       "degrees",      "radians",     "pi",             "exp",              "mod",                       "cosh",
+    "sinh",       "tanh",        "acosh",        "asinh",       "atanh",          "date",             "time",                      "datetime",
+    "julianday",  "unixepoch",   "strftime",     "timediff",    "json",           "json_valid",       "json_type",                 "json_extract",
+    "json_array", "json_object", "json_set",     "json_insert", "json_replace",   "json_remove",      "json_array_length",         "soundex",
+    "like",       "glob",        "json_pretty",  "json_patch",  "->",             "->>",              "sqlite_compileoption_used", "sqlite_compileoption_get",
 };
 
 /// Classify one call for routing: window names first (arity-independent),
@@ -242,6 +242,14 @@ pub fn evalScalar(allocator: std.mem.Allocator, name: []const u8, args: []const 
     if (std.ascii.eqlIgnoreCase(name, "sqlite_source_id")) {
         if (args.len != 0) return error.InvalidArgumentCount;
         return try scalar.evalSqliteSourceId(allocator);
+    }
+    if (std.ascii.eqlIgnoreCase(name, "sqlite_compileoption_used")) {
+        if (args.len != 1) return error.InvalidArgumentCount;
+        return scalar.evalCompileOptionUsed(args[0]);
+    }
+    if (std.ascii.eqlIgnoreCase(name, "sqlite_compileoption_get")) {
+        if (args.len != 1) return error.InvalidArgumentCount;
+        return try scalar.evalCompileOptionGet(allocator, args[0]);
     }
     if (std.ascii.eqlIgnoreCase(name, "json_quote")) {
         if (args.len != 1) return error.InvalidArgumentCount;
@@ -451,6 +459,14 @@ pub fn evalScalar(allocator: std.mem.Allocator, name: []const u8, args: []const 
         if (args.len != 2) return error.InvalidArgumentCount;
         return scalar.evalGlob(allocator, args[0], args[1]);
     }
+    if (std.mem.eql(u8, name, "->")) {
+        if (args.len != 2) return error.InvalidArgumentCount;
+        return json.evalJsonArrowOperator(allocator, args[0], args[1], false);
+    }
+    if (std.mem.eql(u8, name, "->>")) {
+        if (args.len != 2) return error.InvalidArgumentCount;
+        return json.evalJsonArrowOperator(allocator, args[0], args[1], true);
+    }
 
     return error.Unsupported;
 }
@@ -607,4 +623,23 @@ test "scalar min and max evaluate across arguments" {
     const mixedLo = try evalScalar(alloc, "min", &mixed);
     defer mixedLo.free(alloc);
     try std.testing.expectEqual(@as(i64, 3), mixedLo.integer);
+}
+
+test "sqlite_compileoption_used and get evaluate correctly" {
+    const alloc = std.testing.allocator;
+    const used1 = try evalScalar(alloc, "sqlite_compileoption_used", &.{.{ .text = "ENABLE_JSON1" }});
+    try std.testing.expectEqual(@as(i64, 1), used1.integer);
+
+    const used2 = try evalScalar(alloc, "sqlite_compileoption_used", &.{.{ .text = "SQLITE_ENABLE_JSON1" }});
+    try std.testing.expectEqual(@as(i64, 1), used2.integer);
+
+    const used3 = try evalScalar(alloc, "sqlite_compileoption_used", &.{.{ .text = "NONEXISTENT_OPTION" }});
+    try std.testing.expectEqual(@as(i64, 0), used3.integer);
+
+    const opt0 = try evalScalar(alloc, "sqlite_compileoption_get", &.{.{ .integer = 0 }});
+    defer opt0.free(alloc);
+    try std.testing.expectEqualStrings("ENABLE_JSON1", opt0.text);
+
+    const optNone = try evalScalar(alloc, "sqlite_compileoption_get", &.{.{ .integer = 999 }});
+    try std.testing.expect(optNone == .null);
 }

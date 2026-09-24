@@ -234,7 +234,7 @@ test "checkConflictTarget accepts scoped targets and rejects the rest" {
         .{ .name = "a", .typeName = "INTEGER" },
         .{ .name = "b", .typeName = "INTEGER" },
     };
-    const pk = ast.TableConstraint{ .primaryKey = @constCast(&[_][]const u8{ "a", "b" }) };
+    const pk = ast.TableConstraint{ .primaryKey = .{ .columns = @constCast(&[_][]const u8{ "a", "b" }) } };
     try schema.createTable("pairs", &pdefs, &[_]ast.TableConstraint{pk});
     const pt = schema.findConst("pairs").?;
     try std.testing.expect(inCompositePk(pt, "a"));

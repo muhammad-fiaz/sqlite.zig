@@ -839,7 +839,7 @@ test "planner renders composite without rowid pk without index name" {
     };
     const pkCols = [_][]const u8{ "a", "b" };
     const constraints = [_]ast.TableConstraint{
-        .{ .primaryKey = &pkCols },
+        .{ .primaryKey = .{ .columns = &pkCols } },
     };
     try schema.createTableWithOptions("pairs", &cols, &constraints, .{ .withoutRowid = true });
 

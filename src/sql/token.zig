@@ -42,6 +42,10 @@ pub const Tag = enum {
     tilde,
     /// `||` string concatenation operator.
     concat,
+    /// `->` JSON extract (SQL value form).
+    jsonArrow,
+    /// `->>` JSON extract (unquoted SQL text form).
+    jsonArrowText,
     /// `<<`
     lshift,
     /// `>>`

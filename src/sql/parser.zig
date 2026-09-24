@@ -1,20 +1,4 @@
 //! SQL parser: tokens -> owned statements.
-//!
-//! Recursive-descent frontend; the only SQL-string entry point (DSLs build
-//! AST nodes directly). Parses one statement plus optional `;`, keeps
-//! source slices for lazily re-parsed bodies, and fails closed — never a
-//! partial AST. Callers free the statement with `ast.deinit`, then the
-//! parser with `Parser.deinit`. Budgets from `limits.zig` fail `SqlTooBig`;
-//! nesting depth is capped so hostile input cannot overflow the stack.
-//!
-//! TODO (modularization, tracked in docs/api/compatibility.md): this file exceeds
-//! the 2000-line module target (~3.1k lines after extracting
-//! `sql/parser/common.zig`). The remaining grammar is one mutually-recursive
-//! unit (expressions <-> subqueries <-> SELECT), so further splits by family
-//! (`expression,select,ddl,dml,window`) need lazy cross-module recursion or
-//! stay whole; extract the next Parser-independent cluster (DDL column/type
-//! parsing) before attempting grammar-family modules. Grammar behavior must
-//! stay identical vs `sqlite/src/parse.y` plus `tokenize.c`.
 
 const std = @import("std");
 const Token = @import("token.zig").Token;
@@ -197,14 +181,21 @@ pub const Parser = struct {
             }
             statement = .{ .pragma = .{ .name = pragmaName, .value = pragmaValue, .argument = pragmaArgument, .schema = pragmaSchema } };
         } else if (self.acceptWord("with")) statement = try self.parseWith() else if (self.acceptWord("explain")) {
-            try self.requireWord("query");
-            try self.requireWord("plan");
-            const start = self.current().position;
-            try self.requireWord("select");
-            var query = try self.parseSelectOrCompound();
-            defer ast.deinit(self.allocator, &query);
-            const end = self.current().position;
-            statement = .{ .explainQueryPlan = try self.copy(self.source[start..end]) };
+            if (self.acceptWord("query")) {
+                try self.requireWord("plan");
+                const start = self.current().position;
+                try self.requireWord("select");
+                var query = try self.parseSelectOrCompound();
+                defer ast.deinit(self.allocator, &query);
+                const end = self.current().position;
+                statement = .{ .explainQueryPlan = try self.copy(self.source[start..end]) };
+            } else {
+                const start = self.current().position;
+                var inner = try self.parse();
+                defer ast.deinit(self.allocator, &inner);
+                const end = self.current().position;
+                statement = .{ .explain = try self.copy(self.source[start..end]) };
+            }
         } else if (self.acceptWord("attach")) {
             _ = self.acceptWord("database");
             const expr = try self.parseExpr();
@@ -402,30 +393,54 @@ pub const Parser = struct {
         var autoincrement = false;
         var foreignKey: ?ast.ForeignKeyDef = null;
         var defaultValue: ?Value = null;
+        var defaultExpr: ?ast.Expr = null;
         var checkExpr: ?ast.Expr = null;
         var generatedExpr: ?ast.Expr = null;
         var generatedStored = false;
+        var collate: ?[]const u8 = null;
+        var conflict: ast.ConflictPolicy = .none;
         while (self.current().tag == .word) {
             if (self.acceptWord("primary")) {
                 try self.requireWord("key");
                 primaryKey = true;
+                try self.parseOnConflictSuffix(&conflict);
             } else if (self.acceptWord("not")) {
                 try self.requireWord("null");
                 notNull = true;
+                try self.parseOnConflictSuffix(&conflict);
             } else if (self.acceptWord("unique")) {
                 unique = true;
+                try self.parseOnConflictSuffix(&conflict);
             } else if (self.acceptWord("autoincrement")) {
                 autoincrement = true;
+            } else if (self.acceptWord("collate")) {
+                collate = try self.word();
             } else if (self.acceptWord("check")) {
                 try self.requireTag(.lparen);
                 checkExpr = try self.parseExpr();
                 try self.requireTag(.rparen);
+                try self.parseOnConflictSuffix(&conflict);
             } else if (self.acceptWord("default")) {
-                const expression = try self.parseExpr();
-                defaultValue = switch (expression) {
-                    .literal => |value| value,
-                    else => return Error.InvalidSql,
-                };
+                // DEFAULT accepts a literal or parenthesized expression.
+                // CURRENT_TIMESTAMP/DATE/TIME lower to datetime/date/time('now').
+                if (self.current().tag == .word and (std.ascii.eqlIgnoreCase(self.current().text, "current_timestamp") or std.ascii.eqlIgnoreCase(self.current().text, "current_date") or std.ascii.eqlIgnoreCase(self.current().text, "current_time"))) {
+                    const keyword = try self.word();
+                    const fname: []const u8 = if (std.ascii.eqlIgnoreCase(keyword, "current_timestamp")) "datetime" else if (std.ascii.eqlIgnoreCase(keyword, "current_date")) "date" else "time";
+                    const arg = try self.allocator.create(ast.Expr);
+                    errdefer self.allocator.destroy(arg);
+                    arg.* = .{ .literal = .{ .text = "now" } };
+                    defaultExpr = .{ .function = .{ .name = fname, .argument = arg } };
+                } else if (self.current().tag == .lparen) {
+                    _ = self.advance();
+                    defaultExpr = try self.parseExpr();
+                    try self.requireTag(.rparen);
+                } else {
+                    const expression = try self.parseExpr();
+                    defaultValue = switch (expression) {
+                        .literal => |value| value,
+                        else => return Error.InvalidSql,
+                    };
+                }
             } else if (self.acceptWord("generated")) {
                 try self.requireWord("always");
                 try self.requireWord("as");
@@ -448,9 +463,11 @@ pub const Parser = struct {
                 }
             } else if (self.acceptWord("references")) {
                 const foreignTable = try self.word();
-                try self.requireTag(.lparen);
-                const foreignColumn = try self.word();
-                try self.requireTag(.rparen);
+                var foreignColumn: []const u8 = "";
+                if (self.acceptTag(.lparen)) {
+                    foreignColumn = try self.word();
+                    try self.requireTag(.rparen);
+                }
                 var onDelete: ast.ReferentialAction = .noAction;
                 var onUpdate: ast.ReferentialAction = .noAction;
                 while (self.acceptWord("on")) {
@@ -470,7 +487,15 @@ pub const Parser = struct {
                 foreignKey = .{ .table = foreignTable, .column = foreignColumn, .onDelete = onDelete, .onUpdate = onUpdate, .deferrable = deferral.deferrable, .initiallyDeferred = deferral.initiallyDeferred };
             } else break;
         }
-        return .{ .name = columnName, .typeName = typeName, .primaryKey = primaryKey, .notNull = notNull, .unique = unique, .autoincrement = autoincrement, .foreignKey = foreignKey, .defaultValue = defaultValue, .checkExpr = checkExpr, .generatedExpr = generatedExpr, .generatedStored = generatedStored };
+        return .{ .name = columnName, .typeName = typeName, .primaryKey = primaryKey, .notNull = notNull, .unique = unique, .autoincrement = autoincrement, .foreignKey = foreignKey, .defaultValue = defaultValue, .defaultExpr = defaultExpr, .checkExpr = checkExpr, .generatedExpr = generatedExpr, .generatedStored = generatedStored, .collate = collate, .conflict = conflict };
+    }
+
+    /// Optional `ON CONFLICT ABORT|FAIL|IGNORE|REPLACE|ROLLBACK` after a
+    /// column constraint. Leaves `conflict` unchanged when absent.
+    fn parseOnConflictSuffix(self: *Parser, conflict: *ast.ConflictPolicy) !void {
+        if (!self.acceptWord("on")) return;
+        try self.requireWord("conflict");
+        if (self.acceptWord("rollback")) conflict.* = .rollback else if (self.acceptWord("fail")) conflict.* = .fail else if (self.acceptWord("abort")) conflict.* = .abort else if (self.acceptWord("ignore")) conflict.* = .ignore else if (self.acceptWord("replace")) conflict.* = .replace else return Error.UnexpectedToken;
     }
 
     fn parseCreate(self: *Parser) !ast.Statement {
@@ -536,19 +561,38 @@ pub const Parser = struct {
             break :blk true;
         } else false;
         const name = try self.tableName();
+        // CREATE TABLE ... AS SELECT: no column list; schema comes from the
+        // select's result shape. Store the select SQL for execution-time
+        // evaluation (same pattern as CREATE VIEW / INSERT ... SELECT).
+        if (self.acceptWord("as")) {
+            const start = self.current().position;
+            try self.requireWord("select");
+            var selectStatement = try self.parseSelect();
+            defer ast.deinit(self.allocator, &selectStatement);
+            if (selectStatement != .select) return Error.InvalidSql;
+            const end = self.current().position;
+            return .{ .createTable = .{
+                .name = name,
+                .columns = try self.allocator.alloc(ast.ColumnDef, 0),
+                .constraints = try self.allocator.alloc(ast.TableConstraint, 0),
+                .ifNotExists = ifNotExists,
+                .temporary = temporary,
+                .asSelectSql = try self.copy(self.source[start..end]),
+            } };
+        }
         try self.requireTag(.lparen);
         var columns = std.ArrayList(ast.ColumnDef).empty;
         errdefer columns.deinit(self.allocator);
         var constraints = std.ArrayList(ast.TableConstraint).empty;
         errdefer {
             for (constraints.items) |constraint| switch (constraint) {
-                .primaryKey => |names| self.allocator.free(names),
-                .unique => |names| self.allocator.free(names),
+                .primaryKey => |payload| self.allocator.free(payload.columns),
+                .unique => |payload| self.allocator.free(payload.columns),
                 .foreignKey => |foreignKey| {
                     self.allocator.free(foreignKey.columns);
                     self.allocator.free(foreignKey.referencedColumns);
                 },
-                .check => |chk| common.freeParserExpr(self.allocator, chk),
+                .check => |payload| common.freeParserExpr(self.allocator, payload.expr),
             };
             constraints.deinit(self.allocator);
         }
@@ -559,7 +603,9 @@ pub const Parser = struct {
                     try self.requireTag(.lparen);
                     const checkExpr = try self.parseExpr();
                     try self.requireTag(.rparen);
-                    try constraints.append(self.allocator, .{ .check = checkExpr });
+                    var checkConflict: ast.ConflictPolicy = .none;
+                    try self.parseOnConflictSuffix(&checkConflict);
+                    try constraints.append(self.allocator, .{ .check = .{ .expr = checkExpr, .conflict = checkConflict } });
                 } else if (self.acceptWord("foreign")) {
                     try self.requireWord("key");
                     try self.requireTag(.lparen);
@@ -572,15 +618,18 @@ pub const Parser = struct {
                     try self.requireTag(.rparen);
                     try self.requireWord("references");
                     const foreignTable = try self.word();
-                    try self.requireTag(.lparen);
                     var parentColumns = std.ArrayList([]const u8).empty;
-                    errdefer parentColumns.deinit(self.allocator);
-                    while (true) {
-                        try parentColumns.append(self.allocator, try self.word());
-                        if (!self.acceptTag(.comma)) break;
+                    defer parentColumns.deinit(self.allocator);
+                    if (self.acceptTag(.lparen)) {
+                        while (true) {
+                            try parentColumns.append(self.allocator, try self.word());
+                            if (!self.acceptTag(.comma)) break;
+                        }
+                        try self.requireTag(.rparen);
                     }
-                    try self.requireTag(.rparen);
-                    if (childColumns.items.len == 0 or childColumns.items.len != parentColumns.items.len) return Error.InvalidSql;
+                    // Bare `REFERENCES t` (no column list) targets the parent's
+                    // primary key; length check only applies when columns given.
+                    if (parentColumns.items.len != 0 and childColumns.items.len != parentColumns.items.len) return Error.InvalidSql;
                     var onDelete: ast.ReferentialAction = .noAction;
                     var onUpdate: ast.ReferentialAction = .noAction;
                     while (self.acceptWord("on")) {
@@ -613,9 +662,11 @@ pub const Parser = struct {
                     try self.requireTag(.rparen);
                     if (names.items.len == 0) return Error.InvalidSql;
                     const ownedNames = try names.toOwnedSlice(self.allocator);
+                    var kindConflict: ast.ConflictPolicy = .none;
+                    try self.parseOnConflictSuffix(&kindConflict);
                     try constraints.append(self.allocator, switch (kind) {
-                        .primaryKey => .{ .primaryKey = ownedNames },
-                        .unique => .{ .unique = ownedNames },
+                        .primaryKey => .{ .primaryKey = .{ .columns = ownedNames, .conflict = kindConflict } },
+                        .unique => .{ .unique = .{ .columns = ownedNames, .conflict = kindConflict } },
                     });
                 }
                 if (!self.acceptTag(.comma)) break;
@@ -707,6 +758,15 @@ pub const Parser = struct {
         }
         try self.requireWord("on");
         const table = try self.tableName();
+        var eachRow: bool = true;
+        if (self.acceptWord("for")) {
+            try self.requireWord("each");
+            if (self.acceptWord("row")) {
+                eachRow = true;
+            } else if (self.acceptWord("statement")) {
+                eachRow = false;
+            } else return Error.UnexpectedToken;
+        }
         var whenSql: ?[]const u8 = null;
         if (self.acceptWord("when")) {
             const whenStart = self.current().position;
@@ -723,7 +783,7 @@ pub const Parser = struct {
         if (self.current().tag == .eof or self.current().position == bodyStart) return Error.UnexpectedToken;
         const bodyEnd = self.current().position;
         _ = self.advance();
-        return .{ .createTrigger = .{ .name = name, .table = table, .timing = timing, .event = event, .updateOf = try updateOf.toOwnedSlice(self.allocator), .whenSql = whenSql, .body = try self.copy(self.source[bodyStart..bodyEnd]), .ifNotExists = ifNotExists, .temporary = temporary } };
+        return .{ .createTrigger = .{ .name = name, .table = table, .timing = timing, .event = event, .updateOf = try updateOf.toOwnedSlice(self.allocator), .whenSql = whenSql, .body = try self.copy(self.source[bodyStart..bodyEnd]), .ifNotExists = ifNotExists, .temporary = temporary, .eachRow = eachRow } };
     }
 
     fn parseDrop(self: *Parser) !ast.Statement {
@@ -1246,6 +1306,12 @@ pub const Parser = struct {
                 if (self.acceptWord("distinct")) {
                     try self.requireWord("from");
                     isNot = !isNot;
+                } else if (self.acceptWord("true")) {
+                    left = try self.binaryNode(if (isNot) .isNotTrue else .isTrue, left, .{ .literal = .null });
+                    continue;
+                } else if (self.acceptWord("false")) {
+                    left = try self.binaryNode(if (isNot) .isNotFalse else .isFalse, left, .{ .literal = .null });
+                    continue;
                 }
                 var right = try self.parseCmp();
                 right = try self.parseCollateSuffix(right);
@@ -1367,8 +1433,14 @@ pub const Parser = struct {
 
     fn parseConcat(self: *Parser) Error!ast.Expr {
         var left = try self.parseUnary();
-        while (self.acceptTag(.concat)) {
-            left = try self.binaryNode(.concat, left, try self.parseUnary());
+        while (true) {
+            if (self.acceptTag(.concat)) {
+                left = try self.binaryNode(.concat, left, try self.parseUnary());
+            } else if (self.acceptTag(.jsonArrow)) {
+                left = try self.binaryNode(.jsonArrow, left, try self.parseUnary());
+            } else if (self.acceptTag(.jsonArrowText)) {
+                left = try self.binaryNode(.jsonArrowText, left, try self.parseUnary());
+            } else break;
         }
         return left;
     }
@@ -1666,6 +1738,10 @@ pub const Parser = struct {
                     } else if (self.acceptWord("distinct")) {
                         try self.requireWord("from");
                         try conditions.append(self.allocator, .{ .column = column, .op = if (isNot) .isNotDistinct else .isDistinct, .value = try self.parseCmp(), .joinOr = joinOr, .leftExpr = leftExpr, .negated = leadingNot, .collate = collate });
+                    } else if (self.acceptWord("true")) {
+                        try conditions.append(self.allocator, .{ .column = column, .op = if (isNot) .isNotTrue else .isTrue, .value = .{ .literal = .null }, .joinOr = joinOr, .leftExpr = leftExpr, .negated = leadingNot, .collate = collate });
+                    } else if (self.acceptWord("false")) {
+                        try conditions.append(self.allocator, .{ .column = column, .op = if (isNot) .isNotFalse else .isFalse, .value = .{ .literal = .null }, .joinOr = joinOr, .leftExpr = leftExpr, .negated = leadingNot, .collate = collate });
                     } else {
                         try conditions.append(self.allocator, .{ .column = column, .op = if (isNot) .isNotValue else .isValue, .value = try self.parseCmp(), .joinOr = joinOr, .leftExpr = leftExpr, .negated = leadingNot, .collate = collate });
                     }
@@ -1904,10 +1980,27 @@ pub const Parser = struct {
                         }
                     } else {
                         try self.requireWord("on");
-                        const left = try self.qualifiedName();
-                        try self.requireTag(.equal);
-                        const right = try self.qualifiedName();
-                        try joins.append(self.allocator, .{ .kind = effectiveKind, .table = joinedTable, .tableAlias = joinedAlias, .leftTable = left.table, .leftColumn = left.column, .rightTable = right.table, .rightColumn = right.column });
+                        const onConditions = (try self.parseConditionRest()) orelse return Error.InvalidSql;
+                        errdefer ast.freeConditions(self.allocator, onConditions);
+                        // Lower a single `a.x = b.y` equality onto the pair fast path.
+                        if (onConditions.len == 1 and onConditions[0].op == .equal and onConditions[0].leftExpr == null and onConditions[0].column.len != 0 and onConditions[0].value == .identifier and onConditions[0].tableScan == null and onConditions[0].listValues.len == 0 and onConditions[0].escape == null and onConditions[0].value2 == null and !onConditions[0].negated and onConditions[0].collate == null and !onConditions[0].joinOr) {
+                            const leftCol = onConditions[0].column;
+                            const rightId = onConditions[0].value.identifier;
+                            if (std.mem.indexOfScalar(u8, leftCol, '.') != null and std.mem.indexOfScalar(u8, rightId, '.') != null) {
+                                const li = std.mem.lastIndexOfScalar(u8, leftCol, '.').?;
+                                const ri = std.mem.lastIndexOfScalar(u8, rightId, '.').?;
+                                const leftTable = leftCol[0..li];
+                                const leftColumn = leftCol[li + 1 ..];
+                                const rightTable = rightId[0..ri];
+                                const rightColumn = rightId[ri + 1 ..];
+                                ast.freeConditions(self.allocator, onConditions);
+                                try joins.append(self.allocator, .{ .kind = effectiveKind, .table = joinedTable, .tableAlias = joinedAlias, .leftTable = leftTable, .leftColumn = leftColumn, .rightTable = rightTable, .rightColumn = rightColumn });
+                            } else {
+                                try joins.append(self.allocator, .{ .kind = effectiveKind, .table = joinedTable, .tableAlias = joinedAlias, .leftTable = "", .leftColumn = "", .rightTable = "", .rightColumn = "", .onExpr = onConditions });
+                            }
+                        } else {
+                            try joins.append(self.allocator, .{ .kind = effectiveKind, .table = joinedTable, .tableAlias = joinedAlias, .leftTable = "", .leftColumn = "", .rightTable = "", .rightColumn = "", .onExpr = onConditions });
+                        }
                     }
                 } else {
                     try joins.append(self.allocator, .{ .kind = effectiveKind, .table = joinedTable, .tableAlias = joinedAlias, .leftTable = "", .leftColumn = "", .rightTable = "", .rightColumn = "", .mergeOutput = natural });
@@ -1916,22 +2009,24 @@ pub const Parser = struct {
         }
         const condition = try self.parseCondition();
         var groupBy: ?[]const u8 = null;
+        var groupByExprs: []const ast.Expr = &.{};
         if (self.acceptWord("group")) {
             try self.requireWord("by");
-            const groupQualifier = try self.word();
-            if (self.acceptTag(.dot)) {
-                const groupColumn = try self.word();
-                if (self.acceptTag(.dot)) {
-                    const groupThird = try self.word();
-                    const combined = try std.fmt.allocPrint(self.allocator, "{s}.{s}.{s}", .{ groupQualifier, groupColumn, groupThird });
-                    defer self.allocator.free(combined);
-                    groupBy = try self.copy(combined);
-                } else {
-                    const combined = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ groupQualifier, groupColumn });
-                    defer self.allocator.free(combined);
-                    groupBy = try self.copy(combined);
-                }
-            } else groupBy = groupQualifier;
+            var exprs = std.ArrayList(ast.Expr).empty;
+            errdefer {
+                for (exprs.items) |expr| common.freeParserExpr(self.allocator, expr);
+                exprs.deinit(self.allocator);
+            }
+            while (true) {
+                try exprs.append(self.allocator, try self.parseExpr());
+                if (!self.acceptTag(.comma)) break;
+            }
+            groupByExprs = try exprs.toOwnedSlice(self.allocator);
+            // Backward-compatible single simple/qualified identifier also
+            // fills the legacy `groupBy` field used by existing paths/tests.
+            if (groupByExprs.len == 1 and groupByExprs[0] == .identifier) {
+                groupBy = groupByExprs[0].identifier;
+            }
         }
         var havingItems = std.ArrayList(ast.HavingItem).empty;
         errdefer {
@@ -1973,6 +2068,10 @@ pub const Parser = struct {
                         try self.requireWord("from");
                         op = if (isNot) .isNotDistinct else .isDistinct;
                         right = try self.parseBitOr();
+                    } else if (self.acceptWord("true")) {
+                        op = if (isNot) .isNotTrue else .isTrue;
+                    } else if (self.acceptWord("false")) {
+                        op = if (isNot) .isNotFalse else .isFalse;
                     } else {
                         op = if (isNot) .isNotValue else .isValue;
                         right = try self.parseBitOr();
@@ -2062,7 +2161,7 @@ pub const Parser = struct {
                 if (!self.acceptTag(.comma)) break;
             }
         }
-        return .{ .select = .{ .projections = try projections.toOwnedSlice(self.allocator), .table = table, .tableAlias = tableAlias, .fromSubquery = fromSubquery, .joins = if (joins.items.len == 0) &.{} else try joins.toOwnedSlice(self.allocator), .condition = condition, .groupBy = groupBy, .having = having, .orders = try orders.toOwnedSlice(self.allocator), .limit = null, .offset = null, .distinct = distinct } };
+        return .{ .select = .{ .projections = try projections.toOwnedSlice(self.allocator), .table = table, .tableAlias = tableAlias, .fromSubquery = fromSubquery, .joins = if (joins.items.len == 0) &.{} else try joins.toOwnedSlice(self.allocator), .condition = condition, .groupBy = groupBy, .groupByExprs = groupByExprs, .having = having, .orders = try orders.toOwnedSlice(self.allocator), .limit = null, .offset = null, .distinct = distinct } };
     }
 
     fn branchOrderStart(self: *Parser, endIndex: usize) ?usize {
@@ -2137,19 +2236,44 @@ pub const Parser = struct {
         }
         var limit: ?usize = null;
         var offset: ?usize = null;
+        var limitExpr: ?ast.Expr = null;
+        var offsetExpr: ?ast.Expr = null;
+        errdefer if (limitExpr) |expr| common.freeParserExpr(self.allocator, expr);
+        errdefer if (offsetExpr) |expr| common.freeParserExpr(self.allocator, expr);
         if (self.acceptWord("limit")) {
-            const token = self.advance();
-            limit = std.fmt.parseInt(usize, token.text, 10) catch {
-                if (lastBranchOrders.len != 0) self.allocator.free(lastBranchOrders);
-                return Error.InvalidSql;
-            };
+            // `LIMIT a, b` means LIMIT b OFFSET a (SQLite comma form).
+            const first = try self.parseExpr();
+            if (self.acceptTag(.comma)) {
+                const second = try self.parseExpr();
+                offsetExpr = first;
+                limitExpr = second;
+                limit = literalLimit(second);
+                offset = literalLimit(first);
+                if (limitExpr != null and limit != null) {
+                    common.freeParserExpr(self.allocator, limitExpr.?);
+                    limitExpr = null;
+                }
+                if (offsetExpr != null and offset != null) {
+                    common.freeParserExpr(self.allocator, offsetExpr.?);
+                    offsetExpr = null;
+                }
+            } else {
+                limit = literalLimit(first);
+                if (limit == null) {
+                    limitExpr = first;
+                } else {
+                    common.freeParserExpr(self.allocator, first);
+                }
+            }
         }
         if (self.acceptWord("offset")) {
-            const token = self.advance();
-            offset = std.fmt.parseInt(usize, token.text, 10) catch {
-                if (lastBranchOrders.len != 0) self.allocator.free(lastBranchOrders);
-                return Error.InvalidSql;
-            };
+            const expr = try self.parseExpr();
+            offset = literalLimit(expr);
+            if (offset == null) {
+                offsetExpr = expr;
+            } else {
+                common.freeParserExpr(self.allocator, expr);
+            }
         }
         if (hasCompound) {
             if (lastBranchOrderStart) |orderStart| rightEnd = self.tokens[orderStart].position;
@@ -2162,11 +2286,27 @@ pub const Parser = struct {
                 .orders = lastBranchOrders,
                 .limit = limit,
                 .offset = offset,
+                .limitExpr = limitExpr,
+                .offsetExpr = offsetExpr,
             } };
         }
         selectStmt.select.limit = limit;
         selectStmt.select.offset = offset;
+        selectStmt.select.limitExpr = limitExpr;
+        selectStmt.select.offsetExpr = offsetExpr;
         return selectStmt;
+    }
+
+    /// Extract a non-negative integer LIMIT/OFFSET literal, else null.
+    fn literalLimit(expr: ast.Expr) ?usize {
+        return switch (expr) {
+            .literal => |v| switch (v) {
+                .integer => |i| if (i >= 0) @intCast(i) else null,
+                .real => |r| if (r >= 0 and r == std.math.trunc(r) and r <= @as(f64, @floatFromInt(std.math.maxInt(usize)))) @intCast(@as(i64, @intFromFloat(r))) else null,
+                else => null,
+            },
+            else => null,
+        };
     }
 
     fn parseUpdate(self: *Parser) !ast.Statement {
@@ -2627,6 +2767,23 @@ test "parser parses table constraints, generated columns, strict, and without ro
     try std.testing.expect(statement.createTable.columns[2].generatedStored);
     try std.testing.expectEqual(@as(usize, 1), statement.createTable.constraints.len);
     try std.testing.expect(statement.createTable.constraints[0] == .check);
+}
+
+test "parser captures table-level and column-level ON CONFLICT policies" {
+    var parser = try Parser.init(std.testing.allocator, "CREATE TABLE conf (id INTEGER PRIMARY KEY ON CONFLICT REPLACE, email TEXT UNIQUE ON CONFLICT IGNORE, score INT CHECK (score >= 0) ON CONFLICT FAIL, UNIQUE (email, score) ON CONFLICT ROLLBACK, CHECK (id > 0) ON CONFLICT ABORT);");
+    defer parser.deinit();
+    var statement = try parser.parse();
+    defer ast.deinit(std.testing.allocator, &statement);
+    try std.testing.expect(statement == .createTable);
+    const columns = statement.createTable.columns;
+    try std.testing.expectEqual(ast.ConflictPolicy.replace, columns[0].conflict);
+    try std.testing.expectEqual(ast.ConflictPolicy.ignore, columns[1].conflict);
+    try std.testing.expectEqual(ast.ConflictPolicy.fail, columns[2].conflict);
+    try std.testing.expectEqual(@as(usize, 2), statement.createTable.constraints.len);
+    try std.testing.expect(statement.createTable.constraints[0] == .unique);
+    try std.testing.expectEqual(ast.ConflictPolicy.rollback, statement.createTable.constraints[0].unique.conflict);
+    try std.testing.expect(statement.createTable.constraints[1] == .check);
+    try std.testing.expectEqual(ast.ConflictPolicy.abort, statement.createTable.constraints[1].check.conflict);
 }
 
 test "parser parses deferrable foreign key clauses" {

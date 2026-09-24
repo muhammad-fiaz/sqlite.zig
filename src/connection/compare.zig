@@ -122,7 +122,7 @@ pub fn compareCollated(left: Value, op: ast.CompareOp, right: Value, collate: ?[
         .lessEqual => result <= 0,
         .greater => result > 0,
         .greaterEqual => result >= 0,
-        .like, .notLike, .glob, .notGlob, .regexp, .notRegexp, .match, .notMatch, .isNull, .isNotNull, .isValue, .isNotValue, .isDistinct, .isNotDistinct, .between, .notBetween, .in, .notIn, .exists, .notExists, .isTrue => false,
+        .like, .notLike, .glob, .notGlob, .regexp, .notRegexp, .match, .notMatch, .isNull, .isNotNull, .isValue, .isNotValue, .isDistinct, .isNotDistinct, .between, .notBetween, .in, .notIn, .exists, .notExists, .isTrue, .isNotTrue, .isFalse, .isNotFalse => false,
     };
 }
 

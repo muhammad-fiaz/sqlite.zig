@@ -10,6 +10,7 @@ const Header = @import("../format/header.zig").Header;
 const headerSize = @import("../format/header.zig").size;
 const limits = @import("../sql/limits.zig");
 const wal = @import("wal.zig");
+const journal = @import("journal.zig");
 /// Page size used when creating a brand-new database file.
 const pageSizeDefault: usize = limits.default_page_size;
 /// Upper bound for any single image/WAL/payload allocation.
@@ -43,6 +44,9 @@ pub const DatabaseFile = struct {
     schemaVersion: u32 = 1,
     /// When true, `writeImage` appends frames to `-wal` instead of the base.
     walEnabled: bool = false,
+    /// Monotonic file change counter (header offset 24); incremented on
+    /// every non-WAL `writeImage` and stamped into the outgoing image.
+    changeCounter: u32 = 0,
 
     /// Opens (creating when missing) the database at `path`.
     ///
@@ -62,6 +66,12 @@ pub const DatabaseFile = struct {
         const ownedPath = try allocator.dupe(u8, path);
         var result = DatabaseFile{ .allocator = allocator, .path = ownedPath, .threaded = threaded, .file = file, .pageSize = pageSizeDefault };
         errdefer result.close();
+        // Crash recovery first so the header we read reflects restored pages.
+        try result.recoverJournalIfNeeded();
+        // Sticky WAL: a non-empty `-wal` sidecar means the last session left
+        // the database in WAL mode; reopen continues in WAL until checkpoint
+        // / journal_mode=DELETE removes the sidecar.
+        if (try result.hasNonEmptyWal()) result.walEnabled = true;
         const stat = try file.stat(io);
         if (stat.size == 0) {
             var bytes: [headerSize]u8 = undefined;
@@ -83,6 +93,7 @@ pub const DatabaseFile = struct {
             result.userVersion = header.userVersion;
             result.applicationId = header.applicationId;
             result.schemaVersion = header.schemaCookie;
+            result.changeCounter = header.changeCounter;
         }
         return result;
     }
@@ -93,6 +104,121 @@ pub const DatabaseFile = struct {
         self.file.close(self.threaded.io());
         self.threaded.deinit();
         self.allocator.free(self.path);
+    }
+
+    /// Builds the owned `-journal` sidecar path (`path ++ "-journal"`).
+    fn journalPath(self: *DatabaseFile) ![]u8 {
+        return std.fmt.allocPrint(self.allocator, "{s}-journal", .{self.path});
+    }
+
+    /// Reads the whole `-journal` sidecar, or `null` when missing/empty.
+    fn readJournalSidecar(self: *DatabaseFile) !?[]u8 {
+        const path = try self.journalPath();
+        defer self.allocator.free(path);
+        const io = self.threaded.io();
+        var journalFile = Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write }) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        defer journalFile.close(io);
+        const stat = try journalFile.stat(io);
+        if (stat.size == 0) return null;
+        const length: usize = std.math.cast(usize, stat.size) orelse return error.InvalidJournal;
+        if (length > journal.maxJournalBytes) return error.InvalidJournal;
+        const bytes = try self.allocator.alloc(u8, length);
+        errdefer self.allocator.free(bytes);
+        const n = try journalFile.readPositional(io, &.{bytes}, 0);
+        if (n != bytes.len) return error.InvalidJournal;
+        return bytes;
+    }
+
+    /// Restores pages from a leftover journal (if any) and deletes it.
+    /// Called once from `open` before the header is read.
+    fn recoverJournalIfNeeded(self: *DatabaseFile) !void {
+        const journalBytes = try self.readJournalSidecar() orelse return;
+        defer self.allocator.free(journalBytes);
+        const hdr = try journal.JournalHeader.decode(journalBytes);
+        // Prefer the journal's page size over the default we were opened with.
+        self.pageSize = hdr.pageSize;
+        const needPages: usize = hdr.pageCount;
+        const needBytes = needPages * self.pageSize;
+        if (needBytes > maxImageBytes) return error.InvalidJournal;
+        const stat = try self.file.stat(self.threaded.io());
+        const fileLen: usize = if (stat.size == 0) 0 else std.math.cast(usize, stat.size) orelse return error.InvalidJournal;
+        var image = try self.allocator.alloc(u8, @max(needBytes, fileLen));
+        defer self.allocator.free(image);
+        if (fileLen > 0) {
+            _ = try self.file.readPositional(self.threaded.io(), &.{image[0..fileLen]}, 0);
+        }
+        if (image.len < needBytes) return error.InvalidJournal;
+        try journal.applyJournal(image, journalBytes);
+        const restoredLen = needBytes;
+        try self.file.writePositionalAll(self.threaded.io(), image[0..restoredLen], 0);
+        try self.file.setLength(self.threaded.io(), restoredLen);
+        const path = try self.journalPath();
+        defer self.allocator.free(path);
+        Io.Dir.cwd().deleteFile(self.threaded.io(), path) catch {};
+    }
+
+    /// Writes `bytes` as a crash-safe whole-image commit:
+    /// 1. journal the current on-disk pages (commit point is journal delete),
+    /// 2. write the new image,
+    /// 3. fsync when requested,
+    /// 4. delete the journal.
+    /// On any failure before step 4 the journal remains for `open` recovery.
+    fn commitJournaledImage(self: *DatabaseFile, bytes: []u8, sync: bool) !void {
+        const io = self.threaded.io();
+        // Journal the old image only when there is something to protect.
+        const stat = try self.file.stat(io);
+        var journalBytes: ?[]u8 = null;
+        defer if (journalBytes) |jb| self.allocator.free(jb);
+        if (stat.size >= self.pageSize) {
+            const oldLen: usize = @min(@as(usize, @intCast(stat.size)), journal.maxJournalBytes);
+            const oldImage = try self.allocator.alloc(u8, oldLen);
+            defer self.allocator.free(oldImage);
+            const n = try self.file.readPositional(io, &.{oldImage}, 0);
+            if (n == oldLen) {
+                // Round down to whole pages for the journal encoder.
+                const whole = (oldLen / self.pageSize) * self.pageSize;
+                if (whole >= self.pageSize) {
+                    journalBytes = try journal.encodeJournal(self.allocator, oldImage[0..whole], @intCast(self.pageSize), self.changeCounter +% 1);
+                    const jpath = try self.journalPath();
+                    defer self.allocator.free(jpath);
+                    // Incomplete journal must not survive: recovery would
+                    // fail closed on a truncated sidecar.
+                    var jf = Io.Dir.cwd().openFile(io, jpath, .{ .mode = .read_write }) catch |err| switch (err) {
+                        error.FileNotFound => try Io.Dir.cwd().createFile(io, jpath, .{ .read = true, .truncate = true }),
+                        else => return err,
+                    };
+                    errdefer {
+                        jf.close(io);
+                        Io.Dir.cwd().deleteFile(io, jpath) catch {};
+                    }
+                    try jf.writePositionalAll(io, journalBytes.?, 0);
+                    try jf.setLength(io, journalBytes.?.len);
+                    if (sync) try jf.sync(io);
+                    jf.close(io);
+                }
+            }
+        }
+        // Stamp change counter (offset 24) into the outgoing image.
+        if (bytes.len >= 28) {
+            self.changeCounter +%= 1;
+            std.mem.writeInt(u32, bytes[24..28], self.changeCounter, .big);
+        }
+        try self.file.writePositionalAll(io, bytes, 0);
+        try self.file.setLength(io, bytes.len);
+        if (sync) try self.file.sync(io);
+        // Commit point: journal gone means the new image is durable.
+        if (journalBytes != null) {
+            const jpath = try self.journalPath();
+            defer self.allocator.free(jpath);
+            Io.Dir.cwd().deleteFile(io, jpath) catch {};
+        }
+        // Delete-mode commits rewrite the base image; any leftover `-wal`
+        // from a prior WAL session is now stale and must not overlay this
+        // newer base on the next open.
+        if (!self.walEnabled) self.deleteWal() catch {};
     }
 
     /// Reads page `pageNumber` (1-based) into a fresh caller-owned buffer.
@@ -202,9 +328,34 @@ pub const DatabaseFile = struct {
         if (bytes.len >= 44) std.mem.writeInt(u32, bytes[40..44], self.schemaVersion, .big);
         if (bytes.len >= 64) std.mem.writeInt(u32, bytes[60..64], self.userVersion, .big);
         if (bytes.len >= 72) std.mem.writeInt(u32, bytes[68..72], self.applicationId, .big);
-        if (self.walEnabled) return self.writeWal(bytes);
-        try self.file.writePositionalAll(self.threaded.io(), bytes, 0);
-        try self.file.setLength(self.threaded.io(), bytes.len);
+        if (self.walEnabled) {
+            if (bytes.len >= 28) {
+                self.changeCounter +%= 1;
+                std.mem.writeInt(u32, bytes[24..28], self.changeCounter, .big);
+            }
+            return self.writeWal(bytes);
+        }
+        // Journal + commit-point delete for crash safety (no sync: the
+        // connection's `synchronousLevel` drives `syncImage` when needed).
+        try self.commitJournaledImage(bytes, false);
+    }
+
+    /// Re-writes `bytes` and forces an fsync (PRAGMA synchronous FULL).
+    /// Same journal/commit protocol as `writeImage`, with a sync before the
+    /// journal is removed so a power loss after return cannot lose the commit.
+    pub fn syncImage(self: *DatabaseFile, bytes: []u8) !void {
+        if (bytes.len >= 44) std.mem.writeInt(u32, bytes[40..44], self.schemaVersion, .big);
+        if (bytes.len >= 64) std.mem.writeInt(u32, bytes[60..64], self.userVersion, .big);
+        if (bytes.len >= 72) std.mem.writeInt(u32, bytes[68..72], self.applicationId, .big);
+        if (self.walEnabled) {
+            if (bytes.len >= 28) {
+                self.changeCounter +%= 1;
+                std.mem.writeInt(u32, bytes[24..28], self.changeCounter, .big);
+            }
+            try self.writeWal(bytes);
+            return;
+        }
+        try self.commitJournaledImage(bytes, true);
     }
 
     /// Cached PRAGMA user_version accessor (staged until `writeImage`).
@@ -320,6 +471,20 @@ pub const DatabaseFile = struct {
         const n = try walFile.readPositional(io, &.{bytes}, 0);
         if (n != bytes.len) return error.InvalidWal;
         return bytes;
+    }
+
+    /// True when a non-empty `-wal` sidecar exists (sticky WAL detection).
+    fn hasNonEmptyWal(self: *DatabaseFile) !bool {
+        const path = try self.walPath();
+        defer self.allocator.free(path);
+        const io = self.threaded.io();
+        var walFile = Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only }) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
+        defer walFile.close(io);
+        const stat = try walFile.stat(io);
+        return stat.size > 0;
     }
 
     /// Encodes `image` as WAL frames and replaces the `-wal` sidecar.
@@ -446,15 +611,106 @@ test "writeImage stamps versions into the header image" {
     db.setUserVersion(0x01020304);
     db.setApplicationId(0x05060708);
     db.setSchemaVersion(0x090a0b0c);
-    var image = try std.testing.allocator.alloc(u8, 100);
+    var image = try std.testing.allocator.alloc(u8, db.pageSize);
     defer std.testing.allocator.free(image);
     @memset(image, 0);
+    (Header{ .pageSize = 4096, .databaseSizePages = 1 }).encode(image[0..headerSize]);
     try db.writeImage(image);
-    // The mutable-slice stamp is visible in the caller's buffer and on disk.
     try std.testing.expectEqual(@as(u32, 0x090a0b0c), std.mem.readInt(u32, image[40..44], .big));
     try std.testing.expectEqual(@as(u32, 0x01020304), std.mem.readInt(u32, image[60..64], .big));
     try std.testing.expectEqual(@as(u32, 0x05060708), std.mem.readInt(u32, image[68..72], .big));
-    const stored = try db.readBytes(0, 100);
+    // Change counter is stamped by commitJournaledImage (nonzero after write).
+    try std.testing.expect(db.changeCounter >= 1);
+    try std.testing.expectEqual(db.changeCounter, std.mem.readInt(u32, image[24..28], .big));
+    const stored = try db.readBytes(0, db.pageSize);
     defer std.testing.allocator.free(stored);
     try std.testing.expectEqualSlices(u8, image, stored);
+    // No leftover journal after a successful commit.
+    const jpath = try db.journalPath();
+    defer std.testing.allocator.free(jpath);
+    if (Io.Dir.cwd().openFile(db.threaded.io(), jpath, .{ .mode = .read_write })) |jf| {
+        jf.close(db.threaded.io());
+        return error.JournalLeftBehind;
+    } else |_| {}
+}
+
+test "writeImage increments change counter across commits" {
+    const path = "sqlite_zig_file_change_test.db";
+    defer Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    var db = try DatabaseFile.open(std.testing.allocator, path);
+    const first = blk: {
+        var image = try std.testing.allocator.alloc(u8, db.pageSize);
+        defer std.testing.allocator.free(image);
+        @memset(image, 0);
+        (Header{ .pageSize = 4096, .databaseSizePages = 1 }).encode(image[0..headerSize]);
+        try db.writeImage(image);
+        break :blk db.changeCounter;
+    };
+    const second = blk: {
+        var image = try std.testing.allocator.alloc(u8, db.pageSize);
+        defer std.testing.allocator.free(image);
+        @memset(image, 0);
+        (Header{ .pageSize = 4096, .databaseSizePages = 1 }).encode(image[0..headerSize]);
+        try db.writeImage(image);
+        break :blk db.changeCounter;
+    };
+    db.close();
+    try std.testing.expectEqual(first +% 1, second);
+    // Reopen loads the persisted counter from the header.
+    var reopened = try DatabaseFile.open(std.testing.allocator, path);
+    defer reopened.close();
+    try std.testing.expectEqual(second, reopened.changeCounter);
+}
+
+test "leftover journal is recovered on open and deleted" {
+    const path = "sqlite_zig_file_journal_recover_test.db";
+    const jpathBuf = "sqlite_zig_file_journal_recover_test.db-journal";
+    defer Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer Io.Dir.cwd().deleteFile(std.testing.io, jpathBuf) catch {};
+    // Build a two-page image, then simulate a crash: journal old pages,
+    // write a mutated image, leave the journal on disk.
+    const pageSize: usize = 4096;
+    var oldImage = try std.testing.allocator.alloc(u8, pageSize * 2);
+    defer std.testing.allocator.free(oldImage);
+    @memset(oldImage, 0x11);
+    (Header{ .pageSize = 4096, .databaseSizePages = 2 }).encode(oldImage[0..headerSize]);
+    {
+        var db = try DatabaseFile.open(std.testing.allocator, path);
+        const seed = try std.testing.allocator.dupe(u8, oldImage);
+        defer std.testing.allocator.free(seed);
+        try db.writeImage(seed);
+        db.close();
+    }
+    // Simulate crash: write journal of current pages + corrupt base, keep journal.
+    {
+        var db = try DatabaseFile.open(std.testing.allocator, path);
+        defer db.close();
+        const current = try db.readImage();
+        defer std.testing.allocator.free(current);
+        const jb = try journal.encodeJournal(std.testing.allocator, current, @intCast(pageSize), 99);
+        defer std.testing.allocator.free(jb);
+        var jf = try Io.Dir.cwd().createFile(db.threaded.io(), jpathBuf, .{ .read = true, .truncate = true });
+        defer jf.close(db.threaded.io());
+        try jf.writePositionalAll(db.threaded.io(), jb, 0);
+        // Mutate the base file (partial/failed write).
+        const bad = try std.testing.allocator.alloc(u8, pageSize * 2);
+        defer std.testing.allocator.free(bad);
+        @memset(bad, 0xEE);
+        try db.file.writePositionalAll(db.threaded.io(), bad, 0);
+        try db.file.setLength(db.threaded.io(), bad.len);
+    }
+    // Reopen: recovery restores journaled pages and removes the journal.
+    {
+        var db = try DatabaseFile.open(std.testing.allocator, path);
+        defer db.close();
+        const restored = try db.readImage();
+        defer std.testing.allocator.free(restored);
+        try std.testing.expectEqual(@as(u8, 0x11), restored[pageSize]);
+        try std.testing.expectEqualSlices(u8, @as([]const u8, "SQLite format 3\x00"), restored[0..16]);
+    }
+    // Journal is gone after successful recovery.
+    if (Io.Dir.cwd().openFile(std.testing.io, jpathBuf, .{ .mode = .read_write })) |jf| {
+        jf.close(std.testing.io);
+        return error.JournalLeftBehind;
+    } else |_| {}
 }

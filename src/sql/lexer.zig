@@ -37,6 +37,8 @@ pub fn tokenizeLimited(allocator: std.mem.Allocator, sql: []const u8, max_bytes:
     var tokens = std.ArrayList(Token).empty;
     errdefer tokens.deinit(allocator);
     var i: usize = 0;
+    // Skip a UTF-8 BOM so documents saved by Windows tools tokenize cleanly.
+    if (sql.len >= 3 and sql[0] == 0xEF and sql[1] == 0xBB and sql[2] == 0xBF) i = 3;
     while (i < sql.len) {
         const start = i;
         switch (sql[i]) {
@@ -44,6 +46,15 @@ pub fn tokenizeLimited(allocator: std.mem.Allocator, sql: []const u8, max_bytes:
             '-' => if (i + 1 < sql.len and sql[i + 1] == '-') {
                 i += 2;
                 while (i < sql.len and sql[i] != '\n') i += 1;
+            } else if (i + 1 < sql.len and sql[i + 1] == '>') {
+                // JSON path arrow; `->>` is the unquoted form.
+                if (i + 2 < sql.len and sql[i + 2] == '>') {
+                    try tokens.append(allocator, .{ .tag = .jsonArrowText, .text = sql[i .. i + 3], .position = i });
+                    i += 3;
+                } else {
+                    try tokens.append(allocator, .{ .tag = .jsonArrow, .text = sql[i .. i + 2], .position = i });
+                    i += 2;
+                }
             } else {
                 try tokens.append(allocator, .{ .tag = .minus, .text = sql[i .. i + 1], .position = i });
                 i += 1;
@@ -73,12 +84,21 @@ pub fn tokenizeLimited(allocator: std.mem.Allocator, sql: []const u8, max_bytes:
                     }
                 } else return Error.UnterminatedString;
             },
+            '[' => {
+                // MSSQL-style bracket identifier: `[name]` (no escape for `]`).
+                i += 1;
+                const content = i;
+                while (i < sql.len and sql[i] != ']') i += 1;
+                if (i >= sql.len) return Error.UnterminatedString;
+                try tokens.append(allocator, .{ .tag = .word, .text = sql[content..i], .position = start, .quoted = true });
+                i += 1;
+            },
             '0'...'9' => {
                 if (sql[i] == '0' and i + 1 < sql.len and (sql[i + 1] == 'x' or sql[i + 1] == 'X')) {
                     i += 2;
                     const hexStart = i;
                     while (i < sql.len and std.ascii.isHex(sql[i])) i += 1;
-                    if (i == hexStart) i = start + 1;
+                    if (i == hexStart) return Error.InvalidCharacter;
                     try tokens.append(allocator, .{ .tag = .number, .text = sql[start..i], .position = start });
                 } else {
                     i += 1;
@@ -247,6 +267,32 @@ test "lexer tokenizes operators, numbers, and parameters matrix" {
     }
     try std.testing.expect(saw_hex and saw_concat and saw_param);
     try std.testing.expectEqual(Tag.eof, tokens[tokens.len - 1].tag);
+}
+
+test "lexer handles BOM, brackets, and JSON arrows" {
+    const bom = try tokenize(std.testing.allocator, "\xEF\xBB\xBFSELECT 1;");
+    defer std.testing.allocator.free(bom);
+    try std.testing.expectEqual(Tag.word, bom[0].tag);
+    try std.testing.expectEqualStrings("SELECT", bom[0].text);
+
+    const brackets = try tokenize(std.testing.allocator, "SELECT [select] FROM [table];");
+    defer std.testing.allocator.free(brackets);
+    try std.testing.expect(brackets[1].quoted);
+    try std.testing.expectEqualStrings("select", brackets[1].text);
+
+    const arrows = try tokenize(std.testing.allocator, "SELECT a -> b, c ->> d;");
+    defer std.testing.allocator.free(arrows);
+    var sawArrow = false;
+    var sawArrowText = false;
+    for (arrows) |t| {
+        if (t.tag == .jsonArrow) sawArrow = true;
+        if (t.tag == .jsonArrowText) sawArrowText = true;
+    }
+    try std.testing.expect(sawArrow and sawArrowText);
+}
+
+test "lexer rejects hex with zero digits" {
+    try std.testing.expectError(Error.InvalidCharacter, tokenize(std.testing.allocator, "SELECT 0x;"));
 }
 
 test "lexer handles empty input and comments only" {

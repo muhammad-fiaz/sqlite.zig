@@ -202,6 +202,10 @@ fn mapCompareOp(op: dslExpr.Operator) ast.CompareOp {
         .isNotDistinct => .isNotDistinct,
         .between => .between,
         .notBetween => .notBetween,
+        .isTrue => .isTrue,
+        .isNotTrue => .isNotTrue,
+        .isFalse => .isFalse,
+        .isNotFalse => .isNotFalse,
     };
 }
 
@@ -318,6 +322,12 @@ fn projectionToAst(ctx: *Ctx, proj: dslExpr.Projection, base: ?StripBase, cases:
         .aggregate => {
             const argNode = try ctx.node();
             argNode.* = .{ .identifier = try ctx.refName(proj.column, base) };
+            var arg2: ?*const ast.Expr = null;
+            if (proj.hasArgument) {
+                const created = try ctx.node();
+                created.* = .{ .literal = proj.argument };
+                arg2 = created;
+            }
             const callNode = try ctx.node();
             var filter: ?*const ast.Expr = null;
             if (proj.filterExpr) |pred| {
@@ -325,7 +335,7 @@ fn projectionToAst(ctx: *Ctx, proj: dslExpr.Projection, base: ?StripBase, cases:
                 created.* = try predicateToBinary(ctx, pred, base);
                 filter = created;
             }
-            callNode.* = .{ .function = .{ .name = proj.function, .argument = argNode, .distinct = proj.distinct, .filter = filter } };
+            callNode.* = .{ .function = .{ .name = proj.function, .argument = argNode, .argument2 = arg2, .distinct = proj.distinct, .filter = filter } };
             return .{ .expr = ctx.detach(callNode), .alias = proj.alias };
         },
         .scalar => {
@@ -471,6 +481,16 @@ fn predicateToBinary(ctx: *Ctx, expr: dslExpr.Expr, base: ?StripBase) anyerror!a
             const either = try ctx.node();
             either.* = .{ .binary = .{ .op = .logicalOr, .left = lower, .right = upper } };
             break :blk either;
+        },
+        .isTrue, .isNotTrue, .isFalse, .isNotFalse => blk: {
+            const op: ast.BinaryOp = switch (expr.operator) {
+                .isTrue => .isTrue,
+                .isNotTrue => .isNotTrue,
+                .isFalse => .isFalse,
+                .isNotFalse => .isNotFalse,
+                else => unreachable,
+            };
+            break :blk try binaryNode(ctx, op, try leftSideToExpr(ctx, expr.column, expr.function, base), .{ .literal = .null });
         },
         .isNull, .isNotNull => return error.InvalidSql,
     };

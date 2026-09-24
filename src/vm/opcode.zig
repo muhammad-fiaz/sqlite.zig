@@ -65,6 +65,21 @@ pub const OpCode = enum {
     function,
     aggStep,
     aggFinal,
+    transaction,
+    autoCommit,
+    savepoint,
+    checkpoint,
+    vacuum,
+    createBtree,
+    parseSchema,
+    dropTable,
+    dropIndex,
+    dropTrigger,
+    sorterOpen,
+    sorterInsert,
+    sorterSort,
+    sorterNext,
+    sorterData,
 };
 
 /// Single instruction: opcode plus operands. `p1`/`p2`/`p3` are

@@ -800,6 +800,42 @@ pub fn evalSqliteSourceId(allocator: std.mem.Allocator) !Value {
     return .{ .text = try std.fmt.allocPrint(allocator, "{s}|sqlite.zig-native", .{@import("../../version.zig").sqliteEngineVersion}) };
 }
 
+const compileOptions = [_][]const u8{
+    "ENABLE_JSON1",
+    "ENABLE_MATH_FUNCTIONS",
+    "THREADSAFE=1",
+    "SYSTEM_MALLOC",
+};
+
+/// `sqlite_compileoption_used(opt)`: 1 if compiled option is recognized, else 0.
+pub fn evalCompileOptionUsed(arg: Value) Value {
+    const text = switch (arg) {
+        .text => |t| t,
+        else => return .{ .integer = 0 },
+    };
+    var optName = text;
+    if (std.ascii.startsWithIgnoreCase(optName, "SQLITE_")) {
+        optName = optName[7..];
+    }
+    for (compileOptions) |opt| {
+        if (std.ascii.eqlIgnoreCase(opt, optName)) return .{ .integer = 1 };
+        if (std.mem.indexOfScalar(u8, opt, '=')) |eqIdx| {
+            if (std.ascii.eqlIgnoreCase(opt[0..eqIdx], optName)) return .{ .integer = 1 };
+        }
+    }
+    return .{ .integer = 0 };
+}
+
+/// `sqlite_compileoption_get(N)`: Nth compile option, or NULL if out of range.
+pub fn evalCompileOptionGet(allocator: std.mem.Allocator, arg: Value) !Value {
+    const n = switch (arg) {
+        .integer => |i| i,
+        else => return .null,
+    };
+    if (n < 0 or @as(usize, @intCast(n)) >= compileOptions.len) return .null;
+    return .{ .text = try allocator.dupe(u8, compileOptions[@as(usize, @intCast(n))]) };
+}
+
 /// `json_quote(X)`: JSON literal rendering; blob errors `InvalidSql`.
 pub fn evalJsonQuote(allocator: std.mem.Allocator, val: Value) !Value {
     switch (val) {

@@ -23,6 +23,7 @@
 const std = @import("std");
 const Schema = @import("../catalog/schema.zig").Schema;
 const Table = @import("../catalog/schema.zig").Table;
+const parentPkColumnIndex = Schema.parentPkColumnIndex;
 const Value = @import("../vm/value.zig").Value;
 const ast = @import("../sql/ast.zig");
 const compare = @import("compare.zig");
@@ -193,8 +194,10 @@ pub fn applyUpdateActions(allocator: std.mem.Allocator, store: *Schema, parentNa
             const childColumn = childTable.columns[childColumnIndex];
             const foreignTable = childColumn.foreignTable orelse continue;
             if (!std.ascii.eqlIgnoreCase(foreignTable, parentName)) continue;
-            const referenced = childColumn.foreignColumn orelse return error.ConstraintViolation;
-            const parentColumnIndex = try fkColumnIndex(parent, referenced);
+            const parentColumnIndex = if (childColumn.foreignColumn) |name| blk: {
+                if (name.len == 0) break :blk parentPkColumnIndex(parent) orelse return error.ConstraintViolation;
+                break :blk try fkColumnIndex(parent, name);
+            } else parentPkColumnIndex(parent) orelse return error.ConstraintViolation;
             if (compare.sameValue(oldValues[parentColumnIndex], newValues[parentColumnIndex])) continue;
 
             var childRowIndex: usize = 0;
@@ -239,11 +242,15 @@ pub fn applyUpdateActions(allocator: std.mem.Allocator, store: *Schema, parentNa
 /// FK metadata names an unknown column. Shared by both delete passes.
 pub fn deleteFkParentIndex(store: *Schema, parentName: []const u8, column: anytype) !usize {
     const parentTable = store.findConst(parentName) orelse return error.ConstraintViolation;
-    const referenced = column.foreignColumn orelse return error.ConstraintViolation;
-    for (parentTable.columns, 0..) |parentColumn, index| {
-        if (std.ascii.eqlIgnoreCase(parentColumn.name, referenced)) return index;
+    if (column.foreignColumn) |referenced| {
+        if (referenced.len != 0) {
+            for (parentTable.columns, 0..) |parentColumn, index| {
+                if (std.ascii.eqlIgnoreCase(parentColumn.name, referenced)) return index;
+            }
+            return error.ConstraintViolation;
+        }
     }
-    return error.ConstraintViolation;
+    return parentPkColumnIndex(parentTable) orelse error.ConstraintViolation;
 }
 
 /// Column-level plus composite `ON DELETE` actions for every FK pointing at
@@ -435,8 +442,10 @@ pub fn enforceDeferredForeignKeys(store: *const Schema) !void {
                 const foreignTableName = column.foreignTable orelse continue;
                 if (!store.fkCheckDeferred(column.fkDeferrable, column.fkInitiallyDeferred)) continue;
                 const parent = store.findConst(foreignTableName) orelse return error.ConstraintViolation;
-                const foreignColumnName = column.foreignColumn orelse return error.ConstraintViolation;
-                const parentIndex = fkColumnIndex(parent, foreignColumnName) catch return error.ConstraintViolation;
+                const parentIndex = if (column.foreignColumn) |name| blk: {
+                    if (name.len == 0) break :blk parentPkColumnIndex(parent) orelse return error.ConstraintViolation;
+                    break :blk fkColumnIndex(parent, name) catch return error.ConstraintViolation;
+                } else parentPkColumnIndex(parent) orelse return error.ConstraintViolation;
                 if (row.values[childIndex] == .null) continue;
                 var found = false;
                 for (parent.rows.items) |parentRow| {

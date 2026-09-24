@@ -337,9 +337,35 @@ fn buildTableBtree(allocator: std.mem.Allocator, pageBuilder: *PageBuilder, tabl
     var rowids = std.ArrayList(u64).empty;
     defer rowids.deinit(allocator);
 
+    var hasVirtual = false;
+    var storedCount: usize = 0;
+    for (table.columns) |col| {
+        if (col.generatedExpr != null and !col.generatedStored) {
+            hasVirtual = true;
+        } else {
+            storedCount += 1;
+        }
+    }
+
+    var storedValues: ?[]Value = null;
+    if (hasVirtual) {
+        storedValues = try allocator.alloc(Value, storedCount);
+    }
+    defer if (storedValues) |sv| allocator.free(sv);
+
     for (table.rows.items, 0..) |row, rowIndex| {
         const rowid: u64 = @intCast(rowIndex + 1);
-        const item = try buildCell(pageBuilder, rowid, row.values, databasePageSize);
+        const valuesToStore = if (storedValues) |sv| blk: {
+            var destIdx: usize = 0;
+            for (table.columns, 0..) |col, colIdx| {
+                if (!(col.generatedExpr != null and !col.generatedStored)) {
+                    sv[destIdx] = row.values[colIdx];
+                    destIdx += 1;
+                }
+            }
+            break :blk sv;
+        } else row.values;
+        const item = try buildCell(pageBuilder, rowid, valuesToStore, databasePageSize);
         try cellsList.append(allocator, item);
         try rowids.append(allocator, rowid);
     }
@@ -455,11 +481,179 @@ fn buildIndexBtree(allocator: std.mem.Allocator, pageBuilder: *PageBuilder, sche
     return rootPage;
 }
 
-/// Regenerates canonical `CREATE TABLE` SQL for the page-1 catalog.
+/// Keyword for a non-default conflict policy, or null when `.none`.
+fn conflictKeyword(conflict: ast.ConflictPolicy) ?[]const u8 {
+    return switch (conflict) {
+        .none => null,
+        .ignore => "IGNORE",
+        .replace => "REPLACE",
+        .update => "UPDATE",
+        .abort => "ABORT",
+        .fail => "FAIL",
+        .rollback => "ROLLBACK",
+    };
+}
+
+/// Emits ` ON CONFLICT <policy>` when `conflict` is not the default `.none`.
+fn appendConflictSql(allocator: std.mem.Allocator, sql: *std.ArrayList(u8), conflict: ast.ConflictPolicy) error{OutOfMemory}!void {
+    const keyword = conflictKeyword(conflict) orelse return;
+    try sql.appendSlice(allocator, " ON CONFLICT ");
+    try sql.appendSlice(allocator, keyword);
+}
+
+/// Appends SQL text for `expr` (CHECK / generated-column / expression DEFAULT).
+/// Covers the DDL expression subset the parser accepts in those positions.
+pub fn appendExprSql(allocator: std.mem.Allocator, sql: *std.ArrayList(u8), expr: ast.Expr) error{OutOfMemory}!void {
+    switch (expr) {
+        .literal => |value| try appendSqlLiteral(allocator, sql, value),
+        .identifier => |name| try sql.appendSlice(allocator, name),
+        .parameter => |index| {
+            const rendered = try std.fmt.allocPrint(allocator, "?{d}", .{index + 1});
+            defer allocator.free(rendered);
+            try sql.appendSlice(allocator, rendered);
+        },
+        .wildcard => try sql.append(allocator, '*'),
+        .function => |call| {
+            try sql.appendSlice(allocator, call.name);
+            try sql.append(allocator, '(');
+            if (call.distinct) try sql.appendSlice(allocator, "DISTINCT ");
+            try appendExprSql(allocator, sql, call.argument.*);
+            if (call.argument2) |argument| {
+                try sql.appendSlice(allocator, ", ");
+                try appendExprSql(allocator, sql, argument.*);
+            }
+            if (call.argument3) |argument| {
+                try sql.appendSlice(allocator, ", ");
+                try appendExprSql(allocator, sql, argument.*);
+            }
+            for (call.extraArgs) |argument| {
+                try sql.appendSlice(allocator, ", ");
+                try appendExprSql(allocator, sql, argument);
+            }
+            try sql.append(allocator, ')');
+        },
+        .binary => |binary| {
+            try sql.append(allocator, '(');
+            try appendExprSql(allocator, sql, binary.left.*);
+            try sql.appendSlice(allocator, switch (binary.op) {
+                .add => " + ",
+                .subtract => " - ",
+                .multiply => " * ",
+                .divide => " / ",
+                .modulo => " % ",
+                .concat => " || ",
+                .jsonArrow => " -> ",
+                .jsonArrowText => " ->> ",
+                .bitAnd => " & ",
+                .bitOr => " | ",
+                .shiftLeft => " << ",
+                .shiftRight => " >> ",
+                .equal => " = ",
+                .notEqual => " <> ",
+                .less => " < ",
+                .lessEqual => " <= ",
+                .greater => " > ",
+                .greaterEqual => " >= ",
+                .logicalAnd => " AND ",
+                .logicalOr => " OR ",
+                .isOp => " IS ",
+                .isNotOp => " IS NOT ",
+                .isTrue => {
+                    try sql.appendSlice(allocator, " IS TRUE)");
+                    return;
+                },
+                .isNotTrue => {
+                    try sql.appendSlice(allocator, " IS NOT TRUE)");
+                    return;
+                },
+                .isFalse => {
+                    try sql.appendSlice(allocator, " IS FALSE)");
+                    return;
+                },
+                .isNotFalse => {
+                    try sql.appendSlice(allocator, " IS NOT FALSE)");
+                    return;
+                },
+            });
+            try appendExprSql(allocator, sql, binary.right.*);
+            try sql.append(allocator, ')');
+        },
+        .unary => |unary| {
+            try sql.appendSlice(allocator, switch (unary.op) {
+                .negate => "-",
+                .positive => "+",
+                .bitNot => "~",
+                .logicalNot => "NOT ",
+            });
+            try appendExprSql(allocator, sql, unary.expr.*);
+        },
+        .caseExpr => |caseBlock| {
+            try sql.appendSlice(allocator, "CASE");
+            if (caseBlock.base) |base| {
+                try sql.append(allocator, ' ');
+                try appendExprSql(allocator, sql, base.*);
+            }
+            for (caseBlock.whens) |when| {
+                try sql.appendSlice(allocator, " WHEN ");
+                try appendExprSql(allocator, sql, when.condition);
+                try sql.appendSlice(allocator, " THEN ");
+                try appendExprSql(allocator, sql, when.result);
+            }
+            if (caseBlock.otherwise) |otherwise| {
+                try sql.appendSlice(allocator, " ELSE ");
+                try appendExprSql(allocator, sql, otherwise.*);
+            }
+            try sql.appendSlice(allocator, " END");
+        },
+        .patternMatch => |match| {
+            try sql.append(allocator, '(');
+            try appendExprSql(allocator, sql, match.value.*);
+            try sql.appendSlice(allocator, if (match.negated) " NOT " else " ");
+            try sql.appendSlice(allocator, if (match.glob) "GLOB" else if (match.isRegexp) "REGEXP" else if (match.isMatch) "MATCH" else "LIKE");
+            try sql.append(allocator, ' ');
+            try appendExprSql(allocator, sql, match.pattern.*);
+            if (match.escape) |escape| {
+                try sql.appendSlice(allocator, " ESCAPE ");
+                try appendExprSql(allocator, sql, escape.*);
+            }
+            try sql.append(allocator, ')');
+        },
+        .collate => |node| {
+            try sql.append(allocator, '(');
+            try appendExprSql(allocator, sql, node.expr.*);
+            try sql.appendSlice(allocator, " COLLATE ");
+            try sql.appendSlice(allocator, node.name);
+            try sql.append(allocator, ')');
+        },
+        .scalarSubquery, .existsSubquery => |sqlText| try sql.appendSlice(allocator, sqlText),
+        .inSubquery => |inSub| {
+            try sql.append(allocator, '(');
+            try appendExprSql(allocator, sql, inSub.expr.*);
+            try sql.appendSlice(allocator, if (inSub.negated) " NOT IN " else " IN ");
+            try sql.appendSlice(allocator, inSub.subquery);
+            try sql.append(allocator, ')');
+        },
+        .inList => |inList| {
+            try sql.append(allocator, '(');
+            try appendExprSql(allocator, sql, inList.expr.*);
+            try sql.appendSlice(allocator, if (inList.negated) " NOT IN (" else " IN (");
+            for (inList.list, 0..) |item, index| {
+                if (index != 0) try sql.appendSlice(allocator, ", ");
+                try appendExprSql(allocator, sql, item);
+            }
+            try sql.appendSlice(allocator, "))");
+        },
+        .window => try sql.appendSlice(allocator, "/* window */"),
+    }
+}
+
+/// Regenerates canonical `CREATE TABLE` SQL for the page-1 catalog and for
+/// `sqlite_schema`/`sqlite_master` queries.
 ///
-/// CHECK constraints are intentionally skipped (stored separately), and
-/// virtual tables take the `CREATE VIRTUAL TABLE ... USING` path.
-fn createSql(allocator: std.mem.Allocator, table: anytype) ![]u8 {
+/// Column/table CHECK clauses and GENERATED ALWAYS AS are emitted from the
+/// owned AST so they survive reopen; virtual tables take the
+/// `CREATE VIRTUAL TABLE ... USING` path.
+pub fn createSql(allocator: std.mem.Allocator, table: anytype) ![]u8 {
     var sql = std.ArrayList(u8).empty;
     errdefer sql.deinit(allocator);
     if (table.virtualModule) |module| {
@@ -489,16 +683,42 @@ fn createSql(allocator: std.mem.Allocator, table: anytype) ![]u8 {
         if (column.autoincrement) try sql.appendSlice(allocator, " AUTOINCREMENT");
         if (column.notNull) try sql.appendSlice(allocator, " NOT NULL");
         if (column.unique) try sql.appendSlice(allocator, " UNIQUE");
+        if (column.collate) |name| {
+            try sql.appendSlice(allocator, " COLLATE ");
+            try sql.appendSlice(allocator, name);
+        }
         if (column.defaultValue) |default| {
             try sql.appendSlice(allocator, " DEFAULT ");
             try appendSqlLiteral(allocator, &sql, default);
         }
+        if (column.defaultExpr) |defaultExpr| {
+            try sql.appendSlice(allocator, " DEFAULT (");
+            try appendExprSql(allocator, &sql, defaultExpr);
+            try sql.append(allocator, ')');
+        }
+        if (column.conflict != .none) {
+            try appendConflictSql(allocator, &sql, column.conflict);
+        }
+        if (column.checkExpr) |checkExpr| {
+            try sql.appendSlice(allocator, " CHECK (");
+            try appendExprSql(allocator, &sql, checkExpr);
+            try sql.append(allocator, ')');
+        }
+        if (column.generatedExpr) |generatedExpr| {
+            try sql.appendSlice(allocator, " GENERATED ALWAYS AS (");
+            try appendExprSql(allocator, &sql, generatedExpr);
+            try sql.appendSlice(allocator, if (column.generatedStored) ") STORED" else ") VIRTUAL");
+        }
         if (column.foreignTable) |foreignTable| {
             try sql.appendSlice(allocator, " REFERENCES ");
             try sql.appendSlice(allocator, foreignTable);
-            try sql.append(allocator, '(');
-            try sql.appendSlice(allocator, column.foreignColumn.?);
-            try sql.append(allocator, ')');
+            if (column.foreignColumn) |foreignColumn| {
+                if (foreignColumn.len != 0) {
+                    try sql.append(allocator, '(');
+                    try sql.appendSlice(allocator, foreignColumn);
+                    try sql.append(allocator, ')');
+                }
+            }
             switch (column.onDelete) {
                 .restrict, .noAction => {},
                 .cascade => try sql.appendSlice(allocator, " ON DELETE CASCADE"),
@@ -517,7 +737,13 @@ fn createSql(allocator: std.mem.Allocator, table: anytype) ![]u8 {
         }
     }
     for (table.constraints) |constraint| {
-        if (constraint.kind == .check) continue;
+        if (constraint.kind == .check) {
+            try sql.appendSlice(allocator, ", CHECK (");
+            if (constraint.checkExpr) |checkExpr| try appendExprSql(allocator, &sql, checkExpr);
+            try sql.append(allocator, ')');
+            try appendConflictSql(allocator, &sql, constraint.conflict);
+            continue;
+        }
         try sql.appendSlice(allocator, ", ");
         if (constraint.kind == .foreignKey) {
             try sql.appendSlice(allocator, "FOREIGN KEY (");
@@ -531,6 +757,7 @@ fn createSql(allocator: std.mem.Allocator, table: anytype) ![]u8 {
             try sql.appendSlice(allocator, column);
         }
         try sql.append(allocator, ')');
+        if (constraint.kind != .foreignKey) try appendConflictSql(allocator, &sql, constraint.conflict);
         if (constraint.kind == .foreignKey) {
             try sql.appendSlice(allocator, " REFERENCES ");
             try sql.appendSlice(allocator, constraint.foreignTable.?);
@@ -568,7 +795,7 @@ fn createSql(allocator: std.mem.Allocator, table: anytype) ![]u8 {
 }
 
 /// Regenerates `CREATE [UNIQUE] INDEX` SQL (plus `WHERE` for partial indexes).
-fn createIndexSql(allocator: std.mem.Allocator, index: anytype) ![]u8 {
+pub fn createIndexSql(allocator: std.mem.Allocator, index: anytype) ![]u8 {
     var sql = std.ArrayList(u8).empty;
     errdefer sql.deinit(allocator);
     try sql.appendSlice(allocator, if (index.unique) "CREATE UNIQUE INDEX " else "CREATE INDEX ");
@@ -590,7 +817,7 @@ fn createIndexSql(allocator: std.mem.Allocator, index: anytype) ![]u8 {
 }
 
 /// Regenerates `CREATE VIEW` SQL from the stored select text.
-fn createViewSql(allocator: std.mem.Allocator, view: anytype) ![]u8 {
+pub fn createViewSql(allocator: std.mem.Allocator, view: anytype) ![]u8 {
     var sql = std.ArrayList(u8).empty;
     errdefer sql.deinit(allocator);
     try sql.appendSlice(allocator, "CREATE VIEW ");
@@ -601,7 +828,7 @@ fn createViewSql(allocator: std.mem.Allocator, view: anytype) ![]u8 {
 }
 
 /// Regenerates `CREATE TRIGGER` SQL (timing, event, column list, body).
-fn createTriggerSql(allocator: std.mem.Allocator, trigger: anytype) ![]u8 {
+pub fn createTriggerSql(allocator: std.mem.Allocator, trigger: anytype) ![]u8 {
     var sql = std.ArrayList(u8).empty;
     errdefer sql.deinit(allocator);
     try sql.appendSlice(allocator, "CREATE TRIGGER ");
@@ -625,6 +852,11 @@ fn createTriggerSql(allocator: std.mem.Allocator, trigger: anytype) ![]u8 {
     }
     try sql.appendSlice(allocator, " ON ");
     try sql.appendSlice(allocator, trigger.table);
+    if (trigger.eachRow) {
+        try sql.appendSlice(allocator, " FOR EACH ROW");
+    } else {
+        try sql.appendSlice(allocator, " FOR EACH STATEMENT");
+    }
     if (trigger.whenSql) |whenSql| {
         try sql.appendSlice(allocator, " WHEN ");
         try sql.appendSlice(allocator, whenSql);
@@ -979,8 +1211,33 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Schema {
 
         try readTableBtree(allocator, bytes, entry.rootPage, databasePageSize, &tableRows);
 
+        var hasVirtual = false;
+        var storedCount: usize = 0;
+        for (table.columns) |col| {
+            if (col.generatedExpr != null and !col.generatedStored) {
+                hasVirtual = true;
+            } else {
+                storedCount += 1;
+            }
+        }
+
         for (tableRows.items) |row| {
-            try schema.appendRow(table, row.values);
+            if (hasVirtual and row.values.len == storedCount) {
+                const expanded = try allocator.alloc(Value, table.columns.len);
+                defer allocator.free(expanded);
+                var srcIdx: usize = 0;
+                for (table.columns, 0..) |col, colIdx| {
+                    if (col.generatedExpr != null and !col.generatedStored) {
+                        expanded[colIdx] = .null;
+                    } else {
+                        expanded[colIdx] = row.values[srcIdx];
+                        srcIdx += 1;
+                    }
+                }
+                try schema.appendRow(table, expanded);
+            } else {
+                try schema.appendRow(table, row.values);
+            }
         }
     }
 
@@ -1171,4 +1428,58 @@ test "SQLite image decode rejects corrupt inputs without panic or overread" {
         std.mem.writeInt(u32, looped[108..112], 1, .big);
         try std.testing.expectError(error.InvalidHeader, decode(std.testing.allocator, looped));
     }
+}
+
+test "SQLite image round trips table with virtual and stored generated columns" {
+    var schema = Schema.init(std.testing.allocator);
+    defer schema.deinit();
+
+    const genExpr = ast.Expr{
+        .binary = .{
+            .left = &ast.Expr{ .identifier = "base" },
+            .op = .multiply,
+            .right = &ast.Expr{ .literal = .{ .integer = 2 } },
+        },
+    };
+    const storedExpr = ast.Expr{
+        .binary = .{
+            .left = &ast.Expr{ .identifier = "base" },
+            .op = .add,
+            .right = &ast.Expr{ .literal = .{ .integer = 10 } },
+        },
+    };
+
+    const definitions = [_]ast.ColumnDef{
+        .{ .name = "id", .typeName = "INTEGER", .primaryKey = true },
+        .{ .name = "base", .typeName = "INTEGER" },
+        .{ .name = "doubled", .typeName = "INTEGER", .generatedExpr = genExpr, .generatedStored = false },
+        .{ .name = "plus_ten", .typeName = "INTEGER", .generatedExpr = storedExpr, .generatedStored = true },
+    };
+    try schema.createTable("gen_test", &definitions, &.{});
+
+    var rowValues = [_]Value{
+        .{ .integer = 1 },
+        .{ .integer = 21 },
+        .null,
+        .null,
+    };
+    const tbl = schema.find("gen_test").?;
+    try schema.appendRow(tbl, &rowValues);
+
+    try std.testing.expectEqual(@as(i64, 42), tbl.rows.items[0].values[2].integer);
+    try std.testing.expectEqual(@as(i64, 31), tbl.rows.items[0].values[3].integer);
+
+    const bytes = try encode(std.testing.allocator, &schema);
+    defer std.testing.allocator.free(bytes);
+
+    var decoded = try decode(std.testing.allocator, bytes);
+    defer decoded.deinit();
+
+    const decodedTable = decoded.findConst("gen_test").?;
+    try std.testing.expectEqual(@as(usize, 4), decodedTable.columns.len);
+    try std.testing.expectEqual(@as(usize, 1), decodedTable.rows.items.len);
+    try std.testing.expectEqual(@as(i64, 1), decodedTable.rows.items[0].values[0].integer);
+    try std.testing.expectEqual(@as(i64, 21), decodedTable.rows.items[0].values[1].integer);
+    try std.testing.expectEqual(@as(i64, 42), decodedTable.rows.items[0].values[2].integer);
+    try std.testing.expectEqual(@as(i64, 31), decodedTable.rows.items[0].values[3].integer);
 }

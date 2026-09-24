@@ -1,28 +1,4 @@
 //! Engine facade: `Connection` runs SQL against file-backed schemas.
-//!
-//! Parses to AST, resolves against the catalog, plans, executes, and
-//! materializes owned `Result`s, persisting through the storage layer.
-//! Raw SQL, the dynamic DSL, and the typed DSL all run the same path.
-//! `exec` results are caller-owned; `close` rolls back open work,
-//! persists, and frees everything.
-//!
-//! TODO (modularization, tracked in docs/api/compatibility.md): this file is the
-//! remaining interpreter monolith (~16.5k lines incl. integration tests) and
-//! exceeds the 2000-line module target. Split by execution responsibility
-//! into `connection/` submodules (select/join, DML, DDL, pragma/attach,
-//! triggers/views) sharing the single scope/expr core in `dsl/scope.zig`,
-//! `sql/expr.zig`, `connection/compare.zig`, and `connection/pattern.zig`,
-//! moving each group's source-local tests with it. Extracted so far:
-//! `connection/fk_actions.zig` (ON UPDATE/DELETE actions, composite + column
-//! FKs, chained cascades; canonical `compare`/`expr.freeValue` reuse) and
-//! `connection/conflicts.zig` (upsert/REPLACE conflict-row scan plus
-//! `ON CONFLICT(target)` scope validation per `sqlite3UpsertAnalyzeTarget`;
-//! `conflictRowTarget` stays here because it needs the row matcher), and
-//! `connection/fk_actions.zig` further owns deferred-FK COMMIT checks,
-//! `foreign_key_check` violation rows, and referential-action keywords.
-//! Preserve the `Connection` public API and raw/typed/dynamic convergence;
-//! no behavior change vs the SQLite reference (`select.c`, `insert.c`,
-//! `update.c`, `delete.c`, `trigger.c`, `fkey.c`) beyond bug fixes.
 const std = @import("std");
 const DatabaseFile = @import("../storage/file.zig").DatabaseFile;
 const image = @import("../storage/image.zig");
@@ -56,6 +32,7 @@ const patternLib = @import("pattern.zig");
 const compareBridge = @import("compare.zig");
 const fkActions = @import("fk_actions.zig");
 const conflicts = @import("conflicts.zig");
+const Compiler = @import("../vm/compiler.zig").Compiler;
 
 const maxTriggerDepth: usize = 64;
 
@@ -106,6 +83,8 @@ pub const Connection = struct {
     /// function forms); default folds ASCII case like the reference.
     caseSensitiveLike: bool = false,
     triggerStack: std.ArrayList([]const u8) = .empty,
+    /// FOR EACH STATEMENT trigger names already fired in the current statement.
+    statementTriggersFired: std.ArrayList([]const u8) = .empty,
     /// True inside BEGIN..COMMIT; savepoints nest inside it.
     transactionActive: bool = false,
     savepoints: std.ArrayList(Savepoint),
@@ -169,6 +148,8 @@ pub const Connection = struct {
         self.deinitAttachedBackup(&self.attachedStatementBackup);
         self.activeCtes.deinit(self.allocator);
         self.triggerStack.deinit(self.allocator);
+        for (self.statementTriggersFired.items) |key| self.allocator.free(key);
+        self.statementTriggersFired.deinit(self.allocator);
         self.clearSavepoints();
         self.savepoints.deinit(self.allocator);
         self.store.deinit();
@@ -191,8 +172,8 @@ pub const Connection = struct {
     fn persistSchema(self: *Connection, file: *DatabaseFile, store: *Schema) !void {
         const bytes = try sqliteImage.encodeWithPageSize(self.allocator, store, file.pageSize);
         defer self.allocator.free(bytes);
-        try file.writeImage(bytes);
-        if (self.synchronousLevel >= 2) try file.file.sync(file.threaded.io());
+        if (self.synchronousLevel >= 2) try file.syncImage(bytes) else try file.writeImage(bytes);
+        if (self.synchronousLevel >= 3) try file.file.sync(file.threaded.io());
     }
 
     fn clearAttachedBackup(self: *Connection, backups: *std.ArrayList(AttachedBackup)) void {
@@ -351,6 +332,69 @@ pub const Connection = struct {
         const parts = splitSchemaName(name);
         if (parts.qualifier) |qualifier| return self.findTableQualified(qualifier, parts.object);
         return self.findTableOrdered(parts.object);
+    }
+
+    /// True for `sqlite_master` / `sqlite_schema` (optionally `main.`-qualified).
+    /// Temp/attached qualifiers do not use these aliases.
+    fn isSchemaCatalogName(name: []const u8) bool {
+        const parts = splitSchemaName(name);
+        if (parts.qualifier) |qualifier| {
+            if (!std.ascii.eqlIgnoreCase(qualifier, "main")) return false;
+        }
+        return std.ascii.eqlIgnoreCase(parts.object, "sqlite_master") or
+            std.ascii.eqlIgnoreCase(parts.object, "sqlite_schema");
+    }
+
+    /// Materialize the page-1 catalog shape (`type,name,tbl_name,rootpage,sql`)
+    /// over `store` as an owned Result. Rootpages are 0 in memory (assigned at
+    /// encode time); views/triggers match SQLite's 0 as well.
+    fn buildSchemaCatalog(self: *Connection, store: *const Schema) !Result {
+        const headers = [_][]const u8{ "type", "name", "tbl_name", "rootpage", "sql" };
+        const columns = try self.ownedColumns(&headers);
+        var rows = std.ArrayList([]Value).empty;
+        errdefer {
+            for (rows.items) |row| {
+                for (row) |item| self.freeConcatText(item);
+                self.allocator.free(row);
+            }
+            rows.deinit(self.allocator);
+        }
+        const appendRow = struct {
+            fn go(alloc: std.mem.Allocator, list: *std.ArrayList([]Value), kind: []const u8, name: []const u8, tblName: []const u8, rootpage: i64, sql: ?[]const u8) !void {
+                const row = try alloc.alloc(Value, 5);
+                errdefer alloc.free(row);
+                row[0] = .{ .text = try alloc.dupe(u8, kind) };
+                row[1] = .{ .text = try alloc.dupe(u8, name) };
+                row[2] = .{ .text = try alloc.dupe(u8, tblName) };
+                row[3] = .{ .integer = rootpage };
+                row[4] = if (sql) |text| .{ .text = try alloc.dupe(u8, text) } else .null;
+                try list.append(alloc, row);
+            }
+        }.go;
+        for (store.tables.items) |tbl| {
+            const sql = try sqliteImage.createSql(self.allocator, tbl);
+            defer self.allocator.free(sql);
+            try appendRow(self.allocator, &rows, "table", tbl.name, tbl.name, 0, sql);
+        }
+        for (store.indexes.items) |index| {
+            const sql: ?[]u8 = if (std.mem.startsWith(u8, index.name, "sqlite_autoindex_"))
+                null
+            else
+                try sqliteImage.createIndexSql(self.allocator, index);
+            defer if (sql) |owned| self.allocator.free(owned);
+            try appendRow(self.allocator, &rows, "index", index.name, index.table, 0, sql);
+        }
+        for (store.views.items) |view| {
+            const sql = try sqliteImage.createViewSql(self.allocator, view);
+            defer self.allocator.free(sql);
+            try appendRow(self.allocator, &rows, "view", view.name, view.name, 0, sql);
+        }
+        for (store.triggers.items) |trigger| {
+            const sql = try sqliteImage.createTriggerSql(self.allocator, trigger);
+            defer self.allocator.free(sql);
+            try appendRow(self.allocator, &rows, "trigger", trigger.name, trigger.table, 0, sql);
+        }
+        return .{ .allocator = self.allocator, .columns = columns, .rows = try rows.toOwnedSlice(self.allocator) };
     }
 
     fn resolveViewName(self: *Connection, name: []const u8) ?ResolvedView {
@@ -824,7 +868,7 @@ pub const Connection = struct {
             if (expected.pkCount == 1) {
                 (findDefinition(definitions, expected.pk[0]) orelse return error.UnknownColumn).primaryKey = true;
             } else {
-                try constraints.append(self.allocator, .{ .primaryKey = expected.pk[0..expected.pkCount] });
+                try constraints.append(self.allocator, .{ .primaryKey = .{ .columns = expected.pk[0..expected.pkCount] } });
             }
         }
         if (expected.hasUnique) {
@@ -833,7 +877,7 @@ pub const Connection = struct {
             }
             for (expected.uniqueGroups[0..expected.uniqueGroupCount]) |*group| {
                 for (group.names[0..group.count]) |colName| if (findDefinition(definitions, colName) == null) return error.UnknownColumn;
-                try constraints.append(self.allocator, .{ .unique = group.names[0..group.count] });
+                try constraints.append(self.allocator, .{ .unique = .{ .columns = group.names[0..group.count] } });
             }
         }
         if (expected.hasFks) {
@@ -1183,19 +1227,27 @@ pub const Connection = struct {
     fn beginStatementAtomic(self: *Connection) !void {
         if (self.inAtomicStatement) return;
         try self.snapshotStatementSchemas();
+        self.clearStatementTriggersFired();
         self.inAtomicStatement = true;
     }
 
     fn endStatementAtomic(self: *Connection) void {
         if (!self.inAtomicStatement) return;
+        self.clearStatementTriggersFired();
         self.clearStatementBackups();
         self.inAtomicStatement = false;
     }
 
     fn abortStatementAtomic(self: *Connection) void {
         if (!self.inAtomicStatement) return;
+        self.clearStatementTriggersFired();
         self.restoreStatementSchemas();
         self.inAtomicStatement = false;
+    }
+
+    fn clearStatementTriggersFired(self: *Connection) void {
+        for (self.statementTriggersFired.items) |key| self.allocator.free(key);
+        self.statementTriggersFired.clearRetainingCapacity();
     }
 
     fn resolveStatementError(self: *Connection, policy: ast.ConflictPolicy) void {
@@ -1212,11 +1264,18 @@ pub const Connection = struct {
         }
     }
 
+    /// Statement-level OR wins; otherwise the constraint's ON CONFLICT
+    /// (defaulting to ABORT when neither specifies a policy).
+    fn effectiveConflict(statement: ast.ConflictPolicy, constraint: ast.ConflictPolicy) ast.ConflictPolicy {
+        if (statement != .none) return statement;
+        return if (constraint == .none) .abort else constraint;
+    }
+
     fn executeInsertAtomic(self: *Connection, value: anytype, parameters: []const Value) !Result {
         const nested = self.inAtomicStatement;
         if (!nested) try self.beginStatementAtomic();
         const result = self.insertInto(value, parameters) catch |err| {
-            if (!nested) self.resolveStatementError(value.conflict);
+            if (!nested) self.resolveStatementError(effectiveConflict(value.conflict, self.store.lastConstraintConflict));
             return err;
         };
         if (!nested) {
@@ -1230,7 +1289,7 @@ pub const Connection = struct {
         const nested = self.inAtomicStatement;
         if (!nested) try self.beginStatementAtomic();
         const result = self.update(value, parameters) catch |err| {
-            if (!nested) self.resolveStatementError(value.conflict);
+            if (!nested) self.resolveStatementError(effectiveConflict(value.conflict, self.store.lastConstraintConflict));
             return err;
         };
         if (!nested) {
@@ -1391,7 +1450,7 @@ pub const Connection = struct {
 
     fn executeStatement(self: *Connection, statement: ast.Statement, parameters: []const Value, outer: ?*const OuterRow) anyerror!Result {
         const result = switch (statement) {
-            .createTable => |value| try self.createTableCommand(value),
+            .createTable => |value| try self.createTableCommand(value, parameters),
             .createIndex => |value| try self.createIndexCommand(value),
             .createView => |value| try self.createViewCommand(value),
             .createTrigger => |value| try self.createTriggerCommand(value),
@@ -1404,6 +1463,7 @@ pub const Connection = struct {
             .select => |value| try self.selectWithOuter(value, parameters, outer),
             .withSelect => |value| try self.executeWith(value, parameters),
             .compoundSelect => |compound| try self.executeCompoundWithOuter(compound, parameters, outer),
+            .explain => |querySql| try self.explainBytecode(querySql),
             .explainQueryPlan => |querySql| try self.explainQueryPlan(querySql),
             .pragma => |value| try self.executePragma(value),
             .alterTable => |value| try self.alterTableCommand(value),
@@ -1894,6 +1954,13 @@ pub const Connection = struct {
                         row[3] = .{ .integer = if (column.notNull) 1 else 0 };
                         if (generated) {
                             row[4] = .null;
+                        } else if (column.defaultExpr) |defaultExpr| {
+                            var sql = std.ArrayList(u8).empty;
+                            defer sql.deinit(self.allocator);
+                            try sql.appendSlice(self.allocator, "DEFAULT (");
+                            try sqliteImage.appendExprSql(self.allocator, &sql, defaultExpr);
+                            try sql.append(self.allocator, ')');
+                            row[4] = .{ .text = try sql.toOwnedSlice(self.allocator) };
                         } else if (column.defaultValue) |default| {
                             row[4] = if (try self.defaultValueSql(default)) |sql| .{ .text = sql } else .null;
                         } else row[4] = .null;
@@ -2562,8 +2629,11 @@ pub const Connection = struct {
                 for (tbl.columns, 0..) |*column, childIndex| {
                     const foreignTableName = column.foreignTable orelse continue;
                     const parent = self.store.findConst(foreignTableName) orelse return error.ConstraintViolation;
-                    const foreignColumnName = column.foreignColumn orelse return error.ConstraintViolation;
-                    const parentIndex = columnIndex(parent, foreignColumnName) catch return error.ConstraintViolation;
+                    // Bare `REFERENCES t` (null/empty column) targets the parent PK.
+                    const parentIndex = if (column.foreignColumn) |name| blk: {
+                        if (name.len == 0) break :blk Schema.parentPkColumnIndex(parent) orelse return error.ConstraintViolation;
+                        break :blk columnIndex(parent, name) catch return error.ConstraintViolation;
+                    } else Schema.parentPkColumnIndex(parent) orelse return error.ConstraintViolation;
                     defer fkid += 1;
                     if (row.values[childIndex] == .null) continue;
                     var found = false;
@@ -2607,6 +2677,64 @@ pub const Connection = struct {
         }
         const rows = try rowList.toOwnedSlice(self.allocator);
         return .{ .allocator = self.allocator, .columns = columns, .rows = rows };
+    }
+
+    fn explainBytecode(self: *Connection, sql: []const u8) anyerror!Result {
+        var parser = try Parser.init(self.allocator, sql);
+        defer parser.deinit();
+        var statement = try parser.parse();
+        defer ast.deinit(self.allocator, &statement);
+
+        var comp = Compiler.init(self.allocator, &self.store);
+        var compiled = try comp.compile(statement);
+        defer compiled.deinit();
+
+        const columns = [_][]const u8{ "addr", "opcode", "p1", "p2", "p3", "p4", "p5", "comment" };
+        const resultColumns = try self.ownedColumns(&columns);
+
+        var rowList = std.ArrayList([]Value).empty;
+        errdefer {
+            for (rowList.items) |r| {
+                for (r) |v| if (v == .text) self.allocator.free(v.text);
+                self.allocator.free(r);
+            }
+            rowList.deinit(self.allocator);
+        }
+
+        for (compiled.program.instructions.items, 0..) |inst, addr| {
+            const row = try self.allocator.alloc(Value, 8);
+            var filled: usize = 0;
+            errdefer {
+                for (row[0..filled]) |v| if (v == .text) self.allocator.free(v.text);
+                self.allocator.free(row);
+            }
+            row[0] = .{ .integer = @intCast(addr) };
+            filled = 1;
+            row[1] = .{ .text = try self.allocator.dupe(u8, @tagName(inst.opcode)) };
+            filled = 2;
+            row[2] = .{ .integer = inst.p1 };
+            filled = 3;
+            row[3] = .{ .integer = inst.p2 };
+            filled = 4;
+            row[4] = .{ .integer = inst.p3 };
+            filled = 5;
+            if (inst.p4) |p4| {
+                row[5] = try self.copyValue(p4);
+            } else if (inst.value != .null) {
+                row[5] = try self.copyValue(inst.value);
+            } else {
+                row[5] = .null;
+            }
+            filled = 6;
+            row[6] = .{ .integer = @intCast(inst.p5) };
+            filled = 7;
+            row[7] = .null;
+            filled = 8;
+            try rowList.append(self.allocator, row);
+        }
+
+        const rows = try rowList.toOwnedSlice(self.allocator);
+        return .{ .allocator = self.allocator, .columns = resultColumns, .rows = rows };
     }
 
     fn explainQueryPlan(self: *Connection, sql: []const u8) anyerror!Result {
@@ -2667,9 +2795,55 @@ pub const Connection = struct {
         }
         return result;
     }
-    fn createTableCommand(self: *Connection, value: anytype) !Result {
+    fn createTableCommand(self: *Connection, value: anytype, parameters: []const Value) !Result {
         const target = try self.createTarget(value.name, value.temporary);
-        if (target.store.find(target.name) != null and value.ifNotExists) return try emptyResult(self.allocator);
+        if (target.store.find(target.name) != null) {
+            if (value.ifNotExists) return try emptyResult(self.allocator);
+            return error.TableExists;
+        }
+        // CREATE TABLE ... AS SELECT: shape comes from the select result.
+        if (value.asSelectSql) |asSelectSql| {
+            var source = try self.execute(asSelectSql, parameters);
+            defer source.deinit();
+            if (source.columns.len == 0) return error.ColumnCountMismatch;
+            var defs = try self.allocator.alloc(ast.ColumnDef, source.columns.len);
+            defer self.allocator.free(defs);
+            for (source.columns, defs) |columnName, *def| {
+                def.* = .{ .name = columnName, .typeName = "" };
+            }
+            for (0..source.columns.len) |colIndex| {
+                for (source.rows) |row| {
+                    const item = row[colIndex];
+                    if (item == .null) continue;
+                    defs[colIndex].typeName = switch (item) {
+                        .integer => "INTEGER",
+                        .real => "REAL",
+                        .text => "TEXT",
+                        .blob => "BLOB",
+                        .null => "",
+                    };
+                    break;
+                }
+            }
+            try target.store.createTableWithOptions(target.name, defs, &.{}, .{ .strict = value.strict, .withoutRowid = value.withoutRowid });
+            // Populate rows via the INSERT ... SELECT path (triggers/FKs apply).
+            // On insert failure, remove the empty table so CTAS is all-or-nothing.
+            errdefer target.store.dropTable(target.name) catch {};
+            const insertValue = .{
+                .table = target.name,
+                .columns = &[_][]const u8{},
+                .rows = &[_][]const ast.Expr{},
+                .selectSql = @as(?[]const u8, asSelectSql),
+                .conflict = ast.ConflictPolicy.none,
+                .conflictTargetColumns = &[_][]const u8{},
+                .conflictTargetWhere = null,
+                .upsertColumns = &[_][]const u8{},
+                .upsertValues = &[_]ast.Expr{},
+                .upsertWhere = null,
+                .returning = &[_]ast.Projection{},
+            };
+            return try self.executeInsertAtomic(insertValue, parameters);
+        }
         try target.store.createTableWithOptions(target.name, value.columns, value.constraints, .{ .strict = value.strict, .withoutRowid = value.withoutRowid });
         return try emptyResult(self.allocator);
     }
@@ -3391,19 +3565,50 @@ pub const Connection = struct {
             }
             pending.deinit(self.allocator);
         }
+        // Row-level triggers fire with NEW/OLD; statement-level fire once
+        // per statement with NULL row bindings (tracked in statement-level
+        // sets so multi-row DML does not re-fire them).
+        const statementKey = try self.statementTriggerKey(tbl, timing, event);
+        defer if (statementKey) |key| self.allocator.free(key);
+        var statementAlreadyFired = false;
+        if (statementKey) |key| statementAlreadyFired = self.statementTriggerFired(key);
         for (store.triggers.items) |trigger| {
             if (trigger.timing != timing) continue;
             if (trigger.event == event and std.ascii.eqlIgnoreCase(trigger.table, tableName)) {
                 if (!trigger.firesOnUpdate(updatedColumns)) continue;
-                if (!try self.triggerWhenMatched(tbl, trigger, event, newRow, oldRow)) continue;
+                if (!trigger.eachRow) {
+                    if (statementAlreadyFired) continue;
+                }
+                if (!try self.triggerWhenMatched(tbl, trigger, event, if (trigger.eachRow) newRow else null, if (trigger.eachRow) oldRow else null)) continue;
+                if (!trigger.eachRow) {
+                    if (statementKey) |key| try self.markStatementTriggerFired(key);
+                    statementAlreadyFired = true;
+                }
                 const ownedName = try self.allocator.dupe(u8, trigger.name);
                 errdefer self.allocator.free(ownedName);
-                const sql = try self.renderTriggerBody(trigger.body, tbl, event, newRow, oldRow);
+                const sql = try self.renderTriggerBody(trigger.body, tbl, event, if (trigger.eachRow) newRow else null, if (trigger.eachRow) oldRow else null);
                 errdefer self.allocator.free(sql);
                 try pending.append(self.allocator, .{ .name = ownedName, .sql = sql });
             }
         }
         for (pending.items) |item| try self.runTriggerBody(item.name, item.sql);
+    }
+
+    /// Key for de-duplicating FOR EACH STATEMENT triggers within one statement.
+    /// Uses timing+event+table so multi-row DML fires each statement trigger once.
+    fn statementTriggerKey(self: *Connection, tbl: *const Table, timing: ast.TriggerTiming, event: ast.TriggerEvent) !?[]u8 {
+        return try std.fmt.allocPrint(self.allocator, "{s}|{s}|{s}", .{ @tagName(timing), @tagName(event), tbl.name });
+    }
+
+    fn statementTriggerFired(self: *Connection, key: []const u8) bool {
+        for (self.statementTriggersFired.items) |active| if (std.mem.eql(u8, active, key)) return true;
+        return false;
+    }
+
+    fn markStatementTriggerFired(self: *Connection, key: []const u8) !void {
+        const owned = try self.allocator.dupe(u8, key);
+        errdefer self.allocator.free(owned);
+        try self.statementTriggersFired.append(self.allocator, owned);
     }
 
     /// Runs one rendered trigger body under the recursion guard: re-entry
@@ -3439,6 +3644,34 @@ pub const Connection = struct {
         return self.evalContext(null, &.{}, expr, parameters, null);
     }
 
+    /// Evaluate a LIMIT/OFFSET expression to a non-negative count.
+    /// Negative or non-numeric results become null (unlimited / no skip),
+    /// matching SQLite's "no upper bound" rule for negative LIMIT.
+    fn evalLimitOffset(self: *Connection, expr: ast.Expr, parameters: []const Value) !?usize {
+        const raw = try self.resolve(expr, parameters);
+        defer if (evalOwnsResult(expr)) self.freeConcatText(raw);
+        return switch (raw) {
+            .null => null,
+            .integer => |i| if (i < 0) null else @intCast(i),
+            .real => |r| if (r < 0 or r != std.math.trunc(r) or r > @as(f64, @floatFromInt(std.math.maxInt(usize)))) null else @intCast(@as(i64, @intFromFloat(r))),
+            .text => |t| blk: {
+                const trimmed = std.mem.trim(u8, t, " \t\r\n");
+                if (std.fmt.parseInt(i64, trimmed, 10)) |i| {
+                    break :blk if (i < 0) null else @as(?usize, @intCast(i));
+                } else |_| {
+                    break :blk null;
+                }
+            },
+            else => null,
+        };
+    }
+
+    /// True when `groupBy`/`groupByExprs` is the simple single-identifier
+    /// case the legacy single-column paths already handle.
+    fn simpleSingleGroupBy(value: anytype) bool {
+        return value.groupBy != null and value.groupByExprs.len == 1 and value.groupByExprs[0] == .identifier;
+    }
+
     fn copyValue(self: *Connection, value: Value) !Value {
         return switch (value) {
             .text => |bytes| .{ .text = try self.allocator.dupe(u8, bytes) },
@@ -3454,7 +3687,7 @@ pub const Connection = struct {
                 if (column.generatedExpr == null) {
                     if (nonGenIdx < rowExprs.len) {
                         const expr = rowExprs[nonGenIdx];
-                        if (expr == .binary or expr == .unary) self.freeConcatText(row[index]);
+                        if (evalOwnsResult(expr)) self.freeConcatText(row[index]);
                         nonGenIdx += 1;
                     }
                 }
@@ -3462,7 +3695,7 @@ pub const Connection = struct {
             return;
         }
         for (columns, rowExprs) |name, expr| {
-            if (expr != .binary and expr != .unary) continue;
+            if (!evalOwnsResult(expr)) continue;
             const index = columnIndex(tbl, name) catch continue;
             self.freeConcatText(row[index]);
         }
@@ -3549,6 +3782,10 @@ pub const Connection = struct {
             .isNotNull => leftValue != .null,
             .isValue, .isNotDistinct => compareBridge.nullSafeEqual(leftValue, rightValue, null),
             .isNotValue, .isDistinct => !compareBridge.nullSafeEqual(leftValue, rightValue, null),
+            .isTrue => functions.scalar.isTruthyValue(leftValue),
+            .isNotTrue => !functions.scalar.isTruthyValue(leftValue),
+            .isFalse => leftValue != .null and !functions.scalar.isTruthyValue(leftValue),
+            .isNotFalse => !(leftValue != .null and !functions.scalar.isTruthyValue(leftValue)),
             else => compareBridge.compare(leftValue, op, rightValue),
         };
     }
@@ -3617,7 +3854,7 @@ pub const Connection = struct {
                     defer if (item.leftExpr) |left| {
                         if (evalOwnsResult(left)) self.freeConcatText(current);
                     };
-                    const base: bool = if (item.op == .isTrue) functions.scalar.isTruthyValue(current) else if (item.op == .isNull) current == .null else if (item.op == .isNotNull) current != .null else if (item.op == .isValue or item.op == .isNotValue or item.op == .isDistinct or item.op == .isNotDistinct) nullSafeBlk: {
+                    const base: bool = if (item.op == .isTrue) functions.scalar.isTruthyValue(current) else if (item.op == .isNotTrue) !functions.scalar.isTruthyValue(current) else if (item.op == .isFalse) current != .null and !functions.scalar.isTruthyValue(current) else if (item.op == .isNotFalse) !(current != .null and !functions.scalar.isTruthyValue(current)) else if (item.op == .isNull) current == .null else if (item.op == .isNotNull) current != .null else if (item.op == .isValue or item.op == .isNotValue or item.op == .isDistinct or item.op == .isNotDistinct) nullSafeBlk: {
                         const rhs = try self.evalContext(tbl, row, item.value, parameters, outer);
                         defer if (evalOwnsResult(item.value)) self.freeConcatText(rhs);
                         const eq = nullSafeEqual(current, rhs, item.collate);
@@ -3870,6 +4107,21 @@ pub const Connection = struct {
             self.freeConcatText(leftText);
             self.freeConcatText(rightText);
             return if (leftText == .blob or rightText == .blob) .{ .blob = output } else .{ .text = output };
+        }
+        if (binary.op == .jsonArrow or binary.op == .jsonArrowText) {
+            return try functions.json.evalJsonArrowOperator(self.allocator, left, right, binary.op == .jsonArrowText);
+        }
+        if (binary.op == .isTrue or binary.op == .isNotTrue or binary.op == .isFalse or binary.op == .isNotFalse) {
+            const truthy = functions.scalar.isTruthyValue(left);
+            const falsy = left != .null and !truthy;
+            const res = switch (binary.op) {
+                .isTrue => truthy,
+                .isNotTrue => !truthy,
+                .isFalse => falsy,
+                .isNotFalse => !falsy,
+                else => unreachable,
+            };
+            return .{ .integer = if (res) 1 else 0 };
         }
         if (binary.op == .isOp or binary.op == .isNotOp) {
             const collation = if (binary.left.* == .collate) binary.left.*.collate.name else if (binary.right.* == .collate) binary.right.*.collate.name else null;
@@ -4365,12 +4617,33 @@ pub const Connection = struct {
         };
     }
 
-    fn initializeInsertRow(self: *Connection, tbl: *const Table, row: []Value) !void {
-        _ = self;
+    fn initializeInsertRow(self: *Connection, tbl: *const Table, row: []Value, defaultOwned: []bool) !void {
         @memset(row, .null);
+        @memset(defaultOwned, false);
+        errdefer self.freeDefaultTemps(row, defaultOwned);
         for (tbl.columns, 0..) |column, index| {
             if (column.defaultValue) |default| row[index] = default;
+            if (column.defaultExpr) |de| {
+                row[index] = try self.evalContext(tbl, row, de, &.{}, null);
+                defaultOwned[index] = evalOwnsResult(de);
+            }
         }
+    }
+
+    fn freeDefaultTemps(self: *Connection, row: []Value, defaultOwned: []bool) void {
+        for (defaultOwned, 0..) |*owned, index| {
+            if (!owned.*) continue;
+            self.freeConcatText(row[index]);
+            owned.* = false;
+        }
+    }
+
+    fn assignInsertValue(self: *Connection, row: []Value, defaultOwned: []bool, index: usize, value: Value) void {
+        if (defaultOwned[index]) {
+            self.freeConcatText(row[index]);
+            defaultOwned[index] = false;
+        }
+        row[index] = value;
     }
 
     fn validateReturningExpr(tbl: *const Table, expr: ast.Expr) !void {
@@ -4513,53 +4786,66 @@ pub const Connection = struct {
             defer source.deinit();
             var changes: usize = 0;
             for (source.rows) |sourceRow| {
-                var row = try self.allocator.alloc(Value, tbl.columns.len);
+                const row = try self.allocator.alloc(Value, tbl.columns.len);
                 defer self.allocator.free(row);
-                try self.initializeInsertRow(tbl, row);
+                const defaultOwned = try self.allocator.alloc(bool, tbl.columns.len);
+                defer self.allocator.free(defaultOwned);
+                try self.initializeInsertRow(tbl, row, defaultOwned);
+                defer self.freeDefaultTemps(row, defaultOwned);
                 if (value.columns.len == 0) {
                     if (sourceRow.len != nonGenCount) return error.ColumnCountMismatch;
                     var nonGenIdx: usize = 0;
                     for (tbl.columns, 0..) |column, index| {
                         if (column.generatedExpr == null) {
-                            row[index] = sourceRow[nonGenIdx];
+                            self.assignInsertValue(row, defaultOwned, index, sourceRow[nonGenIdx]);
                             nonGenIdx += 1;
                         }
                     }
                 } else {
                     if (value.columns.len != sourceRow.len) return error.ColumnCountMismatch;
-                    for (value.columns, sourceRow) |name, item| row[try columnIndex(tbl, name)] = item;
+                    for (value.columns, sourceRow) |name, item| self.assignInsertValue(row, defaultOwned, try columnIndex(tbl, name), item);
                 }
                 try self.fireTriggers(store, tbl, .before, .insert, row, null, &.{});
                 store.appendRow(tbl, row) catch |err| {
-                    if (value.conflict == .ignore and err == error.ConstraintViolation) {
-                        if (value.conflictTargetColumns.len > 0 or value.conflictTargetWhere != null) {
-                            if (try self.conflictRowTarget(store, tbl, row, value.conflictTargetColumns, value.conflictTargetWhere, parameters) != null) {
-                                continue;
-                            } else {
-                                return err;
-                            }
-                        }
-                        continue;
-                    }
-                    if (value.conflict == .replace and err == error.ConstraintViolation) {
-                        if (try self.replaceConflict(store, tbl, row)) {
-                            try store.appendRow(tbl, row);
-                            self.noteInsertedRowid(tbl);
-                            try self.fireTriggers(store, tbl, .after, .insert, row, null, &.{});
-                            changes += 1;
-                            try affectedRows.append(self.allocator, tbl.rows.items[tbl.rows.items.len - 1].values);
-                            continue;
-                        }
-                    }
-                    if (value.conflict == .update and err == error.ConstraintViolation) {
-                        switch (try self.applyUpsert(store, tbl, row, value.conflictTargetColumns, value.conflictTargetWhere, value.upsertColumns, value.upsertValues, value.upsertWhere, parameters)) {
-                            .updated => |upIdx| {
-                                changes += 1;
-                                try affectedRows.append(self.allocator, tbl.rows.items[upIdx].values);
+                    if (err == error.ConstraintViolation) {
+                        const eff = effectiveConflict(value.conflict, store.lastConstraintConflict);
+                        switch (eff) {
+                            .ignore => {
+                                if (value.conflictTargetColumns.len > 0 or value.conflictTargetWhere != null) {
+                                    if (value.conflict == .ignore) {
+                                        if (try self.conflictRowTarget(store, tbl, row, value.conflictTargetColumns, value.conflictTargetWhere, parameters) != null) {
+                                            continue;
+                                        } else {
+                                            return err;
+                                        }
+                                    }
+                                }
                                 continue;
                             },
-                            .skipped => continue,
-                            .noConflict => {},
+                            .replace => {
+                                if (try self.replaceConflict(store, tbl, row)) {
+                                    try store.appendRow(tbl, row);
+                                    self.noteInsertedRowid(tbl);
+                                    try self.fireTriggers(store, tbl, .after, .insert, row, null, &.{});
+                                    changes += 1;
+                                    try affectedRows.append(self.allocator, tbl.rows.items[tbl.rows.items.len - 1].values);
+                                    continue;
+                                }
+                            },
+                            .update => {
+                                if (value.conflict == .update) {
+                                    switch (try self.applyUpsert(store, tbl, row, value.conflictTargetColumns, value.conflictTargetWhere, value.upsertColumns, value.upsertValues, value.upsertWhere, parameters)) {
+                                        .updated => |upIdx| {
+                                            changes += 1;
+                                            try affectedRows.append(self.allocator, tbl.rows.items[upIdx].values);
+                                            continue;
+                                        },
+                                        .skipped => continue,
+                                        .noConflict => {},
+                                    }
+                                }
+                            },
+                            .none, .abort, .fail, .rollback => {},
                         }
                     }
                     return err;
@@ -4574,57 +4860,74 @@ pub const Connection = struct {
         }
         var changes: usize = 0;
         for (value.rows) |rowExprs| {
-            var row = try self.allocator.alloc(Value, tbl.columns.len);
+            const row = try self.allocator.alloc(Value, tbl.columns.len);
             defer self.allocator.free(row);
-            try self.initializeInsertRow(tbl, row);
+            const defaultOwned = try self.allocator.alloc(bool, tbl.columns.len);
+            defer self.allocator.free(defaultOwned);
+            try self.initializeInsertRow(tbl, row, defaultOwned);
+            defer self.freeDefaultTemps(row, defaultOwned);
             if (value.columns.len == 0) {
                 if (rowExprs.len != 0 and rowExprs.len != nonGenCount) return error.ColumnCountMismatch;
                 var nonGenIdx: usize = 0;
                 for (tbl.columns, 0..) |column, index| {
                     if (column.generatedExpr == null) {
                         if (nonGenIdx < rowExprs.len) {
-                            row[index] = try self.resolve(rowExprs[nonGenIdx], parameters);
+                            const resolvedExpr = try self.resolve(rowExprs[nonGenIdx], parameters);
+                            self.assignInsertValue(row, defaultOwned, index, resolvedExpr);
                             nonGenIdx += 1;
                         }
                     }
                 }
             } else {
                 if (value.columns.len != rowExprs.len) return error.ColumnCountMismatch;
-                for (value.columns, rowExprs) |name, expr| row[try columnIndex(tbl, name)] = try self.resolve(expr, parameters);
+                for (value.columns, rowExprs) |name, expr| {
+                    const resolvedExpr = try self.resolve(expr, parameters);
+                    self.assignInsertValue(row, defaultOwned, try columnIndex(tbl, name), resolvedExpr);
+                }
             }
             {
                 defer self.freeResolvedTemps(tbl, row, value.columns, rowExprs);
                 try self.fireTriggers(store, tbl, .before, .insert, row, null, &.{});
                 store.appendRow(tbl, row) catch |err| {
-                    if (value.conflict == .ignore and err == error.ConstraintViolation) {
-                        if (value.conflictTargetColumns.len > 0 or value.conflictTargetWhere != null) {
-                            if (try self.conflictRowTarget(store, tbl, row, value.conflictTargetColumns, value.conflictTargetWhere, parameters) != null) {
-                                continue;
-                            } else {
-                                return err;
-                            }
-                        }
-                        continue;
-                    }
-                    if (value.conflict == .replace and err == error.ConstraintViolation) {
-                        if (try self.replaceConflict(store, tbl, row)) {
-                            try store.appendRow(tbl, row);
-                            self.noteInsertedRowid(tbl);
-                            try self.fireTriggers(store, tbl, .after, .insert, row, null, &.{});
-                            changes += 1;
-                            try affectedRows.append(self.allocator, tbl.rows.items[tbl.rows.items.len - 1].values);
-                            continue;
-                        }
-                    }
-                    if (value.conflict == .update and err == error.ConstraintViolation) {
-                        switch (try self.applyUpsert(store, tbl, row, value.conflictTargetColumns, value.conflictTargetWhere, value.upsertColumns, value.upsertValues, value.upsertWhere, parameters)) {
-                            .updated => |upIdx| {
-                                changes += 1;
-                                try affectedRows.append(self.allocator, tbl.rows.items[upIdx].values);
+                    if (err == error.ConstraintViolation) {
+                        const eff = effectiveConflict(value.conflict, store.lastConstraintConflict);
+                        switch (eff) {
+                            .ignore => {
+                                if (value.conflictTargetColumns.len > 0 or value.conflictTargetWhere != null) {
+                                    if (value.conflict == .ignore) {
+                                        if (try self.conflictRowTarget(store, tbl, row, value.conflictTargetColumns, value.conflictTargetWhere, parameters) != null) {
+                                            continue;
+                                        } else {
+                                            return err;
+                                        }
+                                    }
+                                }
                                 continue;
                             },
-                            .skipped => continue,
-                            .noConflict => {},
+                            .replace => {
+                                if (try self.replaceConflict(store, tbl, row)) {
+                                    try store.appendRow(tbl, row);
+                                    self.noteInsertedRowid(tbl);
+                                    try self.fireTriggers(store, tbl, .after, .insert, row, null, &.{});
+                                    changes += 1;
+                                    try affectedRows.append(self.allocator, tbl.rows.items[tbl.rows.items.len - 1].values);
+                                    continue;
+                                }
+                            },
+                            .update => {
+                                if (value.conflict == .update) {
+                                    switch (try self.applyUpsert(store, tbl, row, value.conflictTargetColumns, value.conflictTargetWhere, value.upsertColumns, value.upsertValues, value.upsertWhere, parameters)) {
+                                        .updated => |upIdx| {
+                                            changes += 1;
+                                            try affectedRows.append(self.allocator, tbl.rows.items[upIdx].values);
+                                            continue;
+                                        },
+                                        .skipped => continue,
+                                        .noConflict => {},
+                                    }
+                                }
+                            },
+                            .none, .abort, .fail, .rollback => {},
                         }
                     }
                     return err;
@@ -4637,6 +4940,244 @@ pub const Connection = struct {
         }
         if (value.returning.len > 0) return self.evaluateReturning(tbl, value.returning, affectedRows.items, parameters);
         return .{ .allocator = self.allocator, .columns = try self.allocator.alloc([]const u8, 0), .rows = try self.allocator.alloc([]Value, 0), .changes = changes };
+    }
+
+    /// Multi-key / expression GROUP BY over a simple table scan.
+    /// Keys evaluate per row; groups compare with `sameValue` per key.
+    /// Projections: aggregates step over group rows; bare identifiers that
+    /// match a key expression take that key's value; everything else
+    /// evaluates against the group's first row.
+    fn selectGroupedByExprs(self: *Connection, tbl: *const Table, value: anytype, parameters: []const Value, outer: ?*const OuterRow) !Result {
+        const keyExprs = value.groupByExprs;
+        if (keyExprs.len == 0) return error.InvalidSql;
+        const Group = struct { keys: []Value, rows: std.ArrayList(usize) };
+        var groups = std.ArrayList(Group).empty;
+        defer {
+            for (groups.items) |*group| {
+                for (group.keys) |key| self.freeConcatText(key);
+                self.allocator.free(group.keys);
+                group.rows.deinit(self.allocator);
+            }
+            groups.deinit(self.allocator);
+        }
+        for (tbl.rows.items, 0..) |row, rowIndex| {
+            const rowOuter = OuterRow{ .table = tbl, .alias = value.tableAlias, .values = row.values, .prev = outer };
+            if (!try self.matchesContext(tbl, row.values, value.condition, parameters, &rowOuter)) continue;
+            const rowKeys = try self.allocator.alloc(Value, keyExprs.len);
+            var keyCount: usize = 0;
+            errdefer {
+                for (rowKeys[0..keyCount]) |k| self.freeConcatText(k);
+                self.allocator.free(rowKeys);
+            }
+            for (keyExprs, 0..) |keyExpr, ki| {
+                rowKeys[ki] = try self.materializeContext(tbl, row.values, keyExpr, parameters, &rowOuter);
+                keyCount = ki + 1;
+            }
+            var found: ?usize = null;
+            outerGroup: for (groups.items, 0..) |group, position| {
+                if (group.keys.len != rowKeys.len) continue;
+                for (group.keys, rowKeys) |gk, rk| if (!sameValue(gk, rk)) continue :outerGroup;
+                found = position;
+                break;
+            }
+            if (found) |position| {
+                for (rowKeys) |k| self.freeConcatText(k);
+                self.allocator.free(rowKeys);
+                try groups.items[position].rows.append(self.allocator, rowIndex);
+            } else {
+                try groups.append(self.allocator, .{ .keys = rowKeys, .rows = .empty });
+                try groups.items[groups.items.len - 1].rows.append(self.allocator, rowIndex);
+            }
+        }
+        var columns = std.ArrayList([]const u8).empty;
+        defer columns.deinit(self.allocator);
+        for (value.projections) |projection| switch (projection.expr) {
+            .identifier => try columns.append(self.allocator, projection.alias orelse projection.expr.identifier),
+            .function => try columns.append(self.allocator, projection.alias orelse projection.expr.function.name),
+            else => try columns.append(self.allocator, projection.alias orelse "?column?"),
+        };
+        var rows = std.ArrayList([]Value).empty;
+        errdefer {
+            for (rows.items) |row| {
+                for (row) |item| if (item == .text) self.allocator.free(item.text) else if (item == .blob) self.allocator.free(item.blob);
+                self.allocator.free(row);
+            }
+            rows.deinit(self.allocator);
+        }
+        // Sort by output columns when ORDER BY is a projection key; otherwise
+        // sort groups by evaluating the order expression on first rows later.
+        var sortAfter = false;
+        if (value.orders.len != 0) {
+            sortAfter = true;
+            for (value.orders) |keyOrder| {
+                if (resolveSortOutputIndex(columns.items, value.projections, keyOrder.column) == null) {
+                    sortAfter = false;
+                    break;
+                }
+            }
+        }
+        if (!sortAfter and value.orders.len != 0) {
+            // Fall back: sort groups by evaluating each order expression
+            // against the group's first matching row (covers group keys).
+            for (value.orders) |ord| {
+                var gi: usize = 0;
+                while (gi < groups.items.len) : (gi += 1) {
+                    var gj = gi + 1;
+                    while (gj < groups.items.len) : (gj += 1) {
+                        const aFirst = tbl.rows.items[groups.items[gi].rows.items[0]].values;
+                        const bFirst = tbl.rows.items[groups.items[gj].rows.items[0]].values;
+                        const aVal = try self.materializeContext(tbl, aFirst, .{ .identifier = ord.column }, parameters, null);
+                        defer if (evalOwnsResult(.{ .identifier = ord.column })) self.freeConcatText(aVal);
+                        const bVal = try self.materializeContext(tbl, bFirst, .{ .identifier = ord.column }, parameters, null);
+                        defer if (evalOwnsResult(.{ .identifier = ord.column })) self.freeConcatText(bVal);
+                        const placed = compareBridge.compareKey(aVal, bVal, ord.descending, ord.nullsFirst, .binary);
+                        if (placed == .gt) std.mem.swap(Group, &groups.items[gi], &groups.items[gj]);
+                    }
+                }
+            }
+        }
+        for (groups.items) |group| {
+            const firstIdx = group.rows.items[0];
+            const firstRow = tbl.rows.items[firstIdx];
+            const firstOuter = OuterRow{ .table = tbl, .alias = value.tableAlias, .values = firstRow.values, .prev = outer };
+            if (value.having) |arms| {
+                var total = false;
+                var groupOk = true;
+                var started = false;
+                for (arms) |having| {
+                    const leftValue = try self.evalGroupHavingLeft(tbl, group, keyExprs, value.projections, having.left, parameters, value.tableAlias, outer);
+                    defer if (leftValue == .text or leftValue == .blob) self.freeConcatText(leftValue);
+                    var itemResult: bool = undefined;
+                    if (having.op == .isTrue or having.op == .isNotTrue or having.op == .isFalse or having.op == .isNotFalse) {
+                        itemResult = havingCompare(leftValue, having.op, .null);
+                    } else {
+                        const rightValue = try self.resolve(having.right, parameters);
+                        const rightOwned = evalOwnsResult(having.right);
+                        defer if (rightOwned) self.freeConcatText(rightValue);
+                        itemResult = havingCompare(leftValue, having.op, rightValue);
+                    }
+                    if (!started) {
+                        groupOk = itemResult;
+                        started = true;
+                    } else if (having.joinOr) {
+                        total = total or groupOk;
+                        groupOk = itemResult;
+                    } else {
+                        groupOk = groupOk and itemResult;
+                    }
+                }
+                if (!(total or groupOk)) continue;
+            }
+            const output = try self.allocator.alloc(Value, value.projections.len);
+            var outDone: usize = 0;
+            errdefer {
+                for (output[0..outDone]) |item| self.freeConcatText(item);
+                self.allocator.free(output);
+            }
+            for (value.projections, 0..) |projection, oi| {
+                switch (projection.expr) {
+                    .identifier => {
+                        var matchedKey: ?Value = null;
+                        for (keyExprs, group.keys) |keyExpr, keyValue| {
+                            if (keyExpr == .identifier and projection.expr == .identifier and std.ascii.eqlIgnoreCase(keyExpr.identifier, projection.expr.identifier)) {
+                                matchedKey = keyValue;
+                                break;
+                            }
+                        }
+                        if (matchedKey) |k| {
+                            output[oi] = try self.copyValue(k);
+                        } else {
+                            output[oi] = try self.materializeContext(tbl, firstRow.values, projection.expr, parameters, &firstOuter);
+                        }
+                    },
+                    .function => |function| {
+                        if (functions.classify(function.name, functions.argCount(function)) == .aggregate) {
+                            output[oi] = try self.evalAggregateOverGroup(tbl, function, group.rows.items, parameters, value.tableAlias, outer);
+                        } else {
+                            output[oi] = try self.materializeContext(tbl, firstRow.values, projection.expr, parameters, &firstOuter);
+                        }
+                    },
+                    else => output[oi] = try self.materializeContext(tbl, firstRow.values, projection.expr, parameters, &firstOuter),
+                }
+                outDone = oi + 1;
+            }
+            try rows.append(self.allocator, output);
+        }
+        if (sortAfter) try self.sortJoinRows(&rows, columns.items, value.projections, value.orders);
+        try self.paginateJoinRows(&rows, value.limit, value.offset);
+        return .{ .allocator = self.allocator, .columns = try self.ownedColumns(columns.items), .rows = try rows.toOwnedSlice(self.allocator) };
+    }
+
+    /// Aggregate separator for `group_concat`/`string_agg` only. The second
+    /// argument of `json_group_object` is a per-row value expression, not a
+    /// separator — resolving it without row context fails with UnknownColumn.
+    fn aggSeparator(self: *Connection, kind: functions.aggregate.AggKind, function: anytype, parameters: []const Value) !?[]const u8 {
+        if (kind != .groupConcat and kind != .stringAgg) return null;
+        if (function.argument2) |a2| {
+            const sVal = try self.resolve(a2.*, parameters);
+            if (sVal == .text) return sVal.text;
+        }
+        return null;
+    }
+
+    /// Step one row into `agg`; `json_group_object` steps key then value.
+    fn stepAggregateContext(self: *Connection, tbl: *const Table, rowValues: []const Value, function: anytype, agg: *functions.aggregate.AggState, parameters: []const Value, outer: ?*const OuterRow) !void {
+        if (function.argument.* == .wildcard) {
+            agg.stepWildcard();
+            return;
+        }
+        const item = try self.evalContext(tbl, rowValues, function.argument.*, parameters, outer);
+        try agg.step(item, function.distinct);
+        const kind = functions.aggregate.AggKind.fromName(function.name).?;
+        if (kind == .jsonGroupObject) {
+            if (function.argument2) |a2| {
+                const valItem = try self.evalContext(tbl, rowValues, a2.*, parameters, outer);
+                try agg.step(valItem, false);
+            }
+        }
+    }
+
+    /// Run one aggregate call over group row indices; caller owns the result.
+    fn evalAggregateOverGroup(self: *Connection, tbl: *const Table, function: anytype, rowIndices: []const usize, parameters: []const Value, tableAlias: ?[]const u8, outer: ?*const OuterRow) !Value {
+        const kind = functions.aggregate.AggKind.fromName(function.name).?;
+        const sep = try self.aggSeparator(kind, function, parameters);
+        var agg = functions.aggregate.AggState.init(self.allocator, kind, sep);
+        defer agg.deinit();
+        for (rowIndices) |rowIndex| {
+            const rowValues = tbl.rows.items[rowIndex].values;
+            const rowOuter = OuterRow{ .table = tbl, .alias = tableAlias, .values = rowValues, .prev = outer };
+            if (!try self.filterKeepsRow(tbl, rowValues, function.filter, parameters, &rowOuter)) continue;
+            try self.stepAggregateContext(tbl, rowValues, function, &agg, parameters, &rowOuter);
+        }
+        return try agg.result();
+    }
+
+    /// HAVING left side for multi-key groups: group-key idents use the key
+    /// value; SELECT-list aliases resolve to their projection expression;
+    /// aggregates recompute over the group; other exprs use first row.
+    fn evalGroupHavingLeft(self: *Connection, tbl: *const Table, group: anytype, keyExprs: []const ast.Expr, projections: []const ast.Projection, left: ast.Expr, parameters: []const Value, tableAlias: ?[]const u8, outer: ?*const OuterRow) !Value {
+        if (left == .identifier) {
+            for (keyExprs, group.keys) |keyExpr, keyValue| {
+                if (keyExpr == .identifier and std.ascii.eqlIgnoreCase(keyExpr.identifier, left.identifier)) return try self.copyValue(keyValue);
+            }
+            // SELECT-list alias (`SUM(v) AS s` → `HAVING s >= 10`).
+            for (projections) |projection| {
+                if (projection.alias) |aliasName| {
+                    if (std.ascii.eqlIgnoreCase(aliasName, left.identifier)) {
+                        return try self.evalGroupHavingLeft(tbl, group, keyExprs, projections, projection.expr, parameters, tableAlias, outer);
+                    }
+                }
+            }
+        }
+        if (left == .function) {
+            const function = left.function;
+            if (functions.classify(function.name, functions.argCount(function)) == .aggregate) {
+                return try self.evalAggregateOverGroup(tbl, function, group.rows.items, parameters, tableAlias, outer);
+            }
+        }
+        const firstRow = tbl.rows.items[group.rows.items[0]];
+        const firstOuter = OuterRow{ .table = tbl, .alias = tableAlias, .values = firstRow.values, .prev = outer };
+        return try self.materializeContext(tbl, firstRow.values, left, parameters, &firstOuter);
     }
 
     fn selectGrouped(self: *Connection, tbl: *const Table, value: anytype, groupName: []const u8, parameters: []const Value) !Result {
@@ -4721,22 +5262,14 @@ pub const Connection = struct {
                         .function => |function| blk: {
                             if (functions.classify(function.name, functions.argCount(function)) == .aggregate) {
                                 const kind = functions.aggregate.AggKind.fromName(function.name).?;
-                                var sep: ?[]const u8 = null;
-                                if (function.argument2) |a2| {
-                                    const sVal = try self.resolve(a2.*, parameters);
-                                    if (sVal == .text) sep = sVal.text;
-                                }
+                                const sep = try self.aggSeparator(kind, function, parameters);
                                 var agg = functions.aggregate.AggState.init(self.allocator, kind, sep);
                                 defer agg.deinit();
                                 for (group.rows.items) |rowIndex| {
                                     const rowValues = tbl.rows.items[rowIndex].values;
-                                    if (!try self.filterKeepsRow(tbl, rowValues, function.filter, parameters, null)) continue;
-                                    if (function.argument.* == .wildcard) {
-                                        agg.stepWildcard();
-                                    } else {
-                                        const item = try self.eval(tbl, rowValues, function.argument.*, parameters);
-                                        try agg.step(item, function.distinct);
-                                    }
+                                    const rowOuter = OuterRow{ .table = tbl, .alias = value.tableAlias, .values = rowValues, .prev = null };
+                                    if (!try self.filterKeepsRow(tbl, rowValues, function.filter, parameters, &rowOuter)) continue;
+                                    try self.stepAggregateContext(tbl, rowValues, function, &agg, parameters, &rowOuter);
                                 }
                                 break :blk try agg.result();
                             }
@@ -4746,8 +5279,8 @@ pub const Connection = struct {
                     };
                     defer if (leftValue == .text) self.allocator.free(leftValue.text) else if (leftValue == .blob) self.allocator.free(leftValue.blob);
                     var itemResult: bool = undefined;
-                    if (having.op == .isTrue) {
-                        itemResult = functions.scalar.isTruthyValue(leftValue);
+                    if (having.op == .isTrue or having.op == .isNotTrue or having.op == .isFalse or having.op == .isNotFalse) {
+                        itemResult = havingCompare(leftValue, having.op, .null);
                     } else {
                         const rightValue = try self.resolve(having.right, parameters);
                         const rightOwned = evalOwnsResult(having.right);
@@ -4777,22 +5310,14 @@ pub const Connection = struct {
                 .function => |function| {
                     if (functions.classify(function.name, functions.argCount(function)) == .aggregate) {
                         const kind = functions.aggregate.AggKind.fromName(function.name).?;
-                        var sep: ?[]const u8 = null;
-                        if (function.argument2) |a2| {
-                            const sVal = try self.resolve(a2.*, parameters);
-                            if (sVal == .text) sep = sVal.text;
-                        }
+                        const sep = try self.aggSeparator(kind, function, parameters);
                         var agg = functions.aggregate.AggState.init(self.allocator, kind, sep);
                         defer agg.deinit();
                         for (group.rows.items) |rowIndex| {
                             const rowValues = tbl.rows.items[rowIndex].values;
-                            if (!try self.filterKeepsRow(tbl, rowValues, function.filter, parameters, null)) continue;
-                            if (function.argument.* == .wildcard) {
-                                agg.stepWildcard();
-                            } else {
-                                const item = try self.eval(tbl, rowValues, function.argument.*, parameters);
-                                try agg.step(item, function.distinct);
-                            }
+                            const rowOuter = OuterRow{ .table = tbl, .alias = value.tableAlias, .values = rowValues, .prev = null };
+                            if (!try self.filterKeepsRow(tbl, rowValues, function.filter, parameters, &rowOuter)) continue;
+                            try self.stepAggregateContext(tbl, rowValues, function, &agg, parameters, &rowOuter);
                         }
                         output[outputIndex] = try agg.result();
                     } else {
@@ -5060,6 +5585,20 @@ pub const Connection = struct {
     }
 
     fn selectWithOuter(self: *Connection, value: anytype, parameters: []const Value, outer: ?*const OuterRow) anyerror!Result {
+        // Resolve non-literal LIMIT/OFFSET once at entry so every path below
+        // sees plain usize fields (re-entry clears limitExpr/offsetExpr).
+        if (value.limitExpr != null or value.offsetExpr != null) {
+            var resolved = value;
+            if (value.limitExpr) |expr| {
+                resolved.limit = try self.evalLimitOffset(expr, parameters);
+                resolved.limitExpr = null;
+            }
+            if (value.offsetExpr) |expr| {
+                resolved.offset = try self.evalLimitOffset(expr, parameters);
+                resolved.offsetExpr = null;
+            }
+            return self.selectWithOuter(resolved, parameters, outer);
+        }
         if (value.fromSubquery) |fromSubquery| {
             var source = try self.executeWithOuter(fromSubquery, parameters, outer);
             defer source.deinit();
@@ -5076,6 +5615,16 @@ pub const Connection = struct {
         defer projections.deinit(self.allocator);
         if (value.table) |tableName| {
             const resolved = self.resolveTableName(tableName) orelse {
+                if (isSchemaCatalogName(tableName)) {
+                    var source = try self.buildSchemaCatalog(&self.store);
+                    defer source.deinit();
+                    const ephemeralName = "__schema_catalog__";
+                    var scope = try self.materializeDerivedTable(ephemeralName, &source);
+                    defer scope.deinit();
+                    var subValue = value;
+                    subValue.table = ephemeralName;
+                    return self.selectWithOuter(subValue, parameters, outer);
+                }
                 const resolvedView = self.resolveViewName(tableName) orelse return error.UnknownTable;
                 const view = resolvedView.view;
                 var source = try self.execute(view.sql, parameters);
@@ -5089,8 +5638,20 @@ pub const Connection = struct {
                 return self.selectWithOuter(subValue, parameters, outer);
             };
             const tbl = resolved.table;
-            if (value.joins.len != 0) return try self.selectJoin(value, tbl, parameters, outer);
+            if (value.joins.len != 0) {
+                // Multi-key or non-identifier GROUP BY over a join needs the
+                // expression path; single bare/qualified identifier keys keep
+                // the existing `collectJoinGrouped` fast path.
+                const multiGroup = value.groupByExprs.len > 1 or (value.groupByExprs.len == 1 and value.groupByExprs[0] != .identifier);
+                if (multiGroup) return try self.selectJoinGroupedByExprs(value, tbl, parameters, outer);
+                return try self.selectJoin(value, tbl, parameters, outer);
+            }
+            // Multi-key / expression GROUP BY (or single non-simple key) uses
+            // the expression path; the legacy single-column path stays for
+            // `groupBy` set without `groupByExprs` (DSL builders).
+            if (value.groupByExprs.len != 0 and !simpleSingleGroupBy(value)) return try self.selectGroupedByExprs(tbl, value, parameters, outer);
             if (value.groupBy) |groupName| return try self.selectGrouped(tbl, value, groupName, parameters);
+            if (value.groupByExprs.len != 0) return try self.selectGroupedByExprs(tbl, value, parameters, outer);
             var anyAgg = false;
             for (value.projections) |p| {
                 if (p.expr == .function and functions.classify(p.expr.function.name, functions.argCount(p.expr.function)) == .aggregate) {
@@ -5105,11 +5666,7 @@ pub const Connection = struct {
                     if (p.expr == .function) {
                         if (functions.classify(p.expr.function.name, functions.argCount(p.expr.function)) == .aggregate) {
                             const kind = functions.aggregate.AggKind.fromName(p.expr.function.name).?;
-                            var sep: ?[]const u8 = null;
-                            if (p.expr.function.argument2) |a2| {
-                                const sVal = try self.resolve(a2.*, parameters);
-                                if (sVal == .text) sep = sVal.text;
-                            }
+                            const sep = try self.aggSeparator(kind, p.expr.function, parameters);
                             aggStates[i] = functions.aggregate.AggState.init(self.allocator, kind, sep);
                             try columns.append(self.allocator, p.alias orelse p.expr.function.name);
                             continue;
@@ -5134,12 +5691,7 @@ pub const Connection = struct {
                     for (value.projections, 0..) |p, i| {
                         if (aggStates[i]) |*agg| {
                             if (!try self.filterKeepsRow(tbl, row.values, p.expr.function.filter, parameters, &rowOuter)) continue;
-                            if (p.expr.function.argument.* == .wildcard) {
-                                agg.stepWildcard();
-                            } else {
-                                const item = try self.evalContext(tbl, row.values, p.expr.function.argument.*, parameters, &rowOuter);
-                                try agg.step(item, p.expr.function.distinct);
-                            }
+                            try self.stepAggregateContext(tbl, row.values, p.expr.function, agg, parameters, &rowOuter);
                         }
                     }
                 }
@@ -5152,23 +5704,14 @@ pub const Connection = struct {
                             .function => |function| blk: {
                                 if (functions.classify(function.name, functions.argCount(function)) == .aggregate) {
                                     const kind = functions.aggregate.AggKind.fromName(function.name).?;
-                                    var sep: ?[]const u8 = null;
-                                    if (function.argument2) |a2| {
-                                        const sVal = try self.resolve(a2.*, parameters);
-                                        if (sVal == .text) sep = sVal.text;
-                                    }
+                                    const sep = try self.aggSeparator(kind, function, parameters);
                                     var havingAgg = functions.aggregate.AggState.init(self.allocator, kind, sep);
                                     defer havingAgg.deinit();
                                     for (tbl.rows.items) |row| {
                                         const rowOuter = OuterRow{ .table = tbl, .alias = value.tableAlias, .values = row.values, .prev = outer };
                                         if (!try self.matchesContext(tbl, row.values, value.condition, parameters, &rowOuter)) continue;
                                         if (!try self.filterKeepsRow(tbl, row.values, function.filter, parameters, &rowOuter)) continue;
-                                        if (function.argument.* == .wildcard) {
-                                            havingAgg.stepWildcard();
-                                        } else {
-                                            const item = try self.evalContext(tbl, row.values, function.argument.*, parameters, &rowOuter);
-                                            try havingAgg.step(item, function.distinct);
-                                        }
+                                        try self.stepAggregateContext(tbl, row.values, function, &havingAgg, parameters, &rowOuter);
                                     }
                                     break :blk try havingAgg.result();
                                 }
@@ -5178,8 +5721,8 @@ pub const Connection = struct {
                         };
                         defer if (leftValue == .text) self.allocator.free(leftValue.text) else if (leftValue == .blob) self.allocator.free(leftValue.blob);
                         var itemResult: bool = undefined;
-                        if (having.op == .isTrue) {
-                            itemResult = functions.scalar.isTruthyValue(leftValue);
+                        if (having.op == .isTrue or having.op == .isNotTrue or having.op == .isFalse or having.op == .isNotFalse) {
+                            itemResult = havingCompare(leftValue, having.op, .null);
                         } else {
                             const rightValue = try self.resolve(having.right, parameters);
                             const rightOwned = evalOwnsResult(having.right);
@@ -5671,6 +6214,11 @@ pub const Connection = struct {
         return self.matchesContext(row.segments[0].table, row.segments[0].values, condition, parameters, &row.frames[0]);
     }
 
+    /// Evaluate a JOIN ON expression list against the already-extended row.
+    fn joinOnPasses(self: *Connection, row: JoinRow, conditions: ast.Conditions, parameters: []const Value) !bool {
+        return self.matchesContext(row.segments[0].table, row.segments[0].values, conditions, parameters, &row.frames[0]);
+    }
+
     fn evalJoinRowExpr(self: *Connection, row: JoinRow, expr: ast.Expr, parameters: []const Value) !Value {
         return self.evalContext(null, &.{}, expr, parameters, &row.frames[0]);
     }
@@ -5864,7 +6412,263 @@ pub const Connection = struct {
         return .{ .segments = segments, .frames = frames };
     }
 
+    fn selectJoinGroupedByExprs(self: *Connection, value: anytype, left: *const Table, parameters: []const Value, outer: ?*const OuterRow) !Result {
+        // Build join pairs first (same as selectJoin), then group by exprs.
+        // Reuse selectJoin's pair-building by calling through a temporary
+        // shape: we duplicate the minimal setup here.
+        const joins = value.joins;
+        var tables = std.ArrayList(*const Table).empty;
+        defer tables.deinit(self.allocator);
+        try tables.append(self.allocator, left);
+        for (joins) |join| {
+            const resolvedJoin = self.resolveTableName(join.table) orelse return error.UnknownTable;
+            try tables.append(self.allocator, resolvedJoin.table);
+        }
+        var aliases = std.ArrayList(?[]const u8).empty;
+        defer aliases.deinit(self.allocator);
+        try aliases.append(self.allocator, value.tableAlias);
+        for (joins) |join| try aliases.append(self.allocator, join.tableAlias);
+        // For simplicity, only inner/cross equi/OFF pairs are supported on
+        // this multi-key path when merges are required — merge groups still
+        // work because chainPairMatches is applied below; skip selectJoin
+        // fallback to avoid mutual recursion with selectJoin.
+        var current = std.ArrayList(JoinRow).empty;
+        defer freeJoinRows(self.allocator, &current);
+        for (left.rows.items) |leftRow| try current.append(self.allocator, try self.extendJoinRow(null, left, value.tableAlias, leftRow.values, 1, outer));
+        for (joins, 0..) |join, joinIndex| {
+            const right = tables.items[joinIndex + 1];
+            const rightAlias = join.tableAlias;
+            var next = std.ArrayList(JoinRow).empty;
+            errdefer freeJoinRows(self.allocator, &next);
+            const rightMatched = try self.allocator.alloc(bool, right.rows.items.len);
+            defer self.allocator.free(rightMatched);
+            @memset(rightMatched, false);
+            for (current.items) |*row| {
+                var matched = false;
+                for (right.rows.items, 0..) |rightRow, rightRowIndex| {
+                    if (join.onExpr != null) {
+                        var candidate = try self.extendJoinRow(row, right, rightAlias, rightRow.values, joinIndex + 2, outer);
+                        const passes = self.joinOnPasses(candidate, join.onExpr.?, parameters) catch |err| {
+                            freeJoinRow(self.allocator, &candidate);
+                            return err;
+                        };
+                        if (!passes) {
+                            freeJoinRow(self.allocator, &candidate);
+                            continue;
+                        }
+                        matched = true;
+                        rightMatched[rightRowIndex] = true;
+                        try next.append(self.allocator, candidate);
+                        continue;
+                    }
+                    // Simple pair or cross join without merge groups.
+                    const dummyMerge = ChainMerge{ .pairs = &.{}, .droppedRight = &.{} };
+                    if (!try chainPairMatches(row.segments, right, rightAlias, rightRow.values, join, dummyMerge)) continue;
+                    matched = true;
+                    rightMatched[rightRowIndex] = true;
+                    try next.append(self.allocator, try self.extendJoinRow(row, right, rightAlias, rightRow.values, joinIndex + 2, outer));
+                }
+                if ((join.kind == .left or join.kind == .full) and !matched) {
+                    const nullVals = try self.allocator.alloc(Value, right.columns.len);
+                    defer self.allocator.free(nullVals);
+                    @memset(nullVals, .null);
+                    try next.append(self.allocator, try self.extendJoinRow(row, right, rightAlias, nullVals, joinIndex + 2, outer));
+                }
+            }
+            freeJoinRows(self.allocator, &current);
+            current = next;
+        }
+        var pairs = std.ArrayList(JoinRow).empty;
+        defer {
+            freeJoinRows(self.allocator, &pairs);
+        }
+        for (current.items) |row| {
+            if (try self.joinRowPasses(row, value.condition, parameters)) {
+                try pairs.append(self.allocator, row);
+            } else {
+                freeJoinRow(self.allocator, @constCast(&row));
+            }
+        }
+        // Ownership: pairs took ownership of filtered rows from current;
+        // current still owns unfiltered — clear current without free.
+        current.clearRetainingCapacity();
+        return try self.selectJoinGroupedByExprsFromPairs(pairs.items, value, parameters, outer);
+    }
+
+    /// Group already-built join pairs by `groupByExprs` and project.
+    fn selectJoinGroupedByExprsFromPairs(self: *Connection, pairs: []const JoinRow, value: anytype, parameters: []const Value, outer: ?*const OuterRow) !Result {
+        _ = outer;
+        const keyExprs = value.groupByExprs;
+        if (keyExprs.len == 0) return error.InvalidSql;
+        const Group = struct { keys: []Value, rows: std.ArrayList(usize) };
+        var groups = std.ArrayList(Group).empty;
+        defer {
+            for (groups.items) |*group| {
+                for (group.keys) |k| self.freeConcatText(k);
+                self.allocator.free(group.keys);
+                group.rows.deinit(self.allocator);
+            }
+            groups.deinit(self.allocator);
+        }
+        for (pairs, 0..) |pair, pairIndex| {
+            const rowKeys = try self.allocator.alloc(Value, keyExprs.len);
+            var keyCount: usize = 0;
+            errdefer {
+                for (rowKeys[0..keyCount]) |k| self.freeConcatText(k);
+                self.allocator.free(rowKeys);
+            }
+            for (keyExprs, 0..) |keyExpr, ki| {
+                rowKeys[ki] = try self.materializeJoinRowExpr(pair, keyExpr, parameters);
+                keyCount = ki + 1;
+            }
+            var found: ?usize = null;
+            outerGroup: for (groups.items, 0..) |group, position| {
+                if (group.keys.len != rowKeys.len) continue;
+                for (group.keys, rowKeys) |gk, rk| if (!sameValue(gk, rk)) continue :outerGroup;
+                found = position;
+                break;
+            }
+            if (found) |position| {
+                for (rowKeys) |k| self.freeConcatText(k);
+                self.allocator.free(rowKeys);
+                try groups.items[position].rows.append(self.allocator, pairIndex);
+            } else {
+                try groups.append(self.allocator, .{ .keys = rowKeys, .rows = .empty });
+                try groups.items[groups.items.len - 1].rows.append(self.allocator, pairIndex);
+            }
+        }
+        var columns = std.ArrayList([]const u8).empty;
+        defer columns.deinit(self.allocator);
+        for (value.projections) |projection| switch (projection.expr) {
+            .identifier => try columns.append(self.allocator, projection.alias orelse splitQualifier(projection.expr.identifier).column),
+            .function => try columns.append(self.allocator, projection.alias orelse projection.expr.function.name),
+            else => try columns.append(self.allocator, projection.alias orelse "?column?"),
+        };
+        var rows = std.ArrayList([]Value).empty;
+        errdefer self.freeJoinResultRows(&rows);
+        for (groups.items) |group| {
+            const firstPair = pairs[group.rows.items[0]];
+            if (value.having) |arms| {
+                var total = false;
+                var groupOk = true;
+                var started = false;
+                for (arms) |having| {
+                    var leftVal: Value = undefined;
+                    var leftOwned = false;
+                    if (having.left == .identifier) {
+                        var matched: ?Value = null;
+                        for (keyExprs, group.keys) |keyExpr, keyValue| {
+                            if (keyExpr == .identifier and std.ascii.eqlIgnoreCase(keyExpr.identifier, having.left.identifier)) {
+                                matched = keyValue;
+                                break;
+                            }
+                        }
+                        if (matched) |k| {
+                            leftVal = try self.copyValue(k);
+                            leftOwned = true;
+                        }
+                    }
+                    if (!leftOwned) {
+                        if (having.left == .function and functions.classify(having.left.function.name, functions.argCount(having.left.function)) == .aggregate) {
+                            leftVal = try self.evalJoinAggregateOverGroup(pairs, group.rows.items, having.left.function, parameters);
+                            leftOwned = true;
+                        } else {
+                            leftVal = try self.materializeJoinRowExpr(firstPair, having.left, parameters);
+                            leftOwned = having.left == .binary or having.left == .unary or having.left == .function;
+                        }
+                    }
+                    if (leftOwned) {
+                        if (leftVal == .text or leftVal == .blob) self.freeConcatText(leftVal);
+                    }
+                    var itemResult: bool = undefined;
+                    if (having.op == .isTrue or having.op == .isNotTrue or having.op == .isFalse or having.op == .isNotFalse) {
+                        itemResult = havingCompare(leftVal, having.op, .null);
+                    } else {
+                        const rightValue = try self.resolve(having.right, parameters);
+                        const rightOwned = evalOwnsResult(having.right);
+                        defer if (rightOwned) self.freeConcatText(rightValue);
+                        itemResult = havingCompare(leftVal, having.op, rightValue);
+                    }
+                    if (!started) {
+                        groupOk = itemResult;
+                        started = true;
+                    } else if (having.joinOr) {
+                        total = total or groupOk;
+                        groupOk = itemResult;
+                    } else {
+                        groupOk = groupOk and itemResult;
+                    }
+                }
+                if (!(total or groupOk)) continue;
+            }
+            const output = try self.allocator.alloc(Value, value.projections.len);
+            var outDone: usize = 0;
+            errdefer {
+                for (output[0..outDone]) |item| self.freeConcatText(item);
+                self.allocator.free(output);
+            }
+            for (value.projections, 0..) |projection, oi| {
+                switch (projection.expr) {
+                    .identifier => {
+                        var matched: ?Value = null;
+                        for (keyExprs, group.keys) |keyExpr, keyValue| {
+                            if (keyExpr == .identifier and std.ascii.eqlIgnoreCase(keyExpr.identifier, projection.expr.identifier)) {
+                                matched = keyValue;
+                                break;
+                            }
+                        }
+                        if (matched) |k| {
+                            output[oi] = try self.copyValue(k);
+                        } else {
+                            output[oi] = try self.materializeJoinRowExpr(firstPair, projection.expr, parameters);
+                        }
+                    },
+                    .function => |function| {
+                        if (functions.classify(function.name, functions.argCount(function)) == .aggregate) {
+                            output[oi] = try self.evalJoinAggregateOverGroup(pairs, group.rows.items, function, parameters);
+                        } else {
+                            output[oi] = try self.materializeJoinRowExpr(firstPair, projection.expr, parameters);
+                        }
+                    },
+                    else => output[oi] = try self.materializeJoinRowExpr(firstPair, projection.expr, parameters),
+                }
+                outDone = oi + 1;
+            }
+            try rows.append(self.allocator, output);
+        }
+        try self.sortJoinRows(&rows, columns.items, value.projections, value.orders);
+        try self.paginateJoinRows(&rows, value.limit, value.offset);
+        return .{ .allocator = self.allocator, .columns = try self.ownedColumns(columns.items), .rows = try rows.toOwnedSlice(self.allocator) };
+    }
+
+    fn evalJoinAggregateOverGroup(self: *Connection, pairs: []const JoinRow, rowIndices: []const usize, function: anytype, parameters: []const Value) !Value {
+        const kind = functions.aggregate.AggKind.fromName(function.name).?;
+        const sep = try self.aggSeparator(kind, function, parameters);
+        var agg = functions.aggregate.AggState.init(self.allocator, kind, sep);
+        defer agg.deinit();
+        for (rowIndices) |pairIndex| {
+            const pair = pairs[pairIndex];
+            if (!try self.filterKeepsRow(pair.segments[0].table, pair.segments[0].values, function.filter, parameters, &pair.frames[0])) continue;
+            if (function.argument.* == .wildcard) {
+                agg.stepWildcard();
+            } else {
+                const item = try self.evalJoinRowExpr(pair, function.argument.*, parameters);
+                try agg.step(item, function.distinct);
+                if (function.argument2 != null and kind == .jsonGroupObject) {
+                    const valItem = try self.evalJoinRowExpr(pair, function.argument2.?.*, parameters);
+                    try agg.step(valItem, false);
+                }
+            }
+        }
+        return try agg.result();
+    }
+
     fn selectJoin(self: *Connection, value: anytype, left: *const Table, parameters: []const Value, outer: ?*const OuterRow) !Result {
+        // Multi-key GROUP BY over joins: build the pair set once, then group
+        // by evaluating key expressions against each join row's frames.
+        if (value.groupByExprs.len != 0 and (value.groupByExprs.len > 1 or value.groupByExprs[0] != .identifier)) {
+            return try self.selectJoinGroupedByExprs(value, left, parameters, outer);
+        }
         const joins = value.joins;
         var tables = std.ArrayList(*const Table).empty;
         defer tables.deinit(self.allocator);
@@ -6014,6 +6818,23 @@ pub const Connection = struct {
             for (current.items) |*row| {
                 var matched = false;
                 for (right.rows.items, 0..) |rightRow, rightRowIndex| {
+                    // General ON expressions need the extended row in scope;
+                    // evaluate after extending, then drop non-matching pairs.
+                    if (join.onExpr != null) {
+                        var candidate = try self.extendJoinRow(row, right, rightAlias, rightRow.values, joinIndex + 2, outer);
+                        const passes = self.joinOnPasses(candidate, join.onExpr.?, parameters) catch |err| {
+                            freeJoinRow(self.allocator, &candidate);
+                            return err;
+                        };
+                        if (!passes) {
+                            freeJoinRow(self.allocator, &candidate);
+                            continue;
+                        }
+                        matched = true;
+                        rightMatched[rightRowIndex] = true;
+                        try next.append(self.allocator, candidate);
+                        continue;
+                    }
                     if (!try chainPairMatches(row.segments, right, rightAlias, rightRow.values, join, merge)) continue;
                     matched = true;
                     rightMatched[rightRowIndex] = true;
@@ -6034,6 +6855,9 @@ pub const Connection = struct {
         var pairs = std.ArrayList(JoinRow).empty;
         defer pairs.deinit(self.allocator);
         for (current.items) |row| if (try self.joinRowPasses(row, value.condition, parameters)) try pairs.append(self.allocator, row);
+        if (value.groupByExprs.len != 0 and (value.groupByExprs.len > 1 or value.groupByExprs[0] != .identifier)) {
+            return try self.selectJoinGroupedByExprsFromPairs(pairs.items, value, parameters, outer);
+        }
         if (value.groupBy) |groupName| {
             var groupedRows = std.ArrayList([]Value).empty;
             errdefer self.freeJoinResultRows(&groupedRows);
@@ -6088,6 +6912,72 @@ pub const Connection = struct {
         errdefer self.freeJoinResultRows(&rows);
         var pairOrder: ?[]usize = null;
         defer if (pairOrder) |indices| self.allocator.free(indices);
+        var hasWindow = false;
+        for (value.projections) |projection| {
+            if (projection.expr == .window) {
+                hasWindow = true;
+                break;
+            }
+        }
+        var windowCols: ?[]?[]Value = null;
+        defer if (windowCols) |wCols| {
+            for (wCols) |cOpt| {
+                if (cOpt) |cSlice| {
+                    for (cSlice) |item| self.freeConcatText(item);
+                    self.allocator.free(cSlice);
+                }
+            }
+            self.allocator.free(wCols);
+        };
+        if (hasWindow) {
+            const dummyValues = try self.allocator.alloc(Value, pairs.items.len);
+            defer self.allocator.free(dummyValues);
+            const fakeRows = try self.allocator.alloc([]const Value, pairs.items.len);
+            defer self.allocator.free(fakeRows);
+            for (0..pairs.items.len) |i| {
+                dummyValues[i] = .{ .integer = @intCast(i) };
+                fakeRows[i] = dummyValues[i .. i + 1];
+            }
+            const JoinEvalHelper = struct {
+                conn: *Connection,
+                pairs: []const JoinRow,
+                groups: []const MergedGroup,
+                params: []const Value,
+
+                fn evalExpr(ctxPtr: *const anyopaque, expr: ast.Expr, rowSlice: []const Value) anyerror!Value {
+                    const selfCtx: *const @This() = @ptrCast(@alignCast(ctxPtr));
+                    const rowIndex: usize = @intCast(rowSlice[0].integer);
+                    const joinRow = selfCtx.pairs[rowIndex];
+                    if (expr == .identifier) {
+                        const parts = splitQualifier(expr.identifier);
+                        if (parts.qualifier.len == 0 and findMergedGroup(selfCtx.groups, parts.column) != null) {
+                            return joinRowField(joinRow, selfCtx.groups, "", parts.column);
+                        }
+                    }
+                    return selfCtx.conn.evalJoinRowExpr(joinRow, expr, selfCtx.params);
+                }
+            };
+            const helper = JoinEvalHelper{
+                .conn = self,
+                .pairs = pairs.items,
+                .groups = mergedGroups.items,
+                .params = parameters,
+            };
+            const winCtx = functions.window.WindowContext{
+                .allocator = self.allocator,
+                .rows = fakeRows,
+                .evalFn = JoinEvalHelper.evalExpr,
+                .evalCtx = &helper,
+            };
+            const wCols = try self.allocator.alloc(?[]Value, value.projections.len);
+            @memset(wCols, null);
+            windowCols = wCols;
+            for (value.projections, 0..) |projection, pIdx| {
+                if (projection.expr == .window) {
+                    wCols[pIdx] = try functions.window.evaluateWindowFunction(self.allocator, projection.expr, winCtx);
+                }
+            }
+        }
         if (value.orders.len != 0) {
             var allInOutput = true;
             for (value.orders) |keyOrder| {
@@ -6097,7 +6987,10 @@ pub const Connection = struct {
                 }
             }
             if (!allInOutput) {
-                if (value.distinct) return error.Unsupported;
+                // SQLite rejects SELECT DISTINCT ... ORDER BY col when col is
+                // not in the result set: "ORDER BY term does not match any
+                // column in the result set". Mirror that error exactly.
+                if (value.distinct) return error.InvalidSql;
                 const indices = try self.allocator.alloc(usize, pairs.items.len);
                 errdefer self.allocator.free(indices);
                 for (indices, 0..) |*slot, position| slot.* = position;
@@ -6128,9 +7021,9 @@ pub const Connection = struct {
             }
         }
         if (pairOrder) |indices| {
-            for (indices) |pairIndex| try self.appendJoinRow(&rows, value.projections, pairs.items[pairIndex], tables.items, merges.items, mergedGroups.items, parameters);
+            for (indices) |pairIndex| try self.appendJoinRow(&rows, value.projections, pairs.items[pairIndex], tables.items, merges.items, mergedGroups.items, parameters, windowCols, pairIndex);
         } else {
-            for (pairs.items) |pair| try self.appendJoinRow(&rows, value.projections, pair, tables.items, merges.items, mergedGroups.items, parameters);
+            for (pairs.items, 0..) |pair, pairIndex| try self.appendJoinRow(&rows, value.projections, pair, tables.items, merges.items, mergedGroups.items, parameters, windowCols, pairIndex);
             if (value.distinct) {
                 var index: usize = 0;
                 while (index < rows.items.len) {
@@ -6151,7 +7044,7 @@ pub const Connection = struct {
         return .{ .allocator = self.allocator, .columns = try self.ownedColumns(columns.items), .rows = try rows.toOwnedSlice(self.allocator) };
     }
 
-    fn appendJoinRow(self: *Connection, rows: *std.ArrayList([]Value), projections: []const ast.Projection, row: JoinRow, tables: []const *const Table, merges: []const ChainMerge, groups: []const MergedGroup, parameters: []const Value) !void {
+    fn appendJoinRow(self: *Connection, rows: *std.ArrayList([]Value), projections: []const ast.Projection, row: JoinRow, tables: []const *const Table, merges: []const ChainMerge, groups: []const MergedGroup, parameters: []const Value, windowCols: ?[]const ?[]Value, pairIndex: usize) !void {
         var width: usize = 0;
         for (projections) |projection| {
             if (projection.expr == .wildcard) {
@@ -6169,7 +7062,7 @@ pub const Connection = struct {
             for (output[0..outputIndex]) |item| self.freeConcatText(item);
             self.allocator.free(output);
         }
-        for (projections) |projection| {
+        for (projections, 0..) |projection, pIdx| {
             if (projection.expr == .wildcard) {
                 for (row.segments, 0..) |seg, segIdx| {
                     for (seg.values, 0..) |item, colIdx| {
@@ -6178,6 +7071,16 @@ pub const Connection = struct {
                         outputIndex += 1;
                     }
                 }
+            } else if (projection.expr == .window) {
+                if (windowCols) |wCols| {
+                    if (wCols[pIdx]) |colSlice| {
+                        output[outputIndex] = colSlice[pairIndex];
+                        colSlice[pairIndex] = .null;
+                        outputIndex += 1;
+                        continue;
+                    }
+                }
+                return error.Unsupported;
             } else if (projection.expr == .identifier) {
                 const parts = splitQualifier(projection.expr.identifier);
                 if (parts.qualifier.len == 0) {
@@ -6214,11 +7117,7 @@ pub const Connection = struct {
             if (projection.expr == .function) {
                 if (functions.classify(projection.expr.function.name, functions.argCount(projection.expr.function)) == .aggregate) {
                     const kind = functions.aggregate.AggKind.fromName(projection.expr.function.name).?;
-                    var sep: ?[]const u8 = null;
-                    if (projection.expr.function.argument2) |a2| {
-                        const sVal = try self.resolve(a2.*, parameters);
-                        if (sVal == .text) sep = sVal.text;
-                    }
+                    const sep = try self.aggSeparator(kind, projection.expr.function, parameters);
                     aggStates[index] = functions.aggregate.AggState.init(self.allocator, kind, sep);
                     try columns.append(self.allocator, projection.alias orelse projection.expr.function.name);
                     continue;
@@ -6246,6 +7145,13 @@ pub const Connection = struct {
                     } else {
                         const item = try self.evalJoinRowExpr(pair, projection.expr.function.argument.*, parameters);
                         try agg.step(item, projection.expr.function.distinct);
+                        const kind = functions.aggregate.AggKind.fromName(projection.expr.function.name).?;
+                        if (kind == .jsonGroupObject) {
+                            if (projection.expr.function.argument2) |a2| {
+                                const valItem = try self.evalJoinRowExpr(pair, a2.*, parameters);
+                                try agg.step(valItem, false);
+                            }
+                        }
                     }
                 }
             }
@@ -6341,11 +7247,7 @@ pub const Connection = struct {
                         .function => |function| blk: {
                             if (functions.classify(function.name, functions.argCount(function)) == .aggregate) {
                                 const kind = functions.aggregate.AggKind.fromName(function.name).?;
-                                var sep: ?[]const u8 = null;
-                                if (function.argument2) |a2| {
-                                    const sVal = try self.resolve(a2.*, parameters);
-                                    if (sVal == .text) sep = sVal.text;
-                                }
+                                const sep = try self.aggSeparator(kind, function, parameters);
                                 var agg = functions.aggregate.AggState.init(self.allocator, kind, sep);
                                 defer agg.deinit();
                                 for (group.rows.items) |pairIndex| {
@@ -6356,6 +7258,10 @@ pub const Connection = struct {
                                     } else {
                                         const item = try self.evalJoinRowExpr(pair, function.argument.*, parameters);
                                         try agg.step(item, function.distinct);
+                                        if (function.argument2 != null and kind == .jsonGroupObject) {
+                                            const valItem = try self.evalJoinRowExpr(pair, function.argument2.?.*, parameters);
+                                            try agg.step(valItem, false);
+                                        }
                                     }
                                 }
                                 break :blk try agg.result();
@@ -6366,8 +7272,8 @@ pub const Connection = struct {
                     };
                     defer self.freeConcatText(leftValue);
                     var itemResult: bool = undefined;
-                    if (having.op == .isTrue) {
-                        itemResult = functions.scalar.isTruthyValue(leftValue);
+                    if (having.op == .isTrue or having.op == .isNotTrue or having.op == .isFalse or having.op == .isNotFalse) {
+                        itemResult = havingCompare(leftValue, having.op, .null);
                     } else {
                         const rightValue = try self.resolve(having.right, parameters);
                         const rightOwned = evalOwnsResult(having.right);
@@ -6402,11 +7308,7 @@ pub const Connection = struct {
                     .function => |function| {
                         if (functions.classify(function.name, functions.argCount(function)) == .aggregate) {
                             const kind = functions.aggregate.AggKind.fromName(function.name).?;
-                            var sep: ?[]const u8 = null;
-                            if (function.argument2) |a2| {
-                                const sVal = try self.resolve(a2.*, parameters);
-                                if (sVal == .text) sep = sVal.text;
-                            }
+                            const sep = try self.aggSeparator(kind, function, parameters);
                             var agg = functions.aggregate.AggState.init(self.allocator, kind, sep);
                             defer agg.deinit();
                             for (group.rows.items) |pairIndex| {
@@ -6417,6 +7319,10 @@ pub const Connection = struct {
                                 } else {
                                     const item = try self.evalJoinRowExpr(pair, function.argument.*, parameters);
                                     try agg.step(item, function.distinct);
+                                    if (function.argument2 != null and kind == .jsonGroupObject) {
+                                        const valItem = try self.evalJoinRowExpr(pair, function.argument2.?.*, parameters);
+                                        try agg.step(valItem, false);
+                                    }
                                 }
                             }
                             output[outputIndex] = try agg.result();
@@ -6502,13 +7408,17 @@ pub const Connection = struct {
                 try self.fireTriggers(store, tbl, .before, .update, candidate, row.values, value.columns);
                 store.validateUpdate(tbl, rowIndex, candidate) catch |err| {
                     if (err != error.ConstraintViolation) return err;
-                    if (value.conflict == .ignore) continue;
-                    return err;
+                    switch (effectiveConflict(value.conflict, store.lastConstraintConflict)) {
+                        .ignore => continue,
+                        else => return err,
+                    }
                 };
                 fkActions.applyUpdateActions(self.allocator, store, tbl.name, row.values, candidate) catch |err| {
                     if (err != error.ConstraintViolation) return err;
-                    if (value.conflict == .ignore) continue;
-                    return err;
+                    switch (effectiveConflict(value.conflict, store.lastConstraintConflict)) {
+                        .ignore => continue,
+                        else => return err,
+                    }
                 };
                 const oldSnapshot = try self.allocator.alloc(Value, row.values.len);
                 defer {
@@ -6587,14 +7497,14 @@ pub const Connection = struct {
                 const index = try columnIndex(tbl, name);
                 var newValue = try self.eval(tbl, row.values, expr, parameters);
                 if (newValue == .null and tbl.columns[index].notNull) {
-                    if (value.conflict == .ignore) continue :outer;
+                    if (effectiveConflict(value.conflict, tbl.columns[index].conflict) == .ignore) continue :outer;
                     return error.ConstraintViolation;
                 }
                 if (tbl.strict) {
                     const oldTemp = newValue;
                     newValue = Schema.coerceStrict(self.allocator, tbl.columns[index].typeName, newValue) catch |err| {
                         if (evalOwnsResult(expr)) self.freeConcatText(oldTemp);
-                        if (err == error.ConstraintViolation and value.conflict == .ignore) continue :outer;
+                        if (err == error.ConstraintViolation and effectiveConflict(value.conflict, tbl.columns[index].conflict) == .ignore) continue :outer;
                         return err;
                     };
                     self.freeSupersededStrictTemp(expr, oldTemp, newValue);
@@ -6605,7 +7515,7 @@ pub const Connection = struct {
             try self.fireTriggers(store, tbl, .before, .update, candidate, row.values, value.columns);
             store.validateUpdate(tbl, rowIndex, candidate) catch |err| {
                 if (err != error.ConstraintViolation) return err;
-                switch (value.conflict) {
+                switch (effectiveConflict(value.conflict, store.lastConstraintConflict)) {
                     .ignore => continue :outer,
                     .replace => {
                         while (try conflicts.conflictRow(self.allocator, store, tbl, candidate, rowIndex)) |bad| {
@@ -6622,7 +7532,7 @@ pub const Connection = struct {
             };
             fkActions.applyUpdateActions(self.allocator, store, tbl.name, row.values, candidate) catch |err| {
                 if (err != error.ConstraintViolation) return err;
-                switch (value.conflict) {
+                switch (effectiveConflict(value.conflict, store.lastConstraintConflict)) {
                     .ignore => continue :outer,
                     else => return err,
                 }
@@ -8107,6 +9017,59 @@ test "NULL-safe IS DISTINCT FROM works in raw SQL and typed DSL" {
     defer typed.deinit();
     try std.testing.expectEqual(@as(usize, 1), typed.count());
     try std.testing.expectEqual(@as(i64, 2), typed.at(0).id);
+}
+
+test "IS TRUE, IS FALSE, IS NOT TRUE, IS NOT FALSE work in raw SQL and typed/dynamic DSL" {
+    const path = "sqlite_zig_bool_predicate_test.db";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    const BoolItem = @import("../dsl/table.zig").table("bool_items", struct { id: i64, val: ?i64 });
+    var db = try Connection.open(std.testing.allocator, path);
+    defer db.close();
+
+    var resRaw = try db.exec("SELECT 2 IS TRUE, 0 IS TRUE, NULL IS TRUE, 0 IS FALSE, 2 IS FALSE, NULL IS FALSE, 2 IS NOT TRUE, 0 IS NOT TRUE, NULL IS NOT TRUE, 2 IS NOT FALSE, 0 IS NOT FALSE, NULL IS NOT FALSE;");
+    defer resRaw.deinit();
+    try std.testing.expectEqual(@as(i64, 1), resRaw.at(0)[0].integer);
+    try std.testing.expectEqual(@as(i64, 0), resRaw.at(0)[1].integer);
+    try std.testing.expectEqual(@as(i64, 0), resRaw.at(0)[2].integer);
+    try std.testing.expectEqual(@as(i64, 1), resRaw.at(0)[3].integer);
+    try std.testing.expectEqual(@as(i64, 0), resRaw.at(0)[4].integer);
+    try std.testing.expectEqual(@as(i64, 0), resRaw.at(0)[5].integer);
+    try std.testing.expectEqual(@as(i64, 0), resRaw.at(0)[6].integer);
+    try std.testing.expectEqual(@as(i64, 1), resRaw.at(0)[7].integer);
+    try std.testing.expectEqual(@as(i64, 1), resRaw.at(0)[8].integer);
+    try std.testing.expectEqual(@as(i64, 1), resRaw.at(0)[9].integer);
+    try std.testing.expectEqual(@as(i64, 0), resRaw.at(0)[10].integer);
+    try std.testing.expectEqual(@as(i64, 1), resRaw.at(0)[11].integer);
+
+    var created = try db.exec("CREATE TABLE bool_items (id INTEGER, val INTEGER); INSERT INTO bool_items VALUES (1, 10), (2, 0), (3, NULL);");
+    created.deinit();
+
+    var whereTrueRaw = try db.exec("SELECT id FROM bool_items WHERE val IS TRUE ORDER BY id;");
+    defer whereTrueRaw.deinit();
+    try std.testing.expectEqual(@as(usize, 1), whereTrueRaw.count());
+    try std.testing.expectEqual(@as(i64, 1), whereTrueRaw.at(0)[0].integer);
+
+    var whereFalseRaw = try db.exec("SELECT id FROM bool_items WHERE val IS FALSE ORDER BY id;");
+    defer whereFalseRaw.deinit();
+    try std.testing.expectEqual(@as(usize, 1), whereFalseRaw.count());
+    try std.testing.expectEqual(@as(i64, 2), whereFalseRaw.at(0)[0].integer);
+
+    var typedTrue = try db.from(BoolItem).whereTrue(.val).fetch();
+    defer typedTrue.deinit();
+    try std.testing.expectEqual(@as(usize, 1), typedTrue.count());
+    try std.testing.expectEqual(@as(i64, 1), typedTrue.at(0).id);
+
+    var typedFalse = try db.from(BoolItem).where(BoolItem.val.isFalse()).fetch();
+    defer typedFalse.deinit();
+    try std.testing.expectEqual(@as(usize, 1), typedFalse.count());
+    try std.testing.expectEqual(@as(i64, 2), typedFalse.at(0).id);
+
+    var typedNotTrue = try db.from(BoolItem).whereNotTrue(.val).orderBy(.id).fetch();
+    defer typedNotTrue.deinit();
+    try std.testing.expectEqual(@as(usize, 2), typedNotTrue.count());
+    try std.testing.expectEqual(@as(i64, 2), typedNotTrue.at(0).id);
+    try std.testing.expectEqual(@as(i64, 3), typedNotTrue.at(1).id);
 }
 
 test "NULLIF returns NULL only when its arguments are equal" {
@@ -16337,4 +17300,372 @@ test "statement step budget caps trigger bodies only" {
     plain.deinit();
     // A zero cap rejects even one statement.
     try std.testing.expectError(error.SqlTooBig, db.execBudgeted("SELECT 1;", 0));
+}
+
+test "CREATE TABLE AS SELECT shapes columns and copies rows" {
+    const path = "sqlite_zig_ctas_test.db";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    var db = try Connection.open(std.testing.allocator, path);
+    defer db.close();
+    var setup = try db.exec("CREATE TABLE src_items (id INTEGER, label TEXT, price REAL); INSERT INTO src_items VALUES (1, 'a', 9.5), (2, 'b', 10.0), (3, 'a', 1.25);");
+    setup.deinit();
+    var ctas = try db.exec("CREATE TABLE dst_items AS SELECT id, label, price FROM src_items WHERE price > 2;");
+    ctas.deinit();
+    var rows = try db.exec("SELECT id, label, price FROM dst_items ORDER BY id;");
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(usize, 2), rows.count());
+    try std.testing.expectEqual(@as(i64, 1), rows.at(0)[0].integer);
+    try std.testing.expectEqualStrings("a", rows.at(0)[1].text);
+    try std.testing.expectEqual(@as(f64, 9.5), rows.at(0)[2].real);
+    try std.testing.expectEqual(@as(i64, 2), rows.at(1)[0].integer);
+    // Column count matches the select projection.
+    try std.testing.expectEqual(@as(usize, 3), rows.columns.len);
+    // Expression columns: alias + aggregate projection.
+    var agg = try db.exec("CREATE TABLE agg_copy AS SELECT label, COUNT(*) AS n FROM src_items GROUP BY label ORDER BY label;");
+    agg.deinit();
+    var aggRows = try db.exec("SELECT label, n FROM agg_copy ORDER BY label;");
+    defer aggRows.deinit();
+    try std.testing.expectEqual(@as(usize, 2), aggRows.count());
+    try std.testing.expectEqualStrings("label", aggRows.columns[0]);
+    try std.testing.expectEqual(@as(i64, 2), aggRows.at(0)[1].integer);
+    try std.testing.expectEqual(@as(i64, 1), aggRows.at(1)[1].integer);
+    // IF NOT EXISTS short-circuits without rewriting rows.
+    var again = try db.exec("CREATE TABLE IF NOT EXISTS dst_items AS SELECT id FROM src_items;");
+    again.deinit();
+    var still = try db.exec("SELECT count(*) FROM dst_items;");
+    defer still.deinit();
+    try std.testing.expectEqual(@as(i64, 2), still.at(0)[0].integer);
+    // Duplicate without IF NOT EXISTS fails.
+    try std.testing.expectError(error.TableExists, db.exec("CREATE TABLE dst_items AS SELECT id FROM src_items;"));
+    // Empty select still creates the table with the right shape.
+    var emptyCtas = try db.exec("CREATE TABLE empty_copy AS SELECT id FROM src_items WHERE 0;");
+    emptyCtas.deinit();
+    var emptyRows = try db.exec("SELECT id FROM empty_copy;");
+    defer emptyRows.deinit();
+    try std.testing.expectEqual(@as(usize, 0), emptyRows.count());
+    try std.testing.expectEqual(@as(usize, 1), emptyRows.columns.len);
+}
+
+test "CREATE TEMP TABLE AS SELECT uses the temp store" {
+    const path = "sqlite_zig_ctas_temp_test.db";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    var db = try Connection.open(std.testing.allocator, path);
+    defer db.close();
+    var setup = try db.exec("CREATE TABLE t_src (id INTEGER); INSERT INTO t_src VALUES (7), (8);");
+    setup.deinit();
+    var temp = try db.exec("CREATE TEMP TABLE t_dst AS SELECT id FROM t_src;");
+    temp.deinit();
+    var rows = try db.exec("SELECT id FROM t_dst ORDER BY id;");
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(usize, 2), rows.count());
+    try std.testing.expectEqual(@as(i64, 7), rows.at(0)[0].integer);
+    // Temp table is not in main.sqlite_master.
+    try std.testing.expectError(error.UnknownTable, db.exec("SELECT * FROM main.t_dst;"));
+}
+
+test "expression GROUP BY multi-key HAVING and pagination run end to end" {
+    const path = "sqlite_zig_group_expr_test.db";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    var db = try Connection.open(std.testing.allocator, path);
+    defer db.close();
+    var setup = try db.exec("CREATE TABLE gs (a INTEGER, b INTEGER, v INTEGER); INSERT INTO gs VALUES (1, 1, 10), (1, 1, 5), (1, 2, 3), (2, 1, 7), (2, 2, 20), (2, 2, 1);");
+    setup.deinit();
+    var multi = try db.exec("SELECT a, b, SUM(v), COUNT(*) FROM gs GROUP BY a, b ORDER BY a, b;");
+    defer multi.deinit();
+    try std.testing.expectEqual(@as(usize, 4), multi.count());
+    try std.testing.expectEqual(@as(i64, 15), multi.at(0)[2].integer);
+    try std.testing.expectEqual(@as(i64, 2), multi.at(0)[3].integer);
+    try std.testing.expectEqual(@as(i64, 3), multi.at(1)[2].integer);
+    try std.testing.expectEqual(@as(i64, 7), multi.at(2)[2].integer);
+    try std.testing.expectEqual(@as(i64, 21), multi.at(3)[2].integer);
+    // Expression grouping key: parity of `a`.
+    var parity = try db.exec("SELECT a % 2 AS p, SUM(v) FROM gs GROUP BY a % 2 ORDER BY p;");
+    defer parity.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parity.count());
+    // ORDER BY p ASC: p=0 (a=2 rows) sum=28 first, then p=1 (a=1) sum=18.
+    try std.testing.expectEqual(@as(i64, 28), parity.at(0)[1].integer);
+    try std.testing.expectEqual(@as(i64, 18), parity.at(1)[1].integer);
+    // HAVING alias `s` keeps groups (1,1)=15 and (2,2)=21.
+    var havingAll = try db.exec("SELECT a, b, SUM(v) AS s FROM gs GROUP BY a, b HAVING s >= 10 ORDER BY a, b;");
+    defer havingAll.deinit();
+    try std.testing.expectEqual(@as(usize, 2), havingAll.count());
+    try std.testing.expectEqual(@as(i64, 15), havingAll.at(0)[2].integer);
+    try std.testing.expectEqual(@as(i64, 21), havingAll.at(1)[2].integer);
+    // SQLite `LIMIT a, b` means LIMIT b OFFSET a: skip first HAVING row.
+    var having = try db.exec("SELECT a, b, SUM(v) AS s FROM gs GROUP BY a, b HAVING s >= 10 ORDER BY a, b LIMIT 1, 10;");
+    defer having.deinit();
+    try std.testing.expectEqual(@as(usize, 1), having.count());
+    try std.testing.expectEqual(@as(i64, 21), having.at(0)[2].integer);
+    // OFFSET past the HAVING result empties the page.
+    var havingEmpty = try db.exec("SELECT a, b, SUM(v) AS s FROM gs GROUP BY a, b HAVING s >= 10 ORDER BY a, b LIMIT 2, 10;");
+    defer havingEmpty.deinit();
+    try std.testing.expectEqual(@as(usize, 0), havingEmpty.count());
+    // Parameterized LIMIT/OFFSET expressions via prepared binding.
+    var stmt = try db.prepare("SELECT a, b, SUM(v) FROM gs GROUP BY a, b ORDER BY a, b LIMIT ? OFFSET ?;");
+    defer stmt.finalize();
+    try stmt.bind(1, 2);
+    try stmt.bind(2, 1);
+    var limited = try stmt.query();
+    defer limited.deinit();
+    try std.testing.expectEqual(@as(usize, 2), limited.count());
+    try std.testing.expectEqual(@as(i64, 1), limited.at(0)[0].integer);
+    try std.testing.expectEqual(@as(i64, 2), limited.at(0)[1].integer);
+    try std.testing.expectEqual(@as(i64, 2), limited.at(1)[0].integer);
+}
+
+test "JSON arrow operators evaluate projected expressions" {
+    const path = "sqlite_zig_json_arrow_test.db";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    var db = try Connection.open(std.testing.allocator, path);
+    defer db.close();
+    var res = try db.exec("SELECT json_extract('{\"a\":1,\"b\":[2,3]}', '$.a'), '{\"a\":1}' -> '$.a', '{\"a\":\"hi\"}' ->> '$.a';");
+    defer res.deinit();
+    try std.testing.expectEqual(@as(usize, 1), res.count());
+    try std.testing.expectEqual(@as(i64, 1), res.at(0)[0].integer);
+    try std.testing.expectEqual(@as(i64, 1), res.at(0)[1].integer);
+    try std.testing.expectEqualStrings("hi", res.at(0)[2].text);
+    // Missing key yields NULL; nested path works.
+    var miss = try db.exec("SELECT '{\"a\":1}' -> '$.nope', '{\"o\":{\"k\":9}}' -> '$.o' -> '$.k';");
+    defer miss.deinit();
+    try std.testing.expect(miss.at(0)[0] == .null);
+    try std.testing.expectEqual(@as(i64, 9), miss.at(0)[1].integer);
+    // Projected from a table column.
+    var setup = try db.exec("CREATE TABLE jt (payload TEXT); INSERT INTO jt VALUES ('{\"n\":42}');");
+    setup.deinit();
+    var col = try db.exec("SELECT payload -> '$.n' AS n FROM jt;");
+    defer col.deinit();
+    try std.testing.expectEqual(@as(i64, 42), col.at(0)[0].integer);
+}
+
+test "json_group_array and json_group_object aggregate into JSON text" {
+    const path = "sqlite_zig_json_group_test.db";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    var db = try Connection.open(std.testing.allocator, path);
+    defer db.close();
+    var setup = try db.exec("CREATE TABLE jg (k TEXT, v INTEGER); INSERT INTO jg VALUES ('a', 1), ('a', 2), ('b', 3);");
+    setup.deinit();
+    var arr = try db.exec("SELECT json_group_array(v) FROM jg ORDER BY v;");
+    defer arr.deinit();
+    try std.testing.expectEqual(@as(usize, 1), arr.count());
+    // JSON array order follows scan order without ORDER BY on the source.
+    const arrText = arr.at(0)[0].text;
+    try std.testing.expect(std.mem.indexOf(u8, arrText, "1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, arrText, "3") != null);
+    try std.testing.expect(arrText[0] == '[');
+    try std.testing.expect(arrText[arrText.len - 1] == ']');
+    var groupedArr = try db.exec("SELECT k, json_group_array(v) FROM jg GROUP BY k ORDER BY k;");
+    defer groupedArr.deinit();
+    try std.testing.expectEqual(@as(usize, 2), groupedArr.count());
+    try std.testing.expectEqualStrings("a", groupedArr.at(0)[0].text);
+    try std.testing.expectEqualStrings("[1,2]", groupedArr.at(0)[1].text);
+    try std.testing.expectEqualStrings("[3]", groupedArr.at(1)[1].text);
+    var obj = try db.exec("SELECT k, json_group_object(k, v) FROM jg GROUP BY k ORDER BY k;");
+    defer obj.deinit();
+    try std.testing.expectEqual(@as(usize, 2), obj.count());
+    // Duplicate keys keep every pair in scan order (SQLite behavior).
+    try std.testing.expectEqualStrings("{\"a\":1,\"a\":2}", obj.at(0)[1].text);
+    try std.testing.expectEqualStrings("{\"b\":3}", obj.at(1)[1].text);
+}
+
+test "constraint-level ON CONFLICT policies override default abort" {
+    const path = "sqlite_zig_constraint_conflict_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+
+    var setup = try db.exec(
+        \\CREATE TABLE col_ig (id INTEGER PRIMARY KEY, email TEXT UNIQUE ON CONFLICT IGNORE);
+        \\CREATE TABLE col_rp (id INTEGER PRIMARY KEY, n INTEGER CHECK (n > 0) ON CONFLICT REPLACE);
+        \\CREATE TABLE tbl_ig (id INTEGER, email TEXT, UNIQUE (email) ON CONFLICT IGNORE);
+        \\CREATE TABLE tbl_ck (id INTEGER, n INT, CHECK (n >= 0) ON CONFLICT IGNORE);
+        \\CREATE TABLE def_ab (id INTEGER PRIMARY KEY);
+    );
+    setup.deinit();
+
+    var ig1 = try db.exec("INSERT INTO col_ig VALUES (1, 'a@x');");
+    ig1.deinit();
+    var ig2 = try db.exec("INSERT INTO col_ig VALUES (2, 'a@x'); SELECT count(*), min(email) FROM col_ig;");
+    defer ig2.deinit();
+    try std.testing.expectEqual(@as(i64, 1), ig2.rows[0][0].integer);
+    try std.testing.expectEqualStrings("a@x", ig2.rows[0][1].text);
+
+    var rp1 = try db.exec("INSERT INTO col_rp VALUES (1, 5);");
+    rp1.deinit();
+    // SQLite converts CHECK ON CONFLICT REPLACE to ABORT (insert.c:2089).
+    try std.testing.expectError(error.ConstraintViolation, db.exec("INSERT INTO col_rp VALUES (2, -1);"));
+    var rp2 = try db.exec("SELECT count(*) FROM col_rp;");
+    defer rp2.deinit();
+    try std.testing.expectEqual(@as(i64, 1), rp2.rows[0][0].integer);
+
+    var t1 = try db.exec("INSERT INTO tbl_ig VALUES (1, 'k');");
+    t1.deinit();
+    var t2 = try db.exec("INSERT INTO tbl_ig VALUES (2, 'k'); SELECT count(*) FROM tbl_ig;");
+    defer t2.deinit();
+    try std.testing.expectEqual(@as(i64, 1), t2.rows[0][0].integer);
+
+    // CHECK ON CONFLICT IGNORE skips the violating row (insert.c:2084-2085).
+    var c1 = try db.exec("INSERT INTO tbl_ck VALUES (1, -1);");
+    c1.deinit();
+    var c2 = try db.exec("SELECT count(*) FROM tbl_ck;");
+    defer c2.deinit();
+    try std.testing.expectEqual(@as(i64, 0), c2.rows[0][0].integer);
+
+    try std.testing.expectError(error.ConstraintViolation, db.exec("INSERT INTO def_ab VALUES (1); INSERT INTO def_ab VALUES (1);"));
+    var one = try db.exec("SELECT count(*) FROM def_ab;");
+    defer one.deinit();
+    try std.testing.expectEqual(@as(i64, 1), one.rows[0][0].integer);
+}
+
+test "FOR EACH STATEMENT triggers fire once per multi-row statement" {
+    const path = "sqlite_zig_stmt_trigger_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    var setup = try db.exec(
+        \\CREATE TABLE src (id INTEGER PRIMARY KEY, v INTEGER);
+        \\CREATE TABLE audit (n INTEGER);
+        \\CREATE TRIGGER src_stmt AFTER INSERT ON src FOR EACH STATEMENT BEGIN INSERT INTO audit VALUES (1); END;
+        \\CREATE TRIGGER src_row AFTER INSERT ON src FOR EACH ROW BEGIN INSERT INTO audit VALUES (10); END;
+    );
+    setup.deinit();
+
+    var multi = try db.exec("INSERT INTO src VALUES (1, 10), (2, 20), (3, 30); SELECT sum(CASE WHEN n = 1 THEN 1 ELSE 0 END), sum(CASE WHEN n = 10 THEN 1 ELSE 0 END) FROM audit;");
+    defer multi.deinit();
+    try std.testing.expectEqual(@as(i64, 1), multi.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 3), multi.rows[0][1].integer);
+
+    var single = try db.exec("DELETE FROM audit; INSERT INTO src VALUES (4, 40); SELECT sum(n = 1), sum(n = 10) FROM audit;");
+    defer single.deinit();
+    try std.testing.expectEqual(@as(i64, 1), single.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 1), single.rows[0][1].integer);
+
+    var body = try db.exec("SELECT sql FROM sqlite_schema WHERE name = 'src_stmt';");
+    defer body.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, body.rows[0][0].text, "FOR EACH STATEMENT") != null);
+}
+
+test "DDL clauses round trip through the on-disk image" {
+    const path = "sqlite_zig_ddl_roundtrip_test.db";
+    var db = try freshDb(path);
+    var setup = try db.exec(
+        \\CREATE TABLE parents (id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE);
+        \\CREATE TABLE kids (
+        \\  id INTEGER PRIMARY KEY ON CONFLICT REPLACE,
+        \\  pid INTEGER REFERENCES parents,
+        \\  amount REAL DEFAULT (0.0 + 1),
+        \\  stamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+        \\  doubled INTEGER GENERATED ALWAYS AS (id * 2) STORED,
+        \\  label TEXT UNIQUE ON CONFLICT IGNORE,
+        \\  CHECK (amount >= 0) ON CONFLICT IGNORE
+        \\);
+        \\CREATE TRIGGER kids_stmt AFTER INSERT ON kids FOR EACH STATEMENT BEGIN SELECT 1; END;
+        \\INSERT INTO parents VALUES (1, 'Ann');
+        \\INSERT INTO kids (id, pid, amount, label) VALUES (1, 1, 5, 'x');
+    );
+    setup.deinit();
+    db.close();
+
+    db = try Connection.open(std.testing.allocator, path);
+    defer dropDb(db, path);
+
+    var info = try db.exec("PRAGMA table_xinfo(kids);");
+    defer info.deinit();
+    var sawGenerated = false;
+    var sawDefaultExpr = false;
+    for (info.rows) |row| {
+        if (std.ascii.eqlIgnoreCase(row[1].text, "doubled")) {
+            sawGenerated = true;
+            try std.testing.expectEqual(@as(i64, 0), row[3].integer); // notnull
+            try std.testing.expectEqual(@as(i64, 3), row[6].integer); // hidden=STORED
+        }
+        if (std.ascii.eqlIgnoreCase(row[1].text, "amount") and row[4] == .text) {
+            sawDefaultExpr = true;
+            try std.testing.expect(std.mem.indexOf(u8, row[4].text, "DEFAULT") != null);
+        }
+    }
+    try std.testing.expect(sawGenerated);
+    try std.testing.expect(sawDefaultExpr);
+
+    var fk = try db.exec("PRAGMA foreign_key_list(kids);");
+    defer fk.deinit();
+    try std.testing.expectEqual(@as(usize, 1), fk.count());
+    try std.testing.expectEqualStrings("parents", fk.rows[0][2].text);
+    try std.testing.expectEqualStrings("pid", fk.rows[0][3].text);
+
+    var trig = try db.exec("SELECT sql FROM sqlite_schema WHERE name = 'kids_stmt';");
+    defer trig.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, trig.rows[0][0].text, "FOR EACH STATEMENT") != null);
+
+    var row = try db.exec("SELECT doubled, label FROM kids WHERE id = 1;");
+    defer row.deinit();
+    try std.testing.expectEqual(@as(i64, 2), row.rows[0][0].integer);
+
+    var fresh = try db.exec("INSERT INTO kids (id, pid, amount, label) VALUES (1, 1, 9, 'y'); SELECT count(*), label FROM kids WHERE id = 1;");
+    defer fresh.deinit();
+    try std.testing.expectEqual(@as(i64, 1), fresh.rows[0][0].integer);
+    try std.testing.expectEqualStrings("y", fresh.rows[0][1].text);
+
+    var ig = try db.exec("INSERT INTO kids (id, pid, amount, label) VALUES (2, 1, 9, 'y'); SELECT count(*) FROM kids WHERE label = 'y';");
+    defer ig.deinit();
+    try std.testing.expectEqual(@as(i64, 1), ig.rows[0][0].integer);
+}
+
+test "window functions over join" {
+    const path = "sqlite_zig_window_join_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    var s1 = try db.exec("CREATE TABLE depts (id INTEGER PRIMARY KEY, name TEXT);");
+    s1.deinit();
+    var s2 = try db.exec("CREATE TABLE emps (id INTEGER PRIMARY KEY, dept_id INTEGER, name TEXT, salary INTEGER);");
+    s2.deinit();
+    var s3 = try db.exec("INSERT INTO depts VALUES (1, 'Engineering'), (2, 'Sales');");
+    s3.deinit();
+    var s4 = try db.exec("INSERT INTO emps VALUES (10, 1, 'Alice', 100), (20, 1, 'Bob', 120), (30, 2, 'Charlie', 90);");
+    s4.deinit();
+    var res = try db.exec("SELECT emps.name, depts.name, ROW_NUMBER() OVER (PARTITION BY depts.name ORDER BY emps.salary DESC) AS rn FROM emps JOIN depts ON emps.dept_id = depts.id ORDER BY depts.name, rn;");
+    defer res.deinit();
+    try std.testing.expectEqual(@as(usize, 3), res.count());
+    try std.testing.expectEqualStrings("Bob", res.rows[0][0].text);
+    try std.testing.expectEqualStrings("Engineering", res.rows[0][1].text);
+    try std.testing.expectEqual(@as(i64, 1), res.rows[0][2].integer);
+    try std.testing.expectEqualStrings("Alice", res.rows[1][0].text);
+    try std.testing.expectEqualStrings("Engineering", res.rows[1][1].text);
+    try std.testing.expectEqual(@as(i64, 2), res.rows[1][2].integer);
+    try std.testing.expectEqualStrings("Charlie", res.rows[2][0].text);
+    try std.testing.expectEqualStrings("Sales", res.rows[2][1].text);
+    try std.testing.expectEqual(@as(i64, 1), res.rows[2][2].integer);
+}
+
+test "EXPLAIN produces real VM bytecode program" {
+    const path = "sqlite_zig_explain_test.db";
+    var db = try freshDb(path);
+    defer dropDb(db, path);
+    var setup = try db.exec("CREATE TABLE t (id INTEGER, val TEXT);");
+    setup.deinit();
+
+    var explainSel = try db.exec("EXPLAIN SELECT id, val FROM t WHERE id = 1;");
+    defer explainSel.deinit();
+    try std.testing.expectEqual(@as(usize, 8), explainSel.columns.len);
+    try std.testing.expectEqualStrings("addr", explainSel.columns[0]);
+    try std.testing.expectEqualStrings("opcode", explainSel.columns[1]);
+    try std.testing.expectEqualStrings("p1", explainSel.columns[2]);
+    try std.testing.expect(explainSel.count() > 0);
+
+    var explainIns = try db.exec("EXPLAIN INSERT INTO t VALUES (1, 'hello');");
+    defer explainIns.deinit();
+    try std.testing.expectEqual(@as(usize, 8), explainIns.columns.len);
+    try std.testing.expect(explainIns.count() > 0);
+
+    var explainUpd = try db.exec("EXPLAIN UPDATE t SET val = 'world' WHERE id = 1;");
+    defer explainUpd.deinit();
+    try std.testing.expectEqual(@as(usize, 8), explainUpd.columns.len);
+    try std.testing.expect(explainUpd.count() > 0);
+
+    var explainDel = try db.exec("EXPLAIN DELETE FROM t WHERE id = 1;");
+    defer explainDel.deinit();
+    try std.testing.expectEqual(@as(usize, 8), explainDel.columns.len);
+    try std.testing.expect(explainDel.count() > 0);
 }

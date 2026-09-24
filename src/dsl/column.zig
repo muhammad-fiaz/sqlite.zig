@@ -466,6 +466,16 @@ pub fn count(col: anytype) WindowBuilder {
     return WindowBuilder.withArg(col, "count");
 }
 
+/// `total(col) OVER (...)` aggregate window handle.
+pub fn total(col: anytype) WindowBuilder {
+    return WindowBuilder.withArg(col, "total");
+}
+
+/// `group_concat(col) OVER (...)` aggregate window handle.
+pub fn groupConcat(col: anytype) WindowBuilder {
+    return WindowBuilder.withArg(col, "group_concat");
+}
+
 /// `count(*) OVER (...)` aggregate window handle.
 pub fn countStar() WindowBuilder {
     return .{ .func = "count" };
@@ -714,6 +724,18 @@ pub fn Column(comptime tableName: []const u8, comptime columnName: []const u8, c
         pub fn isNotNull(self: Self) Expr {
             return .{ .column = self.ref(), .operator = .isNotNull, .function = self.func };
         }
+        pub fn isTrue(self: Self) Expr {
+            return .{ .column = self.ref(), .operator = .isTrue, .function = self.func };
+        }
+        pub fn isNotTrue(self: Self) Expr {
+            return .{ .column = self.ref(), .operator = .isNotTrue, .function = self.func };
+        }
+        pub fn isFalse(self: Self) Expr {
+            return .{ .column = self.ref(), .operator = .isFalse, .function = self.func };
+        }
+        pub fn isNotFalse(self: Self) Expr {
+            return .{ .column = self.ref(), .operator = .isNotFalse, .function = self.func };
+        }
         pub fn between(self: Self, lo: anytype, hi: anytype) Expr {
             return .{ .column = self.ref(), .operator = .between, .rhs = rhsFrom(lo), .rhs2 = rhsFrom(hi), .function = self.func };
         }
@@ -731,8 +753,20 @@ pub fn Column(comptime tableName: []const u8, comptime columnName: []const u8, c
         pub fn sum(self: Self) Projection {
             return .{ .kind = .aggregate, .column = self.ref(), .function = "SUM" };
         }
+        pub fn sumDistinct(self: Self) Projection {
+            return .{ .kind = .aggregate, .column = self.ref(), .function = "SUM", .distinct = true };
+        }
         pub fn avg(self: Self) Projection {
             return .{ .kind = .aggregate, .column = self.ref(), .function = "AVG" };
+        }
+        pub fn avgDistinct(self: Self) Projection {
+            return .{ .kind = .aggregate, .column = self.ref(), .function = "AVG", .distinct = true };
+        }
+        pub fn total(self: Self) Projection {
+            return .{ .kind = .aggregate, .column = self.ref(), .function = "TOTAL" };
+        }
+        pub fn totalDistinct(self: Self) Projection {
+            return .{ .kind = .aggregate, .column = self.ref(), .function = "TOTAL", .distinct = true };
         }
         pub fn min(self: Self) Projection {
             return .{ .kind = .aggregate, .column = self.ref(), .function = "MIN" };
@@ -745,6 +779,18 @@ pub fn Column(comptime tableName: []const u8, comptime columnName: []const u8, c
         }
         pub fn countDistinct(self: Self) Projection {
             return .{ .kind = .aggregate, .column = self.ref(), .function = "COUNT", .distinct = true };
+        }
+        pub fn groupConcat(self: Self) Projection {
+            return .{ .kind = .aggregate, .column = self.ref(), .function = "GROUP_CONCAT" };
+        }
+        pub fn groupConcatDistinct(self: Self) Projection {
+            return .{ .kind = .aggregate, .column = self.ref(), .function = "GROUP_CONCAT", .distinct = true };
+        }
+        pub fn groupConcatSep(self: Self, sep: anytype) Projection {
+            return .{ .kind = .aggregate, .column = self.ref(), .function = "GROUP_CONCAT", .argument = toValue(sep), .hasArgument = true };
+        }
+        pub fn groupConcatDistinctSep(self: Self, sep: anytype) Projection {
+            return .{ .kind = .aggregate, .column = self.ref(), .function = "GROUP_CONCAT", .argument = toValue(sep), .hasArgument = true, .distinct = true };
         }
 
         fn wrap(self: Self, call: FuncCall) Self {
@@ -1042,6 +1088,18 @@ pub const DynamicColumn = struct {
     pub fn isNotNull(self: @This()) Expr {
         return .{ .column = self.ref(), .operator = .isNotNull, .function = self.func };
     }
+    pub fn isTrue(self: @This()) Expr {
+        return .{ .column = self.ref(), .operator = .isTrue, .function = self.func };
+    }
+    pub fn isNotTrue(self: @This()) Expr {
+        return .{ .column = self.ref(), .operator = .isNotTrue, .function = self.func };
+    }
+    pub fn isFalse(self: @This()) Expr {
+        return .{ .column = self.ref(), .operator = .isFalse, .function = self.func };
+    }
+    pub fn isNotFalse(self: @This()) Expr {
+        return .{ .column = self.ref(), .operator = .isNotFalse, .function = self.func };
+    }
     pub fn between(self: @This(), lo: anytype, hi: anytype) Expr {
         return .{
             .column = self.ref(),
@@ -1071,8 +1129,20 @@ pub const DynamicColumn = struct {
     pub fn sum(self: @This()) Projection {
         return .{ .kind = .aggregate, .column = self.ref(), .function = "SUM" };
     }
+    pub fn sumDistinct(self: @This()) Projection {
+        return .{ .kind = .aggregate, .column = self.ref(), .function = "SUM", .distinct = true };
+    }
     pub fn avg(self: @This()) Projection {
         return .{ .kind = .aggregate, .column = self.ref(), .function = "AVG" };
+    }
+    pub fn avgDistinct(self: @This()) Projection {
+        return .{ .kind = .aggregate, .column = self.ref(), .function = "AVG", .distinct = true };
+    }
+    pub fn total(self: @This()) Projection {
+        return .{ .kind = .aggregate, .column = self.ref(), .function = "TOTAL" };
+    }
+    pub fn totalDistinct(self: @This()) Projection {
+        return .{ .kind = .aggregate, .column = self.ref(), .function = "TOTAL", .distinct = true };
     }
     pub fn min(self: @This()) Projection {
         return .{ .kind = .aggregate, .column = self.ref(), .function = "MIN" };
@@ -1085,6 +1155,18 @@ pub const DynamicColumn = struct {
     }
     pub fn countDistinct(self: @This()) Projection {
         return .{ .kind = .aggregate, .column = self.ref(), .function = "COUNT", .distinct = true };
+    }
+    pub fn groupConcat(self: @This()) Projection {
+        return .{ .kind = .aggregate, .column = self.ref(), .function = "GROUP_CONCAT" };
+    }
+    pub fn groupConcatDistinct(self: @This()) Projection {
+        return .{ .kind = .aggregate, .column = self.ref(), .function = "GROUP_CONCAT", .distinct = true };
+    }
+    pub fn groupConcatSep(self: @This(), sep: anytype) Projection {
+        return .{ .kind = .aggregate, .column = self.ref(), .function = "GROUP_CONCAT", .argument = toValue(sep), .hasArgument = true };
+    }
+    pub fn groupConcatDistinctSep(self: @This(), sep: anytype) Projection {
+        return .{ .kind = .aggregate, .column = self.ref(), .function = "GROUP_CONCAT", .argument = toValue(sep), .hasArgument = true, .distinct = true };
     }
 
     fn wrap(self: @This(), call: FuncCall) @This() {
@@ -1401,10 +1483,25 @@ test "typed columns build orders aggregates and wrappers" {
     try std.testing.expect(!asc.descending);
     try std.testing.expectEqualStrings("age", asc.column.name);
     try std.testing.expect(age.desc().descending);
-    const total = age.sum();
-    try std.testing.expect(total.kind == .aggregate);
-    try std.testing.expectEqualStrings("SUM", total.function);
-    try std.testing.expectEqualStrings("users", total.column.table);
+    const sumProj = age.sum();
+    try std.testing.expect(sumProj.kind == .aggregate);
+    try std.testing.expectEqualStrings("SUM", sumProj.function);
+    try std.testing.expectEqualStrings("users", sumProj.column.table);
+    const totProj = age.total();
+    try std.testing.expect(totProj.kind == .aggregate);
+    try std.testing.expectEqualStrings("TOTAL", totProj.function);
+    const sumDist = age.sumDistinct();
+    try std.testing.expect(sumDist.distinct);
+    try std.testing.expectEqualStrings("SUM", sumDist.function);
+    const avgDist = age.avgDistinct();
+    try std.testing.expect(avgDist.distinct);
+    try std.testing.expectEqualStrings("AVG", avgDist.function);
+    const gc = age.groupConcat();
+    try std.testing.expectEqualStrings("GROUP_CONCAT", gc.function);
+    const gcSep = age.groupConcatSep(", ");
+    try std.testing.expectEqualStrings("GROUP_CONCAT", gcSep.function);
+    try std.testing.expect(gcSep.hasArgument);
+    try std.testing.expectEqualStrings(", ", gcSep.argument.text);
     const lowered = (Column("users", "name", []const u8){}).lower();
     const lp = lowered.projection();
     try std.testing.expect(lp.kind == .scalar);

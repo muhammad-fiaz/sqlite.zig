@@ -49,6 +49,10 @@ pub const Operator = enum {
     isNotDistinct,
     between,
     notBetween,
+    isTrue,
+    isNotTrue,
+    isFalse,
+    isNotFalse,
 
     /// Reference keyword rendering for diagnostics/tests. Never parsed back.
     pub fn sql(self: Operator) []const u8 {
@@ -75,6 +79,10 @@ pub const Operator = enum {
             .isNotDistinct => "IS NOT DISTINCT FROM",
             .between => "BETWEEN",
             .notBetween => "NOT BETWEEN",
+            .isTrue => "IS TRUE",
+            .isNotTrue => "IS NOT TRUE",
+            .isFalse => "IS FALSE",
+            .isNotFalse => "IS NOT FALSE",
         };
     }
 };
@@ -98,9 +106,9 @@ pub const Expr = struct {
     collate: ?[]const u8 = null,
     negated: bool = false,
 
-    /// True unless the operator is IS NULL / IS NOT NULL (no RHS needed).
+    /// True unless the operator is IS NULL / IS NOT NULL / IS [NOT] TRUE/FALSE (no RHS needed).
     pub fn needsRhs(self: Expr) bool {
-        return self.operator != .isNull and self.operator != .isNotNull;
+        return self.operator != .isNull and self.operator != .isNotNull and self.operator != .isTrue and self.operator != .isNotTrue and self.operator != .isFalse and self.operator != .isNotFalse;
     }
 
     /// True only for BETWEEN / NOT BETWEEN (a second RHS bound is required).

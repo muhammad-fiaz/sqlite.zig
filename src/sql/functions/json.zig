@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const Value = @import("../../vm/value.zig").Value;
+const scalarFn = @import("scalar.zig");
 
 const PathStep = union(enum) {
     key: []const u8,
@@ -370,6 +371,60 @@ pub fn evalJsonExtract(allocator: std.mem.Allocator, args: []const Value) !Value
     }
     const resStr = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(std.json.Value{ .array = resultList }, .{})});
     return .{ .text = resStr };
+}
+
+/// `json -> key` / `json ->> key` (and integer indexes): SQL-value extract
+/// for `->`, always-text extract for `->>`. NULL input/path → NULL.
+pub fn evalJsonArrowOperator(allocator: std.mem.Allocator, jsonVal: Value, pathVal: Value, asText: bool) !Value {
+    if (jsonVal == .null or pathVal == .null) return .null;
+    if (jsonVal != .text) return .null;
+    const pathText: []const u8 = switch (pathVal) {
+        .text => |t| t,
+        .integer => |i| blk: {
+            const buf = try std.fmt.allocPrint(allocator, "[{d}]", .{i});
+            defer allocator.free(buf);
+            break :blk try allocator.dupe(u8, buf);
+        },
+        .real => |r| blk: {
+            if (r != std.math.trunc(r)) return .null;
+            const buf = try std.fmt.allocPrint(allocator, "[{d}]", .{@as(i64, @intFromFloat(r))});
+            defer allocator.free(buf);
+            break :blk try allocator.dupe(u8, buf);
+        },
+        else => return .null,
+    };
+    defer if (pathVal != .text) allocator.free(pathText);
+    // Build a json_extract-style path: `.name` or `[n]`.
+    var pathBuf = std.ArrayList(u8).empty;
+    defer pathBuf.deinit(allocator);
+    if (std.mem.startsWith(u8, pathText, "$")) {
+        try pathBuf.appendSlice(allocator, pathText);
+    } else if (std.mem.startsWith(u8, pathText, "[") or std.mem.indexOfScalar(u8, pathText, '.') != null) {
+        try pathBuf.appendSlice(allocator, "$");
+        try pathBuf.appendSlice(allocator, pathText);
+    } else {
+        try pathBuf.appendSlice(allocator, "$.");
+        try pathBuf.appendSlice(allocator, pathText);
+    }
+    const args = [_]Value{ jsonVal, .{ .text = pathBuf.items } };
+    const extracted = try evalJsonExtract(allocator, &args);
+    if (asText) {
+        if (extracted == .null) return .null;
+        // Unwrap text to plain SQL text; stringify non-text via json_quote.
+        if (extracted == .text) return extracted;
+        const quoted = try scalarFn.evalJsonQuote(allocator, extracted);
+        freeValueShallow(allocator, extracted);
+        return quoted;
+    }
+    return extracted;
+}
+
+fn freeValueShallow(allocator: std.mem.Allocator, v: Value) void {
+    switch (v) {
+        .text => |t| allocator.free(t),
+        .blob => |b| allocator.free(b),
+        else => {},
+    }
 }
 
 /// `json_array_length(X[,P])`: element count of the array at path P (or

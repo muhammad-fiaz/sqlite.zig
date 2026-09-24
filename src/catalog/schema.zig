@@ -20,13 +20,13 @@ const statsMod = @import("stats.zig");
 /// dupes; `defaultValue` owns its text/blob payload; `checkExpr`/
 /// `generatedExpr` are schema-owned cloned ASTs. Borrowed views dangle after
 /// drop/rename/deinit.
-pub const Column = struct { name: []u8, typeName: []u8, primaryKey: bool, notNull: bool, unique: bool = false, autoincrement: bool = false, defaultValue: ?Value = null, foreignTable: ?[]u8 = null, foreignColumn: ?[]u8 = null, onDelete: ast.ReferentialAction = .restrict, onUpdate: ast.ReferentialAction = .restrict, fkDeferrable: bool = false, fkInitiallyDeferred: bool = false, checkExpr: ?ast.Expr = null, generatedExpr: ?ast.Expr = null, generatedStored: bool = false };
+pub const Column = struct { name: []u8, typeName: []u8, primaryKey: bool, notNull: bool, unique: bool = false, autoincrement: bool = false, defaultValue: ?Value = null, defaultExpr: ?ast.Expr = null, collate: ?[]u8 = null, conflict: ast.ConflictPolicy = .none, foreignTable: ?[]u8 = null, foreignColumn: ?[]u8 = null, onDelete: ast.ReferentialAction = .restrict, onUpdate: ast.ReferentialAction = .restrict, fkDeferrable: bool = false, fkInitiallyDeferred: bool = false, checkExpr: ?ast.Expr = null, generatedExpr: ?ast.Expr = null, generatedStored: bool = false };
 /// Owned row: `values` has one entry per column and owns text/blob payloads.
 /// Freed by schema lifecycle ops; never retain after drop/truncate/deinit.
 pub const Row = struct { values: []Value };
 /// Owned table-level constraint. Name lists and FK strings are schema-owned
 /// dupes; `checkExpr` is a schema-owned cloned AST.
-pub const Constraint = struct { kind: enum { primaryKey, unique, foreignKey, check }, columns: [][]u8, foreignTable: ?[]u8 = null, referencedColumns: [][]u8 = &.{}, onDelete: ast.ReferentialAction = .restrict, onUpdate: ast.ReferentialAction = .restrict, deferrable: bool = false, initiallyDeferred: bool = false, checkExpr: ?ast.Expr = null };
+pub const Constraint = struct { kind: enum { primaryKey, unique, foreignKey, check }, columns: [][]u8, foreignTable: ?[]u8 = null, referencedColumns: [][]u8 = &.{}, onDelete: ast.ReferentialAction = .restrict, onUpdate: ast.ReferentialAction = .restrict, deferrable: bool = false, initiallyDeferred: bool = false, checkExpr: ?ast.Expr = null, conflict: ast.ConflictPolicy = .none };
 /// Owned table: heap-allocated by the schema (`tables` holds `*Table`).
 /// `name`/columns/constraints/rows/virtual strings are schema-owned. A `*Table`
 /// from `find` borrows the schema and dangles after drop/remove/deinit.
@@ -61,6 +61,8 @@ pub const Trigger = struct {
     updateOf: [][]u8 = &.{},
     whenSql: ?[]u8 = null,
     body: []u8,
+    /// True for `FOR EACH ROW` (default); false for `FOR EACH STATEMENT`.
+    eachRow: bool = true,
 
     /// True when this trigger fires for an UPDATE touching `updatedColumns`.
     /// Non-UPDATE events and column-less UPDATE triggers always fire.
@@ -87,6 +89,9 @@ pub const Schema = struct {
     /// `PRAGMA defer_foreign_keys`: every FK check postpones to COMMIT (or
     /// statement end in autocommit), including NOT DEFERRABLE constraints.
     deferForeignKeys: bool = false,
+    /// Set when the last `appendRow`/`validateUpdate` failed with a
+    /// constraint-level `ON CONFLICT` policy (`.none` = default ABORT).
+    lastConstraintConflict: ast.ConflictPolicy = .none,
 
     /// Borrow an empty catalog over `allocator`. Owns nothing yet; `deinit`
     /// releases whatever is created afterwards. Never fails.
@@ -234,7 +239,7 @@ pub const Schema = struct {
             updateOf[index] = try self.allocator.dupe(u8, column);
             copied += 1;
         }
-        try self.triggers.append(self.allocator, .{ .name = try self.allocator.dupe(u8, definition.name), .table = try self.allocator.dupe(u8, definition.table), .timing = definition.timing, .event = definition.event, .updateOf = updateOf, .whenSql = whenSql, .body = try self.allocator.dupe(u8, definition.body) });
+        try self.triggers.append(self.allocator, .{ .name = try self.allocator.dupe(u8, definition.name), .table = try self.allocator.dupe(u8, definition.table), .timing = definition.timing, .event = definition.event, .updateOf = updateOf, .whenSql = whenSql, .body = try self.allocator.dupe(u8, definition.body), .eachRow = definition.eachRow });
     }
 
     /// Drop a trigger by name, freeing its dupes. Fails `UnknownTrigger`.
@@ -466,7 +471,7 @@ pub const Schema = struct {
             }
             if (!hasPk) {
                 for (definitionsConstraints) |c| {
-                    if (c == .primaryKey and c.primaryKey.len > 0) {
+                    if (c == .primaryKey and c.primaryKey.columns.len > 0) {
                         hasPk = true;
                         break;
                     }
@@ -483,6 +488,8 @@ pub const Schema = struct {
             self.allocator.free(column.name);
             self.allocator.free(column.typeName);
             if (column.defaultValue) |value| freeValue(self.allocator, value);
+            if (column.defaultExpr) |de| ast.freeOwnedExpr(self.allocator, de);
+            if (column.collate) |colName| self.allocator.free(colName);
             if (column.foreignTable) |value| self.allocator.free(value);
             if (column.foreignColumn) |value| self.allocator.free(value);
             if (column.checkExpr) |chk| ast.freeOwnedExpr(self.allocator, chk);
@@ -493,20 +500,22 @@ pub const Schema = struct {
             var inPk = definition.primaryKey;
             for (definitionsConstraints) |c| {
                 if (c == .primaryKey) {
-                    for (c.primaryKey) |pkCol| {
+                    for (c.primaryKey.columns) |pkCol| {
                         if (std.ascii.eqlIgnoreCase(pkCol, definition.name)) {
                             inPk = true;
-                            if (c.primaryKey.len == 1) isPk = true;
+                            if (c.primaryKey.columns.len == 1) isPk = true;
                             break;
                         }
                     }
                 }
             }
             const isNotNull = definition.notNull or (options.withoutRowid and inPk);
-            const clonedCheck = if (definition.checkExpr) |chk| try ast.cloneOwnedExpr(self.allocator, chk) else null;
+            var clonedCheck = if (definition.checkExpr) |chk| try ast.cloneOwnedExpr(self.allocator, chk) else null;
             errdefer if (clonedCheck) |chk| ast.freeOwnedExpr(self.allocator, chk);
-            const clonedGen = if (definition.generatedExpr) |gen| try ast.cloneOwnedExpr(self.allocator, gen) else null;
+            var clonedGen = if (definition.generatedExpr) |gen| try ast.cloneOwnedExpr(self.allocator, gen) else null;
             errdefer if (clonedGen) |gen| ast.freeOwnedExpr(self.allocator, gen);
+            var clonedDefaultExpr = if (definition.defaultExpr) |de| try ast.cloneOwnedExpr(self.allocator, de) else null;
+            errdefer if (clonedDefaultExpr) |de| ast.freeOwnedExpr(self.allocator, de);
 
             columns[index] = blk: {
                 const ownedColName = try self.allocator.dupe(u8, definition.name);
@@ -515,9 +524,11 @@ pub const Schema = struct {
                 errdefer self.allocator.free(ownedColType);
                 const ownedColDefault = if (definition.defaultValue) |value| try self.copyValue(value) else null;
                 errdefer if (ownedColDefault) |val| freeValue(self.allocator, val);
+                const ownedColCollate = if (definition.collate) |colName| try self.allocator.dupe(u8, colName) else null;
+                errdefer if (ownedColCollate) |val| self.allocator.free(val);
                 const ownedColForeignTable = if (definition.foreignKey) |foreignKey| try self.allocator.dupe(u8, foreignKey.table) else null;
                 errdefer if (ownedColForeignTable) |val| self.allocator.free(val);
-                const ownedColForeignColumn = if (definition.foreignKey) |foreignKey| try self.allocator.dupe(u8, foreignKey.column) else null;
+                const ownedColForeignColumn = if (definition.foreignKey) |foreignKey| if (foreignKey.column.len != 0) try self.allocator.dupe(u8, foreignKey.column) else null else null;
                 errdefer if (ownedColForeignColumn) |val| self.allocator.free(val);
                 break :blk .{
                     .name = ownedColName,
@@ -527,6 +538,9 @@ pub const Schema = struct {
                     .unique = definition.unique,
                     .autoincrement = definition.autoincrement,
                     .defaultValue = ownedColDefault,
+                    .defaultExpr = clonedDefaultExpr,
+                    .collate = ownedColCollate,
+                    .conflict = definition.conflict,
                     .foreignTable = ownedColForeignTable,
                     .foreignColumn = ownedColForeignColumn,
                     .onDelete = if (definition.foreignKey) |foreignKey| foreignKey.onDelete else .restrict,
@@ -538,6 +552,10 @@ pub const Schema = struct {
                     .generatedStored = definition.generatedStored,
                 };
             };
+            // Ownership moved into columns[index]: disarm clone errdefers.
+            clonedCheck = null;
+            clonedGen = null;
+            clonedDefaultExpr = null;
             count += 1;
         }
         const constraints = try self.allocator.alloc(Constraint, definitionsConstraints.len);
@@ -553,10 +571,16 @@ pub const Schema = struct {
         };
         for (definitionsConstraints, 0..) |definition, index| {
             const sourceColumns = switch (definition) {
-                .primaryKey => |value| value,
-                .unique => |value| value,
+                .primaryKey => |value| value.columns,
+                .unique => |value| value.columns,
                 .foreignKey => |value| value.columns,
                 .check => &.{},
+            };
+            const sourceConflict = switch (definition) {
+                .primaryKey => |value| value.conflict,
+                .unique => |value| value.conflict,
+                .check => |value| value.conflict,
+                .foreignKey => ast.ConflictPolicy.none,
             };
             const copiedColumns = try self.allocator.alloc([]u8, sourceColumns.len);
             var copiedCount: usize = 0;
@@ -566,7 +590,7 @@ pub const Schema = struct {
                 copiedColumns[columnIdx] = try self.allocator.dupe(u8, column);
                 copiedCount += 1;
             }
-            const clonedCheck = if (definition == .check) try ast.cloneOwnedExpr(self.allocator, definition.check) else null;
+            const clonedCheck = if (definition == .check) try ast.cloneOwnedExpr(self.allocator, definition.check.expr) else null;
             errdefer if (clonedCheck) |chk| ast.freeOwnedExpr(self.allocator, chk);
 
             constraints[index] = .{
@@ -578,12 +602,36 @@ pub const Schema = struct {
                 },
                 .columns = copiedColumns,
                 .checkExpr = clonedCheck,
+                .conflict = sourceConflict,
             };
             switch (definition) {
                 .foreignKey => |foreignKey| {
-                    if (foreignKey.referencedColumns.len != sourceColumns.len) return error.ConstraintViolation;
-                    const referencedColumns = try self.allocator.alloc([]u8, foreignKey.referencedColumns.len);
-                    for (foreignKey.referencedColumns, 0..) |column, columnIdx| {
+                    // Bare `REFERENCES t` (empty column list) targets the
+                    // parent primary key when the parent is already known.
+                    var parentCols = foreignKey.referencedColumns;
+                    var bareResolved = false;
+                    if (parentCols.len == 0) {
+                        if (self.findConst(foreignKey.table)) |parent| {
+                            var pks = std.ArrayList([]const u8).empty;
+                            defer pks.deinit(self.allocator);
+                            for (parent.columns) |col| if (col.primaryKey) try pks.append(self.allocator, col.name);
+                            if (pks.items.len == 0) {
+                                // WITHOUT ROWID composite PK is table-level; scan constraints.
+                                for (parent.constraints) |c| if (c.kind == .primaryKey) for (c.columns) |pkName| try pks.append(self.allocator, pkName);
+                            }
+                            if (pks.items.len != 0 and pks.items.len == sourceColumns.len) {
+                                parentCols = try pks.toOwnedSlice(self.allocator);
+                                bareResolved = true;
+                            }
+                        }
+                    }
+                    defer if (bareResolved) {
+                        for (parentCols) |c| self.allocator.free(c);
+                        self.allocator.free(parentCols);
+                    };
+                    if (parentCols.len != sourceColumns.len) return error.ConstraintViolation;
+                    const referencedColumns = try self.allocator.alloc([]u8, parentCols.len);
+                    for (parentCols, 0..) |column, columnIdx| {
                         referencedColumns[columnIdx] = try self.allocator.dupe(u8, column);
                         if (self.findConst(foreignKey.table)) |parent| {
                             if (self.columnIndex(parent, column) == null) return error.UnknownColumn;
@@ -1072,11 +1120,15 @@ pub const Schema = struct {
             errdefer self.allocator.free(ownedName);
             const ownedType = try self.allocator.dupe(u8, definition.typeName);
             errdefer self.allocator.free(ownedType);
-            const ownedDefault = if (definition.defaultValue) |value| try self.copyValue(value) else null;
-            errdefer if (ownedDefault) |val| freeValue(self.allocator, val);
+            const ownedColDefault = if (definition.defaultValue) |value| try self.copyValue(value) else null;
+            errdefer if (ownedColDefault) |val| freeValue(self.allocator, val);
+            const clonedDefaultExpr = if (definition.defaultExpr) |de| try ast.cloneOwnedExpr(self.allocator, de) else null;
+            errdefer if (clonedDefaultExpr) |de| ast.freeOwnedExpr(self.allocator, de);
+            const ownedColCollate = if (definition.collate) |colName| try self.allocator.dupe(u8, colName) else null;
+            errdefer if (ownedColCollate) |val| self.allocator.free(val);
             const ownedForeignTable = if (definition.foreignKey) |foreignKey| try self.allocator.dupe(u8, foreignKey.table) else null;
             errdefer if (ownedForeignTable) |val| self.allocator.free(val);
-            const ownedForeignColumn = if (definition.foreignKey) |foreignKey| try self.allocator.dupe(u8, foreignKey.column) else null;
+            const ownedForeignColumn = if (definition.foreignKey) |foreignKey| if (foreignKey.column.len != 0) try self.allocator.dupe(u8, foreignKey.column) else null else null;
             errdefer if (ownedForeignColumn) |val| self.allocator.free(val);
             break :blk .{
                 .name = ownedName,
@@ -1085,7 +1137,10 @@ pub const Schema = struct {
                 .notNull = definition.notNull,
                 .unique = definition.unique,
                 .autoincrement = definition.autoincrement,
-                .defaultValue = ownedDefault,
+                .defaultValue = ownedColDefault,
+                .defaultExpr = clonedDefaultExpr,
+                .collate = ownedColCollate,
+                .conflict = definition.conflict,
                 .foreignTable = ownedForeignTable,
                 .foreignColumn = ownedForeignColumn,
                 .onDelete = if (definition.foreignKey) |foreignKey| foreignKey.onDelete else .noAction,
@@ -1106,6 +1161,8 @@ pub const Schema = struct {
             self.allocator.free(newColumns[table.columns.len].name);
             self.allocator.free(newColumns[table.columns.len].typeName);
             if (newColumns[table.columns.len].defaultValue) |val| freeValue(self.allocator, val);
+            if (newColumns[table.columns.len].defaultExpr) |de| ast.freeOwnedExpr(self.allocator, de);
+            if (newColumns[table.columns.len].collate) |colName| self.allocator.free(colName);
             if (newColumns[table.columns.len].foreignTable) |val| self.allocator.free(val);
             if (newColumns[table.columns.len].foreignColumn) |val| self.allocator.free(val);
             if (newColumns[table.columns.len].checkExpr) |chk| ast.freeOwnedExpr(self.allocator, chk);
@@ -1319,6 +1376,8 @@ pub const Schema = struct {
         self.allocator.free(oldColumn.name);
         self.allocator.free(oldColumn.typeName);
         if (oldColumn.defaultValue) |value| freeValue(self.allocator, value);
+        if (oldColumn.defaultExpr) |de| ast.freeOwnedExpr(self.allocator, de);
+        if (oldColumn.collate) |colName| self.allocator.free(colName);
         if (oldColumn.foreignTable) |value| self.allocator.free(value);
         if (oldColumn.foreignColumn) |value| self.allocator.free(value);
         if (oldColumn.checkExpr) |chk| ast.freeOwnedExpr(self.allocator, chk);
@@ -1332,6 +1391,38 @@ pub const Schema = struct {
     /// canonical lookup instead of duplicating the scan.
     pub fn columnIndex(self: *const Schema, table: *const Table, name: []const u8) ?usize {
         _ = self;
+        for (table.columns, 0..) |column, index| if (std.ascii.eqlIgnoreCase(column.name, name)) return index;
+        return null;
+    }
+
+    /// Index of the parent table's single-column primary key (column-level
+    /// `PRIMARY KEY` or one-column table-level PK). Null for composite or
+    /// missing PKs — bare `REFERENCES t` needs a single parent key column.
+    pub fn parentPkColumnIndex(table: *const Table) ?usize {
+        var found: ?usize = null;
+        for (table.columns, 0..) |column, index| {
+            if (!column.primaryKey) continue;
+            if (found != null) return null;
+            found = index;
+        }
+        if (found != null) {
+            for (table.constraints) |c| if (c.kind == .primaryKey and c.columns.len > 1) return null;
+            return found;
+        }
+        // Table-level single-column PK.
+        var pkCount: usize = 0;
+        var pkIdx: ?usize = null;
+        for (table.constraints) |c| {
+            if (c.kind != .primaryKey) continue;
+            if (c.columns.len != 1) return null;
+            pkCount += 1;
+            pkIdx = columnIndexInner(table, c.columns[0]);
+        }
+        if (pkCount == 1) return pkIdx;
+        return null;
+    }
+
+    fn columnIndexInner(table: *const Table, name: []const u8) ?usize {
         for (table.columns, 0..) |column, index| if (std.ascii.eqlIgnoreCase(column.name, name)) return index;
         return null;
     }
@@ -1358,6 +1449,8 @@ pub const Schema = struct {
             self.allocator.free(column.name);
             self.allocator.free(column.typeName);
             if (column.defaultValue) |value| freeValue(self.allocator, value);
+            if (column.defaultExpr) |de| ast.freeOwnedExpr(self.allocator, de);
+            if (column.collate) |colName| self.allocator.free(colName);
             if (column.foreignTable) |value| self.allocator.free(value);
             if (column.foreignColumn) |value| self.allocator.free(value);
             if (column.checkExpr) |chk| ast.freeOwnedExpr(self.allocator, chk);
@@ -1425,6 +1518,7 @@ pub const Schema = struct {
     /// `ConstraintViolation`.
     pub fn appendRow(self: *Schema, table: *Table, values: []const Value) !void {
         if (values.len != table.columns.len) return error.ColumnCountMismatch;
+        self.lastConstraintConflict = .none;
         const owned = try self.allocator.alloc(Value, values.len);
         errdefer self.allocator.free(owned);
         var count: usize = 0;
@@ -1477,9 +1571,16 @@ pub const Schema = struct {
             }
         }
         for (table.columns, 0..) |col, index| {
-            if (col.notNull and owned[index] == .null) return error.ConstraintViolation;
+            if (col.notNull and owned[index] == .null) {
+                self.lastConstraintConflict = col.conflict;
+                return error.ConstraintViolation;
+            }
         }
-        try self.validateConstraints(table, owned, null);
+        var policy: ast.ConflictPolicy = .none;
+        self.validateConstraints(table, owned, null, &policy) catch |err| {
+            if (err == error.ConstraintViolation) self.lastConstraintConflict = policy;
+            return err;
+        };
         try table.rows.append(self.allocator, .{ .values = owned });
     }
 
@@ -1487,6 +1588,7 @@ pub const Schema = struct {
     /// NOT NULL/constraints, ignoring the row itself for uniqueness). The
     /// caller applies the mutation only on success.
     pub fn validateUpdate(self: *Schema, table: *const Table, rowIndex: usize, values: []Value) !void {
+        self.lastConstraintConflict = .none;
         try self.applyAutoincrement(table, values);
         try assignRowidAlias(table, values);
         if (table.strict) {
@@ -1496,9 +1598,16 @@ pub const Schema = struct {
             }
         }
         for (table.columns, 0..) |col, index| {
-            if (col.notNull and values[index] == .null) return error.ConstraintViolation;
+            if (col.notNull and values[index] == .null) {
+                self.lastConstraintConflict = col.conflict;
+                return error.ConstraintViolation;
+            }
         }
-        try self.validateConstraints(table, values, rowIndex);
+        var policy: ast.ConflictPolicy = .none;
+        self.validateConstraints(table, values, rowIndex, &policy) catch |err| {
+            if (err == error.ConstraintViolation) self.lastConstraintConflict = policy;
+            return err;
+        };
     }
 
     /// Re-validate a stored row in place (shape, NOT NULL, constraints).
@@ -1509,7 +1618,8 @@ pub const Schema = struct {
         for (table.columns, 0..) |col, index| {
             if (col.notNull and row.values[index] == .null) return error.ConstraintViolation;
         }
-        try self.validateConstraints(table, row.values, rowIndex);
+        var policy: ast.ConflictPolicy = .none;
+        try self.validateConstraints(table, row.values, rowIndex, &policy);
     }
 
     /// True when an FK check postpones to COMMIT/statement end: the
@@ -1519,7 +1629,8 @@ pub const Schema = struct {
         return self.deferForeignKeys or (deferrable and initiallyDeferred);
     }
 
-    fn validateConstraints(self: *const Schema, table: *const Table, values: []const Value, ignoredRow: ?usize) !void {
+    fn validateConstraints(self: *const Schema, table: *const Table, values: []const Value, ignoredRow: ?usize, outPolicy: *ast.ConflictPolicy) !void {
+        outPolicy.* = .none;
         var colNames = try self.allocator.alloc([]const u8, table.columns.len);
         defer self.allocator.free(colNames);
         for (table.columns, 0..) |col, idx| colNames[idx] = col.name;
@@ -1527,22 +1638,34 @@ pub const Schema = struct {
         for (table.columns) |column| {
             if (column.checkExpr) |chk| {
                 const passed = try exprEvaluator.evalCheck(self.allocator, colNames, values, chk);
-                if (!passed) return error.ConstraintViolation;
+                if (!passed) {
+                    outPolicy.* = column.conflict;
+                    return error.ConstraintViolation;
+                }
             }
         }
         for (table.columns, 0..) |column, index| {
-            if (column.primaryKey and values[index] == .null) return error.ConstraintViolation;
+            if (column.primaryKey and values[index] == .null) {
+                outPolicy.* = column.conflict;
+                return error.ConstraintViolation;
+            }
             if (column.unique or column.primaryKey) {
                 if (values[index] != .null) for (table.rows.items, 0..) |existing, existingIndex| {
                     if (ignoredRow != null and ignoredRow.? == existingIndex) continue;
-                    if (valuesEqual(existing.values[index], values[index])) return error.ConstraintViolation;
+                    if (valuesEqual(existing.values[index], values[index])) {
+                        outPolicy.* = column.conflict;
+                        return error.ConstraintViolation;
+                    }
                 };
             }
             if (self.foreignKeysEnabled and !self.fkCheckDeferred(column.fkDeferrable, column.fkInitiallyDeferred)) {
                 if (column.foreignTable) |foreignTableName| {
                     const foreignTable = self.findConst(foreignTableName) orelse return error.ConstraintViolation;
-                    const foreignColumnName = column.foreignColumn orelse return error.ConstraintViolation;
-                    const foreignIndex = self.columnIndex(foreignTable, foreignColumnName) orelse return error.ConstraintViolation;
+                    // Bare `REFERENCES t`: resolve the parent single-column PK.
+                    const foreignIndex = if (column.foreignColumn) |name| blk: {
+                        if (name.len == 0) break :blk parentPkColumnIndex(foreignTable) orelse return error.ConstraintViolation;
+                        break :blk self.columnIndex(foreignTable, name) orelse return error.ConstraintViolation;
+                    } else parentPkColumnIndex(foreignTable) orelse return error.ConstraintViolation;
                     if (values[index] != .null) {
                         var found = false;
                         // Self-reference: like the reference engine, the row
@@ -1555,7 +1678,10 @@ pub const Schema = struct {
                             found = true;
                             break;
                         };
-                        if (!found) return error.ConstraintViolation;
+                        if (!found) {
+                            outPolicy.* = column.conflict;
+                            return error.ConstraintViolation;
+                        }
                     }
                 }
             }
@@ -1564,7 +1690,10 @@ pub const Schema = struct {
             if (constraint.kind == .check) {
                 if (constraint.checkExpr) |chk| {
                     const passed = try exprEvaluator.evalCheck(self.allocator, colNames, values, chk);
-                    if (!passed) return error.ConstraintViolation;
+                    if (!passed) {
+                        outPolicy.* = constraint.conflict;
+                        return error.ConstraintViolation;
+                    }
                 }
                 continue;
             }
@@ -1573,7 +1702,10 @@ pub const Schema = struct {
                 const index = self.columnIndex(table, name) orelse return error.UnknownColumn;
                 if (values[index] == .null) hasNull = true;
             }
-            if (constraint.kind == .primaryKey and hasNull) return error.ConstraintViolation;
+            if (constraint.kind == .primaryKey and hasNull) {
+                outPolicy.* = constraint.conflict;
+                return error.ConstraintViolation;
+            }
             if (constraint.kind == .unique and hasNull) continue;
             if (constraint.kind == .foreignKey) {
                 if (!self.foreignKeysEnabled) continue;
@@ -1597,13 +1729,19 @@ pub const Schema = struct {
                             if (!valuesEqual(values[childIndex], foreignRow.values[parentIndex])) matched = false;
                         }
                         if (matched) break;
-                    } else return error.ConstraintViolation;
+                    } else {
+                        outPolicy.* = constraint.conflict;
+                        return error.ConstraintViolation;
+                    }
                 }
                 continue;
             }
             for (table.rows.items, 0..) |existing, existingIndex| {
                 if (ignoredRow != null and ignoredRow.? == existingIndex) continue;
-                if (indexValuesEqual(table, values, existing.values, constraint.columns)) return error.ConstraintViolation;
+                if (indexValuesEqual(table, values, existing.values, constraint.columns)) {
+                    outPolicy.* = constraint.conflict;
+                    return error.ConstraintViolation;
+                }
             }
         }
         for (self.indexes.items) |index| if (index.unique and std.ascii.eqlIgnoreCase(index.table, table.name)) {
@@ -1697,7 +1835,10 @@ pub const Schema = struct {
                 .unique = column.unique,
                 .autoincrement = column.autoincrement,
                 .defaultValue = column.defaultValue,
-                .foreignKey = if (column.foreignTable != null) .{ .table = column.foreignTable.?, .column = column.foreignColumn.?, .onDelete = column.onDelete, .onUpdate = column.onUpdate, .deferrable = column.fkDeferrable, .initiallyDeferred = column.fkInitiallyDeferred } else null,
+                .defaultExpr = column.defaultExpr,
+                .collate = column.collate,
+                .conflict = column.conflict,
+                .foreignKey = if (column.foreignTable != null) .{ .table = column.foreignTable.?, .column = column.foreignColumn orelse "", .onDelete = column.onDelete, .onUpdate = column.onUpdate, .deferrable = column.fkDeferrable, .initiallyDeferred = column.fkInitiallyDeferred } else null,
                 .checkExpr = column.checkExpr,
                 .generatedExpr = column.generatedExpr,
                 .generatedStored = column.generatedStored,
@@ -1705,10 +1846,10 @@ pub const Schema = struct {
             const constraintDefinitions = try self.allocator.alloc(ast.TableConstraint, table.constraints.len);
             defer self.allocator.free(constraintDefinitions);
             for (table.constraints, 0..) |constraint, index| constraintDefinitions[index] = switch (constraint.kind) {
-                .primaryKey => .{ .primaryKey = constraint.columns },
-                .unique => .{ .unique = constraint.columns },
+                .primaryKey => .{ .primaryKey = .{ .columns = constraint.columns, .conflict = constraint.conflict } },
+                .unique => .{ .unique = .{ .columns = constraint.columns, .conflict = constraint.conflict } },
                 .foreignKey => .{ .foreignKey = .{ .columns = constraint.columns, .table = constraint.foreignTable.?, .referencedColumns = constraint.referencedColumns, .onDelete = constraint.onDelete, .onUpdate = constraint.onUpdate, .deferrable = constraint.deferrable, .initiallyDeferred = constraint.initiallyDeferred } },
-                .check => .{ .check = constraint.checkExpr orelse .{ .literal = .null } },
+                .check => .{ .check = .{ .expr = constraint.checkExpr orelse .{ .literal = .null }, .conflict = constraint.conflict } },
             };
             try result.createTableWithOptions(table.name, definitions, constraintDefinitions, .{ .strict = table.strict, .withoutRowid = table.withoutRowid });
             const target = result.find(table.name).?;
@@ -1728,7 +1869,7 @@ pub const Schema = struct {
             try result.createIndex(.{ .name = index.name, .table = index.table, .columns = columns, .keyExprs = index.keyExprs, .unique = index.unique, .whereExpr = index.whereExpr, .whereSql = index.whereSql });
         }
         for (self.views.items) |view| try result.createView(view.name, view.sql);
-        for (self.triggers.items) |trigger| try result.createTrigger(.{ .name = trigger.name, .table = trigger.table, .timing = trigger.timing, .event = trigger.event, .updateOf = trigger.updateOf, .whenSql = trigger.whenSql, .body = trigger.body });
+        for (self.triggers.items) |trigger| try result.createTrigger(.{ .name = trigger.name, .table = trigger.table, .timing = trigger.timing, .event = trigger.event, .updateOf = trigger.updateOf, .whenSql = trigger.whenSql, .body = trigger.body, .eachRow = trigger.eachRow });
         result.foreignKeysEnabled = self.foreignKeysEnabled;
         result.deferForeignKeys = self.deferForeignKeys;
         return result;

@@ -104,8 +104,8 @@ pub fn foldConstants(allocator: std.mem.Allocator, expr: ast.Expr) !ast.Expr {
 /// they need catalog/row context or have their own dispatch.
 fn isFoldableBinary(op: ast.BinaryOp) bool {
     return switch (op) {
-        .add, .subtract, .multiply, .divide, .modulo, .bitAnd, .bitOr, .shiftLeft, .shiftRight, .equal, .notEqual, .less, .lessEqual, .greater, .greaterEqual, .isOp, .isNotOp, .concat => true,
-        .logicalAnd, .logicalOr => false,
+        .add, .subtract, .multiply, .divide, .modulo, .bitAnd, .bitOr, .shiftLeft, .shiftRight, .equal, .notEqual, .less, .lessEqual, .greater, .greaterEqual, .isOp, .isNotOp, .concat, .isTrue, .isNotTrue, .isFalse, .isNotFalse => true,
+        .logicalAnd, .logicalOr, .jsonArrow, .jsonArrowText => false,
     };
 }
 
