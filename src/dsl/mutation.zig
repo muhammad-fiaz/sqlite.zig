@@ -19,6 +19,7 @@
 //! builder and result. Errors: engine errors from execution; overflow
 //! panics like every other builder limit path.
 
+const reflectionCompat = @import("../compat.zig");
 const std = @import("std");
 const dslExpr = @import("expr.zig");
 const Expr = dslExpr.Expr;
@@ -58,7 +59,7 @@ pub fn rootScopeName(comptime Columns: type) []const u8 {
     if (Columns == void) return "";
     const info = @typeInfo(Columns);
     if (info != .@"struct") return "";
-    for (info.@"struct".fields) |field| {
+    for (reflectionCompat.fields(info.@"struct")) |field| {
         if (@hasDecl(field.type, "dslTable")) return field.type.dslTable;
     }
     return "";
@@ -76,7 +77,7 @@ pub fn allMatchesRoot(comptime Columns: type, comptime Marker: type) bool {
 /// The marker carries its own columns descriptor, so the qualifier is
 /// always the side the marker was built from (table name or alias).
 pub fn appendMarkerColumns(projections: []Projection, count: *usize, comptime Marker: type) void {
-    inline for (@typeInfo(Marker.Columns).@"struct".fields) |field| {
+    inline for (reflectionCompat.fields(@typeInfo(Marker.Columns).@"struct")) |field| {
         if (count.* >= projections.len) @panic("too many DSL projections");
         projections[count.*] = toProjection(field.type{});
         count.* += 1;
@@ -98,7 +99,7 @@ pub fn checkDynAssignScope(item: anytype, table: []const u8, tableAlias: ?[]cons
 /// (`Columns == void`) stay unchecked by design.
 pub fn checkDynAssignColumn(comptime Columns: type, name: []const u8) !void {
     if (Columns == void) return;
-    inline for (@typeInfo(Columns).@"struct".fields) |field| {
+    inline for (reflectionCompat.fields(@typeInfo(Columns).@"struct")) |field| {
         if (std.mem.eql(u8, field.type.dslName, name)) return;
     }
     return error.UnknownColumn;
@@ -117,7 +118,7 @@ pub fn checkDuplicateName(names: []const []const u8, dest: []const u8) !void {
 /// prune a trailing `@compileError` during analysis.
 pub fn hasAssignColumn(comptime Col: type, comptime Columns: type) bool {
     if (Columns == void) return true;
-    inline for (@typeInfo(Columns).@"struct".fields) |field| {
+    inline for (reflectionCompat.fields(@typeInfo(Columns).@"struct")) |field| {
         if (std.mem.eql(u8, field.type.dslName, Col.dslName)) return true;
     }
     return false;
@@ -129,7 +130,7 @@ pub fn hasAssignColumn(comptime Col: type, comptime Columns: type) bool {
 /// runtime `checkDuplicateName`/inline sweeps at each use site instead.
 /// Callers gate explicitly.
 pub fn hasDuplicateAssign(comptime Tuple: type, comptime index: usize) bool {
-    const fields = @typeInfo(Tuple).@"struct".fields;
+    const fields = reflectionCompat.fields(@typeInfo(Tuple).@"struct");
     const needleT = fields[index].type;
     if (comptime !columnMod.isAssignValue(needleT)) return false;
     const needle = needleT.assignColumn.dslName;
@@ -265,8 +266,8 @@ pub fn isAssignItem(comptime T: type) bool {
 pub fn isAssignList(comptime T: type) bool {
     const info = @typeInfo(T);
     if (info != .@"struct" or !info.@"struct".is_tuple) return false;
-    if (info.@"struct".fields.len == 0) return false;
-    inline for (info.@"struct".fields) |field| {
+    if (reflectionCompat.fields(info.@"struct").len == 0) return false;
+    inline for (reflectionCompat.fields(info.@"struct")) |field| {
         if (!isAssignItem(field.type)) return false;
     }
     return true;
@@ -495,20 +496,20 @@ pub fn UpsertBuilder(comptime Row: type, comptime Columns: type) type {
                 return;
             }
             if (isTyped) {
-                inline for (@typeInfo(RowType).@"struct".fields) |field| {
+                inline for (reflectionCompat.fields(@typeInfo(RowType).@"struct")) |field| {
                     if (!@hasField(Row, field.name)) @compileError("DSL row contains an unknown table column");
                 }
             }
             self.setCount = 0;
             if (Columns == void) {
-                inline for (@typeInfo(RowType).@"struct".fields) |field| {
+                inline for (reflectionCompat.fields(@typeInfo(RowType).@"struct")) |field| {
                     if (comptime isExplicitDefault(@TypeOf(@field(assignments, field.name)))) continue;
                     if (self.setCount >= self.sets.len) return error.InvalidSql;
                     self.sets[self.setCount] = .{ .name = field.name, .value = upsertValueOf(@field(assignments, field.name)) };
                     self.setCount += 1;
                 }
             } else {
-                inline for (@typeInfo(Columns).@"struct".fields) |colField| {
+                inline for (reflectionCompat.fields(@typeInfo(Columns).@"struct")) |colField| {
                     if (@hasField(RowType, colField.name)) {
                         if (comptime isExplicitDefault(@TypeOf(@field(assignments, colField.name)))) continue;
                         if (self.setCount >= self.sets.len) return error.InvalidSql;
@@ -530,12 +531,12 @@ pub fn UpsertBuilder(comptime Row: type, comptime Columns: type) type {
             const RowType = @TypeOf(row);
             if (@typeInfo(RowType) != .@"struct") @compileError("DSL row must be a struct");
             if (isTyped) {
-                inline for (@typeInfo(RowType).@"struct".fields) |field| {
+                inline for (reflectionCompat.fields(@typeInfo(RowType).@"struct")) |field| {
                     if (!@hasField(Row, field.name)) @compileError("DSL row contains an unknown table column");
                 }
             }
             if (Columns == void) {
-                const fields = @typeInfo(RowType).@"struct".fields;
+                const fields = reflectionCompat.fields(@typeInfo(RowType).@"struct");
                 var names: [fields.len][]const u8 = undefined;
                 var vals: [fields.len]dslExpr.SetValue = undefined;
                 var count: usize = 0;
@@ -556,7 +557,7 @@ pub fn UpsertBuilder(comptime Row: type, comptime Columns: type) type {
                 defer built.deinit();
                 return self.executeFn(self.connection, &built.stmt, &.{}, false);
             } else {
-                const colFields = @typeInfo(Columns).@"struct".fields;
+                const colFields = reflectionCompat.fields(@typeInfo(Columns).@"struct");
                 var names: [colFields.len][]const u8 = undefined;
                 var vals: [colFields.len]dslExpr.SetValue = undefined;
                 var count: usize = 0;

@@ -345,8 +345,8 @@ pub const VirtualMachine = struct {
             .allocator = allocator,
             .arena = std.heap.ArenaAllocator.init(allocator),
             .schema = schema,
-            .cursors = [_]?Cursor{null} ** 32,
-            .aggStates = [_]AggState{.{}} ** 16,
+            .cursors = @as([32]?Cursor, @splat(null)),
+            .aggStates = @as([16]AggState, @splat(.{})),
             .changes = 0,
         };
     }

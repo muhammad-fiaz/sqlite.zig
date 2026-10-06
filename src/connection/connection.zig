@@ -1,4 +1,5 @@
 //! Engine facade: `Connection` runs SQL against file-backed schemas.
+const reflectionCompat = @import("../compat.zig");
 const std = @import("std");
 const DatabaseFile = @import("../storage/file.zig").DatabaseFile;
 const image = @import("../storage/image.zig");
@@ -691,8 +692,8 @@ pub const Connection = struct {
 
     fn createTypedTable(self: *Connection, comptime TableType: type, options: anytype) !void {
         const Row = TableType.rowType;
-        const rowFields = @typeInfo(Row).@"struct".fields;
-        const colFields = @typeInfo(@TypeOf(TableType.columns)).@"struct".fields;
+        const rowFields = reflectionCompat.fields(@typeInfo(Row).@"struct");
+        const colFields = reflectionCompat.fields(@typeInfo(@TypeOf(TableType.columns)).@"struct");
         if (rowFields.len != colFields.len) @compileError("table columns do not match row fields");
         var definitions: [colFields.len]ast.ColumnDef = undefined;
         inline for (colFields, 0..) |colField, index| {
@@ -752,8 +753,8 @@ pub const Connection = struct {
         const Cols = tableMod.columnsTypeOfValue(T);
         const tableOpts = tableMod.tableOptionsField(T).value;
         const tname: []const u8 = target.tableName;
-        const rowFields = @typeInfo(Row).@"struct".fields;
-        const colFields = @typeInfo(Cols).@"struct".fields;
+        const rowFields = reflectionCompat.fields(@typeInfo(Row).@"struct");
+        const colFields = reflectionCompat.fields(@typeInfo(Cols).@"struct");
         var definitions: [colFields.len]ast.ColumnDef = undefined;
         inline for (colFields, 0..) |colField, index| {
             const F = colField.type.fieldType;
@@ -1117,8 +1118,8 @@ pub const Connection = struct {
 
             pub fn validate(self: @This()) !void {
                 const t = self.connection.store.findConst(self.tableName) orelse return error.UnknownTable;
-                const rowFields = @typeInfo(Row).@"struct".fields;
-                const colFields = @typeInfo(Cols).@"struct".fields;
+                const rowFields = reflectionCompat.fields(@typeInfo(Row).@"struct");
+                const colFields = reflectionCompat.fields(@typeInfo(Cols).@"struct");
                 if (t.columns.len != colFields.len) return error.SchemaMismatch;
                 if (rowFields.len != colFields.len) return error.SchemaMismatch;
                 var pkBuf: [16][]const u8 = undefined;

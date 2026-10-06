@@ -38,14 +38,14 @@ pub const Affinity = enum {
 pub fn fromDeclaration(declaration: []const u8) Affinity {
     const trimmed = std.mem.trim(u8, declaration, " \t\r\n");
     if (trimmed.len == 0) return .blob;
-    if (std.ascii.indexOfIgnoreCase(trimmed, "INT")) |_| return .integer;
-    if (std.ascii.indexOfIgnoreCase(trimmed, "CHAR")) |_| return .text;
-    if (std.ascii.indexOfIgnoreCase(trimmed, "CLOB")) |_| return .text;
-    if (std.ascii.indexOfIgnoreCase(trimmed, "TEXT")) |_| return .text;
-    if (std.ascii.indexOfIgnoreCase(trimmed, "BLOB")) |_| return .blob;
-    if (std.ascii.indexOfIgnoreCase(trimmed, "REAL")) |_| return .real;
-    if (std.ascii.indexOfIgnoreCase(trimmed, "FLOA")) |_| return .real;
-    if (std.ascii.indexOfIgnoreCase(trimmed, "DOUB")) |_| return .real;
+    if (std.ascii.findIgnoreCase(trimmed, "INT")) |_| return .integer;
+    if (std.ascii.findIgnoreCase(trimmed, "CHAR")) |_| return .text;
+    if (std.ascii.findIgnoreCase(trimmed, "CLOB")) |_| return .text;
+    if (std.ascii.findIgnoreCase(trimmed, "TEXT")) |_| return .text;
+    if (std.ascii.findIgnoreCase(trimmed, "BLOB")) |_| return .blob;
+    if (std.ascii.findIgnoreCase(trimmed, "REAL")) |_| return .real;
+    if (std.ascii.findIgnoreCase(trimmed, "FLOA")) |_| return .real;
+    if (std.ascii.findIgnoreCase(trimmed, "DOUB")) |_| return .real;
     return .numeric;
 }
 

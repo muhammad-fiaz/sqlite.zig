@@ -91,7 +91,7 @@ pub const PageHeader = struct {
         const offset = headerOffset(pageNumber);
         std.debug.assert(offset + headerSize(self.pageType) <= page.len);
         std.debug.assert(self.pageType == .interiorTable or self.pageType == .interiorIndex or self.rightChild == null);
-        page[offset] = @intFromEnum(self.pageType);
+        page[offset] = @backingInt(self.pageType);
         page[offset + 1] = @truncate(self.firstFreeblock >> 8);
         page[offset + 2] = @truncate(self.firstFreeblock);
         page[offset + 3] = @truncate(self.cellCount >> 8);
@@ -345,7 +345,7 @@ test "B-tree keeps keys ordered and replaces values" {
 }
 
 test "PageHeader encodes and decodes leaf and interior headers" {
-    var page = [_]u8{0} ** 4096;
+    var page = @as([4096]u8, @splat(0));
     const leafHeader = PageHeader{
         .pageType = .leafTable,
         .firstFreeblock = 0,
@@ -374,7 +374,7 @@ test "PageHeader encodes and decodes leaf and interior headers" {
 }
 
 test "formatLeafTablePage and formatInteriorTablePage construct valid pages" {
-    var page = [_]u8{0} ** 4096;
+    var page = @as([4096]u8, @splat(0));
     const dummyCell = "cell_payload";
     const cells = [_][]const u8{ dummyCell, dummyCell };
     try formatLeafTablePage(&page, 2, &cells, 4096);
@@ -382,7 +382,7 @@ test "formatLeafTablePage and formatInteriorTablePage construct valid pages" {
     try std.testing.expectEqual(PageType.leafTable, decoded.pageType);
     try std.testing.expectEqual(@as(u16, 2), decoded.cellCount);
 
-    var interiorPage = [_]u8{0} ** 4096;
+    var interiorPage = @as([4096]u8, @splat(0));
     const leftKids = [_]u32{ 2, 3 };
     const keys = [_]u64{ 10, 20 };
     try formatInteriorTablePage(&interiorPage, 4, &leftKids, &keys, 5, 4096);
@@ -394,7 +394,7 @@ test "formatLeafTablePage and formatInteriorTablePage construct valid pages" {
 test "PageHeader rejects unknown flags and short buffers" {
     // Error: every non-SQLite flag byte fails closed.
     for ([_]u8{ 0x00, 0x01, 0x09, 0xff }) |flag| {
-        var page = [_]u8{0} ** 512;
+        var page = @as([512]u8, @splat(0));
         page[0] = flag;
         try std.testing.expectError(error.InvalidHeader, PageHeader.decode(&page, 2));
     }
@@ -407,7 +407,7 @@ test "PageHeader rejects unknown flags and short buffers" {
     shortOne[100] = 0x05; // interior needs 12 bytes, only 1 available
     try std.testing.expectError(error.InvalidHeader, PageHeader.decode(&shortOne, 1));
     // Normal: page-1 headers decode past the 100-byte reservation.
-    var pageOne = [_]u8{0} ** 512;
+    var pageOne = @as([512]u8, @splat(0));
     (PageHeader{ .pageType = .leafTable, .cellCount = 1 }).encode(pageOne[0..], 1);
     try std.testing.expectEqual(PageType.leafTable, (try PageHeader.decode(pageOne[0..], 1)).pageType);
 }
@@ -425,25 +425,25 @@ test "page formatters fail closed on unfittable and short pages" {
     const payloads = [_][]const u8{"p"};
     try std.testing.expectError(error.PageOverflow, formatInteriorIndexPage(&small, 2, &kids, &payloads, 3, 4096));
     // Error: key/child and payload/child length mismatches.
-    var page = [_]u8{0} ** 512;
+    var page = @as([512]u8, @splat(0));
     const twoKids = [_]u32{ 2, 3 };
     const oneKey = [_]u64{9};
     try std.testing.expectError(error.InvalidParam, formatInteriorTablePage(&page, 2, &twoKids, &oneKey, 4, 512));
     try std.testing.expectError(error.InvalidParam, formatInteriorIndexPage(&page, 2, &twoKids, &payloads, 4, 512));
     // Error: a cell larger than the page cannot fit anywhere.
-    var big = [_]u8{0} ** 512;
-    const hugeCell = [_]u8{0xaa} ** 600;
+    var big = @as([512]u8, @splat(0));
+    const hugeCell = @as([600]u8, @splat(0xaa));
     const hugeCells = [_][]const u8{&hugeCell};
     try std.testing.expectError(error.PageOverflow, formatLeafTablePage(&big, 2, &hugeCells, 512));
     // Boundary: empty pages format with zero cells and null-free headers.
-    var blank = [_]u8{0} ** 512;
+    var blank = @as([512]u8, @splat(0));
     try formatLeafTablePage(&blank, 2, &[_][]const u8{}, 512);
     try std.testing.expectEqual(@as(u16, 0), (try PageHeader.decode(&blank, 2)).cellCount);
     // Normal: index leaf + interior pages round-trip their headers.
-    var leafIdx = [_]u8{0} ** 512;
+    var leafIdx = @as([512]u8, @splat(0));
     try formatLeafIndexPage(&leafIdx, 2, &cells, 512);
     try std.testing.expectEqual(PageType.leafIndex, (try PageHeader.decode(&leafIdx, 2)).pageType);
-    var interiorIdx = [_]u8{0} ** 512;
+    var interiorIdx = @as([512]u8, @splat(0));
     try formatInteriorIndexPage(&interiorIdx, 2, &kids, &payloads, 9, 512);
     try std.testing.expectEqual(@as(u32, 9), (try PageHeader.decode(&interiorIdx, 2)).rightChild.?);
 }
@@ -614,7 +614,7 @@ test "interior formatters frame children with exact cells" {
             try payloads.append(alloc, buf);
         }
         const right: u32 = rand.int(u32);
-        var page = [_]u8{0} ** 4096;
+        var page = @as([4096]u8, @splat(0));
         if (tableInterior) {
             try formatInteriorTablePage(&page, 2, kids.items, keys.items, right, 4096);
         } else {

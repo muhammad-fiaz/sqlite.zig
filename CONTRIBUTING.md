@@ -5,7 +5,7 @@ zero-dependency SQLite-compatible engine written entirely in Zig.
 
 ## Prerequisites
 
-- Zig **0.16.0+** (see [ziglang.org](https://ziglang.org/download/)).
+- Zig **0.17.0+** (see [ziglang.org](https://ziglang.org/download/)).
 - Windows 10+, Linux, or macOS.
 - Git.
 - [Bun](https://bun.sh) (only if you work on the documentation website in

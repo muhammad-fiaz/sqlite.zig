@@ -56,7 +56,7 @@ const DistinctKey = union(enum) {
 const DistinctContext = struct {
     pub fn hash(_: @This(), key: DistinctKey) u64 {
         var hasher = std.hash.Wyhash.init(0);
-        hasher.update(&[_]u8{@intFromEnum(key)});
+        hasher.update(&[_]u8{@backingInt(key)});
         switch (key) {
             .integer => |n| hasher.update(std.mem.asBytes(&n)),
             .real => |bits| hasher.update(std.mem.asBytes(&bits)),

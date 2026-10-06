@@ -3,6 +3,7 @@
 //! Everything is comptime-known borrowed names; no heap, no deinit.
 //! Misuse is a compile error.
 
+const reflectionCompat = @import("../compat.zig");
 const std = @import("std");
 const Column = @import("column.zig").Column;
 
@@ -39,7 +40,7 @@ pub fn isAllOpFn(comptime T: type) bool {
     if (info != .pointer or info.pointer.size != .one) return false;
     const fnInfo = @typeInfo(info.pointer.child);
     if (fnInfo != .@"fn") return false;
-    if (fnInfo.@"fn".params.len != 0) return false;
+    if (fnInfo.@"fn".param_types.len != 0) return false;
     const Ret = fnInfo.@"fn".return_type orelse return false;
     return isAllProjectionType(Ret);
 }
@@ -91,7 +92,7 @@ pub fn TablePublic(comptime name: []const u8, comptime spec: anytype, comptime o
     if (@TypeOf(spec) == type) {
         const info = @typeInfo(spec);
         if (info != .@"struct") @compileError("sqlite.table row must be a struct");
-        return TableTypeFor(name, spec, opts, info.@"struct".fields, null);
+        return TableTypeFor(name, spec, opts, reflectionCompat.fields(info.@"struct"), null);
     }
     return DescribedTypeFor(name, spec, opts);
 }
@@ -102,7 +103,7 @@ pub fn tableWith(comptime name: []const u8, comptime spec: anytype, comptime opt
     if (@TypeOf(spec) == type) {
         const info = @typeInfo(spec);
         if (info != .@"struct") @compileError("sqlite.table row must be a struct");
-        return buildTable(name, spec, opts, info.@"struct".fields, null);
+        return buildTable(name, spec, opts, reflectionCompat.fields(info.@"struct"), null);
     }
     return buildDescribed(name, spec, opts);
 }
@@ -122,8 +123,8 @@ fn comptimeStringEq(comptime a: []const u8, comptime b: []const u8) bool {
     return true;
 }
 
-fn makeAttrs(comptime n: usize) *const [n]std.builtin.Type.StructField.Attributes {
-    const A = [_]std.builtin.Type.StructField.Attributes{.{}} ** n;
+fn makeAttrs(comptime n: usize) *const [n]std.builtin.Type.Struct.FieldAttributes {
+    const A = @as([n]std.builtin.Type.Struct.FieldAttributes, @splat(.{}));
     return &A;
 }
 
@@ -167,7 +168,7 @@ fn TableTypeFor(
 }
 
 fn DescribedTypeFor(comptime tname: []const u8, comptime spec: anytype, comptime opts: anytype) type {
-    const fields = @typeInfo(@TypeOf(spec)).@"struct".fields;
+    const fields = reflectionCompat.fields(@typeInfo(@TypeOf(spec)).@"struct");
     const N = fields.len;
     const hasUserAll = @hasField(@TypeOf(spec), "all");
     const Total = N + metaCount + (if (hasUserAll) 0 else 1);
@@ -227,7 +228,7 @@ fn buildTable(
     v.rowType = .{};
     v.tableOptions = .{};
     v.tableAlias = "";
-    inline for (@typeInfo(T).@"struct".fields) |field| {
+    inline for (reflectionCompat.fields(@typeInfo(T).@"struct")) |field| {
         if (comptime isColumnField(field.type)) {
             @field(v, field.name) = .{};
         } else if (comptime isAllOpFn(field.type)) {
@@ -239,7 +240,7 @@ fn buildTable(
 
 fn buildDescribed(comptime tname: []const u8, comptime spec: anytype, comptime opts: anytype) DescribedTypeFor(tname, spec, opts) {
     const T = DescribedTypeFor(tname, spec, opts);
-    const fields = @typeInfo(@TypeOf(spec)).@"struct".fields;
+    const fields = reflectionCompat.fields(@typeInfo(@TypeOf(spec)).@"struct");
     const N = fields.len;
     var sqls: [N][]const u8 = undefined;
     inline for (fields, 0..) |field, i| {
@@ -251,7 +252,7 @@ fn buildDescribed(comptime tname: []const u8, comptime spec: anytype, comptime o
     v.rowType = .{};
     v.tableOptions = .{};
     v.tableAlias = "";
-    inline for (@typeInfo(T).@"struct".fields) |field| {
+    inline for (reflectionCompat.fields(@typeInfo(T).@"struct")) |field| {
         if (comptime isColumnField(field.type)) {
             @field(v, field.name) = .{};
         } else if (comptime isAllOpFn(field.type)) {
@@ -286,7 +287,7 @@ fn isMetaFieldName(comptime name: []const u8) bool {
 pub fn AliasedType(comptime T: type, comptime aliasName: []const u8) type {
     if (!isTableValue(T)) @compileError("aliased() takes a sqlite.table(...) value");
     if (aliasName.len == 0) @compileError("alias must not be empty");
-    const fields = @typeInfo(T).@"struct".fields;
+    const fields = reflectionCompat.fields(@typeInfo(T).@"struct");
     comptime var names: [fields.len][:0]const u8 = undefined;
     comptime var types: [fields.len]type = undefined;
     comptime var allIndex: ?usize = null;
@@ -339,8 +340,8 @@ fn allOpForType(comptime Fn: type) Fn {
 pub fn aliased(tbl: anytype, comptime aliasName: []const u8) AliasedType(@TypeOf(tbl), aliasName) {
     const T = @TypeOf(tbl);
     const A = AliasedType(T, aliasName);
-    const AF = @typeInfo(A).@"struct".fields;
-    const TF = @typeInfo(T).@"struct".fields;
+    const AF = reflectionCompat.fields(@typeInfo(A).@"struct");
+    const TF = reflectionCompat.fields(@typeInfo(T).@"struct");
     var v: A = undefined;
     inline for (AF, 0..) |afield, i| {
         if (comptime isMetaFieldName(afield.name)) {
@@ -366,16 +367,16 @@ pub fn tableNameOfValue(source: anytype) []const u8 {
 
 /// Row struct type carried by a table value type.
 pub fn rowTypeOfValue(comptime T: type) type {
-    return @typeInfo(T).@"struct".fields[2].type.value;
+    return reflectionCompat.fields(@typeInfo(T).@"struct")[2].type.value;
 }
 
 /// Options-holder type carried by a table value type.
 pub fn tableOptionsField(comptime T: type) type {
-    return @typeInfo(T).@"struct".fields[3].type;
+    return reflectionCompat.fields(@typeInfo(T).@"struct")[3].type;
 }
 
 fn hasTrailingAllOp(comptime T: type) bool {
-    const f = @typeInfo(T).@"struct".fields;
+    const f = reflectionCompat.fields(@typeInfo(T).@"struct");
     if (f.len <= metaCount) return false;
     const last = f[f.len - 1];
     return comptimeStringEq(last.name, "all") and isAllOpFn(last.type);
@@ -384,7 +385,7 @@ fn hasTrailingAllOp(comptime T: type) bool {
 /// Columns-only struct type of a table value (metadata + trailing `all` op
 /// stripped). Used by `query_builder` to map result columns positionally.
 pub fn columnsTypeOfValue(comptime T: type) type {
-    const f = @typeInfo(T).@"struct".fields;
+    const f = reflectionCompat.fields(@typeInfo(T).@"struct");
     const skip: usize = if (hasTrailingAllOp(T)) 1 else 0;
     const n = f.len - metaCount - skip;
     comptime var names: [n][:0]const u8 = undefined;
@@ -398,7 +399,7 @@ pub fn columnsTypeOfValue(comptime T: type) type {
 
 /// Number of column fields in a table value type (excludes metadata/`all`).
 pub fn columnCount(comptime T: type) usize {
-    const f = @typeInfo(T).@"struct".fields;
+    const f = reflectionCompat.fields(@typeInfo(T).@"struct");
     const skip: usize = if (hasTrailingAllOp(T)) 1 else 0;
     return f.len - metaCount - skip;
 }
@@ -457,10 +458,10 @@ test "all() builds the all-columns operation on collision-free tables" {
     try std.testing.expect(isAllProjectionType(@TypeOf(u.all())));
     try std.testing.expectEqualStrings("u", @TypeOf(u.all()).qualifierName);
     // The marker's columns describe the source scope for expansion.
-    inline for (@typeInfo(@TypeOf(u.all()).Columns).@"struct".fields) |f| {
+    inline for (reflectionCompat.fields(@typeInfo(@TypeOf(u.all()).Columns).@"struct")) |f| {
         try std.testing.expectEqualStrings("u", f.type.table);
     }
-    inline for (@typeInfo(@TypeOf(proj).Columns).@"struct".fields) |f| {
+    inline for (reflectionCompat.fields(@typeInfo(@TypeOf(proj).Columns).@"struct")) |f| {
         try std.testing.expectEqualStrings("users", f.type.table);
     }
 }

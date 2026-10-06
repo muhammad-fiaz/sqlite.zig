@@ -18,7 +18,7 @@ description: "Quick start guide for sqlite.zig, a fully native, zero-dependency 
 
 ## Prerequisites
 
-- **Zig 0.16.0** or later — download from [ziglang.org](https://ziglang.org/download/)
+- **Zig 0.17.0** or later — download from [ziglang.org](https://ziglang.org/download/)
 
 ## Your First Database
 

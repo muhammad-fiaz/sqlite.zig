@@ -1,5 +1,6 @@
 //! Value-semantic query and mutation builders over the native AST.
 
+const reflectionCompat = @import("../compat.zig");
 const std = @import("std");
 const dslExpr = @import("expr.zig");
 const Expr = dslExpr.Expr;
@@ -58,7 +59,7 @@ fn tupleHasForeignAll(comptime Columns: type, comptime T: type) bool {
     if (info == .array) return tupleHasForeignAll(Columns, info.array.child);
     if (comptime tableMod.isAllProjectionType(T)) return !mutationMod.allMatchesRoot(Columns, T);
     if (info == .@"struct" and info.@"struct".is_tuple) {
-        inline for (info.@"struct".fields) |field| {
+        inline for (reflectionCompat.fields(info.@"struct")) |field| {
             if (comptime tupleHasForeignAll(Columns, field.type)) return true;
         }
     }
@@ -81,7 +82,7 @@ fn toOrder(item: anytype) Order {
 }
 
 fn destSqlFor(comptime Columns: type, want: []const u8) ?[]const u8 {
-    inline for (@typeInfo(Columns).@"struct".fields) |colField| {
+    inline for (reflectionCompat.fields(@typeInfo(Columns).@"struct")) |colField| {
         if (std.mem.eql(u8, colField.name, want)) return colField.type.dslName;
     }
     return null;
@@ -125,7 +126,7 @@ fn containsAllMarker(comptime T: type) bool {
     if (info == .pointer) return containsAllMarker(info.pointer.child);
     if (info == .array) return containsAllMarker(info.array.child);
     if (info == .@"struct" and info.@"struct".is_tuple) {
-        inline for (info.@"struct".fields) |field| {
+        inline for (reflectionCompat.fields(info.@"struct")) |field| {
             if (containsAllMarker(field.type)) return true;
         }
     }
@@ -1087,7 +1088,7 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
         fn validateRow(comptime RowType: type) void {
             if (@typeInfo(RowType) != .@"struct") @compileError("DSL row must be a struct");
             if (isTyped) {
-                inline for (@typeInfo(RowType).@"struct".fields) |field| {
+                inline for (reflectionCompat.fields(@typeInfo(RowType).@"struct")) |field| {
                     if (!@hasField(Row, field.name)) @compileError("DSL row contains an unknown table column");
                 }
             }
@@ -1124,7 +1125,7 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
         pub fn insertFrom(self: Self, source: anytype, mapping: anytype) !Result {
             const MappingType = @TypeOf(mapping);
             if (@typeInfo(MappingType) != .@"struct") @compileError("insertFrom mapping must be a struct of destination-field = source-column pairs");
-            const mapFields = @typeInfo(MappingType).@"struct".fields;
+            const mapFields = reflectionCompat.fields(@typeInfo(MappingType).@"struct");
             if (mapFields.len == 0) @compileError("insertFrom mapping must name at least one column");
             const SourceT = @TypeOf(source);
             const isDynamicSource = SourceT != type and @typeInfo(SourceT) == .@"struct" and @hasDecl(SourceT, "isDynamicTable");
@@ -1362,7 +1363,7 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
             if (comptime mutationMod.isAssignItem(RowType)) return self.insertAssigns(.{row}, conflict);
             validateRow(RowType);
             if (Columns == void) {
-                const fields = @typeInfo(RowType).@"struct".fields;
+                const fields = reflectionCompat.fields(@typeInfo(RowType).@"struct");
                 var names: [fields.len][]const u8 = undefined;
                 var vals: [fields.len]dslExpr.SetValue = undefined;
                 var count: usize = 0;
@@ -1377,7 +1378,7 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
                 defer built.deinit();
                 return self.executeFn(self.connection, &built.stmt, &.{}, false);
             } else {
-                const colFields = @typeInfo(Columns).@"struct".fields;
+                const colFields = reflectionCompat.fields(@typeInfo(Columns).@"struct");
                 var names: [colFields.len][]const u8 = undefined;
                 var vals: [colFields.len]dslExpr.SetValue = undefined;
                 var count: usize = 0;
@@ -1450,7 +1451,7 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
             }
             validateRow(RowType);
             if (Columns == void) {
-                inline for (@typeInfo(RowType).@"struct".fields) |field| {
+                inline for (reflectionCompat.fields(@typeInfo(RowType).@"struct")) |field| {
                     if (comptime mutationMod.isExplicitDefault(@TypeOf(@field(assignments, field.name)))) continue;
                     if (mutation.setCount >= mutation.setNames.len) return error.InvalidSql;
                     mutation.setNames[mutation.setCount] = field.name;
@@ -1458,7 +1459,7 @@ pub fn Builder(comptime Row: type, comptime Columns: type, comptime mapped: bool
                     mutation.setCount += 1;
                 }
             } else {
-                inline for (@typeInfo(Columns).@"struct".fields) |colField| {
+                inline for (reflectionCompat.fields(@typeInfo(Columns).@"struct")) |colField| {
                     if (@hasField(RowType, colField.name)) {
                         if (comptime mutationMod.isExplicitDefault(@TypeOf(@field(assignments, colField.name)))) continue;
                         if (mutation.setCount >= mutation.setNames.len) return error.InvalidSql;
@@ -1888,7 +1889,7 @@ fn assignMappedValue(allocator: std.mem.Allocator, destination: anytype, value: 
 }
 
 fn freeMappedRow(comptime Row: type, allocator: std.mem.Allocator, row: *Row) void {
-    inline for (@typeInfo(Row).@"struct".fields) |field| {
+    inline for (reflectionCompat.fields(@typeInfo(Row).@"struct")) |field| {
         freeMappedValue(allocator, @field(row.*, field.name));
     }
 }
@@ -1904,18 +1905,18 @@ fn mapResultRows(comptime Row: type, comptime Columns: type, allocator: std.mem.
         var destination: Row = undefined;
         var assigned: usize = 0;
         errdefer {
-            inline for (@typeInfo(Row).@"struct".fields, 0..) |field, fi| {
+            inline for (reflectionCompat.fields(@typeInfo(Row).@"struct"), 0..) |field, fi| {
                 if (fi < assigned) freeMappedValue(allocator, @field(destination, field.name));
             }
         }
         if (Columns == void) {
-            inline for (@typeInfo(Row).@"struct".fields, 0..) |field, fi| {
+            inline for (reflectionCompat.fields(@typeInfo(Row).@"struct"), 0..) |field, fi| {
                 const index = findResultColumn(result.columns, field.name) orelse return error.UnknownColumn;
                 try assignMappedValue(allocator, &@field(destination, field.name), source[index]);
                 assigned = fi + 1;
             }
         } else {
-            inline for (@typeInfo(Columns).@"struct".fields, 0..) |colField, fi| {
+            inline for (reflectionCompat.fields(@typeInfo(Columns).@"struct"), 0..) |colField, fi| {
                 const index = findResultColumn(result.columns, colField.type.dslName) orelse return error.UnknownColumn;
                 try assignMappedValue(allocator, &@field(destination, colField.name), source[index]);
                 assigned = fi + 1;
@@ -2195,7 +2196,7 @@ test "select preserves projection order and AllColumns routing" {
     const all = starBase.selectAll();
     try std.testing.expect(all.allColumns);
     try std.testing.expectEqual(@as(usize, 0), all.projectionCount);
-    try std.testing.expectEqual(@as(usize, 2), @typeInfo(@TypeOf(T.all()).Columns).@"struct".fields.len);
+    try std.testing.expectEqual(@as(usize, 2), reflectionCompat.fields(@typeInfo(@TypeOf(T.all()).Columns).@"struct").len);
 }
 
 test "scoped and explicit selects converge on one projection" {

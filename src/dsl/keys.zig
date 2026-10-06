@@ -3,6 +3,7 @@
 //! Outputs borrow the inputs; validation only borrows the table.
 //! Wrong tables give `UnknownColumn`, bad shapes `InvalidSql`, drift `SchemaMismatch`.
 
+const reflectionCompat = @import("../compat.zig");
 const std = @import("std");
 const ast = @import("../sql/ast.zig");
 const Value = @import("../vm/value.zig").Value;
@@ -180,7 +181,7 @@ fn referencesWantScope(comptime S: type, comptime T: type) bool {
     const info = @typeInfo(T);
     if (info == .pointer and info.pointer.size == .one) return referencesWantScope(S, info.pointer.child);
     if (info == .@"struct" and info.@"struct".is_tuple) {
-        inline for (info.@"struct".fields) |field| {
+        inline for (reflectionCompat.fields(info.@"struct")) |field| {
             if (comptime scopeMod.isScopedItem(field.type, S.Row)) return true;
         }
     }
@@ -554,7 +555,7 @@ pub fn validateKeys(table: *const schemaMod.Table, expected: *const ExpectedKeys
             if (col.unique) actualSingleCount += 1;
         }
         if (actualSingleCount != expected.uniqueSingleCount) return error.SchemaMismatch;
-        var matched: [8]bool = .{false} ** 8;
+        var matched: [8]bool = @splat(false);
         var actualGroupCount: usize = 0;
         for (table.constraints) |*c| {
             if (c.kind != .unique) continue;
@@ -572,7 +573,7 @@ pub fn validateKeys(table: *const schemaMod.Table, expected: *const ExpectedKeys
         if (actualGroupCount != expected.uniqueGroupCount) return error.SchemaMismatch;
     }
     if (expected.hasFks) {
-        var matched: [8]bool = .{false} ** 8;
+        var matched: [8]bool = @splat(false);
         var actualCount: usize = 0;
         for (table.columns) |*col| {
             if (col.foreignTable == null) continue;
@@ -756,7 +757,7 @@ test "zig type mapping documents the storage contract" {
     try std.testing.expectEqualStrings("TEXT", dslTypeName([]const u8));
     try std.testing.expectEqualStrings("TEXT", dslTypeName([]u8));
     const S = struct { n: i64 = 7, t: []const u8 = "hi", f: f64 = 1.5, o: ?i64 = null, b: bool = true };
-    inline for (@typeInfo(S).@"struct".fields) |field| {
+    inline for (reflectionCompat.fields(@typeInfo(S).@"struct")) |field| {
         const got = zigDefault(field.type, field.default_value_ptr);
         if (std.mem.eql(u8, field.name, "n")) try std.testing.expect(got.?.integer == 7);
         if (std.mem.eql(u8, field.name, "t")) try std.testing.expectEqualStrings("hi", got.?.text);

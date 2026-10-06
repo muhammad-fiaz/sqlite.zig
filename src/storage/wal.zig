@@ -199,12 +199,12 @@ pub fn apply(allocator: std.mem.Allocator, baseImage: []const u8, walImage: []co
 
 test "WAL encodes and applies SQLite page frames" {
     const pageSize = 512;
-    var image = [_]u8{0} ** (pageSize * 2);
+    var image = @as([(pageSize * 2)]u8, @splat(0));
     image[0] = 'S';
     image[pageSize + 7] = 42;
     const encoded = try encodeImage(std.testing.allocator, &image, pageSize);
     defer std.testing.allocator.free(encoded);
-    var base = [_]u8{0} ** (pageSize * 2);
+    var base = @as([(pageSize * 2)]u8, @splat(0));
     const applied = try apply(std.testing.allocator, &base, encoded);
     defer std.testing.allocator.free(applied);
     try std.testing.expectEqual(@as(u8, 'S'), applied[0]);
@@ -233,11 +233,11 @@ test "WAL header decode rejects bad magic version geometry and checksum" {
 
 test "WAL apply rejects corrupt frames without unsafe behavior" {
     const pageSize = 512;
-    var image = [_]u8{0} ** pageSize;
+    var image = @as([pageSize]u8, @splat(0));
     image[3] = 0xab;
     const encoded = try encodeImage(std.testing.allocator, &image, pageSize);
     defer std.testing.allocator.free(encoded);
-    var base = [_]u8{0} ** pageSize;
+    var base = @as([pageSize]u8, @splat(0));
     // Truncations fail closed, except the exact end-of-header prefix, which
     // is a valid zero-frame WAL that applies to a copy of the base image.
     var cut: usize = 1;
@@ -285,7 +285,7 @@ test "WAL apply rejects corrupt frames without unsafe behavior" {
 
 test "WAL encodeImage validates geometry and frame headers round trip" {
     // Error: bad geometry and unframed images fail before allocating.
-    var image = [_]u8{0} ** 512;
+    var image = @as([512]u8, @splat(0));
     try std.testing.expectError(error.InvalidPageSize, encodeImage(std.testing.allocator, &image, 100));
     try std.testing.expectError(error.InvalidPageSize, encodeImage(std.testing.allocator, &image, 0));
     try std.testing.expectError(error.InvalidPageSize, encodeImage(std.testing.allocator, image[0..100], 512));
@@ -304,7 +304,7 @@ test "WAL encodeImage validates geometry and frame headers round trip" {
     // Boundary: a zero-frame WAL applies to a copy of the base image.
     var hdr: [headerSize]u8 = undefined;
     (WalHeader{ .pageSize = 512 }).encode(&hdr);
-    var base = [_]u8{0x5a} ** 512;
+    var base = @as([512]u8, @splat(0x5a));
     const copied = try apply(std.testing.allocator, &base, &hdr);
     defer std.testing.allocator.free(copied);
     try std.testing.expectEqualSlices(u8, &base, copied);

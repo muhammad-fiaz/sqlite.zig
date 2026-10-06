@@ -42,7 +42,7 @@ pub const Page = struct {
         if (self.pageNumber == 0) return error.InvalidPage;
         const offset = self.headerOffset();
         if (offset >= self.bytes.len) return error.InvalidPage;
-        self.bytes[offset] = @intFromEnum(kind);
+        self.bytes[offset] = @backingInt(kind);
     }
 };
 

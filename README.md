@@ -5,7 +5,7 @@
 # SQLite.zig
 
 <a href="https://muhammad-fiaz.github.io/sqlite.zig/"><img src="https://img.shields.io/badge/docs-muhammad--fiaz.github.io-blue" alt="Documentation"></a>
-<a href="https://ziglang.org/"><img src="https://img.shields.io/badge/Zig-0.16.0-orange.svg?logo=zig" alt="Zig Version"></a>
+<a href="https://ziglang.org/"><img src="https://img.shields.io/badge/Zig-0.17.0-orange.svg?logo=zig" alt="Zig Version"></a>
 <a href="https://github.com/muhammad-fiaz/sqlite.zig"><img src="https://img.shields.io/github/stars/muhammad-fiaz/sqlite.zig" alt="GitHub stars"></a>
 <a href="https://github.com/muhammad-fiaz/sqlite.zig/issues"><img src="https://img.shields.io/github/issues/muhammad-fiaz/sqlite.zig" alt="GitHub issues"></a>
 <a href="https://github.com/muhammad-fiaz/sqlite.zig/pulls"><img src="https://img.shields.io/github/issues-pr/muhammad-fiaz/sqlite.zig" alt="GitHub pull requests"></a>
@@ -121,7 +121,7 @@ Before using `sqlite.zig`, ensure you have the following:
 
 | Requirement | Version | Notes |
 |-------------|---------|-------|
-| **Zig** | 0.16.0+ | Download from [ziglang.org](https://ziglang.org/download/) |
+| **Zig** | 0.17.0+ | Download from [ziglang.org](https://ziglang.org/download/) |
 | **Operating System** | Windows 10+, Linux, macOS | Cross-platform database engine |
 
 ---

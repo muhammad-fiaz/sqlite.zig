@@ -48,6 +48,7 @@
 //! `.id` lives in column-list positions while predicates always name their
 //! table explicitly (`User.id.eq(1)`, `u.id.eq(1)`) or use dynamic columns.
 
+const reflectionCompat = @import("../compat.zig");
 const std = @import("std");
 const dslExpr = @import("expr.zig");
 const ColumnRef = dslExpr.ColumnRef;
@@ -99,7 +100,7 @@ pub fn isScopedList(comptime T: type, comptime Row: type) bool {
     if (info == .array) return isScopedItem(info.array.child, Row);
     if (info == .pointer and info.pointer.size == .slice) return isScopedItem(info.pointer.child, Row);
     if (info == .@"struct" and info.@"struct".is_tuple) {
-        const fields = info.@"struct".fields;
+        const fields = reflectionCompat.fields(info.@"struct");
         if (fields.len == 0) return false;
         inline for (fields) |field| {
             if (!isScopedItem(field.type, Row)) return false;
@@ -113,7 +114,7 @@ pub fn isScopedList(comptime T: type, comptime Row: type) bool {
 /// columns descriptor struct). Usable at runtime for slice inputs; returns
 /// null when the field is unknown.
 pub fn sqlNameOf(comptime Columns: type, zigName: []const u8) ?[]const u8 {
-    inline for (@typeInfo(Columns).@"struct".fields) |field| {
+    inline for (reflectionCompat.fields(@typeInfo(Columns).@"struct")) |field| {
         if (std.mem.eql(u8, field.name, zigName)) return field.type.dslName;
     }
     return null;
